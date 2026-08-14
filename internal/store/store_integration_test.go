@@ -284,6 +284,31 @@ func TestAnalysis_InsertAndQuery(t *testing.T) {
 	}
 }
 
+func TestAnalysis_TimeframeWorkflowRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	wf := store.TimeframeWorkflowAudit{
+		Version: 1, RoutingSource: "profile", Mode: "enforce",
+		Primary:      store.TimeframePassAudit{Timeframe: "1d", Action: "BUY", Confidence: .82, SelectedLens: "momentum"},
+		Confirmation: &store.TimeframePassAudit{Timeframe: "4h", Status: "confirmed", Action: "BUY", Confidence: .76, SelectedLens: "momentum"},
+		FinalAction:  "BUY",
+	}
+	id, err := store.InsertAnalysisWithScannerRunAudit(ctx, "TEST_TF_AUDIT", "momentum", testAnalysisResp(analysis.ActionBuy), testModelMeta(), "", store.AnalysisAudit{SelectionStatus: analysis.LensSelectionSelected, SelectedLens: "momentum", TimeframeWorkflow: &wf})
+	if err != nil {
+		t.Fatalf("insert workflow audit: %v", err)
+	}
+	got, err := store.GetAnalysisByID(ctx, id)
+	if err != nil || got == nil {
+		t.Fatalf("get workflow audit: %v", err)
+	}
+	var decoded store.TimeframeWorkflowAudit
+	if err := json.Unmarshal(got.TimeframeWorkflow, &decoded); err != nil {
+		t.Fatalf("decode workflow audit: %v", err)
+	}
+	if decoded.RoutingSource != "profile" || decoded.Confirmation == nil || decoded.Confirmation.Status != "confirmed" {
+		t.Fatalf("workflow audit = %+v", decoded)
+	}
+}
+
 func TestAnalysis_EnsembleInsertAndQuery(t *testing.T) {
 	ctx := context.Background()
 
@@ -428,6 +453,26 @@ func TestSignal_PullbackStrengthRoundTrip(t *testing.T) {
 		trade.EntrySetupEvidence != "reclaimed $99.00 support" {
 		t.Fatalf("trade entry attribution = %q / %q",
 			trade.EntrySetup, trade.EntrySetupEvidence)
+	}
+}
+
+func TestSignal_EntryGateDecisionsRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	decisions, _ := json.Marshal([]store.EntryGateDecision{{Name: "trend_alignment", Status: "passed"}, {Name: "runup_anti_chase", Status: "blocked", Reason: "extended"}})
+	id, err := store.InsertSignal(ctx, store.Signal{Ticker: "TEST_GATE_AUDIT", Action: "BUY", Strategy: "momentum", SignalPrice: 100, Confidence: .8, SizePct: 1, Status: "blocked", BlockReason: "extended", ExpiresAt: time.Now().Add(time.Hour), EntryGateDecisions: decisions})
+	if err != nil {
+		t.Fatalf("insert gate audit: %v", err)
+	}
+	got, err := store.GetSignalByID(ctx, id)
+	if err != nil || got == nil {
+		t.Fatalf("get gate audit: %v", err)
+	}
+	var decoded []store.EntryGateDecision
+	if err := json.Unmarshal(got.EntryGateDecisions, &decoded); err != nil {
+		t.Fatalf("decode gate decisions: %v", err)
+	}
+	if len(decoded) != 2 || decoded[0].Status != "passed" || decoded[1].Reason != "extended" {
+		t.Fatalf("gate decisions = %+v", decoded)
 	}
 }
 

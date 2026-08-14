@@ -143,6 +143,10 @@ type Engine struct {
 	// the alt timeframe before reading. Defaults to fetchAndStoreCandles;
 	// tests override it to avoid network/DB.
 	multiTFCandleFetcher func(ctx context.Context, ticker string, tf data.Timeframe)
+	// profileConfirmationCandleFetcher is checked because the mandatory
+	// profile entry pass must fail closed when fresh market data cannot be
+	// obtained. It intentionally does not share the legacy fail-open seam.
+	profileConfirmationCandleFetcher func(ctx context.Context, ticker string, tf data.Timeframe) error
 
 	// recoveredEntryEffects keeps asynchronous polling and coordinator startup
 	// recovery from publishing the same in-process entry event twice.
@@ -249,6 +253,10 @@ func New(cfg *config.Config, market data.MarketDataProvider, news data.NewsProvi
 	// Tests override this field directly to avoid network/DB. See Issue #321
 	// PR #336 fix for stale alt-tf candles.
 	e.multiTFCandleFetcher = e.fetchAndStoreCandles
+	e.profileConfirmationCandleFetcher = func(ctx context.Context, ticker string, tf data.Timeframe) error {
+		_, err := e.fetchAndStoreCandlesObserved(ctx, ticker, tf)
+		return err
+	}
 
 	if cfg.Feedback.Enabled && store.IsConnected() {
 		e.feedbackReviewer = feedback.NewReviewer(cfg.Feedback, bus, store.GetDB())
@@ -639,7 +647,7 @@ func (e *Engine) processStockWithProfile(
 	discoveryContext *tradeprofile.DiscoveryContext,
 	executionProfile *tradeprofile.ExecutionProfile,
 ) {
-	requestedTimeframes := stockTimeframesForEntry(timeframes, false)
+	workflow := resolveTimeframeWorkflow(timeframes, executionProfile)
 	// The complete pullback setup is defined on daily history even when a
 	// scanner candidate uses 1H/4H for its analyst prompt. Fetch 1D explicitly
 	// so the execution gate never silently fails open because of watchlist
@@ -650,7 +658,16 @@ func (e *Engine) processStockWithProfile(
 	pullbackPromptCandidate := pullbackLensAdmissible(strategies, executionProfile)
 	needsDailyEvidence := pullbackCandidate || pullbackPromptCandidate ||
 		entryGates.TrendAlignmentEnabled
-	fetchTimeframes := stockTimeframesForEntry(timeframes, needsDailyEvidence)
+	fetchTimeframes := workflow.FetchTimeframes
+	if workflow.ProfileOwned {
+		// Entry-timing evidence is fetched only if the primary decision is
+		// eligible for confirmation. That checked on-demand refresh is the
+		// fail-closed freshness boundary for the second pass.
+		fetchTimeframes = []string{string(workflow.PrimaryTimeframe)}
+	}
+	if needsDailyEvidence && workflow.PrimaryTimeframe != data.Timeframe1Day {
+		fetchTimeframes = append(fetchTimeframes, string(data.Timeframe1Day))
+	}
 
 	for _, tfStr := range fetchTimeframes {
 		tf := data.Timeframe(tfStr)
@@ -660,7 +677,7 @@ func (e *Engine) processStockWithProfile(
 	// Compute indicators on the primary timeframe (prefer "1d", fall back to first).
 	// Only requested timeframes participate: an evidence-only daily fetch must
 	// not silently change a scanner item's 1H/4H analyst prompt to daily.
-	primaryTF := primaryStockTimeframe(requestedTimeframes)
+	primaryTF := workflow.PrimaryTimeframe
 
 	// Determine the ticker's primary strategy for prompt-context capping.
 	// NOTE: HistoryWindowByStrategy caps how many candles reach the prompt
@@ -1129,7 +1146,7 @@ func (e *Engine) runAnalysisWithProfile(
 		ExecutionProfile:   executionProfile,
 		PullbackContext:    pullbackContext,
 		Timeframe:          timeframe,
-		MomentumPlay:       source == "scanner",
+		MomentumPlay:       profileMomentumPlay(timeframe, source, executionProfile),
 		RecentCandles:      snaps,
 		KnowledgeContext:   knowledgeCtx,
 		SimilarAnalyses:    similarSetups,
@@ -1155,6 +1172,17 @@ func (e *Engine) runAnalysisWithProfile(
 	}
 
 	impact := e.calculateImpactScore(ticker, snippets, candles)
+	workflow := resolveTimeframeWorkflow([]string{timeframe}, executionProfile)
+	routingSource := "legacy"
+	if workflow.ProfileOwned {
+		routingSource = "profile"
+	}
+	workflowAudit := store.TimeframeWorkflowAudit{
+		Version: 1, RoutingSource: routingSource, Mode: "enforce",
+		Primary: store.TimeframePassAudit{Timeframe: timeframe},
+	}
+	signalCandles := candles
+	signalTimeframe := timeframe
 	// Specialist mode runs three directional roles followed by a mandatory
 	// Risk Specialist instead of the generalist ensemble. Both paths return
 	// AnalyzeResult so downstream cost tracking and persistence stay shared.
@@ -1212,7 +1240,49 @@ func (e *Engine) runAnalysisWithProfile(
 	// over the combined set. The recursion guard is enforced by passing the
 	// secondPass=false flag here; runSecondTimeframePass never re-invokes this
 	// branch, so a third pass cannot fire.
+	var primaryAudit analysis.LensSelectionAudit
 	if err == nil {
+		primaryResp := result.Response
+		primaryAudit = analysis.ValidateFinalLensSelection(&primaryResp, req, len(result.AnalystResults) > 1)
+		result.Response = primaryResp
+		populatePrimaryWorkflowAudit(&workflowAudit, primaryResp, primaryAudit)
+	}
+	if err == nil && workflow.ProfileOwned {
+		primaryResp := result.Response
+		if workflow.EntryTimingTimeframe != "" && profileConfirmationEligible(primaryResp, primaryAudit, req.LensSet()) {
+			entryTF := string(workflow.EntryTimingTimeframe)
+			logger.Info("profile timeframe: running entry confirmation", "ticker", ticker, "primary_tf", timeframe, "entry_tf", entryTF)
+			confirmation, confirmationCandles, available := e.runProfileConfirmation(ctx, req, primaryResp, entryTF, ticker, impact)
+			e.recordProfileConfirmationCost(confirmation)
+			confirmationResp := confirmation.Response
+			confirmationAudit := analysis.LensSelectionAudit{}
+			confirmationPass := &store.TimeframePassAudit{Timeframe: entryTF, Status: "unavailable", Reason: "fresh candles or confirmation model unavailable"}
+			if available {
+				confirmationAudit = analysis.ValidateFinalLensSelection(&confirmationResp, analysis.AnalysisRequest{
+					ExecutionProfile: executionProfile,
+				}, len(confirmation.AnalystResults) > 1)
+				confirmationPass.Action = string(confirmationResp.Action)
+				confirmationPass.Confidence = confirmationResp.Confidence
+				confirmationPass.SelectedLens = confirmationAudit.SelectedLens
+				confirmationPass.Status = "rejected"
+				if profileConfirmationConfirmed(confirmationResp, primaryAudit, confirmationAudit, available) {
+					confirmationPass.Status = "confirmed"
+					confirmationPass.Reason = "entry timing confirmed"
+				} else {
+					confirmationPass.Reason = "confirmation did not return BUY under the primary lens"
+				}
+			}
+			workflowAudit.Confirmation = confirmationPass
+			result.Response = mergeProfileConfirmation(primaryResp, confirmationResp, primaryAudit, confirmationAudit, req.LensSet(), available)
+			signalCandles, signalTimeframe = signalEvidenceAfterConfirmation(
+				candles, timeframe, confirmationCandles, entryTF, confirmationPass.Status, result.Response.Action,
+			)
+		} else if workflow.EntryTimingTimeframe != "" {
+			workflowAudit.Confirmation = &store.TimeframePassAudit{Timeframe: string(workflow.EntryTimingTimeframe), Status: "not_requested", Reason: "primary outcome was not eligible for timing confirmation"}
+		}
+	}
+
+	if err == nil && !workflow.ProfileOwned {
 		if altTF, run := shouldRunSecondPass(e.cfg.Analysis, result.Response, timeframe, false); run {
 			logger.Info("multi-tf: borderline WAIT — running alt-timeframe pass",
 				"ticker", ticker, "primary_tf", timeframe, "alt_tf", altTF,
@@ -1260,6 +1330,7 @@ func (e *Engine) runAnalysisWithProfile(
 	// Invalid model output remains in meta.RawResponse, but is cleared from the
 	// live response before the existing downstream compatibility paths see it.
 	lensAudit := analysis.ValidateFinalLensSelection(&resp, req, len(result.AnalystResults) > 1)
+	workflowAudit.FinalAction = string(resp.Action)
 	if lensAudit.SelectionStatus == analysis.LensSelectionInvalid {
 		logger.Warn("invalid profile-bound lens selection",
 			"ticker", ticker, "selected", lensAudit.SelectedLens,
@@ -1372,19 +1443,21 @@ func (e *Engine) runAnalysisWithProfile(
 			DissentSummary:  dissentSummary,
 			ScannerRunID:    scannerRunID,
 			Audit: store.AnalysisAudit{
-				SelectedLens:    lensAudit.SelectedLens,
-				RejectedLenses:  lensAudit.RejectedLenses,
-				Regime:          lensAudit.Regime,
-				SelectionStatus: lensAudit.SelectionStatus,
+				SelectedLens:      lensAudit.SelectedLens,
+				RejectedLenses:    lensAudit.RejectedLenses,
+				Regime:            lensAudit.Regime,
+				SelectionStatus:   lensAudit.SelectionStatus,
+				TimeframeWorkflow: &workflowAudit,
 			},
 		})
 	} else {
 		analysisID, err = store.InsertAnalysisWithScannerRunAudit(
 			ctx, ticker, strategy, resp, meta, scannerRunID, store.AnalysisAudit{
-				SelectedLens:    lensAudit.SelectedLens,
-				RejectedLenses:  lensAudit.RejectedLenses,
-				Regime:          lensAudit.Regime,
-				SelectionStatus: lensAudit.SelectionStatus,
+				SelectedLens:      lensAudit.SelectedLens,
+				RejectedLenses:    lensAudit.RejectedLenses,
+				Regime:            lensAudit.Regime,
+				SelectionStatus:   lensAudit.SelectionStatus,
+				TimeframeWorkflow: &workflowAudit,
 			},
 		)
 	}
@@ -1403,7 +1476,7 @@ func (e *Engine) runAnalysisWithProfile(
 	// prefetch unset, and generateSignal then re-fetches on-demand and applies
 	// its degraded-mode handling.
 	e.generateSignal(
-		ctx, ticker, timeframe, strategy, strategies, candles, resp, analysisID,
+		ctx, ticker, signalTimeframe, strategy, strategies, signalCandles, resp, analysisID,
 		prefetchedOpenTrades, e.analysisSourceNode(result), scannerRunID,
 		pullbackCandidate, req.LensSet(),
 	)
@@ -1978,10 +2051,18 @@ func (e *Engine) generateSignal(
 		analysisIDs = []string{analysisID}
 	}
 	createdAt := time.Now()
+	admissibleLenses := strategies
+	if len(admissibleLensSets) > 0 {
+		admissibleLenses = admissibleLensSets[0]
+	}
+	signalStrategy := strategy
+	if resp.Action == analysis.ActionBuy {
+		signalStrategy = effectiveGateStrategy(strategy, resp.SelectedStrategy, admissibleLenses)
+	}
 	sig := store.Signal{
 		Ticker:            ticker,
 		Action:            string(resp.Action),
-		Strategy:          strategy,
+		Strategy:          signalStrategy,
 		SignalPrice:       signalPrice,
 		StopLoss:          resp.StopLoss,
 		TakeProfit:        resp.TakeProfit,
@@ -1995,6 +2076,7 @@ func (e *Engine) generateSignal(
 		AnalysisIDs:       analysisIDs,
 		CreatedAt:         createdAt,
 	}
+	gateDecisions := make([]store.EntryGateDecision, 0, 4)
 
 	// Entry-quality gates (entry_gates.go): daily trend alignment, news
 	// tape-confirmation, and momentum anti-chase. Checked before the generic
@@ -2009,10 +2091,6 @@ func (e *Engine) generateSignal(
 		entryDailyCandles := candles
 		var pullbackObservedAt time.Time
 		pullbackCandidate = eg.PullbackStrengthEnabled && pullbackCandidate
-		admissibleLenses := strategies
-		if len(admissibleLensSets) > 0 {
-			admissibleLenses = admissibleLensSets[0]
-		}
 		// A lens made available by the scanner profile cannot bypass its own
 		// deterministic qualification. Legacy qualified candidates retain the
 		// additive path below even when an older model omits selected_strategy.
@@ -2120,6 +2198,15 @@ func (e *Engine) generateSignal(
 			}
 			entryGateReason = "pullback strength: deterministic qualification required for the selected lens: " + pullbackFailureReason
 		}
+		if pullbackSelected {
+			status, reason := "passed", "deterministic pullback qualification passed"
+			if !pullbackConfirmed {
+				status, reason = "blocked", entryGateReason
+			}
+			gateDecisions = append(gateDecisions, store.EntryGateDecision{Name: "pullback_qualification", Status: status, Reason: reason})
+		} else {
+			gateDecisions = append(gateDecisions, store.EntryGateDecision{Name: "pullback_qualification", Status: "not_applicable"})
+		}
 		if entryGateReason == "" && !pullbackConfirmed && eg.TrendAlignmentEnabled {
 			var evaluated bool
 			entryGateReason, evaluated = evaluateTrendAlignmentGate(
@@ -2130,13 +2217,18 @@ func (e *Engine) generateSignal(
 				logger.Warn("entry gates: daily trend evidence unavailable — trend gate fails open",
 					"ticker", ticker, "timeframe", timeframe, "candles", len(candles))
 			}
+			status := entryGateAuditStatus(evaluated, entryGateReason)
+			gateDecisions = append(gateDecisions, store.EntryGateDecision{Name: "trend_alignment", Status: status, Reason: entryGateReason})
+		} else if !eg.TrendAlignmentEnabled {
+			gateDecisions = append(gateDecisions, store.EntryGateDecision{Name: "trend_alignment", Status: "disabled"})
 		}
 		if !pullbackConfirmed && entryGateReason == "" &&
 			(eg.NewsMinRunupPct > 0 || eg.MomentumMaxRunupPct > 0) {
 			nowET := time.Now().In(nyLoc)
 			dayStartET := time.Date(nowET.Year(), nowET.Month(), nowET.Day(), 0, 0, 0, 0, nyLoc)
 			prevClose, pcErr := store.GetPrevDailyClose(ctx, ticker, dayStartET)
-			if pcErr != nil || prevClose <= 0 {
+			evaluated := pcErr == nil && prevClose > 0
+			if !evaluated {
 				logger.Warn("entry gates: prior daily close unavailable — run-up gates fail open",
 					"ticker", ticker, "err", pcErr)
 			}
@@ -2144,8 +2236,11 @@ func (e *Engine) generateSignal(
 				effectiveGateStrategy(strategy, resp.SelectedStrategy, admissibleLenses),
 				string(resp.Action), signalPrice, prevClose, eg,
 			)
+			status := entryGateAuditStatus(evaluated, entryGateReason)
+			gateDecisions = append(gateDecisions, store.EntryGateDecision{Name: "runup_anti_chase", Status: status, Reason: entryGateReason})
 		}
 		if entryGateReason != "" {
+			sig.EntryGateDecisions, _ = json.Marshal(gateDecisions)
 			sig.Status = "blocked"
 			sig.BlockReason = entryGateReason
 			if _, err := store.InsertSignal(ctx, sig); err != nil {
@@ -2158,6 +2253,7 @@ func (e *Engine) generateSignal(
 			})
 			return
 		}
+		sig.EntryGateDecisions, _ = json.Marshal(gateDecisions)
 	}
 
 	// Run risk checks.
@@ -2365,6 +2461,16 @@ func (e *Engine) generateSignal(
 	default:
 		logger.Warn("unknown mode, defaulting to manual", "mode", mode)
 	}
+}
+
+func entryGateAuditStatus(evaluated bool, blockReason string) string {
+	if !evaluated {
+		return "unavailable_fail_open"
+	}
+	if blockReason != "" {
+		return "blocked"
+	}
+	return "passed"
 }
 
 // resolveFallbackCandle selects the freshest available candle for a signal

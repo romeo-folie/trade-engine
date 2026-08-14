@@ -35,6 +35,7 @@ type StoredAnalysis struct {
 	RejectedLenses      []byte // JSONB
 	Regime              string
 	LensSelectionStatus string
+	TimeframeWorkflow   []byte // JSONB
 	CreatedAt           time.Time
 }
 
@@ -61,10 +62,29 @@ func InsertAnalysisWithScannerRun(
 // an analysis. It deliberately lives on analyses, not signals or gates: those
 // execution decisions are PR 2 work.
 type AnalysisAudit struct {
-	SelectedLens    string
-	RejectedLenses  map[string]string
-	Regime          string
-	SelectionStatus analysis.LensSelectionStatus
+	SelectedLens      string
+	RejectedLenses    map[string]string
+	Regime            string
+	SelectionStatus   analysis.LensSelectionStatus
+	TimeframeWorkflow *TimeframeWorkflowAudit
+}
+
+type TimeframePassAudit struct {
+	Timeframe    string  `json:"timeframe"`
+	Status       string  `json:"status,omitempty"`
+	Action       string  `json:"action,omitempty"`
+	Confidence   float64 `json:"confidence,omitempty"`
+	SelectedLens string  `json:"selected_lens,omitempty"`
+	Reason       string  `json:"reason,omitempty"`
+}
+
+type TimeframeWorkflowAudit struct {
+	Version       int                 `json:"version"`
+	RoutingSource string              `json:"routing_source"`
+	Mode          string              `json:"mode"`
+	Primary       TimeframePassAudit  `json:"primary"`
+	Confirmation  *TimeframePassAudit `json:"confirmation,omitempty"`
+	FinalAction   string              `json:"final_action"`
 }
 
 // InsertAnalysisWithScannerRunAudit persists a completed analysis with its
@@ -77,7 +97,7 @@ func InsertAnalysisWithScannerRunAudit(
 	scannerRunID string,
 	audit AnalysisAudit,
 ) (string, error) {
-	selectedLens, rejectedLenses, regime, status, err := analysisAuditValues(audit)
+	selectedLens, rejectedLenses, regime, status, workflow, err := analysisAuditValues(audit)
 	if err != nil {
 		return "", err
 	}
@@ -89,7 +109,7 @@ func InsertAnalysisWithScannerRunAudit(
 			model_provider, model_name,
 			token_count_input, token_count_output, latency_ms,
 			indicators, scanner_run_id,
-			selected_lens, rejected_lenses, regime, lens_selection_status
+			selected_lens, rejected_lenses, regime, lens_selection_status, timeframe_workflow
 		) VALUES (
 			$1, $2, $3, $4, $5,
 			$6, $7, $8,
@@ -97,7 +117,7 @@ func InsertAnalysisWithScannerRunAudit(
 			$12, $13,
 			$14, $15, $16,
 			$17, $18,
-			$19, $20, $21, $22
+			$19, $20, $21, $22, $23
 		) RETURNING id`
 	var id string
 	err = GetDB().QueryRow(ctx, q,
@@ -107,7 +127,7 @@ func InsertAnalysisWithScannerRunAudit(
 		meta.Provider, meta.Model,
 		meta.InputTokens, meta.OutputTokens, meta.LatencyMs,
 		meta.IndicatorJSON, nullableString(scannerRunID),
-		selectedLens, rejectedLenses, regime, status,
+		selectedLens, rejectedLenses, regime, status, workflow,
 	).Scan(&id)
 	return id, err
 }
@@ -124,7 +144,7 @@ type EnsembleRecord struct {
 
 // InsertEnsembleAnalysis persists an ensemble analysis record (Phase 12).
 func InsertEnsembleAnalysis(ctx context.Context, ticker, strategy string, resp analysis.AnalysisResponse, meta analysis.ModelCallMeta, ensemble EnsembleRecord) (string, error) {
-	selectedLens, rejectedLenses, regime, status, err := analysisAuditValues(ensemble.Audit)
+	selectedLens, rejectedLenses, regime, status, workflow, err := analysisAuditValues(ensemble.Audit)
 	if err != nil {
 		return "", err
 	}
@@ -138,7 +158,7 @@ func InsertEnsembleAnalysis(ctx context.Context, ticker, strategy string, resp a
 			indicators,
 			ensemble_results, arbiter_response, fast_pathed, dissent_summary,
 			scanner_run_id,
-			selected_lens, rejected_lenses, regime, lens_selection_status
+			selected_lens, rejected_lenses, regime, lens_selection_status, timeframe_workflow
 		) VALUES (
 			$1, $2, $3, $4, $5,
 			$6, $7, $8,
@@ -147,7 +167,7 @@ func InsertEnsembleAnalysis(ctx context.Context, ticker, strategy string, resp a
 			$14, $15, $16,
 			$17,
 			$18, $19, $20, $21, $22,
-			$23, $24, $25, $26
+			$23, $24, $25, $26, $27
 		) RETURNING id`
 	var id string
 	err = GetDB().QueryRow(ctx, q,
@@ -159,22 +179,28 @@ func InsertEnsembleAnalysis(ctx context.Context, ticker, strategy string, resp a
 		meta.IndicatorJSON,
 		ensemble.EnsembleResults, ensemble.ArbiterResponse, ensemble.FastPathed,
 		nullableString(ensemble.DissentSummary), nullableString(ensemble.ScannerRunID),
-		selectedLens, rejectedLenses, regime, status,
+		selectedLens, rejectedLenses, regime, status, workflow,
 	).Scan(&id)
 	return id, err
 }
 
-func analysisAuditValues(audit AnalysisAudit) (selectedLens, rejectedLenses, regime, status any, err error) {
+func analysisAuditValues(audit AnalysisAudit) (selectedLens, rejectedLenses, regime, status, workflow any, err error) {
 	if audit.SelectionStatus == "" {
 		audit.SelectionStatus = analysis.LensSelectionAbsent
 	}
 	if len(audit.RejectedLenses) > 0 {
 		rejectedLenses, err = json.Marshal(audit.RejectedLenses)
 		if err != nil {
-			return nil, nil, nil, nil, fmt.Errorf("marshal rejected lenses: %w", err)
+			return nil, nil, nil, nil, nil, fmt.Errorf("marshal rejected lenses: %w", err)
 		}
 	}
-	return nullableString(audit.SelectedLens), rejectedLenses, nullableString(audit.Regime), string(audit.SelectionStatus), nil
+	if audit.TimeframeWorkflow != nil {
+		workflow, err = json.Marshal(audit.TimeframeWorkflow)
+		if err != nil {
+			return nil, nil, nil, nil, nil, fmt.Errorf("marshal timeframe workflow: %w", err)
+		}
+	}
+	return nullableString(audit.SelectedLens), rejectedLenses, nullableString(audit.Regime), string(audit.SelectionStatus), workflow, nil
 }
 
 // ModelPerformanceRow is a row from the model_performance_detail view.
@@ -572,7 +598,7 @@ func GetAnalysesByTicker(ctx context.Context, ticker string, limit int) ([]Store
 		       COALESCE(token_count_input, 0), COALESCE(token_count_output, 0), COALESCE(latency_ms, 0),
 		       COALESCE(indicators, '{}'), COALESCE(selected_lens, ''),
 		       COALESCE(rejected_lenses, '{}'), COALESCE(regime, ''),
-		       COALESCE(lens_selection_status, ''), created_at
+		       COALESCE(lens_selection_status, ''), COALESCE(timeframe_workflow, '{}'), created_at
 		FROM analyses
 		WHERE ticker = $1
 		ORDER BY created_at DESC
@@ -595,7 +621,7 @@ func GetAnalysisByID(ctx context.Context, id string) (*StoredAnalysis, error) {
 		       COALESCE(token_count_input, 0), COALESCE(token_count_output, 0), COALESCE(latency_ms, 0),
 		       COALESCE(indicators, '{}'), COALESCE(selected_lens, ''),
 		       COALESCE(rejected_lenses, '{}'), COALESCE(regime, ''),
-		       COALESCE(lens_selection_status, ''), created_at
+		       COALESCE(lens_selection_status, ''), COALESCE(timeframe_workflow, '{}'), created_at
 		FROM analyses
 		WHERE id = $1`
 	rows, err := GetDB().Query(ctx, q, id)
@@ -620,7 +646,7 @@ func GetRecentAnalyses(ctx context.Context, limit int) ([]StoredAnalysis, error)
 		       COALESCE(token_count_input, 0), COALESCE(token_count_output, 0), COALESCE(latency_ms, 0),
 		       COALESCE(indicators, '{}'), COALESCE(selected_lens, ''),
 		       COALESCE(rejected_lenses, '{}'), COALESCE(regime, ''),
-		       COALESCE(lens_selection_status, ''), created_at
+		       COALESCE(lens_selection_status, ''), COALESCE(timeframe_workflow, '{}'), created_at
 		FROM analyses
 		ORDER BY created_at DESC
 		LIMIT $1`
@@ -643,7 +669,7 @@ func scanAnalyses(rows pgx.Rows) ([]StoredAnalysis, error) {
 			&a.ModelProvider, &a.ModelName,
 			&a.InputTokens, &a.OutputTokens, &a.LatencyMs,
 			&a.Indicators, &a.SelectedLens, &a.RejectedLenses, &a.Regime,
-			&a.LensSelectionStatus, &a.CreatedAt,
+			&a.LensSelectionStatus, &a.TimeframeWorkflow, &a.CreatedAt,
 		); err != nil {
 			return nil, err
 		}

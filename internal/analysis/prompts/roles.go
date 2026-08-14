@@ -177,6 +177,36 @@ func BuildRolePromptWithDiscoveryContext(
 	discoveryContext *tradeprofile.DiscoveryContext,
 	pullbackContexts ...*pullback.PromptContext,
 ) (systemPrompt, userMessage string) {
+	var pullbackContext *pullback.PromptContext
+	if len(pullbackContexts) > 0 {
+		pullbackContext = pullbackContexts[0]
+	}
+	return BuildRolePromptWithAnalysisContext(
+		role, ticker, strategies, timeframe, candles, ind, news, portfolio,
+		knowledgeContext, similarSetups, performanceContext, discoveryContext,
+		pullbackContext, TimeframeRolePrimaryThesis, nil,
+	)
+}
+
+// BuildRolePromptWithAnalysisContext is the timeframe-workflow-aware variant
+// for every directional specialist and the risk specialist. It keeps the
+// role-specific system prompt while making confirmation constraints explicit.
+func BuildRolePromptWithAnalysisContext(
+	role, ticker string,
+	strategies []string,
+	timeframe string,
+	candles []Candle,
+	ind Indicators,
+	news []NewsItem,
+	portfolio Portfolio,
+	knowledgeContext string,
+	similarSetups []SimilarPastSetup,
+	performanceContext string,
+	discoveryContext *tradeprofile.DiscoveryContext,
+	pullbackContext *pullback.PromptContext,
+	timeframeRole TimeframeRole,
+	primaryThesis *PrimaryThesisContext,
+) (systemPrompt, userMessage string) {
 	contract := lensContract(strategies)
 	exitOverride := ExitOnlyOverride(strategies)
 	switch role {
@@ -191,11 +221,8 @@ func BuildRolePromptWithDiscoveryContext(
 	default:
 		return "", ""
 	}
-	var pullbackContext *pullback.PromptContext
-	if len(pullbackContexts) > 0 {
-		pullbackContext = pullbackContexts[0]
-	}
-	userMessage = buildUser(ticker, timeframe, candles, ind, news, portfolio, knowledgeContext, similarSetups, performanceContext, discoveryContext, pullbackContext)
+	systemPrompt += timeframeRoleInstruction(timeframeRole)
+	userMessage = buildUserWithTimeframeContext(ticker, timeframe, candles, ind, news, portfolio, knowledgeContext, similarSetups, performanceContext, discoveryContext, pullbackContext, timeframeRole, primaryThesis)
 	return
 }
 
@@ -237,20 +264,42 @@ func BuildRiskManagerReviewPromptWithDiscoveryContext(
 	discoveryContext *tradeprofile.DiscoveryContext,
 	pullbackContexts ...*pullback.PromptContext,
 ) (systemPrompt, userMessage string) {
-	systemPrompt, userMessage = BuildRolePrompt(
-		"risk_manager", ticker, strategies, timeframe, candles, ind, news,
-		portfolio, knowledgeContext, similarSetups, performanceContext,
-	)
 	var pullbackContext *pullback.PromptContext
 	if len(pullbackContexts) > 0 {
 		pullbackContext = pullbackContexts[0]
 	}
-	if discoveryContext != nil || pullbackContext != nil {
-		systemPrompt, userMessage = BuildRolePromptWithDiscoveryContext(
-			"risk_manager", ticker, strategies, timeframe, candles, ind, news,
-			portfolio, knowledgeContext, similarSetups, performanceContext, discoveryContext, pullbackContext,
-		)
-	}
+	return BuildRiskManagerReviewPromptWithAnalysisContext(
+		ticker, strategies, timeframe, candles, ind, news, portfolio,
+		knowledgeContext, similarSetups, performanceContext, directionalFindings,
+		discoveryContext, pullbackContext, TimeframeRolePrimaryThesis, nil,
+	)
+}
+
+// BuildRiskManagerReviewPromptWithAnalysisContext preserves the sequential
+// risk review while carrying the same primary-thesis constraint given to its
+// directional inputs.
+func BuildRiskManagerReviewPromptWithAnalysisContext(
+	ticker string,
+	strategies []string,
+	timeframe string,
+	candles []Candle,
+	ind Indicators,
+	news []NewsItem,
+	portfolio Portfolio,
+	knowledgeContext string,
+	similarSetups []SimilarPastSetup,
+	performanceContext string,
+	directionalFindings string,
+	discoveryContext *tradeprofile.DiscoveryContext,
+	pullbackContext *pullback.PromptContext,
+	timeframeRole TimeframeRole,
+	primaryThesis *PrimaryThesisContext,
+) (systemPrompt, userMessage string) {
+	systemPrompt, userMessage = BuildRolePromptWithAnalysisContext(
+		"risk_manager", ticker, strategies, timeframe, candles, ind, news,
+		portfolio, knowledgeContext, similarSetups, performanceContext, discoveryContext,
+		pullbackContext, timeframeRole, primaryThesis,
+	)
 	if systemPrompt == "" || userMessage == "" {
 		return "", ""
 	}

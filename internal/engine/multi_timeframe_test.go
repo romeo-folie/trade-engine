@@ -25,6 +25,28 @@ func borderlineCfg() config.AnalysisConfig {
 	}
 }
 
+func TestPromptCandleLimit(t *testing.T) {
+	tests := []struct {
+		name       string
+		available  int
+		configured int
+		windows    map[string]int
+		want       int
+	}{
+		{name: "zero config uses bounded default", available: 5000, want: 20},
+		{name: "lens history widens default", available: 5000, windows: map[string]int{"momentum": 35}, want: 35},
+		{name: "configured max remains hard cap", available: 5000, configured: 25, windows: map[string]int{"momentum": 35}, want: 25},
+		{name: "available candles bound result", available: 12, configured: 25, want: 12},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := promptCandleLimit(tt.available, tt.configured, tt.windows, "momentum", []string{"momentum"}); got != tt.want {
+				t.Fatalf("promptCandleLimit() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestShouldRunSecondPass_BorderlineWAITTriggers(t *testing.T) {
 	cfg := borderlineCfg()
 	resp := analysis.AnalysisResponse{Action: analysis.ActionWait, Confidence: 0.62}
@@ -350,6 +372,32 @@ func TestLoadAltCandles_NilFetcherStillLoads(t *testing.T) {
 	}
 	if loadCalls != 1 {
 		t.Fatalf("expected exactly 1 load call, got %d", loadCalls)
+	}
+}
+
+func TestLoadFreshConfirmationCandles_RefreshFailureRejectsCachedRows(t *testing.T) {
+	loadCalls := 0
+	fetcher := func(_ context.Context, _ string, _ data.Timeframe) error {
+		return errors.New("provider unavailable")
+	}
+	loader := func(_ context.Context, _ string, _ data.Timeframe, _, _ time.Time) ([]data.Candle, error) {
+		loadCalls++
+		return make([]data.Candle, 100), nil
+	}
+	if _, ok := loadFreshConfirmationCandles(context.Background(), "AAPL", "4h", fetcher, loader); ok {
+		t.Fatal("failed refresh must reject confirmation even when cached rows exist")
+	}
+	if loadCalls != 0 {
+		t.Fatalf("cached rows must not be loaded after failed refresh; load calls = %d", loadCalls)
+	}
+}
+
+func TestLoadFreshConfirmationCandles_RequiresCheckedFetcher(t *testing.T) {
+	loader := func(_ context.Context, _ string, _ data.Timeframe, _, _ time.Time) ([]data.Candle, error) {
+		return make([]data.Candle, 100), nil
+	}
+	if _, ok := loadFreshConfirmationCandles(context.Background(), "AAPL", "4h", nil, loader); ok {
+		t.Fatal("missing checked refresh seam must fail closed")
 	}
 }
 

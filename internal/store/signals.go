@@ -12,6 +12,12 @@ const (
 	EntrySetupPullbackStrength = "pullback_strength"
 )
 
+type EntryGateDecision struct {
+	Name   string `json:"name"`
+	Status string `json:"status"`
+	Reason string `json:"reason,omitempty"`
+}
+
 // Signal mirrors a row from the signals table.
 type Signal struct {
 	ID                 string
@@ -32,7 +38,8 @@ type Signal struct {
 	EntrySetupEvidence string
 	// ScannerRunID links scanner-originated signals to the exact prospective
 	// universe snapshot that sourced the ticker.
-	ScannerRunID string
+	ScannerRunID       string
+	EntryGateDecisions []byte // JSONB ordered gate audit
 	// PullbackStrength marks signals whose stop and eligibility came from the
 	// complete pullback setup. It survives manual approval/restarts so execution
 	// can revalidate the low-of-day stop against a fresh mark. For these signals,
@@ -70,15 +77,15 @@ func InsertSignal(ctx context.Context, s Signal) (string, error) {
 			confidence, size_pct, status, block_reason,
 			analysis_ids, expires_at, stale_threshold_pct, deferred,
 			pullback_strength, entry_setup, entry_setup_evidence, created_at,
-			scanner_run_id
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+			scanner_run_id, entry_gate_decisions
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
 		RETURNING id`,
 		s.Ticker, s.Action, s.Strategy, s.SignalPrice,
 		nullableFloat(s.StopLoss), nullableFloat(s.TakeProfit),
 		s.Confidence, s.SizePct, s.Status, nullableString(s.BlockReason),
 		ids, s.ExpiresAt, s.StalePriceMovePct, s.Deferred,
 		s.PullbackStrength, entrySetup, nullableString(s.EntrySetupEvidence), createdAt,
-		nullableString(s.ScannerRunID),
+		nullableString(s.ScannerRunID), s.EntryGateDecisions,
 	).Scan(&id)
 	return id, err
 }
@@ -118,7 +125,7 @@ func GetPendingSignals(ctx context.Context) ([]Signal, error) {
 		       confidence, COALESCE(size_pct,0), status,
 		       COALESCE(block_reason,''), expires_at, stale_threshold_pct,
 		       pullback_strength, entry_setup, COALESCE(entry_setup_evidence,''),
-		       created_at, updated_at, COALESCE(scanner_run_id::text, '')
+		       created_at, updated_at, COALESCE(scanner_run_id::text, ''), COALESCE(entry_gate_decisions, '[]')
 		FROM signals WHERE status IN ('pending','approved')
 		ORDER BY created_at DESC`)
 	if err != nil {
@@ -138,7 +145,7 @@ func GetDeferredSignals(ctx context.Context) ([]Signal, error) {
 		       confidence, COALESCE(size_pct,0), status,
 		       COALESCE(block_reason,''), expires_at, stale_threshold_pct,
 		       pullback_strength, entry_setup, COALESCE(entry_setup_evidence,''),
-		       created_at, updated_at, COALESCE(scanner_run_id::text, '')
+		       created_at, updated_at, COALESCE(scanner_run_id::text, ''), COALESCE(entry_gate_decisions, '[]')
 		FROM signals WHERE status = 'pending' AND deferred = TRUE
 		ORDER BY created_at ASC`)
 	if err != nil {
@@ -160,7 +167,7 @@ func GetSignalsByTicker(ctx context.Context, ticker string, limit int) ([]Signal
 		       confidence, COALESCE(size_pct,0), status,
 		       COALESCE(block_reason,''), expires_at, stale_threshold_pct,
 		       pullback_strength, entry_setup, COALESCE(entry_setup_evidence,''),
-		       created_at, updated_at, COALESCE(scanner_run_id::text, '')
+		       created_at, updated_at, COALESCE(scanner_run_id::text, ''), COALESCE(entry_gate_decisions, '[]')
 		FROM signals WHERE ticker=$1
 		ORDER BY created_at DESC LIMIT $2`, ticker, limit)
 	if err != nil {
@@ -178,7 +185,7 @@ func GetSignalByID(ctx context.Context, id string) (*Signal, error) {
 		       confidence, COALESCE(size_pct,0), status,
 		       COALESCE(block_reason,''), expires_at, stale_threshold_pct,
 		       pullback_strength, entry_setup, COALESCE(entry_setup_evidence,''),
-		       created_at, updated_at, COALESCE(scanner_run_id::text, '')
+		       created_at, updated_at, COALESCE(scanner_run_id::text, ''), COALESCE(entry_gate_decisions, '[]')
 		FROM signals WHERE id=$1`, id)
 	if err != nil {
 		return nil, err
@@ -205,7 +212,7 @@ func scanSignals(rows interface {
 			&s.Confidence, &s.SizePct, &s.Status,
 			&s.BlockReason, &s.ExpiresAt, &s.StalePriceMovePct,
 			&s.PullbackStrength, &s.EntrySetup, &s.EntrySetupEvidence,
-			&s.CreatedAt, &s.UpdatedAt, &s.ScannerRunID,
+			&s.CreatedAt, &s.UpdatedAt, &s.ScannerRunID, &s.EntryGateDecisions,
 		); err != nil {
 			return nil, err
 		}
@@ -222,7 +229,7 @@ func GetRecentSignals(ctx context.Context, limit int) ([]Signal, error) {
 		       confidence, COALESCE(size_pct,0), status, COALESCE(block_reason,''),
 		       COALESCE(analysis_ids, '{}'), expires_at, stale_threshold_pct,
 		       pullback_strength, entry_setup, COALESCE(entry_setup_evidence,''),
-		       created_at, updated_at, COALESCE(scanner_run_id::text, '')
+		       created_at, updated_at, COALESCE(scanner_run_id::text, ''), COALESCE(entry_gate_decisions, '[]')
 		FROM signals
 		ORDER BY created_at DESC LIMIT $1`, limit)
 	if err != nil {
@@ -239,7 +246,7 @@ func GetRecentSignals(ctx context.Context, limit int) ([]Signal, error) {
 			&s.Confidence, &s.SizePct, &s.Status,
 			&s.BlockReason, &s.AnalysisIDs, &s.ExpiresAt, &s.StalePriceMovePct,
 			&s.PullbackStrength, &s.EntrySetup, &s.EntrySetupEvidence,
-			&s.CreatedAt, &s.UpdatedAt, &s.ScannerRunID,
+			&s.CreatedAt, &s.UpdatedAt, &s.ScannerRunID, &s.EntryGateDecisions,
 		); err != nil {
 			return nil, err
 		}
@@ -289,7 +296,7 @@ func ListSignals(ctx context.Context, opts ListSignalsOpts) ([]Signal, error) {
 		       confidence, COALESCE(size_pct,0), status, COALESCE(block_reason,''),
 		       COALESCE(analysis_ids, '{}'), expires_at, stale_threshold_pct,
 		       pullback_strength, entry_setup, COALESCE(entry_setup_evidence,''),
-		       created_at, updated_at, COALESCE(scanner_run_id::text, '')
+		       created_at, updated_at, COALESCE(scanner_run_id::text, ''), COALESCE(entry_gate_decisions, '[]')
 		FROM signals
 		%s
 		ORDER BY created_at DESC, id DESC
@@ -310,7 +317,7 @@ func ListSignals(ctx context.Context, opts ListSignalsOpts) ([]Signal, error) {
 			&s.Confidence, &s.SizePct, &s.Status,
 			&s.BlockReason, &s.AnalysisIDs, &s.ExpiresAt, &s.StalePriceMovePct,
 			&s.PullbackStrength, &s.EntrySetup, &s.EntrySetupEvidence,
-			&s.CreatedAt, &s.UpdatedAt, &s.ScannerRunID,
+			&s.CreatedAt, &s.UpdatedAt, &s.ScannerRunID, &s.EntryGateDecisions,
 		); err != nil {
 			return nil, err
 		}

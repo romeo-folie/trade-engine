@@ -43,6 +43,7 @@ func TestBuildScannerTradeProfileUsesSourceOwnedMenus(t *testing.T) {
 			candidate:  SwingCandidate{Ticker: "GOV", Sources: []string{"political_disclosure"}},
 			score:      SwingScoreResult{Strategy: "weekly_leader"},
 			wantLenses: []string{"trend_following", "momentum"}, wantPrimary: "1D",
+			wantEntry:     "4H",
 			wantRecommend: "trend_following",
 		},
 		{
@@ -53,6 +54,7 @@ func TestBuildScannerTradeProfileUsesSourceOwnedMenus(t *testing.T) {
 			},
 			score:      SwingScoreResult{Strategy: "momentum", SetupType: "momentum_breakout", Reasoning: "Continuation."},
 			wantLenses: []string{"momentum", "trend_following", "pullback_strength"}, wantPrimary: "1D",
+			wantEntry:     "4H",
 			wantRecommend: "momentum",
 		},
 		{
@@ -104,6 +106,33 @@ func TestBuildScannerTradeProfileUsesSourceOwnedMenus(t *testing.T) {
 						t.Fatalf("source %q leaked into lenses %v", source, profile.AdmissibleLenses)
 					}
 				}
+			}
+		})
+	}
+}
+
+func TestScannerProfileDefaultsAssignTimeframeRolesBySource(t *testing.T) {
+	tests := []struct {
+		name        string
+		source      string
+		wantPrimary string
+		wantEntry   string
+	}{
+		{name: "political disclosure", source: "political_disclosure", wantPrimary: "1D", wantEntry: "4H"},
+		{name: "weekly leader", source: "weekly_leader", wantPrimary: "1D", wantEntry: "4H"},
+		{name: "potent industry", source: "potent_industry", wantPrimary: "1D", wantEntry: "4H"},
+		{name: "premarket episodic", source: "premarket_episodic", wantPrimary: "4H", wantEntry: "1H"},
+		{name: "news sympathy", source: "news_sympathy", wantPrimary: "4H"},
+		{name: "graph neighbour", source: "graph_neighbor", wantPrimary: "4H"},
+		{name: "ordinary mover", source: "mover", wantPrimary: "4H"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := scannerDefaultsForSources([]string{tt.source})
+			if got.primary != tt.wantPrimary || got.entryTiming != tt.wantEntry {
+				t.Fatalf("scannerDefaultsForSources(%q) = primary %q entry %q, want primary %q entry %q",
+					tt.source, got.primary, got.entryTiming, tt.wantPrimary, tt.wantEntry)
 			}
 		})
 	}

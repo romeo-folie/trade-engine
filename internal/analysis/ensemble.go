@@ -214,9 +214,12 @@ func Arbitrate(ctx context.Context, arbiter ModelProvider, req AnalysisRequest, 
 	}
 
 	arbReq := AnalysisRequest{
-		CustomSystemPrompt: arbiterSystemPrompt() + prompts.ExitOnlyOverride(req.LensSet()),
-		CustomUserMessage:  buildArbiterUserMessage(req.Ticker, currentPrice, sb.String()),
-		Ticker:             req.Ticker,
+		CustomSystemPrompt: arbiterSystemPrompt() + prompts.ExitOnlyOverride(req.LensSet()) + prompts.TimeframeRoleInstruction(req.TimeframeRole),
+		CustomUserMessage: buildArbiterUserMessage(req.Ticker, currentPrice, sb.String()) + "\n\n" +
+			prompts.RenderTimeframeWorkflow(req.TimeframeRole, req.PrimaryThesisContext),
+		Ticker:               req.Ticker,
+		TimeframeRole:        req.TimeframeRole,
+		PrimaryThesisContext: req.PrimaryThesisContext,
 	}
 
 	t0 := time.Now()

@@ -9,8 +9,20 @@ import (
 	"context"
 	"time"
 
+	"github.com/romeo-folie/trade-engine/internal/analysis/prompts"
 	"github.com/romeo-folie/trade-engine/internal/strategy/pullback"
 	"github.com/romeo-folie/trade-engine/internal/tradeprofile"
+)
+
+// TimeframeRole and PrimaryThesisContext are aliases for the prompt-safe
+// workflow contract. Keeping them available from analysis makes request
+// construction ergonomic without duplicating a DTO across providers.
+type TimeframeRole = prompts.TimeframeRole
+type PrimaryThesisContext = prompts.PrimaryThesisContext
+
+const (
+	TimeframeRolePrimaryThesis     = prompts.TimeframeRolePrimaryThesis
+	TimeframeRoleEntryConfirmation = prompts.TimeframeRoleEntryConfirmation
 )
 
 // Action represents a trade recommendation from a model.
@@ -39,6 +51,14 @@ type AnalysisRequest struct {
 	// an identity to advocate for. Empty falls back to Strategy.
 	Strategies []string
 	Timeframe  string
+	// TimeframeRole says whether this request establishes a thesis or confirms
+	// entry timing for a completed primary-thesis request. The zero value is the
+	// primary thesis role, preserving existing callers.
+	TimeframeRole TimeframeRole
+	// PrimaryThesisContext is supplied only to an entry-confirmation pass. It
+	// fixes the selected lens and records the first-pass evidence; confirmation
+	// cannot issue an independent exit decision.
+	PrimaryThesisContext *PrimaryThesisContext
 
 	// DiscoveryContext records why scanner promotion found this ticker. It is
 	// prompt context only: source labels must never become execution lenses.
