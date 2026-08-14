@@ -1,12 +1,50 @@
 package engine
 
 import (
+	"reflect"
 	"testing"
 
+	"github.com/romeo-folie/trade-engine/internal/analysis"
 	"github.com/romeo-folie/trade-engine/internal/analysis/prompts"
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/risk"
+	"github.com/romeo-folie/trade-engine/internal/tradeprofile"
 )
+
+func TestLensSelectionTelemetryUsesCanonicalExecutionProfile(t *testing.T) {
+	profile := &tradeprofile.ExecutionProfile{
+		Version:              tradeprofile.ExecutionProfileVersion,
+		RecommendedLens:      " MOMENTUM ",
+		AdmissibleLenses:     []string{" MOMENTUM ", "TREND_FOLLOWING"},
+		PrimaryTimeframe:     "1d",
+		EntryTimingTimeframe: "4h",
+		ScorerRationale:      "scanner selected a momentum setup",
+	}
+
+	configured, admissible := lensSelectionTelemetry(
+		"mean_reversion",
+		[]string{"mean_reversion", "news_sentiment"},
+		profile,
+	)
+	if configured != "momentum" {
+		t.Fatalf("configured lens = %q, want canonical profile recommendation %q", configured, "momentum")
+	}
+	if want := []string{"momentum", "trend_following"}; !reflect.DeepEqual(admissible, want) {
+		t.Fatalf("admissible lenses = %v, want canonical profile menu %v", admissible, want)
+	}
+
+	legacyConfigured, legacyAdmissible := lensSelectionTelemetry(
+		"mean_reversion",
+		[]string{"mean_reversion", "news_sentiment"},
+		nil,
+	)
+	if legacyConfigured != "mean_reversion" {
+		t.Fatalf("legacy configured lens = %q, want legacy strategy", legacyConfigured)
+	}
+	if want := []string{"mean_reversion", "news_sentiment"}; !reflect.DeepEqual(legacyAdmissible, want) {
+		t.Fatalf("legacy admissible lenses = %v, want legacy menu %v", legacyAdmissible, want)
+	}
+}
 
 // TestWidestHistoryWindow: with every admissible lens now selectable by the
 // analyst, the candle budget must satisfy the most demanding one. Capping at
@@ -68,6 +106,55 @@ func TestWidestHistoryWindow(t *testing.T) {
 					tc.primary, tc.strategies, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestProfileLensSetDrivesHistoryWindow(t *testing.T) {
+	profile := &tradeprofile.ExecutionProfile{
+		Version: tradeprofile.ExecutionProfileVersion, RecommendedLens: "momentum",
+		AdmissibleLenses: []string{"momentum", "trend_following"},
+		PrimaryTimeframe: "1D", ScorerRationale: "test profile",
+	}
+	request := analysis.AnalysisRequest{
+		Strategy: "momentum", Strategies: []string{"momentum"}, ExecutionProfile: profile,
+	}
+	if got := widestHistoryWindow(map[string]int{"momentum": 14, "trend_following": 20}, request.Strategy, request.LensSet()); got != 20 {
+		t.Fatalf("profile lens history window = %d, want 20", got)
+	}
+}
+
+func TestPullbackLensAdmissiblePrefersExecutionProfile(t *testing.T) {
+	profile := &tradeprofile.ExecutionProfile{
+		Version:          tradeprofile.ExecutionProfileVersion,
+		RecommendedLens:  "momentum",
+		AdmissibleLenses: []string{"momentum", "pullback_strength"},
+		PrimaryTimeframe: "1D",
+		ScorerRationale:  "Momentum leadership permits a qualified pullback entry.",
+	}
+	if !pullbackLensAdmissible([]string{"momentum"}, profile) {
+		t.Fatal("profile-admissible pullback lens did not request deterministic prompt facts")
+	}
+	profile.AdmissibleLenses = []string{"momentum"}
+	if pullbackLensAdmissible([]string{"pullback_strength"}, profile) {
+		t.Fatal("valid profile must bound prompt context even when legacy strategies include pullback")
+	}
+}
+
+func TestSelectedPullbackLensCannotBypassQualification(t *testing.T) {
+	if !selectedPullbackLens("momentum", "pullback_strength", []string{"momentum", "pullback_strength"}) {
+		t.Fatal("selected profile pullback lens did not require deterministic qualification")
+	}
+	if selectedPullbackLens("momentum", "pullback_strength", []string{"momentum"}) {
+		t.Fatal("unoffered pullback selection must not activate a gate")
+	}
+	if !selectedPullbackLens("pullback_strength", "pullback_strength", []string{"pullback_strength"}) {
+		t.Fatal("selected pullback lens must remain detectable when its gate is disabled")
+	}
+	if !pullbackSelectionDisabled(false, true) {
+		t.Fatal("disabled pullback qualification must block a selected pullback lens")
+	}
+	if pullbackSelectionDisabled(true, true) || pullbackSelectionDisabled(false, false) {
+		t.Fatal("only a disabled selected pullback lens should block")
 	}
 }
 

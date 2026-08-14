@@ -542,6 +542,17 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 		if hasSource(sc.candidate.Sources, "premarket_episodic") {
 			strategies = appendUniqueStrategy(strategies, "premarket_episodic")
 		}
+		discoveryContext, executionProfile, profileErr := buildScannerTradeProfile(
+			sc.candidate, sc.score,
+		)
+		if profileErr != nil {
+			return fmt.Errorf("build scanner trade profile for %s: %w", sc.candidate.Ticker, profileErr)
+		}
+		if err := recorder.setTradeProfile(
+			sc.candidate, discoveryContext, executionProfile,
+		); err != nil {
+			return fmt.Errorf("record scanner trade profile for %s: %w", sc.candidate.Ticker, err)
+		}
 		item := store.WatchlistItem{
 			Ticker:     sc.candidate.Ticker,
 			Platform:   "stock",
@@ -556,6 +567,8 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			// trigger) so the engine's deep-analysis prompt carries the origin
 			// thesis instead of losing it after this pass.
 			GraphContext:                    sc.candidate.GraphContext,
+			DiscoveryContext:                discoveryContext,
+			ExecutionProfile:                executionProfile,
 			ScannerRunID:                    recorder.run.ID,
 			ExpiresAt:                       &expiresAt,
 			PullbackRequalificationComplete: sc.candidate.PullbackQualificationKnown,
@@ -579,6 +592,17 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			recorder.fallbackScored(
 				fallback, fallbackScore, scoreErr, s.Cfg.MinConviction,
 			)
+			fallbackDiscovery, fallbackProfile, fallbackProfileErr := buildScannerTradeProfile(
+				fallback, fallbackScore,
+			)
+			if fallbackProfileErr != nil {
+				return fmt.Errorf("build fallback scanner trade profile for %s: %w", fallback.Ticker, fallbackProfileErr)
+			}
+			if err := recorder.setTradeProfile(
+				fallback, fallbackDiscovery, fallbackProfile,
+			); err != nil {
+				return fmt.Errorf("record fallback scanner trade profile for %s: %w", fallback.Ticker, err)
+			}
 			if scoreErr != nil {
 				if ctx.Err() != nil {
 					return ctx.Err()
@@ -630,6 +654,8 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			item.Timeframes = timeframes
 			item.MinConfidence = fallbackScore.Conviction
 			item.GraphContext = fallback.GraphContext
+			item.DiscoveryContext = fallbackDiscovery
+			item.ExecutionProfile = fallbackProfile
 			item.PullbackRequalificationComplete =
 				fallback.PullbackQualificationKnown
 			sc = scoredCandidate{candidate: fallback, score: fallbackScore}

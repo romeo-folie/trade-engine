@@ -72,7 +72,7 @@ func (c *AnthropicClient) Analyze(ctx context.Context, req AnalysisRequest) (Ana
 		systemPrompt = req.CustomSystemPrompt
 		userMessage = req.CustomUserMessage
 	} else {
-		systemPrompt, userMessage = prompts.BuildStockPrompt(req.Ticker, req.LensSet(), req.Timeframe,
+		systemPrompt, userMessage = prompts.BuildStockPromptWithDiscoveryContext(req.Ticker, req.LensSet(), req.Timeframe,
 			toPromptCandles(req.RecentCandles),
 			toPromptIndicators(req.Indicators),
 			toPromptNews(req.News),
@@ -80,7 +80,7 @@ func (c *AnthropicClient) Analyze(ctx context.Context, req AnalysisRequest) (Ana
 			req.KnowledgeContext,
 			toPromptSimilarSetups(req.SimilarAnalyses),
 			req.PerformanceContext,
-			req.MomentumPlay,
+			req.MomentumPlay, req.DiscoveryContext, req.PullbackContext,
 		)
 	}
 

@@ -47,11 +47,11 @@ func TestStrategyGuidance_NewsSentimentOnly(t *testing.T) {
 // must define it from the latest close (and omit the line when no candles).
 func TestBuildUser_CurrentPriceLine(t *testing.T) {
 	candles := []Candle{{Timestamp: time.Now(), Open: 10, High: 11, Low: 9, Close: 10.55, Volume: 1000, VWAP: 10.4}}
-	user := buildUser("AAPL", "1d", candles, Indicators{}, nil, Portfolio{}, "", nil, "")
+	user := buildUser("AAPL", "1d", candles, Indicators{}, nil, Portfolio{}, "", nil, "", nil, nil)
 	if !strings.Contains(user, "CURRENT PRICE (latest close): 10.55") {
 		t.Error("user message is missing the CURRENT PRICE / signal_price line")
 	}
-	empty := buildUser("AAPL", "1d", nil, Indicators{}, nil, Portfolio{}, "", nil, "")
+	empty := buildUser("AAPL", "1d", nil, Indicators{}, nil, Portfolio{}, "", nil, "", nil, nil)
 	if strings.Contains(empty, "CURRENT PRICE") {
 		t.Error("CURRENT PRICE line must be omitted when there are no candles")
 	}
@@ -120,7 +120,7 @@ func TestBuildUser_PortfolioRendering_CacheStable(t *testing.T) {
 		},
 		OmittedPositions: 3,
 	}
-	user := buildUser("HIMS", "1d", nil, Indicators{}, nil, p, "", nil, "")
+	user := buildUser("HIMS", "1d", nil, Indicators{}, nil, p, "", nil, "", nil, nil)
 	for _, want := range []string{
 		"Cash available: ≈$12300",
 		"HIMS: long 10.0000 @ 100.00  unrealized≈+5%",
@@ -145,7 +145,7 @@ func TestBuildUser_CashKnownStates(t *testing.T) {
 	deployed := buildUser("HIMS", "1d", nil, Indicators{}, nil,
 		Portfolio{CashAvailable: 0, CashKnown: true, OpenPositions: []Position{
 			{Ticker: "HIMS", Side: "long", Quantity: 10, AvgCostBasis: 40}, // no mark-to-market
-		}}, "", nil, "")
+		}}, "", nil, "", nil, nil)
 	if !strings.Contains(deployed, "≈$0 (fully deployed") {
 		t.Error("known $0 must render as fully deployed")
 	}
@@ -155,7 +155,7 @@ func TestBuildUser_CashKnownStates(t *testing.T) {
 	if strings.Contains(deployed, "unrealized≈") {
 		t.Error("position without mark-to-market must omit the P&L bucket")
 	}
-	unknown := buildUser("HIMS", "1d", nil, Indicators{}, nil, Portfolio{}, "", nil, "")
+	unknown := buildUser("HIMS", "1d", nil, Indicators{}, nil, Portfolio{}, "", nil, "", nil, nil)
 	if !strings.Contains(unknown, "not provided — do not assume zero") {
 		t.Error("unknown cash must render the explicit marker")
 	}

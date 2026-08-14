@@ -15,13 +15,13 @@ func TestLenses_FiltersToAnalysisLenses(t *testing.T) {
 		in   []string
 		want []string
 	}{
-		{"drops entry-gate tag", []string{"momentum", "pullback_strength"}, []string{"momentum"}},
+		{"keeps pullback execution lens", []string{"momentum", "pullback_strength"}, []string{"momentum", "pullback_strength"}},
 		{"drops unknown label", []string{"mean_reversion", "swing"}, []string{"mean_reversion"}},
 		{"preserves order", []string{"news_sentiment", "momentum"}, []string{"news_sentiment", "momentum"}},
 		{"dedupes", []string{"momentum", "momentum"}, []string{"momentum"}},
 		{"normalizes case and space", []string{" Mean_Reversion "}, []string{"mean_reversion"}},
 		{"empty falls back", nil, []string{defaultLens}},
-		{"all-unusable falls back", []string{"pullback_strength", "swing"}, []string{defaultLens}},
+		{"drops unknown alongside pullback lens", []string{"pullback_strength", "swing"}, []string{"pullback_strength"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -181,7 +181,7 @@ func TestBuildUser_RendersEveryProvidedCandle(t *testing.T) {
 			Open:      1, High: 2, Low: 0.5, Close: 1.5, Volume: 100, VWAP: 1.2,
 		}
 	}
-	user := buildUser("KO", "1d", candles, Indicators{}, nil, Portfolio{}, "", nil, "")
+	user := buildUser("KO", "1d", candles, Indicators{}, nil, Portfolio{}, "", nil, "", nil, nil)
 	// One row per candle, each stamped with its own timestamp.
 	for i := range candles {
 		stamp := candles[i].Timestamp.Format("2006-01-02 15:04")

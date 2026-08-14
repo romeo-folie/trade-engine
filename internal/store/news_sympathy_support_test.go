@@ -140,8 +140,8 @@ func TestWatchlistGraphContext_RoundTrip(t *testing.T) {
 		t.Error("added item not returned by GetWatchlistItems")
 	}
 
-	// Re-add without context (e.g. later plain screener re-add) must clear it —
-	// the origin thesis belongs to the sourcing event, not the ticker forever.
+	// Legacy rows have no discovery/execution contract, so retain the historic
+	// upsert semantics: the incoming write replaces its graph provenance.
 	if err := store.AddWatchlistItem(ctx, store.WatchlistItem{
 		Ticker: ticker, Platform: "stock", Strategies: []string{"momentum"},
 		Timeframes: []string{"1H"}, Source: "scanner", ExpiresAt: &exp,
@@ -150,7 +150,7 @@ func TestWatchlistGraphContext_RoundTrip(t *testing.T) {
 	}
 	item, _ = store.GetWatchlistItem(ctx, ticker, "stock")
 	if item.GraphContext != "" {
-		t.Errorf("re-add without context must clear GraphContext, got %q", item.GraphContext)
+		t.Errorf("legacy re-add must replace GraphContext, got %q", item.GraphContext)
 	}
 }
 

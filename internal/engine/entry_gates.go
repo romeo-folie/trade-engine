@@ -11,6 +11,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/indicators"
 	"github.com/romeo-folie/trade-engine/internal/store"
 	"github.com/romeo-folie/trade-engine/internal/strategy/pullback"
+	"github.com/romeo-folie/trade-engine/internal/tradeprofile"
 )
 
 // stockTimeframesForEntry returns a normalized copy and ensures the complete
@@ -109,6 +110,31 @@ func hasEntryStrategy(strategies []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// pullbackLensAdmissible is deliberately separate from pullbackCandidate.
+// The latter controls the legacy additive execution path and must not be
+// broadened in PR 1. This helper only decides whether a scanner-owned profile
+// authorises daily pullback facts to be shown to the analyst.
+func pullbackLensAdmissible(strategies []string, profile *tradeprofile.ExecutionProfile) bool {
+	if profile != nil {
+		if canonical, err := profile.Canonicalize(); err == nil {
+			return hasEntryStrategy(canonical.AdmissibleLenses, store.EntrySetupPullbackStrength)
+		}
+	}
+	return hasEntryStrategy(strategies, store.EntrySetupPullbackStrength)
+}
+
+// selectedPullbackLens reports whether the analyst selected the offered
+// pullback lens. It intentionally does not consider whether the gate is
+// enabled: selecting a disabled pullback lens must be blocked, not permitted
+// to fall through to the standard-entry path.
+func selectedPullbackLens(configured, selected string, admissible []string) bool {
+	return effectiveGateStrategy(configured, selected, admissible) == store.EntrySetupPullbackStrength
+}
+
+func pullbackSelectionDisabled(enabled, selected bool) bool {
+	return selected && !enabled
 }
 
 func pullbackEntryEvidence(setup pullback.Result) string {

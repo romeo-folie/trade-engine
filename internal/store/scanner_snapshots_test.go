@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/analysis"
 	"github.com/romeo-folie/trade-engine/internal/store"
+	"github.com/romeo-folie/trade-engine/internal/tradeprofile"
 )
 
 func TestScannerSnapshotLineageAndFunnel(t *testing.T) {
@@ -61,9 +63,21 @@ func TestScannerSnapshotLineageAndFunnel(t *testing.T) {
 	}
 	err = store.FinishScannerRun(ctx, run, []store.ScannerCandidateSnapshot{
 		{
-			ScannerRunID:           runID,
-			Ticker:                 "SNAP_A",
-			Sources:                []string{"mover"},
+			ScannerRunID: runID,
+			Ticker:       "SNAP_A",
+			Sources:      []string{"weekly_leader", "mover"},
+			DiscoveryContext: &tradeprofile.DiscoveryContext{
+				Version: tradeprofile.DiscoveryContextVersion, Sources: []string{"mover", "weekly_leader"},
+				Thesis: "Leader at scan time", EvidenceBySource: map[string]json.RawMessage{
+					"weekly_leader": json.RawMessage(`{"rank":1}`),
+					"mover":         json.RawMessage(`{"change_pct":8.2}`),
+				},
+			},
+			ExecutionProfile: &tradeprofile.ExecutionProfile{
+				Version: tradeprofile.ExecutionProfileVersion, RecommendedLens: "momentum",
+				AdmissibleLenses: []string{"momentum", "trend_following"}, PrimaryTimeframe: "1D",
+				EntryTimingTimeframe: "4H", ScorerRationale: "Leadership needs timed entry.",
+			},
 			QualificationKnown:     true,
 			PullbackQualified:      true,
 			QualificationStage:     "qualified",
@@ -75,7 +89,7 @@ func TestScannerSnapshotLineageAndFunnel(t *testing.T) {
 			WatchlistAdded:         true,
 			Strategies:             []string{"momentum", "pullback_strength"},
 			FinalStage:             "watchlist_added",
-			SourceScores:           map[string]float64{"mover": 0},
+			SourceScores:           map[string]float64{"weekly_leader": 0, "mover": 0},
 			UniverseMember:         boolPtr(true),
 			Sector:                 "Technology",
 			Industry:               "Software",
@@ -104,13 +118,14 @@ func TestScannerSnapshotLineageAndFunnel(t *testing.T) {
 	var storedUniverseID, regime string
 	var storedPromotionCap int
 	var storedUniverseAsOf time.Time
-	var sourceScores json.RawMessage
+	var sourceScores, discoveryContext, executionProfile json.RawMessage
 	var universeMember bool
 	var potentIndustryEvidence string
 	err = store.GetDB().QueryRow(ctx, `
 		SELECT r.universe_version_id::text, r.universe_as_of, r.regime_reference,
 		       r.promotion_max_per_industry,
-		       c.source_scores, c.universe_member, c.potent_industry_evidence
+		       c.source_scores, c.universe_member, c.potent_industry_evidence,
+		       c.discovery_context, c.execution_profile
 		FROM scanner_runs r
 		JOIN scanner_candidate_snapshots c ON c.scanner_run_id=r.id
 		WHERE r.id=$1 AND c.ticker='SNAP_A'`,
@@ -118,12 +133,17 @@ func TestScannerSnapshotLineageAndFunnel(t *testing.T) {
 	).Scan(
 		&storedUniverseID, &storedUniverseAsOf, &regime, &storedPromotionCap,
 		&sourceScores, &universeMember, &potentIndustryEvidence,
+		&discoveryContext, &executionProfile,
 	)
+	storedContext, contextErr := tradeprofile.DecodeDiscoveryContext(discoveryContext)
+	storedProfile, profileErr := tradeprofile.DecodeExecutionProfile(executionProfile)
 	if err != nil || storedUniverseID != universeID || regime != "pending" ||
 		storedPromotionCap != 2 ||
 		!storedUniverseAsOf.Equal(universeAsOf) ||
-		!universeMember || string(sourceScores) != `{"mover": 0}` ||
-		potentIndustryEvidence != "Software broad_strong; member rank 1" {
+		!universeMember || string(sourceScores) != `{"mover": 0, "weekly_leader": 0}` ||
+		potentIndustryEvidence != "Software broad_strong; member rank 1" ||
+		contextErr != nil || storedContext == nil || storedContext.Thesis != "Leader at scan time" ||
+		profileErr != nil || storedProfile == nil || storedProfile.RecommendedLens != "momentum" {
 		t.Fatalf(
 			"extended snapshot = universe=%q as_of=%s regime=%q scores=%s member=%v err=%v",
 			storedUniverseID, storedUniverseAsOf, regime, sourceScores, universeMember, err,
@@ -221,6 +241,36 @@ func TestScannerSnapshotLineageAndFunnel(t *testing.T) {
 	if len(funnel.QualificationStages) != 2 || len(funnel.FinalStages) != 2 ||
 		len(funnel.EngineStages) != 1 {
 		t.Fatalf("stage distributions missing: %+v", funnel)
+	}
+}
+
+func TestScannerSnapshotDiscoverySourcesMustMatchLegacySources(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping store integration test")
+	}
+	ctx := context.Background()
+	runID, err := store.BeginScannerRun(ctx, store.ScannerRun{StartedAt: time.Now().UTC()})
+	if err != nil {
+		t.Fatalf("BeginScannerRun: %v", err)
+	}
+	t.Cleanup(func() { _, _ = store.GetDB().Exec(ctx, "DELETE FROM scanner_runs WHERE id=$1", runID) })
+
+	err = store.FinishScannerRun(ctx, store.ScannerRun{ID: runID}, []store.ScannerCandidateSnapshot{{
+		ScannerRunID: runID, Ticker: "SNAP_SOURCE_MISMATCH", Sources: []string{"weekly_leader"},
+		DiscoveryContext: &tradeprofile.DiscoveryContext{
+			Version: tradeprofile.DiscoveryContextVersion, Sources: []string{"premarket_episodic"},
+			Thesis: "A different source", EvidenceBySource: map[string]json.RawMessage{
+				"premarket_episodic": json.RawMessage(`{"gap_pct":8.2}`),
+			},
+		},
+		ExecutionProfile: &tradeprofile.ExecutionProfile{
+			Version: tradeprofile.ExecutionProfileVersion, RecommendedLens: "news_sentiment",
+			AdmissibleLenses: []string{"news_sentiment"}, PrimaryTimeframe: "1H",
+			ScorerRationale: "Fresh event requires intraday confirmation.",
+		},
+	}})
+	if err == nil || !strings.Contains(err.Error(), "legacy sources do not match discovery context sources") {
+		t.Fatalf("FinishScannerRun error = %v, want source-set mismatch", err)
 	}
 }
 

@@ -31,6 +31,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/risk"
 	"github.com/romeo-folie/trade-engine/internal/store"
 	"github.com/romeo-folie/trade-engine/internal/strategy/pullback"
+	"github.com/romeo-folie/trade-engine/internal/tradeprofile"
 )
 
 const (
@@ -576,9 +577,10 @@ func (e *Engine) tick(ctx context.Context) error {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			e.processStock(
+			e.processStockWithProfile(
 				ctx, item.Ticker, item.Timeframes, item.Strategies, item.Source,
 				item.MinConfidence, item.GraphContext, item.ScannerRunID,
+				item.DiscoveryContext, item.ExecutionProfile,
 			)
 		}(item)
 	}
@@ -618,6 +620,25 @@ func (e *Engine) processStock(
 	scannerConviction float64,
 	graphContext, scannerRunID string,
 ) {
+	e.processStockWithProfile(
+		ctx, ticker, timeframes, strategies, source, scannerConviction, graphContext, scannerRunID,
+		nil, nil,
+	)
+}
+
+// processStockWithProfile carries the scanner's immutable provenance and
+// bounded lens profile to deep analysis. The legacy processStock wrapper is
+// intentionally kept for test/tool callers that have no persisted profile.
+func (e *Engine) processStockWithProfile(
+	ctx context.Context,
+	ticker string,
+	timeframes, strategies []string,
+	source string,
+	scannerConviction float64,
+	graphContext, scannerRunID string,
+	discoveryContext *tradeprofile.DiscoveryContext,
+	executionProfile *tradeprofile.ExecutionProfile,
+) {
 	requestedTimeframes := stockTimeframesForEntry(timeframes, false)
 	// The complete pullback setup is defined on daily history even when a
 	// scanner candidate uses 1H/4H for its analyst prompt. Fetch 1D explicitly
@@ -626,7 +647,8 @@ func (e *Engine) processStock(
 	entryGates := e.cfg.Risk.EntryGates
 	pullbackCandidate := entryGates.PullbackStrengthEnabled &&
 		hasEntryStrategy(strategies, store.EntrySetupPullbackStrength)
-	needsDailyEvidence := pullbackCandidate ||
+	pullbackPromptCandidate := pullbackLensAdmissible(strategies, executionProfile)
+	needsDailyEvidence := pullbackCandidate || pullbackPromptCandidate ||
 		entryGates.TrendAlignmentEnabled
 	fetchTimeframes := stockTimeframesForEntry(timeframes, needsDailyEvidence)
 
@@ -720,12 +742,14 @@ func (e *Engine) processStock(
 	if len(candles) > 0 {
 		latestClose = candles[len(candles)-1].Close
 	}
+	contractDigest := DiscoveryExecutionContractDigest(discoveryContext, executionProfile)
 	mcIn := MaterialChangeInput{
-		RSI:      set.RSI,
-		EMA20:    set.EMA20,
-		Price:    latestClose,
-		NewsHash: newsHash,
-		Now:      time.Now(),
+		RSI:            set.RSI,
+		EMA20:          set.EMA20,
+		Price:          latestClose,
+		NewsHash:       newsHash,
+		ContractDigest: contractDigest,
+		Now:            time.Now(),
 	}
 
 	mcCfg := applyScannerOverrides(e.cfg.Analysis, source, scannerConviction)
@@ -755,10 +779,39 @@ func (e *Engine) processStock(
 		return
 	}
 
+	// Evaluate the daily pullback facts once for the prompt whenever the
+	// scanner's bounded menu admits the lens. This does not expand the additive
+	// execution path: generateSignal still uses pullbackCandidate and rechecks
+	// the setup against a refreshed daily snapshot immediately before entry.
+	var pullbackContext *pullback.PromptContext
+	if pullbackPromptCandidate {
+		dailyCandles := candles
+		if primaryTF != data.Timeframe1Day {
+			var dailyErr error
+			dailyCandles, dailyErr = store.GetCandles(ctx, ticker, data.Timeframe1Day, historyFrom, time.Now())
+			if dailyErr != nil {
+				logger.Warn("pullback strength: load daily prompt evidence", "ticker", ticker, "err", dailyErr)
+				dailyCandles = nil
+			}
+		}
+		if len(dailyCandles) > 0 {
+			signalPrice := dailyCandles[len(dailyCandles)-1].Close
+			setup := pullback.Evaluate(dailyCandles, signalPrice, pullback.Config{
+				MinMomentumReturnPct:  entryGates.PullbackMinMomentumReturnPct,
+				ConsolidationSessions: entryGates.PullbackConsolidationSessions,
+				SupportTolerancePct:   entryGates.PullbackSupportTolerancePct,
+				MaxStopWidthPct:       entryGates.PullbackMaxStopWidthPct,
+			})
+			context := setup.PromptContext()
+			pullbackContext = &context
+		}
+	}
+
 	// Run LLM analysis — PRD §8. Errors are logged but non-fatal.
-	e.runAnalysis(
+	e.runAnalysisWithProfile(
 		ctx, ticker, string(primaryTF), primaryStrategy, strategies, candles, set,
 		newsHash, source, graphContext, scannerRunID, pullbackCandidate,
+		discoveryContext, executionProfile, pullbackContext,
 	)
 }
 
@@ -860,6 +913,28 @@ func (e *Engine) runAnalysis(
 	newsHash, source, graphContext, scannerRunID string,
 	pullbackCandidate bool,
 ) {
+	e.runAnalysisWithProfile(
+		ctx, ticker, timeframe, strategy, strategies, candles, set,
+		newsHash, source, graphContext, scannerRunID, pullbackCandidate, nil, nil,
+		nil,
+	)
+}
+
+// runAnalysisWithProfile is the scanner-aware analysis path. It does not
+// alter timeframe scheduling or entry gates; PR 1 only carries the profile
+// into prompts and analysis audit storage.
+func (e *Engine) runAnalysisWithProfile(
+	ctx context.Context,
+	ticker, timeframe, strategy string,
+	strategies []string,
+	candles []data.Candle,
+	set *indicators.IndicatorSet,
+	newsHash, source, graphContext, scannerRunID string,
+	pullbackCandidate bool,
+	discoveryContext *tradeprofile.DiscoveryContext,
+	executionProfile *tradeprofile.ExecutionProfile,
+	pullbackContext *pullback.PromptContext,
+) {
 	if set == nil {
 		e.recordScannerEngineOutcome(ctx, scannerRunID, ticker, "indicators_missing", "", "")
 		return
@@ -873,6 +948,13 @@ func (e *Engine) runAnalysis(
 	if strategy == "" {
 		strategy = "trend_following"
 	}
+	// A valid scanner profile supersedes legacy Strategies for the analyst's
+	// candidate menu, so it must also determine the prompt history budget.
+	// Otherwise an offered long-window lens can be starved by a short legacy
+	// strategy window before the model has a chance to select it.
+	promptLenses := analysis.AnalysisRequest{
+		Strategy: strategy, Strategies: strategies, ExecutionProfile: executionProfile,
+	}.LensSet()
 
 	// Pre-LLM SELL ownership short-circuit (#319). For strategies whose primary
 	// action is SELL (close/exit-only), there is no point asking the analyst
@@ -944,7 +1026,7 @@ func (e *Engine) runAnalysis(
 	// starve a lens that needs more history (momentum 14 vs trend_following 20)
 	// of the bars required to confirm or reject it.
 	if windows := e.cfg.Analysis.HistoryWindowByStrategy; len(windows) > 0 {
-		if n := widestHistoryWindow(windows, strategy, strategies); n > 0 {
+		if n := widestHistoryWindow(windows, strategy, promptLenses); n > 0 {
 			candleCap = n // strategy window overrides; MaxCandlesPerPrompt clamps below
 		}
 	}
@@ -1043,6 +1125,9 @@ func (e *Engine) runAnalysis(
 		Ticker:             ticker,
 		Strategy:           strategy,
 		Strategies:         strategies,
+		DiscoveryContext:   discoveryContext,
+		ExecutionProfile:   executionProfile,
+		PullbackContext:    pullbackContext,
 		Timeframe:          timeframe,
 		MomentumPlay:       source == "scanner",
 		RecentCandles:      snaps,
@@ -1170,6 +1255,16 @@ func (e *Engine) runAnalysis(
 		return
 	}
 	resp, meta := result.Response, result.Meta
+	// Validate the final aggregate, rather than individual analyst responses:
+	// an execution profile bounds what may be persisted as the selected lens.
+	// Invalid model output remains in meta.RawResponse, but is cleared from the
+	// live response before the existing downstream compatibility paths see it.
+	lensAudit := analysis.ValidateFinalLensSelection(&resp, req, len(result.AnalystResults) > 1)
+	if lensAudit.SelectionStatus == analysis.LensSelectionInvalid {
+		logger.Warn("invalid profile-bound lens selection",
+			"ticker", ticker, "selected", lensAudit.SelectedLens,
+			"admissible", strings.Join(req.LensSet(), ","))
+	}
 
 	reasoningPreview := resp.Reasoning[:min(120, len(resp.Reasoning))]
 	logger.Info("analysis complete",
@@ -1194,13 +1289,14 @@ func (e *Engine) runAnalysis(
 	// for. This is the phase-1 evidence that decides whether persisting
 	// selected_strategy is worth a migration.
 	if resp.SelectedStrategy != "" {
+		configuredLens, admissibleLenses := lensSelectionTelemetry(strategy, strategies, executionProfile)
 		logger.Info("lens selection",
 			"ticker", ticker,
-			"configured", strategy,
+			"configured", configuredLens,
 			"selected", resp.SelectedStrategy,
 			"regime", resp.Regime,
-			"divergent", resp.SelectedStrategy != strategy,
-			"admissible", strings.Join(prompts.Lenses(strategies), ","),
+			"divergent", resp.SelectedStrategy != configuredLens,
+			"admissible", strings.Join(admissibleLenses, ","),
 			"rejected_count", len(resp.RejectedStrategies),
 		)
 	}
@@ -1275,10 +1371,21 @@ func (e *Engine) runAnalysis(
 			FastPathed:      result.FastPathed,
 			DissentSummary:  dissentSummary,
 			ScannerRunID:    scannerRunID,
+			Audit: store.AnalysisAudit{
+				SelectedLens:    lensAudit.SelectedLens,
+				RejectedLenses:  lensAudit.RejectedLenses,
+				Regime:          lensAudit.Regime,
+				SelectionStatus: lensAudit.SelectionStatus,
+			},
 		})
 	} else {
-		analysisID, err = store.InsertAnalysisWithScannerRun(
-			ctx, ticker, strategy, resp, meta, scannerRunID,
+		analysisID, err = store.InsertAnalysisWithScannerRunAudit(
+			ctx, ticker, strategy, resp, meta, scannerRunID, store.AnalysisAudit{
+				SelectedLens:    lensAudit.SelectedLens,
+				RejectedLenses:  lensAudit.RejectedLenses,
+				Regime:          lensAudit.Regime,
+				SelectionStatus: lensAudit.SelectionStatus,
+			},
 		)
 	}
 	if err != nil {
@@ -1298,7 +1405,7 @@ func (e *Engine) runAnalysis(
 	e.generateSignal(
 		ctx, ticker, timeframe, strategy, strategies, candles, resp, analysisID,
 		prefetchedOpenTrades, e.analysisSourceNode(result), scannerRunID,
-		pullbackCandidate,
+		pullbackCandidate, req.LensSet(),
 	)
 
 	// Update material-change gate state for next tick.
@@ -1308,14 +1415,33 @@ func (e *Engine) runAnalysis(
 	}
 	e.tickerStateMu.Lock()
 	e.tickerState[ticker] = &TickerState{
-		LastRSI:        set.RSI,
-		LastEMAGapPct:  emaGapPct(latestClose, set.EMA20),
-		LastPrice:      latestClose,
-		LastNewsHash:   newsHash,
-		LastDecision:   string(resp.Action),
-		LastAnalysedAt: time.Now(),
+		LastRSI:            set.RSI,
+		LastEMAGapPct:      emaGapPct(latestClose, set.EMA20),
+		LastPrice:          latestClose,
+		LastNewsHash:       newsHash,
+		LastContractDigest: DiscoveryExecutionContractDigest(discoveryContext, executionProfile),
+		LastDecision:       string(resp.Action),
+		LastAnalysedAt:     time.Now(),
 	}
 	e.tickerStateMu.Unlock()
+}
+
+// lensSelectionTelemetry returns the scanner-owned recommendation and bounded
+// menu that a profile-bound analyst was asked to choose from. Legacy rows
+// retain the historical strategy-derived telemetry. Canonicalizing here keeps
+// log fields consistent with the durable execution-profile contract even when
+// callers constructed the profile with non-canonical casing or whitespace.
+func lensSelectionTelemetry(
+	strategy string,
+	strategies []string,
+	executionProfile *tradeprofile.ExecutionProfile,
+) (configured string, admissible []string) {
+	if executionProfile != nil {
+		if canonical, err := executionProfile.Canonicalize(); err == nil {
+			return canonical.RecommendedLens, canonical.AdmissibleLenses
+		}
+	}
+	return strategy, prompts.Lenses(strategies)
 }
 
 // analysisSourceNode identifies the configured analysis stage that produced the
@@ -1823,6 +1949,7 @@ func (e *Engine) generateSignal(
 	analysisSourceNode string,
 	scannerRunID string,
 	pullbackCandidate bool,
+	admissibleLensSets ...[]string,
 ) {
 	if resp.Action == analysis.ActionHold || resp.Action == analysis.ActionWait {
 		// WAIT: real catalyst but poor entry timing — analysis is recorded,
@@ -1882,10 +2009,29 @@ func (e *Engine) generateSignal(
 		entryDailyCandles := candles
 		var pullbackObservedAt time.Time
 		pullbackCandidate = eg.PullbackStrengthEnabled && pullbackCandidate
+		admissibleLenses := strategies
+		if len(admissibleLensSets) > 0 {
+			admissibleLenses = admissibleLensSets[0]
+		}
+		// A lens made available by the scanner profile cannot bypass its own
+		// deterministic qualification. Legacy qualified candidates retain the
+		// additive path below even when an older model omits selected_strategy.
+		pullbackSelected := selectedPullbackLens(strategy, resp.SelectedStrategy, admissibleLenses)
+		// A scanner profile may outlive a temporary gate disable. In that case a
+		// BUY reasoned under pullback_strength cannot silently fall back to a
+		// standard entry: qualification is integral to that lens, and disabled
+		// qualification makes the recommendation non-executable.
+		if pullbackSelectionDisabled(eg.PullbackStrengthEnabled, pullbackSelected) {
+			entryGateReason = "pullback strength: selected lens is disabled"
+			entryGateFailedCheck = "pullback_disabled"
+		}
+		pullbackEvaluationRequired := pullbackCandidate ||
+			(pullbackSelected && eg.PullbackStrengthEnabled)
 		pullbackConfirmed := false
-		needsDailyEvidence := pullbackCandidate ||
+		pullbackFailureReason := ""
+		needsDailyEvidence := pullbackEvaluationRequired ||
 			eg.TrendAlignmentEnabled
-		if pullbackCandidate {
+		if pullbackEvaluationRequired {
 			// The analyst may take long enough for the session low to change.
 			// Refresh the partial daily bar at qualification time, then scan
 			// every exact trade print from the returned snapshot boundary.
@@ -1899,7 +2045,7 @@ func (e *Engine) generateSignal(
 			}
 		}
 		if needsDailyEvidence &&
-			(data.Timeframe(timeframe) != data.Timeframe1Day || pullbackCandidate) {
+			(data.Timeframe(timeframe) != data.Timeframe1Day || pullbackEvaluationRequired) {
 			var err error
 			entryDailyCandles, err = store.GetCandles(
 				ctx, ticker, data.Timeframe1Day,
@@ -1911,7 +2057,7 @@ func (e *Engine) generateSignal(
 				entryDailyCandles = nil
 			}
 		}
-		if pullbackCandidate && !pullbackObservedAt.IsZero() {
+		if pullbackEvaluationRequired && !pullbackObservedAt.IsZero() {
 			// Use the refreshed daily snapshot's close for reclaim, stop width,
 			// signal persistence, and the initial risk pass. The pre-analysis
 			// primary-timeframe close may be minutes old by this point.
@@ -1958,6 +2104,8 @@ func (e *Engine) generateSignal(
 					"stop_width_pct", fmt.Sprintf("%.2f", setup.StopWidthPct),
 				)
 			} else {
+				pullbackFailureReason = setup.Reason
+				entryGateFailedCheck = setup.FailedCheck
 				logger.Info("pullback strength not confirmed; using standard entry path",
 					"ticker", ticker,
 					"failed_check", setup.FailedCheck,
@@ -1965,7 +2113,14 @@ func (e *Engine) generateSignal(
 				)
 			}
 		}
-		if !pullbackConfirmed && eg.TrendAlignmentEnabled {
+		if pullbackSelected && !pullbackConfirmed && entryGateReason == "" {
+			if pullbackFailureReason == "" {
+				pullbackFailureReason = "daily setup evidence was unavailable for deterministic qualification"
+				entryGateFailedCheck = "pullback_evidence"
+			}
+			entryGateReason = "pullback strength: deterministic qualification required for the selected lens: " + pullbackFailureReason
+		}
+		if entryGateReason == "" && !pullbackConfirmed && eg.TrendAlignmentEnabled {
 			var evaluated bool
 			entryGateReason, evaluated = evaluateTrendAlignmentGate(
 				string(resp.Action), signalPrice, data.Timeframe1Day,
@@ -1986,7 +2141,7 @@ func (e *Engine) generateSignal(
 					"ticker", ticker, "err", pcErr)
 			}
 			entryGateReason = evaluateRunupGates(
-				effectiveGateStrategy(strategy, resp.SelectedStrategy, strategies),
+				effectiveGateStrategy(strategy, resp.SelectedStrategy, admissibleLenses),
 				string(resp.Action), signalPrice, prevClose, eg,
 			)
 		}

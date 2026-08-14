@@ -2,12 +2,14 @@ package engine
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/config"
+	"github.com/romeo-folie/trade-engine/internal/tradeprofile"
 )
 
 // SkipReason describes why analysis was skipped.
@@ -23,12 +25,16 @@ const (
 // Stored in-memory in the engine. On restart, the first tick always analyses
 // (no prior state → conservative default).
 type TickerState struct {
-	LastRSI        float64
-	LastEMAGapPct  float64 // (price - EMA20) / EMA20 * 100
-	LastPrice      float64
-	LastNewsHash   string
-	LastDecision   string // BUY | SELL | HOLD | ""
-	LastAnalysedAt time.Time
+	LastRSI       float64
+	LastEMAGapPct float64 // (price - EMA20) / EMA20 * 100
+	LastPrice     float64
+	LastNewsHash  string
+	// LastContractDigest identifies the scanner-owned discovery and execution
+	// contract used for the last analysis. A changed contract is material even
+	// when market indicators and news are unchanged.
+	LastContractDigest string
+	LastDecision       string // BUY | SELL | HOLD | ""
+	LastAnalysedAt     time.Time
 }
 
 // MaterialChangeInput carries current-tick values for the gate check.
@@ -37,7 +43,70 @@ type MaterialChangeInput struct {
 	EMA20    float64
 	Price    float64 // latest close
 	NewsHash string  // SHA-256 digest of current news headlines
-	Now      time.Time
+	// ContractDigest identifies the discovery/execution contract currently
+	// constraining the analysis request. Empty means the legacy no-contract path.
+	ContractDigest string
+	Now            time.Time
+}
+
+// DiscoveryExecutionContractDigest returns a stable digest for the scanner
+// provenance and bounded execution profile passed to analysis. The contracts
+// are canonicalized before hashing, so insignificant source/lens casing and
+// map iteration order do not cause an unnecessary model invocation. A nil pair
+// remains empty to preserve the legacy no-contract material-change behaviour.
+func DiscoveryExecutionContractDigest(discovery *tradeprofile.DiscoveryContext, execution *tradeprofile.ExecutionProfile) string {
+	if discovery == nil && execution == nil {
+		return ""
+	}
+
+	// Marshal helpers canonicalize valid durable contracts. Falling back to the
+	// caller values still creates a deterministic best-effort identity for a
+	// malformed in-memory contract, which is safer than silently treating it as
+	// the legacy no-contract path.
+	discoveryJSON, err := tradeprofile.MarshalDiscoveryContext(discovery)
+	if err != nil {
+		discoveryJSON, _ = json.Marshal(discovery)
+	}
+	discoveryJSON = canonicalContractJSON(discoveryJSON)
+	executionJSON, err := tradeprofile.MarshalExecutionProfile(execution)
+	if err != nil {
+		executionJSON, _ = json.Marshal(execution)
+	}
+	executionJSON = canonicalContractJSON(executionJSON)
+
+	payload := struct {
+		Discovery json.RawMessage `json:"discovery_context"`
+		Execution json.RawMessage `json:"execution_profile"`
+	}{
+		Discovery: discoveryJSON,
+		Execution: executionJSON,
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		// Both fields are JSON values above, so this is defensive only. Return a
+		// non-empty stable marker rather than disabling the contract-change gate.
+		raw = []byte("contract-marshal-error")
+	}
+	sum := sha256.Sum256(raw)
+	return fmt.Sprintf("%x", sum[:])
+}
+
+// canonicalContractJSON normalizes nested evidence object key ordering before
+// it becomes part of a digest. Discovery evidence is intentionally schemaless,
+// so RawMessage key order must not create a false material change.
+func canonicalContractJSON(raw []byte) []byte {
+	if len(raw) == 0 {
+		return nil
+	}
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return raw
+	}
+	canonical, err := json.Marshal(value)
+	if err != nil {
+		return raw
+	}
+	return canonical
 }
 
 // NewsDigestHash returns a SHA-256 hex hash of the sorted, NUL-delimited
@@ -107,10 +176,11 @@ func applyScannerOverrides(cfg config.AnalysisConfig, source string, scannerConv
 //
 // Decision matrix:
 //  1. If MaterialChangeOnly is disabled → never skip (always analyze).
-//  2. If last decision was HOLD and HoldCooldownMin has not elapsed → HOLD_COOLDOWN skip.
-//  3. If no prior state exists → analyze (conservative first-run default).
-//  4. If all deltas are below their thresholds AND news hash unchanged → NO_MATERIAL_CHANGE skip.
-//  5. Otherwise → analyze.
+//  2. A changed discovery/execution contract → analyze, including during HOLD cooldown.
+//  3. If last decision was HOLD and HoldCooldownMin has not elapsed → HOLD_COOLDOWN skip.
+//  4. If no prior state exists → analyze (conservative first-run default).
+//  5. If all deltas are below their thresholds AND news hash unchanged → NO_MATERIAL_CHANGE skip.
+//  6. Otherwise → analyze.
 //
 // Callers should log the skip reason and the delta values for observability.
 func CheckMaterialChange(prev *TickerState, in MaterialChangeInput, cfg config.AnalysisConfig) (skip bool, reason SkipReason, deltas map[string]float64) {
@@ -120,7 +190,16 @@ func CheckMaterialChange(prev *TickerState, in MaterialChangeInput, cfg config.A
 		return false, SkipReasonNone, deltas
 	}
 
-	// Rule 1: HOLD cooldown.
+	// Rule 1: scanner provenance and bounded lens selection change what the
+	// analyst is asked to decide. Treat that as material before the HOLD
+	// cooldown so a refreshed scanner contract cannot be trapped behind a
+	// previous HOLD result.
+	if prev != nil && in.ContractDigest != prev.LastContractDigest {
+		deltas["contract_changed"] = 1
+		return false, SkipReasonNone, deltas
+	}
+
+	// Rule 2: HOLD cooldown.
 	if prev != nil && prev.LastDecision == "HOLD" && !prev.LastAnalysedAt.IsZero() {
 		cooldown := time.Duration(cfg.HoldCooldownMin) * time.Minute
 		elapsed := in.Now.Sub(prev.LastAnalysedAt)
@@ -131,7 +210,7 @@ func CheckMaterialChange(prev *TickerState, in MaterialChangeInput, cfg config.A
 		}
 	}
 
-	// Rule 2: No prior state → analyze.
+	// Rule 3: No prior state → analyze.
 	if prev == nil {
 		return false, SkipReasonNone, deltas
 	}
@@ -150,7 +229,7 @@ func CheckMaterialChange(prev *TickerState, in MaterialChangeInput, cfg config.A
 	deltas["ema_gap_delta_pct"] = emaGapDelta
 	deltas["price_move_pct"] = priceDelta
 
-	// Rule 3: Any threshold exceeded → analyze.
+	// Rule 4: Any threshold exceeded → analyze.
 	if rsiDelta >= cfg.RSIDeltaThreshold {
 		return false, SkipReasonNone, deltas
 	}
@@ -164,6 +243,6 @@ func CheckMaterialChange(prev *TickerState, in MaterialChangeInput, cfg config.A
 		return false, SkipReasonNone, deltas
 	}
 
-	// Rule 4: Nothing changed materially → skip.
+	// Rule 5: Nothing changed materially → skip.
 	return true, SkipReasonNoChange, deltas
 }

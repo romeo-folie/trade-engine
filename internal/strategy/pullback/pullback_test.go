@@ -68,6 +68,26 @@ func TestEvaluateCompleteSetup(t *testing.T) {
 	}
 }
 
+func TestPromptContextPreservesDeterministicSetupFacts(t *testing.T) {
+	setup := Evaluate(validSetupCandles(), 120, Config{})
+	context := setup.PromptContext()
+	if !context.Qualified || context.FailedCheck != "" {
+		t.Fatalf("qualified context = %+v", context)
+	}
+	if context.SignalSession.IsZero() || context.AVWAPHighAnchor.IsZero() || context.AVWAPLowAnchor.IsZero() {
+		t.Fatalf("AVWAP signal/anchor times missing: %+v", context)
+	}
+	if context.AVWAPDefinition == "" || context.StackedAVWAP <= 0 || context.StackedCompanion <= 0 || context.Support <= 0 {
+		t.Fatalf("support context missing: %+v", context)
+	}
+	if !context.ConsolidationHigherLow || !context.ConsolidationRangeNarrower || !context.FlushedIntoSupport || !context.PositiveReclaim {
+		t.Fatalf("qualification checks missing: %+v", context)
+	}
+	if context.StopLoss != 117 || context.MaxStopWidthPct != 4 || context.ExecutionInvalidation != "" {
+		t.Fatalf("stop context = %+v", context)
+	}
+}
+
 func TestEvaluateRequiresStrengthAndReclaim(t *testing.T) {
 	t.Run("weak momentum", func(t *testing.T) {
 		candles := validSetupCandles()

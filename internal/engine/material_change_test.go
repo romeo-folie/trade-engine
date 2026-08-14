@@ -1,10 +1,12 @@
 package engine
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/config"
+	"github.com/romeo-folie/trade-engine/internal/tradeprofile"
 )
 
 func TestCheckMaterialChange(t *testing.T) {
@@ -247,6 +249,111 @@ func TestCheckMaterialChange_FirstTouchAlwaysAnalyses(t *testing.T) {
 		if _, ok := deltas[k]; ok {
 			t.Fatalf("first-touch deltas leaked %q (prev was nil) — value=%v", k, deltas[k])
 		}
+	}
+}
+
+func TestCheckMaterialChange_ContractChangeBypassesHoldCooldown(t *testing.T) {
+	now := time.Now()
+	cfg := config.AnalysisConfig{
+		MaterialChangeOnly:    true,
+		HoldCooldownMin:       120,
+		RSIDeltaThreshold:     3.0,
+		EMAGapDeltaPct:        0.5,
+		PriceMoveThresholdPct: 0.75,
+		NewsNoveltyEnabled:    true,
+	}
+	oldDigest := DiscoveryExecutionContractDigest(testDiscoveryContext("original catalyst"), testExecutionProfile("momentum"))
+	newDigest := DiscoveryExecutionContractDigest(testDiscoveryContext("refreshed catalyst"), testExecutionProfile("pullback_strength"))
+	if oldDigest == newDigest {
+		t.Fatal("different scanner contracts must produce different digests")
+	}
+
+	skip, reason, deltas := CheckMaterialChange(&TickerState{
+		LastRSI:            50,
+		LastEMAGapPct:      5,
+		LastPrice:          105,
+		LastNewsHash:       "same-news",
+		LastContractDigest: oldDigest,
+		LastDecision:       "HOLD",
+		LastAnalysedAt:     now.Add(-time.Minute),
+	}, MaterialChangeInput{
+		RSI:            50,
+		EMA20:          100,
+		Price:          105,
+		NewsHash:       "same-news",
+		ContractDigest: newDigest,
+		Now:            now,
+	}, cfg)
+	if skip || reason != SkipReasonNone {
+		t.Fatalf("changed scanner contract must analyze despite HOLD cooldown; skip=%v reason=%q", skip, reason)
+	}
+	if deltas["contract_changed"] != 1 {
+		t.Fatalf("contract change delta = %v, want 1", deltas["contract_changed"])
+	}
+}
+
+func TestDiscoveryExecutionContractDigest_IsCanonicalAndSensitive(t *testing.T) {
+	first := &tradeprofile.DiscoveryContext{
+		Version:          tradeprofile.DiscoveryContextVersion,
+		Sources:          []string{"weekly_leader"},
+		Thesis:           "Catalyst",
+		EvidenceBySource: map[string]json.RawMessage{"weekly_leader": json.RawMessage(`{"score":1,"detail":{"a":1,"b":2}}`)},
+	}
+	second := &tradeprofile.DiscoveryContext{
+		Version:          tradeprofile.DiscoveryContextVersion,
+		Sources:          []string{" WEEKLY_LEADER "},
+		Thesis:           "  Catalyst  ",
+		EvidenceBySource: map[string]json.RawMessage{"WEEKLY_LEADER": json.RawMessage(`{ "detail": { "b": 2, "a": 1 }, "score": 1 }`)},
+	}
+	firstProfile := &tradeprofile.ExecutionProfile{
+		Version:              tradeprofile.ExecutionProfileVersion,
+		RecommendedLens:      "momentum",
+		AdmissibleLenses:     []string{"momentum", "trend_following"},
+		PrimaryTimeframe:     "1D",
+		EntryTimingTimeframe: "4H",
+		ScorerRationale:      "confirmed strength",
+	}
+	secondProfile := &tradeprofile.ExecutionProfile{
+		Version:              tradeprofile.ExecutionProfileVersion,
+		RecommendedLens:      " MOMENTUM ",
+		AdmissibleLenses:     []string{"MOMENTUM", "trend_following"},
+		PrimaryTimeframe:     "1d",
+		EntryTimingTimeframe: "4h",
+		ScorerRationale:      " confirmed strength ",
+	}
+	firstDigest := DiscoveryExecutionContractDigest(first, firstProfile)
+	if got := DiscoveryExecutionContractDigest(second, secondProfile); got != firstDigest {
+		t.Fatalf("canonical-equivalent contracts produced different digests: %q != %q", got, firstDigest)
+	}
+	if got := DiscoveryExecutionContractDigest(first, testExecutionProfile("news_sentiment")); got == firstDigest {
+		t.Fatal("changed execution profile must produce a different digest")
+	}
+	if got := DiscoveryExecutionContractDigest(testDiscoveryContext("different catalyst"), firstProfile); got == firstDigest {
+		t.Fatal("changed discovery context must produce a different digest")
+	}
+	if got := DiscoveryExecutionContractDigest(nil, nil); got != "" {
+		t.Fatalf("legacy no-contract digest = %q, want empty", got)
+	}
+}
+
+func testDiscoveryContext(thesis string) *tradeprofile.DiscoveryContext {
+	return &tradeprofile.DiscoveryContext{
+		Version: tradeprofile.DiscoveryContextVersion,
+		Sources: []string{"weekly_leader"},
+		Thesis:  thesis,
+		EvidenceBySource: map[string]json.RawMessage{
+			"weekly_leader": json.RawMessage(`{"rank":1}`),
+		},
+	}
+}
+
+func testExecutionProfile(recommendedLens string) *tradeprofile.ExecutionProfile {
+	return &tradeprofile.ExecutionProfile{
+		Version:          tradeprofile.ExecutionProfileVersion,
+		RecommendedLens:  recommendedLens,
+		AdmissibleLenses: []string{recommendedLens},
+		PrimaryTimeframe: "1D",
+		ScorerRationale:  "test profile",
 	}
 }
 
