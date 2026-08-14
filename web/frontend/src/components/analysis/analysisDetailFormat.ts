@@ -3,7 +3,7 @@ export function titleCase(value: string): string {
 }
 
 export function formatIndicator(value: number | undefined, digits = 2): string {
-  if (value == null || !Number.isFinite(value) || value === 0) return 'Unavailable';
+  if (value == null || !Number.isFinite(value)) return 'Unavailable';
   return value.toLocaleString('en-US', {
     minimumFractionDigits: digits,
     maximumFractionDigits: digits,

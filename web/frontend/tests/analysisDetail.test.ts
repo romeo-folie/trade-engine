@@ -19,7 +19,7 @@ test('indicator catalog lists only technical indicator families', () => {
 
 test('analysis detail formatting distinguishes unavailable indicator values', () => {
   assert.equal(formatIndicator(undefined), 'Unavailable');
-  assert.equal(formatIndicator(0), 'Unavailable');
+  assert.equal(formatIndicator(0), '0.00');
   assert.equal(formatIndicator(61.257), '61.26');
   assert.equal(formatIndicator(1234, 0), '1,234');
   assert.equal(titleCase('pullback_strength'), 'Pullback Strength');
