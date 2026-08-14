@@ -48,12 +48,13 @@ func (c *OllamaClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 		systemPrompt = req.CustomSystemPrompt
 		userMessage = req.CustomUserMessage
 	} else {
-		systemPrompt, userMessage = prompts.BuildStockPromptWithDiscoveryContext(
+		systemPrompt, userMessage = prompts.BuildStockPromptWithAnalysisContext(
 			req.Ticker, req.LensSet(), req.Timeframe,
 			toPromptCandles(req.RecentCandles), toPromptIndicators(req.Indicators),
 			toPromptNews(req.News), toPromptPortfolio(req.Portfolio, req.Ticker),
 			req.KnowledgeContext, toPromptSimilarSetups(req.SimilarAnalyses),
 			req.PerformanceContext, req.MomentumPlay, req.DiscoveryContext, req.PullbackContext,
+			req.TimeframeRole, req.PrimaryThesisContext,
 		)
 	}
 	combinedPrompt := systemPrompt + "\n\n" + userMessage

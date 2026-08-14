@@ -401,6 +401,38 @@ func BuildStockPromptWithDiscoveryContext(
 	discoveryContext *tradeprofile.DiscoveryContext,
 	pullbackContexts ...*pullback.PromptContext,
 ) (systemPrompt, userMessage string) {
+	var pullbackContext *pullback.PromptContext
+	if len(pullbackContexts) > 0 {
+		pullbackContext = pullbackContexts[0]
+	}
+	return BuildStockPromptWithAnalysisContext(
+		ticker, strategies, timeframe, candles, ind, news, portfolio,
+		knowledgeContext, similarSetups, performanceContext, momentumPlay,
+		discoveryContext, pullbackContext, TimeframeRolePrimaryThesis, nil,
+	)
+}
+
+// BuildStockPromptWithAnalysisContext renders the standard prompt together
+// with explicit timeframe-workflow context. It is used for both the primary
+// thesis pass and the optional entry-confirmation pass. The older discovery
+// context builder remains for callers that do not participate in the workflow.
+func BuildStockPromptWithAnalysisContext(
+	ticker string,
+	strategies []string,
+	timeframe string,
+	candles []Candle,
+	ind Indicators,
+	news []NewsItem,
+	portfolio Portfolio,
+	knowledgeContext string,
+	similarSetups []SimilarPastSetup,
+	performanceContext string,
+	momentumPlay bool,
+	discoveryContext *tradeprofile.DiscoveryContext,
+	pullbackContext *pullback.PromptContext,
+	timeframeRole TimeframeRole,
+	primaryThesis *PrimaryThesisContext,
+) (systemPrompt, userMessage string) {
 	lenses := Lenses(strategies)
 	contract := lensContract(strategies)
 	exitOverride := ExitOnlyOverride(strategies)
@@ -409,11 +441,8 @@ func BuildStockPromptWithDiscoveryContext(
 	} else {
 		systemPrompt = buildSystem(contract, exitOverride, lenses)
 	}
-	var pullbackContext *pullback.PromptContext
-	if len(pullbackContexts) > 0 {
-		pullbackContext = pullbackContexts[0]
-	}
-	userMessage = buildUser(ticker, timeframe, candles, ind, news, portfolio, knowledgeContext, similarSetups, performanceContext, discoveryContext, pullbackContext)
+	systemPrompt += timeframeRoleInstruction(timeframeRole)
+	userMessage = buildUserWithTimeframeContext(ticker, timeframe, candles, ind, news, portfolio, knowledgeContext, similarSetups, performanceContext, discoveryContext, pullbackContext, timeframeRole, primaryThesis)
 	return
 }
 
@@ -497,6 +526,8 @@ USING SIMILAR PAST ANALYSES:
 		lensGuidance(lenses), exitOverride)
 }
 
+// buildUser is retained for focused prompt tests and older package-local
+// helpers. Timeframe-aware callers use buildUserWithTimeframeContext.
 func buildUser(
 	ticker, timeframe string,
 	candles []Candle,
@@ -509,10 +540,32 @@ func buildUser(
 	discoveryContext *tradeprofile.DiscoveryContext,
 	pullbackContext *pullback.PromptContext,
 ) string {
+	return buildUserWithTimeframeContext(
+		ticker, timeframe, candles, ind, news, portfolio, knowledgeContext,
+		similarSetups, performanceContext, discoveryContext, pullbackContext,
+		TimeframeRolePrimaryThesis, nil,
+	)
+}
+
+func buildUserWithTimeframeContext(
+	ticker, timeframe string,
+	candles []Candle,
+	ind Indicators,
+	news []NewsItem,
+	portfolio Portfolio,
+	knowledgeContext string,
+	similarSetups []SimilarPastSetup,
+	performanceContext string,
+	discoveryContext *tradeprofile.DiscoveryContext,
+	pullbackContext *pullback.PromptContext,
+	timeframeRole TimeframeRole,
+	primaryThesis *PrimaryThesisContext,
+) string {
 	var b strings.Builder
 
 	// Market data section
 	b.WriteString(fmt.Sprintf("## TICKER: %s | TIMEFRAME: %s\n\n", ticker, timeframe))
+	writePrimaryThesisContext(&b, timeframeRole, primaryThesis)
 	writeDiscoveryContext(&b, discoveryContext)
 	writePullbackContext(&b, pullbackContext)
 	// The R:R self-filter in every system prompt computes against

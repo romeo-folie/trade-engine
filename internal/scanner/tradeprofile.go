@@ -74,21 +74,21 @@ func scannerDefaultsForSources(sources []string) scannerProfileDefaults {
 		{
 			name: "political_disclosure",
 			defaults: scannerProfileDefaults{
-				lenses: []string{"trend_following", "momentum"}, primary: "1D",
+				lenses: []string{"trend_following", "momentum"}, primary: "1D", entryTiming: "4H",
 				rationale: "Political-disclosure provenance is a swing thesis; evaluate daily trend and momentum.",
 			},
 		},
 		{
 			name: "weekly_leader",
 			defaults: scannerProfileDefaults{
-				lenses: []string{"trend_following", "momentum", "pullback_strength"}, primary: "1D",
+				lenses: []string{"trend_following", "momentum", "pullback_strength"}, primary: "1D", entryTiming: "4H",
 				rationale: "Weekly leadership is a daily trend/relative-strength thesis with a qualified pullback alternative.",
 			},
 		},
 		{
 			name: "potent_industry",
 			defaults: scannerProfileDefaults{
-				lenses: []string{"trend_following", "momentum"}, primary: "1D",
+				lenses: []string{"trend_following", "momentum"}, primary: "1D", entryTiming: "4H",
 				rationale: "Potent-industry leadership is a daily trend and momentum thesis.",
 			},
 		},

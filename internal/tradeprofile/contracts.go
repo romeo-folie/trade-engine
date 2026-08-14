@@ -165,6 +165,9 @@ func (p ExecutionProfile) Canonicalize() (ExecutionProfile, error) {
 		strings.TrimSpace(p.ScorerRationale) == "" {
 		return ExecutionProfile{}, fmt.Errorf("execution profile requires recognised timeframes and scorer rationale")
 	}
+	if p.EntryTimingTimeframe != "" && p.EntryTimingTimeframe == p.PrimaryTimeframe {
+		return ExecutionProfile{}, fmt.Errorf("execution profile entry timing timeframe must differ from primary timeframe")
+	}
 	p.AdmissibleLenses = canonicalLenses
 	return p, nil
 }

@@ -25,6 +25,7 @@ import (
 // per provider/model. The cost report can sum entries with this suffix to
 // measure the marginal spend of the multi-timeframe feature (Issue #321).
 const multiTFCostSuffix = "#mtf2"
+const profileConfirmationCostSuffix = "#profile-confirm"
 
 // shouldRunSecondPass returns true when the first arbiter result is WAIT and
 // confidence falls inside the configured borderline band [min, max] (inclusive),
@@ -117,6 +118,14 @@ func combineForArbiter(primaryTF, altTF string, primary, alt []analysis.AnalystR
 // cost tracker keys spend by "provider/model"; suffixing the model keeps the
 // provider attribution intact while giving us a way to slice marginal spend.
 func (e *Engine) recordMultiTFCost(result analysis.AnalyzeResult) {
+	e.recordAnalysisCostWithSuffix(result, multiTFCostSuffix)
+}
+
+func (e *Engine) recordProfileConfirmationCost(result analysis.AnalyzeResult) {
+	e.recordAnalysisCostWithSuffix(result, profileConfirmationCostSuffix)
+}
+
+func (e *Engine) recordAnalysisCostWithSuffix(result analysis.AnalyzeResult, suffix string) {
 	if e == nil || e.costTracker == nil {
 		return
 	}
@@ -128,12 +137,12 @@ func (e *Engine) recordMultiTFCost(result analysis.AnalyzeResult) {
 			if ar.Meta.InputTokens == 0 && ar.Meta.OutputTokens == 0 {
 				continue
 			}
-			e.costTracker.Record(ar.Meta.Provider, ar.Meta.Model+multiTFCostSuffix,
+			e.costTracker.Record(ar.Meta.Provider, ar.Meta.Model+suffix,
 				ar.Meta.InputTokens, ar.Meta.OutputTokens)
 		}
 		if result.Arbiter != nil && result.Arbiter.Meta.Provider != "" && result.Arbiter.Meta.Model != "" &&
 			(result.Arbiter.Meta.InputTokens > 0 || result.Arbiter.Meta.OutputTokens > 0) {
-			e.costTracker.Record(result.Arbiter.Meta.Provider, result.Arbiter.Meta.Model+multiTFCostSuffix,
+			e.costTracker.Record(result.Arbiter.Meta.Provider, result.Arbiter.Meta.Model+suffix,
 				result.Arbiter.Meta.InputTokens, result.Arbiter.Meta.OutputTokens)
 		}
 		return
@@ -144,7 +153,7 @@ func (e *Engine) recordMultiTFCost(result analysis.AnalyzeResult) {
 	if result.Meta.InputTokens == 0 && result.Meta.OutputTokens == 0 {
 		return
 	}
-	e.costTracker.Record(result.Meta.Provider, result.Meta.Model+multiTFCostSuffix,
+	e.costTracker.Record(result.Meta.Provider, result.Meta.Model+suffix,
 		result.Meta.InputTokens, result.Meta.OutputTokens)
 }
 
@@ -172,6 +181,7 @@ type altCandleFetcher func(ctx context.Context, ticker string, tf data.Timeframe
 // altCandleLoader reads alt-timeframe candles from the candle store
 // (matches store.GetCandles).
 type altCandleLoader func(ctx context.Context, ticker string, tf data.Timeframe, from, to time.Time) ([]data.Candle, error)
+type checkedAltCandleFetcher func(ctx context.Context, ticker string, tf data.Timeframe) error
 
 // loadAltCandles refreshes the alt-timeframe candles via fetcher (when
 // provided) and then loads them via loader. Returns (candles, true) when at
@@ -202,6 +212,25 @@ func loadAltCandles(ctx context.Context, ticker, altTF string, fetcher altCandle
 	return candles, true
 }
 
+func loadFreshConfirmationCandles(ctx context.Context, ticker, entryTF string, fetcher checkedAltCandleFetcher, loader altCandleLoader) ([]data.Candle, bool) {
+	if fetcher == nil {
+		return nil, false
+	}
+	if err := fetcher(ctx, ticker, data.Timeframe(entryTF)); err != nil {
+		logger.Warn("profile confirmation: candle refresh failed — confirmation unavailable",
+			"ticker", ticker, "entry_tf", entryTF, "err", err.Error())
+		return nil, false
+	}
+	historyFrom := time.Now().AddDate(-2, 0, 0)
+	candles, err := loader(ctx, ticker, data.Timeframe(entryTF), historyFrom, time.Now())
+	if err != nil || len(candles) < 20 {
+		logger.Warn("profile confirmation: refreshed candles unavailable",
+			"ticker", ticker, "entry_tf", entryTF, "count", len(candles), "err", err)
+		return nil, false
+	}
+	return candles, true
+}
+
 func (e *Engine) runSecondTimeframePass(ctx context.Context, primaryReq analysis.AnalysisRequest, altTF string, ticker string, impact depth.ImpactScore) (analysis.AnalyzeResult, bool) {
 	candles, ok := loadAltCandles(ctx, ticker, altTF, e.multiTFCandleFetcher, store.GetCandles)
 	if !ok {
@@ -216,22 +245,8 @@ func (e *Engine) runSecondTimeframePass(ctx context.Context, primaryReq analysis
 
 	// Build candle snapshots — mirror the primary pass's cap so prompt size is
 	// comparable.
-	candleCap := e.cfg.Analysis.MaxCandlesPerPrompt
-	if candleCap <= 0 {
-		candleCap = 20
-	}
-	if windows := e.cfg.Analysis.HistoryWindowByStrategy; len(windows) > 0 {
-		if n := widestHistoryWindow(windows, primaryReq.Strategy, primaryReq.LensSet()); n > 0 {
-			candleCap = n
-		}
-	}
-	if max := e.cfg.Analysis.MaxCandlesPerPrompt; max > 0 && candleCap > max {
-		candleCap = max
-	}
-	limit := len(candles)
-	if limit > candleCap {
-		limit = candleCap
-	}
+	limit := promptCandleLimit(len(candles), e.cfg.Analysis.MaxCandlesPerPrompt,
+		e.cfg.Analysis.HistoryWindowByStrategy, primaryReq.Strategy, primaryReq.LensSet())
 	snaps := make([]analysis.CandleSnapshot, 0, limit)
 	for i := len(candles) - 1; i >= 0 && len(snaps) < limit; i-- {
 		c := candles[i]
@@ -290,6 +305,75 @@ func (e *Engine) runSecondTimeframePass(ctx context.Context, primaryReq analysis
 		}
 	}
 	return analysis.AnalyzeResult{AnalystResults: altAnalysts}, true
+}
+
+// runProfileConfirmation executes the profile-owned entry-timing pass through
+// the same generalist/specialist dispatcher as the primary thesis. Unlike the
+// legacy Issue #321 pass, this returns a complete decision and fails closed
+// when fresh entry-timeframe evidence or the model is unavailable.
+func (e *Engine) runProfileConfirmation(ctx context.Context, primaryReq analysis.AnalysisRequest, primary analysis.AnalysisResponse, entryTF, ticker string, impact depth.ImpactScore) (analysis.AnalyzeResult, []data.Candle, bool) {
+	candles, ok := loadFreshConfirmationCandles(ctx, ticker, entryTF, e.profileConfirmationCandleFetcher, store.GetCandles)
+	if !ok {
+		return analysis.AnalyzeResult{}, nil, false
+	}
+	set, err := indicators.Compute(candles)
+	if err != nil {
+		return analysis.AnalyzeResult{}, nil, false
+	}
+	limit := promptCandleLimit(len(candles), e.cfg.Analysis.MaxCandlesPerPrompt,
+		e.cfg.Analysis.HistoryWindowByStrategy, primaryReq.Strategy, primaryReq.LensSet())
+	snaps := make([]analysis.CandleSnapshot, 0, limit)
+	for i := len(candles) - 1; i >= 0 && len(snaps) < limit; i-- {
+		c := candles[i]
+		snaps = append(snaps, analysis.CandleSnapshot{Timestamp: c.Timestamp, Open: c.Open, High: c.High, Low: c.Low, Close: c.Close, Volume: c.Volume, VWAP: c.VWAP})
+	}
+	req := primaryReq
+	req.Timeframe = entryTF
+	req.TimeframeRole = analysis.TimeframeRoleEntryConfirmation
+	req.PrimaryThesisContext = &analysis.PrimaryThesisContext{
+		PrimaryTimeframe: primaryReq.Timeframe, EntryTimingTimeframe: entryTF,
+		Action: string(primary.Action), Confidence: primary.Confidence,
+		SelectedLens: primary.SelectedStrategy, Regime: primary.Regime,
+		RejectedLenses: primary.RejectedStrategies, Reasoning: primary.Reasoning,
+		StopLoss: primary.StopLoss, TakeProfit: primary.TakeProfit,
+	}
+	req.RecentCandles = snaps
+	req.Indicators = analysis.IndicatorSnapshot{
+		EMA20: set.EMA20, EMA50: set.EMA50, EMA200: set.EMA200,
+		SMA20: set.SMA20, SMA50: set.SMA50, SMA200: set.SMA200,
+		RSI: set.RSI, MACDLine: set.MACDLine, MACDSignal: set.MACDSignal,
+		MACDHistogram: set.MACDHistogram, BBUpper: set.BBUpper, BBMiddle: set.BBMiddle,
+		BBLower: set.BBLower, ADX: set.ADX, ATR: set.ATR, OBV: set.OBV,
+		StochK: set.StochK, StochD: set.StochD, VWAP: set.VWAP,
+		VolSMA20: set.VolumeSMA20, VolRatio: volRatio(candles, set.VolumeSMA20),
+	}
+	var result analysis.AnalyzeResult
+	if e.cfg.Analysis.SpecialistModeEnabled {
+		result, err = e.analyzer.AnalyzeSpecialist(ctx, req, impact)
+	} else {
+		result, err = e.analyzer.AnalyzeFull(ctx, req, impact)
+	}
+	if err != nil {
+		return result, nil, false
+	}
+	return result, candles, true
+}
+
+func promptCandleLimit(available, configuredMax int, windows map[string]int, strategy string, lenses []string) int {
+	candleCap := configuredMax
+	if candleCap <= 0 {
+		candleCap = 20
+	}
+	if n := widestHistoryWindow(windows, strategy, lenses); n > 0 {
+		candleCap = n
+	}
+	if configuredMax > 0 && candleCap > configuredMax {
+		candleCap = configuredMax
+	}
+	if available < candleCap {
+		return available
+	}
+	return candleCap
 }
 
 // reArbitrate runs the configured arbiter over the combined analyst set and

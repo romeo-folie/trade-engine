@@ -11,16 +11,39 @@ import (
 // captureArbiter is a minimal ModelProvider used by tests to capture the
 // arbiter prompt produced by Arbitrate without making any real LLM call.
 type captureArbiter struct {
-	captured string
-	response AnalysisResponse
+	captured       string
+	capturedSystem string
+	response       AnalysisResponse
 }
 
 func (c *captureArbiter) Analyze(_ context.Context, req AnalysisRequest) (AnalysisResponse, ModelCallMeta, error) {
 	c.captured = req.CustomUserMessage
+	c.capturedSystem = req.CustomSystemPrompt
 	if c.response.Action != "" {
 		return c.response, ModelCallMeta{Provider: "test", Model: "arbiter"}, nil
 	}
 	return AnalysisResponse{Action: ActionHold, Confidence: 0.5, Reasoning: "ok"}, ModelCallMeta{Provider: "test", Model: "arbiter"}, nil
+}
+
+func TestArbitrate_PreservesEntryConfirmationConstraints(t *testing.T) {
+	cap := &captureArbiter{}
+	req := AnalysisRequest{
+		Ticker:        "TEST",
+		TimeframeRole: TimeframeRoleEntryConfirmation,
+		PrimaryThesisContext: &PrimaryThesisContext{
+			PrimaryTimeframe: "1D", EntryTimingTimeframe: "4H", SelectedLens: "momentum", Reasoning: "daily thesis",
+		},
+	}
+	results := []AnalystResult{makeResult(ActionBuy, .8, nil), makeResult(ActionWait, .7, nil)}
+	if _, err := Arbitrate(context.Background(), cap, req, results); err != nil {
+		t.Fatalf("Arbitrate: %v", err)
+	}
+	if !strings.Contains(cap.capturedSystem, "Do not emit SELL") {
+		t.Fatalf("arbiter system prompt omitted confirmation constraint: %q", cap.capturedSystem)
+	}
+	if !strings.Contains(cap.captured, "PRIMARY THESIS CONTEXT") || !strings.Contains(cap.captured, "selected lens: momentum") {
+		t.Fatalf("arbiter user prompt omitted primary thesis context: %q", cap.captured)
+	}
 }
 func (c *captureArbiter) ProviderName() string { return "test" }
 func (c *captureArbiter) ModelName() string    { return "arbiter" }

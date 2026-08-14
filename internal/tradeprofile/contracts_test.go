@@ -114,3 +114,17 @@ func TestExecutionProfileRejectsDuplicateCanonicalLens(t *testing.T) {
 		t.Fatalf("Validate = %v, want duplicate lens rejection", err)
 	}
 }
+
+func TestExecutionProfileRejectsMatchingPrimaryAndEntryTimingTimeframes(t *testing.T) {
+	err := (ExecutionProfile{
+		Version:              ExecutionProfileVersion,
+		RecommendedLens:      "momentum",
+		AdmissibleLenses:     []string{"momentum"},
+		PrimaryTimeframe:     " 4h ",
+		EntryTimingTimeframe: "4H",
+		ScorerRationale:      "duplicate timeframe roles are not a workflow",
+	}).Validate()
+	if err == nil || !strings.Contains(err.Error(), "must differ") {
+		t.Fatalf("Validate = %v, want matching timeframe rejection", err)
+	}
+}
