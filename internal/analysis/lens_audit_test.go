@@ -43,12 +43,29 @@ func TestValidateFinalLensSelectionRejectsProfileExternalLens(t *testing.T) {
 }
 
 func TestValidateFinalLensSelectionDistinguishesNoneAndNoConsensus(t *testing.T) {
-	none := AnalysisResponse{SelectedStrategy: "none"}
+	none := AnalysisResponse{Action: ActionBuy, SelectedStrategy: "none"}
 	if got := ValidateFinalLensSelection(&none, AnalysisRequest{ExecutionProfile: profileForLensAudit()}, false); got.SelectionStatus != LensSelectionNone {
 		t.Fatalf("none status = %q", got.SelectionStatus)
 	}
-	aggregate := AnalysisResponse{}
+	if none.Action != ActionHold {
+		t.Fatalf("profile-bound none action = %q, want HOLD", none.Action)
+	}
+	aggregate := AnalysisResponse{Action: ActionBuy}
 	if got := ValidateFinalLensSelection(&aggregate, AnalysisRequest{ExecutionProfile: profileForLensAudit()}, true); got.SelectionStatus != LensSelectionNoConsensus {
 		t.Fatalf("aggregate empty status = %q", got.SelectionStatus)
+	}
+	if aggregate.Action != ActionHold {
+		t.Fatalf("profile-bound no-consensus action = %q, want HOLD", aggregate.Action)
+	}
+}
+
+func TestValidateFinalLensSelectionProfileBoundAbsentSelectionSuppressesBuy(t *testing.T) {
+	resp := AnalysisResponse{Action: ActionBuy}
+	audit := ValidateFinalLensSelection(&resp, AnalysisRequest{ExecutionProfile: profileForLensAudit()}, false)
+	if audit.SelectionStatus != LensSelectionAbsent {
+		t.Fatalf("status = %q, want absent", audit.SelectionStatus)
+	}
+	if resp.Action != ActionHold {
+		t.Fatalf("profile-bound absent selection action = %q, want HOLD", resp.Action)
 	}
 }

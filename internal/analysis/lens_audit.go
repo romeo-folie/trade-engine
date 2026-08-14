@@ -34,6 +34,19 @@ func ValidateFinalLensSelection(
 	req AnalysisRequest,
 	aggregated bool,
 ) LensSelectionAudit {
+	// The profile is a strict authority only after it validates. Invalid or
+	// absent profiles retain legacy compatibility rather than turning an
+	// operational row into a false-negative selection.
+	var allowed map[string]struct{}
+	if req.ExecutionProfile != nil {
+		if profile, err := req.ExecutionProfile.Canonicalize(); err == nil {
+			allowed = make(map[string]struct{}, len(profile.AdmissibleLenses))
+			for _, lens := range profile.AdmissibleLenses {
+				allowed[lens] = struct{}{}
+			}
+		}
+	}
+
 	selected := strings.ToLower(strings.TrimSpace(response.SelectedStrategy))
 	audit := LensSelectionAudit{
 		SelectedLens:    selected,
@@ -45,39 +58,43 @@ func ValidateFinalLensSelection(
 		if aggregated {
 			audit.SelectionStatus = LensSelectionNoConsensus
 		}
+		suppressProfileBoundAction(response, allowed)
 		return audit
 	}
 	if selected == "none" {
 		audit.SelectionStatus = LensSelectionNone
+		suppressProfileBoundAction(response, allowed)
 		return audit
 	}
 
-	// The profile is the strict authority only after it validates. Invalid or
-	// absent profiles must retain legacy compatibility rather than turning an
-	// operational row into a false-negative selection.
-	if req.ExecutionProfile != nil {
-		if profile, err := req.ExecutionProfile.Canonicalize(); err == nil {
-			allowed := make(map[string]struct{}, len(profile.AdmissibleLenses))
-			for _, lens := range profile.AdmissibleLenses {
-				allowed[lens] = struct{}{}
-			}
-			if _, ok := allowed[selected]; !ok {
-				response.SelectedStrategy = ""
-				// A profile-bound actionable response was reasoned under a lens the
-				// scanner explicitly prohibited. Clearing only SelectedStrategy would let
-				// downstream entry gates fall back to the legacy configured strategy
-				// and potentially execute that invalid recommendation. Preserve the
-				// response for audit, but make it non-actionable.
-				if response.Action != ActionHold && response.Action != ActionWait {
-					response.Action = ActionHold
-				}
-				audit.SelectionStatus = LensSelectionInvalid
-				return audit
-			}
+	if allowed != nil {
+		if _, ok := allowed[selected]; !ok {
+			response.SelectedStrategy = ""
+			// A profile-bound actionable response was reasoned under a lens the
+			// scanner explicitly prohibited. Clearing only SelectedStrategy would let
+			// downstream entry gates fall back to the legacy configured strategy
+			// and potentially execute that invalid recommendation. Preserve the
+			// response for audit, but make it non-actionable.
+			suppressProfileBoundAction(response, allowed)
+			audit.SelectionStatus = LensSelectionInvalid
+			return audit
 		}
 	}
 	audit.SelectionStatus = LensSelectionSelected
 	return audit
+}
+
+// suppressProfileBoundAction prevents a scanner-profiled result without a
+// valid selected lens from reaching a legacy configured-strategy fallback. A
+// lens is the authorisation for an actionable trade on those rows; "none" or
+// no consensus is explicitly not such an authorisation.
+func suppressProfileBoundAction(response *AnalysisResponse, allowed map[string]struct{}) {
+	if allowed == nil {
+		return
+	}
+	if response.Action != ActionHold && response.Action != ActionWait {
+		response.Action = ActionHold
+	}
 }
 
 func cloneRejectedLenses(in map[string]string) map[string]string {

@@ -198,7 +198,18 @@ func addWatchlistItem(
 				ELSE EXCLUDED.scanner_run_id
 			END,
 			active         = true,
-			expires_at     = EXCLUDED.expires_at,
+			-- A legacy/manual refresh without the complete scanner contract must
+			-- preserve the whole provenance envelope. In particular, clearing the
+			-- scanner TTL here would turn a bounded scanner candidate into an
+			-- indefinitely-active watchlist row while its source/profile are still
+			-- retained above.
+			expires_at = CASE
+				WHEN EXCLUDED.discovery_context IS NULL
+					AND watchlist.discovery_context IS NOT NULL
+					AND watchlist.execution_profile IS NOT NULL
+					THEN watchlist.expires_at
+				ELSE EXCLUDED.expires_at
+			END,
 			pullback_requalification_required = false,
 			updated_at     = NOW()
 		WHERE NOT (

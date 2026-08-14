@@ -103,6 +103,10 @@ func TestWatchlistTradeProfileNilUpsertPreservesAndCompleteUpsertReplaces(t *tes
 	legacyRefresh.DiscoveryContext = nil
 	legacyRefresh.ExecutionProfile = nil
 	legacyRefresh.ScannerRunID = ""
+	// This models a normal manual/config refresh rather than a copied scanner
+	// item: it has no scanner TTL to replace. The existing profile-backed
+	// provenance envelope must therefore retain its original expiry too.
+	legacyRefresh.ExpiresAt = nil
 	if err := store.AddWatchlistItem(ctx, legacyRefresh); err != nil {
 		t.Fatalf("legacy refresh: %v", err)
 	}
@@ -113,7 +117,8 @@ func TestWatchlistTradeProfileNilUpsertPreservesAndCompleteUpsertReplaces(t *tes
 	if stored.DiscoveryContext == nil || stored.DiscoveryContext.Thesis != "Original thesis" ||
 		stored.ExecutionProfile == nil || stored.ExecutionProfile.RecommendedLens != "momentum" ||
 		stored.ScannerRunID != initialRunID || stored.Source != "scanner" ||
-		stored.GraphContext != "Original graph context" {
+		stored.GraphContext != "Original graph context" || stored.ExpiresAt == nil ||
+		!stored.ExpiresAt.Equal(firstExpiry) {
 		t.Fatalf("legacy refresh erased scanner contracts: %+v", stored)
 	}
 
