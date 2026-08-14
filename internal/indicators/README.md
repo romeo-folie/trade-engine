@@ -1,12 +1,14 @@
 # internal/indicators — Technical Analysis Engine
 
-Pure computation — no I/O, no side effects. Takes a slice of `data.Candle` and returns an `IndicatorSet` with all 11 indicators computed. Used by the engine loop before building the LLM prompt.
+Pure computation—no I/O and no side effects. Takes ascending `data.Candle`
+history and returns the fixed `IndicatorSet` used by analysis, strategy gates,
+replay, and trailing-stop calculations.
 
 ## Components
 
 | File | Purpose |
 |------|---------|
-| `indicators.go` | `IndicatorSet` struct + `Compute(candles)` entry point |
+| `indicators.go` | `IndicatorSet`, `Compute`, plus configurable `ComputeATR` and `ComputeEMA` helpers |
 | `technical.go` | All indicator computation functions (unexported, tested directly) |
 | `technical_test.go` | Unit tests for every indicator with known inputs/outputs |
 
@@ -48,7 +50,9 @@ All use standard formulations:
 | VWAP | Cumulative (TP × Volume) / cumulative Volume | 1 |
 | Volume SMA | SMA(20) of volume | 20 |
 
-> **Recommended minimum:** 200 candles for EMA200 and ADX to be meaningful. The `BackfillHistory` function in the engine ensures this is satisfied on watchlist add.
+> **Recommended minimum:** 200 candles for EMA200 and ADX to be meaningful.
+> Scanner/watchlist workflows backfill sufficient history before ordinary
+> analysis, while callers of the pure package remain responsible for lookback.
 
 ## Usage
 

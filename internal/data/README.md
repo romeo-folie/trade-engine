@@ -1,6 +1,8 @@
 # internal/data — Market Data & News Providers
 
-Defines the provider interfaces and concrete adapters for fetching market price data and financial news. All components are swappable via Go interfaces, so the engine code is never coupled to a specific provider.
+Defines provider interfaces and adapters for stock, options, forex/CFD, futures,
+universe, premarket, historical, and news data. Consumers depend on small Go
+interfaces rather than a single venue.
 
 ## Components
 
@@ -8,6 +10,11 @@ Defines the provider interfaces and concrete adapters for fetching market price 
 |------|---------|
 | `provider.go` | `MarketDataProvider` interface + `Candle`, `Quote`, `Timeframe` types |
 | `alpaca.go` | Alpaca REST adapter implementing `MarketDataProvider` |
+| `alpaca_universe.go`, `alpaca_options_hist.go` | Stock-universe and historical options data |
+| `ibkr.go` | IBKR candle/quote adapter for session strategies |
+| `dukascopy.go`, `histdata.go` | Historical forex/futures research data |
+| `oanda.go`, `exness.go` | Additional market-data adapters |
+| `universe.go`, `screener.go`, `premarket.go` | Discovery capability interfaces |
 | `news.go` | `NewsProvider` interface + `NewsItem` type |
 | `finnhub.go` | Finnhub company news adapter implementing `NewsProvider` |
 
@@ -20,7 +27,11 @@ Ticker | Timeframe | Timestamp | Open | High | Low | Close | Volume | VWAP
 
 **`Quote`** — latest bid/ask/last for a ticker (fetched on demand for order sizing).
 
-**`Timeframe`** — a string enum: `1m`, `5m`, `15m`, `1h`, `1d`.
+**`Timeframe`** — a string enum: `1m`, `5m`, `15m`, `1h`, `4h`, `1d`.
+
+**`MarketTrade`** — an exact exchange print used when an OHLC bucket would
+straddle a signal boundary. Providers may expose this optional capability via
+`TradePathProvider`.
 
 **`NewsItem`** — a news article with headline, summary, source, tickers, and optional sentiment score.
 
@@ -46,6 +57,12 @@ Uses [Alpaca Market Data API v2](https://docs.alpaca.markets/reference/stockbars
 - Rate limit: 200 req/min free tier → 300ms minimum interval between requests
 - Handles pagination (`next_page_token`) automatically for large date-range fetches
 - Timeframe mapping: `1m→1Min`, `5m→5Min`, `15m→15Min`, `1h→1Hour`, `1d→1Day`
+
+### IBKR and historical adapters
+
+IBKR supplies runtime data for configured forex/CFD and futures session
+strategies. Dukascopy and local historical-data adapters support deterministic
+research/replay paths; they are not interchangeable with broker execution.
 
 ### FinnhubClient
 Uses [Finnhub Company News API](https://finnhub.io/docs/api/company-news). Auth via `token` query param.

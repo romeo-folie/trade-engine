@@ -1,47 +1,58 @@
-# internal/execution
+# internal/execution — Broker Adapters
 
-Order execution adapters. Defines the `Executor` interface and provides two implementations.
-
-## Purpose
-
-Abstracts order placement so the engine can swap between paper simulation, Alpaca paper trading, and (eventually) live broker execution without changing core logic.
+Defines the shared order contract and broker-facing implementations used by
+stock, options, forex/CFD, and futures workflows.
 
 ## Components
 
-| File | Description |
-|------|-------------|
-| `executor.go` | `Executor` interface + shared types (`OrderRequest`, `OrderResult`, `Position`) |
-| `paper.go` | `PaperExecutor` — local in-memory simulator. Fills immediately at provided price. |
-| `alpaca_broker.go` | `AlpacaBroker` — HTTP adapter for Alpaca Trading API (paper or live). |
+| Area | Purpose |
+|---|---|
+| `executor.go` | `Executor`, order/result/position types, bracket and contract metadata |
+| `paper.go` | Local immediate-fill simulator for development and replay |
+| `alpaca_broker.go`, `alpaca_options.go` | Alpaca stock/options trading and option-chain access |
+| `ibkr_broker.go`, `ibkr_conid.go` | IBKR CASH, CFD, and futures contract resolution/execution |
+| `brokerview.go`, `alpaca_brokerview.go`, `ibkr_brokerview.go` | Read-only broker order/position views for reconciliation |
+| `account_validation.go` | Stock-account identity, status, freshness, and capability checks |
+| `read_only.go` | Wrapper that rejects mutating broker operations |
+| `trailing/` | Persistent server-side trailing-stop manager |
 
-## Executor Interface
+## Executor Contract
 
-```go
-type Executor interface {
-    PlaceOrder(ctx, OrderRequest) (OrderResult, error)
-    CancelOrder(ctx, brokerOrderID) error
-    GetOrderStatus(ctx, brokerOrderID) (OrderResult, error)
-    GetPositions(ctx) ([]Position, error)
-}
-```
+`Executor` places, cancels, and looks up orders; lists positions; and reads
+account state. Optional capability interfaces add broker-order views and stop
+replacement where supported. `OrderRequest` carries instrument identity
+(`CASH`, `CFD`, futures contract ID, or OCC option contract), order prices,
+bracket children, time in force, deterministic client-order IDs, and durable
+coordinator metadata.
 
-## Architecture
+Broker adapters preserve the distinction between:
+
+- definitive rejection, where no order was accepted;
+- ambiguous transport/5xx/duplicate-client-ID outcomes, which require lookup;
+- terminal zero-fill outcomes, which allow a deliberate next-generation retry;
+  and
+- accepted/partially filled orders, which must be projected and reconciled.
+
+This distinction is essential to preventing duplicate entries or duplicate
+protective stops after a crash or timeout.
+
+## Implementations
 
 ```mermaid
-graph TD
-    Engine -->|mode=paper, no broker| PaperExecutor
-    Engine -->|mode=paper/auto, broker configured| AlpacaBroker
-    AlpacaBroker -->|HTTP| AlpacaAPI[Alpaca Trading API]
-    PaperExecutor -->|in-memory| OrderMap[map of paper orders]
+flowchart LR
+    C[Engine / session runner] --> E[Executor]
+    E --> P[PaperExecutor]
+    E --> A[AlpacaBroker]
+    E --> I[IBKRBroker]
+    A --> AS[Equities and equity options]
+    I --> IF[Forex, CFDs, and futures]
 ```
 
-## Selection Logic
+Alpaca can target paper or live endpoints according to validated stock
+configuration. The options path requires real-time OPRA data for live chain
+decisions and fails closed on the delayed indicative feed. IBKR uses exact
+contract identity for lifecycle operations and exposes keepalive/terminal
+status helpers for long-running sessions.
 
-The engine constructor (`engine.New`) receives an `Executor`. If nil, it falls back to `PaperExecutor`. The CLI (`run.go`) builds `AlpacaBroker` when Alpaca API keys are configured.
-
-## Paper Executor Notes
-
-- Thread-safe (mutex-protected map).
-- All fills are immediate at the provided `LimitPrice` (or `StopPrice` for stop orders).
-- `GetPositions` returns empty — position state is tracked by the `portfolio` package.
-- Used by: backtesting engine (Phase 7), local development, fallback when no broker configured.
+`PaperExecutor` is thread-safe and fills at the provided reference/limit price;
+it is not broker truth and does not replace broker reconciliation tests.

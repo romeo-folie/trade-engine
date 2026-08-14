@@ -1,92 +1,74 @@
-# internal/store — Database Access Layer
+# internal/store — PostgreSQL Access Layer
 
-All PostgreSQL interactions. Each file owns one table or a related group of tables. The package exposes package-level functions backed by a singleton pgx/v5 connection pool; call `store.Connect(ctx)` before use and `store.Close()` on shutdown.
+Owns durable engine state through pgx/v5. Call `store.Connect(ctx)` before using
+package-level helpers and `store.Close()` on shutdown. `te migrate` reads the
+ordered SQL files from the repository/installed `migrations/` directory and
+tracks them in `schema_migrations`. Migrations run transactionally unless their
+first non-empty line is the explicit `-- no-transaction` directive; those files
+must be idempotent because their DDL cannot be rolled back as a unit.
 
-## Components
+## Storage Areas
 
-| File | Table(s) | Purpose |
-|------|---------|---------|
-| `db.go` | `schema_migrations` | Pool management, migration runner |
-| `overrides.go` | `config_overrides` | DB-backed runtime config overrides |
-| `candles.go` | `candles` | OHLCV bar storage and retrieval |
-| `watchlist.go` | `watchlist` | Watchlist CRUD |
-| `news.go` | `news_items` | News article storage and retrieval |
-| `analyses.go` | `analyses` | LLM analysis persistence and retrieval |
-| `signals.go` | `signals` | Signal CRUD (pending/blocked/executed/expired/stale) |
-| `trades.go` | `trades` | Trade lifecycle CRUD (open/closed) |
-| `orders.go` | `orders` | Broker order records linked to trades |
-| `retention.go` | `candles`, `analyses` | Data retention cleanup (intraday candles, prompt cache) |
+| Area | Representative files | Purpose |
+|---|---|---|
+| Market evidence | `candles.go`, `news.go`, `earnings.go`, `option_iv.go` | Price/news/event history and option-volatility inputs |
+| Discovery lineage | `swing_universe.go`, `weekly_leaders.go`, `industry_rotation.go`, `premarket_episodic.go` | Immutable research/scanner observations |
+| Scanner lifecycle | `scanner_snapshots.go`, `scanner_cycle_claims.go`, `scanner_source_promotions.go`, `watchlist.go` | Candidate snapshots, source ownership, promotion, and expiry |
+| Decisions | `analyses.go`, `analysis_cache.go`, `signals.go` | Model audit, cache fingerprints, selected lenses, timeframe workflow, and entry-gate decisions |
+| Stock execution | `stock_order_intents.go`, `orders.go`, `trades.go`, `closed_ledger.go` | Durable intents/attempts, broker orders, trade projection, and closed-trade ledger |
+| Session strategies | `orb.go`, `currency_strength.go` | ORB and currency-strength lifecycle records |
+| Risk/operations | `account_risk_baseline.go`, `buy_control.go`, `engine_state.go`, `portfolio.go` | Account baselines, buy pause, engine state, and snapshots |
+| Knowledge/feedback | `entities.go`, `relationships.go`, `embeddings.go`, `feedback.go` | Graph, vector retrieval, and outcome feedback |
+| Research/reporting | `backtests.go`, `study.go`, `sweep.go` | Replay runs, offline studies, and parameter sweeps |
 
-## Architecture
+## Important Semantics
 
-```mermaid
-graph TD
-    Client[Caller] --> Connect[store.Connect]
-    Connect --> Pool[pgx.Pool singleton]
-    Pool --> db.go
-    Pool --> overrides.go
-    Pool --> candles.go
-    Pool --> watchlist.go
-    Pool --> news.go
-```
+### Watchlist and scanner lineage
 
-The pool is a package-level singleton initialized by `Connect(ctx)`. All other functions call `GetDB()` to access it. `Close()` releases the pool on shutdown.
+- Watchlist removal is a soft delete; re-addition can reactivate the row.
+- Scanner discovery context and execution profile are an atomic pair.
+- Active, unexpired scanner-owned rows preserve their complete provenance
+  envelope against legacy/manual refreshes; expired rows can be replaced.
+- Candidate snapshots are immutable and retain the exact promotion-time
+  discovery/profile contract.
+- Invalid persisted profile JSON is isolated to that row and never blocks
+  unrelated watchlist rows from loading.
 
-## Key Behaviours
+### Analysis and signals
 
-**Candles (`candles.go`)**
-- `UpsertCandles` batches inserts in chunks of 500 rows (8 params × 500 = 4,000 params, well within Postgres 65k limit)
-- Conflict target: `(ticker, timeframe, ts)` — reinserting the same bar is a no-op
-- `GetLatestCandle` returns `nil, nil` if no candle exists (used to detect first-time backfill)
+- Analysis rows retain raw prompts/responses, token usage, indicator evidence,
+  configured and selected lenses, rejected alternatives, regime, scanner run,
+  and the compact timeframe-workflow audit.
+- Signals link to all contributing analysis IDs and persist ordered entry-gate
+  decisions plus the effective execution strategy.
+- Raw provider output remains available even when the validated live decision
+  is downgraded.
 
-**Watchlist (`watchlist.go`)**
-- `AddWatchlistItem` uses `INSERT ... ON CONFLICT DO UPDATE` — re-adding a removed ticker re-enables it
-- `RemoveWatchlistItem` is a soft delete (`active = false`); history is preserved
-- `GetWatchlistItems(activeOnly=true)` is the call used by the engine loop
+### Durable stock orders
 
-**News (`news.go`)**
-- `UpsertNewsItems` deduplicates on `external_id` (Finnhub article ID)
-- URL uniqueness is enforced by the `UNIQUE` constraint on the `news_items.url` column
-- `GetRecentNews(ticker, since)` uses a GIN index on `tickers[]` for efficient array lookup
+Stock entry and protection operations use immutable intent keys and per-attempt
+client order IDs. Recovery can distinguish a definitive rejection from an
+ambiguous submission, look up accepted broker orders, and project the trade
+without submitting duplicate risk. Order/trade projection and broker lineage
+are intentionally separate from the intent record.
 
-**Analyses (`analyses.go`)**
-- `InsertAnalysis` writes the full model output + metadata (`raw_prompt`, `raw_response`, token usage, latency)
-- `prompt_hash` stores SHA-256 of the exact prompt text for reproducibility/caching
-- `indicators` stores a JSONB snapshot of technical inputs used for the recommendation
-- `GetAnalysesByTicker` and `GetAnalysisByID` support audit/review tooling
+### Candles and retention
 
-**Overrides (`overrides.go`)**
-- All engine settings (mode, tick interval, etc.) can be overridden at runtime via `te config set --runtime`
-- Overrides are read on each tick and on `te status`
+- Candle conflict identity is `(ticker, timeframe, ts)`.
+- Bulk inserts are bounded and idempotent.
+- Sanity checks reject structurally invalid price series before they contaminate
+  downstream analysis.
+- Retention removes bounded intraday/prompt-cache history while preserving the
+  durable trading and scanner lineage required for audit.
 
-**Signals (`signals.go`)**
-- `InsertSignal` returns the UUID of the created signal
-- `UpdateSignalStatus` sets status + optional block reason, updates `updated_at`
-- `GetPendingSignals` returns signals with status `pending` or `approved`
+## Runtime Overrides
 
-**Trades (`trades.go`)**
-- `InsertTrade` creates an open trade linked to a signal (via `signal_id`)
-- `CloseTrade` sets exit price, P&L, status=closed, and `closed_at`
-- `GetOpenTrades` returns all trades with status=open (used by position monitor)
-- `GetRecentTrades` returns most-recent trades regardless of status (CLI display)
-
-**Orders (`orders.go`)**
-- `InsertOrder` records an entry or exit order with broker linkage
-- `UpdateOrderFill` updates filled price/qty/status after broker confirmation
-- `OpenExitLegsForTrade` returns still-working protective legs; `ExitLegsForMarketExit`
-  returns working legs and terminal protective fills in one snapshot for replacement
-  exits.
-- `GetOrdersByTrade` returns all orders linked to a trade (for `te trades show`)
-
-**Retention (`retention.go`)**
-- `CleanupIntradayCandles` deletes 1m/5m/15m candles older than 90 days
-- `CleanupPromptCache` deletes analysis records older than 6 months
-- Both return the number of rows deleted for logging
+`config_overrides` is intentionally narrow. The engine currently consumes the
+DB-backed `engine.mode` startup override; other settings remain YAML/env/CLI
+configuration rather than arbitrary runtime database overrides.
 
 ## Error Handling
 
-`isNoRows(err)` detects pgx/v5 "no rows" via string matching (pgx v5 does not export a sentinel error type). Returns `nil, nil` for single-row queries that find nothing — callers must nil-check before dereferencing.
-
-## Migration Runner
-
-`Migrate(ctx)` reads all `.sql` files from the embedded `migrations/` directory, tracks applied migrations in `schema_migrations`, and runs each unapplied file in a transaction. See `db.go` for implementation details.
+Single-row lookups generally return `nil, nil` when no record exists. Callers
+must nil-check. Write paths return contextual errors and transaction boundaries
+are kept around state transitions that must remain atomic.
