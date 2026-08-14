@@ -15,6 +15,8 @@ import (
 
 var brokerProtectionVerificationRetryDelay = 2 * time.Second
 
+const brokerProtectionVerificationAttempts = 5
+
 // containUnprotectedBrokerEntry stops a bracket parent before flattening an
 // accepted position that has not obtained verifiable broker protection. Alpaca
 // keeps bracket children held until the parent has fully filled, so flattening
@@ -293,7 +295,7 @@ func (e *Engine) verifyOrContainBrokerEntryAsync(tradeID, entryBrokerOrderID, ti
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		for attempt := 0; attempt < 3; attempt++ {
+		for attempt := 0; attempt < brokerProtectionVerificationAttempts; attempt++ {
 			status, err := e.executor.GetOrderStatus(ctx, entryBrokerOrderID)
 			if err != nil {
 				logger.Warn("broker protection: fresh parent snapshot unavailable; retrying",
@@ -322,7 +324,7 @@ func (e *Engine) verifyOrContainBrokerEntryAsync(tradeID, entryBrokerOrderID, ti
 			if state.UnprotectedQty <= 1e-9 {
 				return
 			}
-			if attempt < 2 {
+			if attempt < brokerProtectionVerificationAttempts-1 {
 				logger.Info("broker protection: bracket unprotected; re-verifying",
 					"trade_id", tradeID, "attempt", attempt+1, "status", status.Status,
 					"transient", brokerBracketProtectionTransient(status))
@@ -330,6 +332,15 @@ func (e *Engine) verifyOrContainBrokerEntryAsync(tradeID, entryBrokerOrderID, ti
 					return
 				}
 				continue
+			}
+			if !e.brokerBracketProtectionDefinitivelyUnprotected(ctx, status, heldQty) {
+				// A parent snapshot can lag a child transition.  In particular, do
+				// not flatten a live position merely because a direct child read is
+				// temporarily unavailable or reports a newer working stop.
+				logger.Error("broker protection: coverage remains uncertain; retaining broker ownership",
+					"trade_id", tradeID, "broker_order_id", entryBrokerOrderID,
+					"held_qty", heldQty)
+				return
 			}
 			logger.Error("broker protection: containment required", "trade_id", tradeID,
 				"held_qty", state.HeldQty, "working_entry_qty", state.WorkingEntryQty,
@@ -353,9 +364,9 @@ func waitForBrokerProtectionRetry(ctx context.Context) bool {
 }
 
 // brokerBracketProtectionTransient reports expected Alpaca bracket transitions.
-// A partial parent keeps its children held until the parent completes; neither
-// snapshot proves a broken bracket, so verification gives the broker a bounded
-// opportunity to activate the stop before containment cancels the parent.
+// A partial parent keeps its children held until the parent completes; that
+// snapshot is not active protection for the filled shares, but it merits a
+// bounded recheck before containment cancels the parent.
 func brokerBracketProtectionTransient(result execution.OrderResult) bool {
 	if result.Status == "partial" || (result.Quantity > 0 && result.FilledQty+1e-9 < result.Quantity) {
 		return true
@@ -413,9 +424,11 @@ func brokerProtectionFailureReason(result execution.OrderResult, requestedQty fl
 }
 
 // brokerProtectionState is a broker-snapshot accounting of a bracket's
-// exposure. It deliberately distinguishes a known child from active downside
-// protection: Alpaca reports children while they are held under a partial
-// parent, but those shares are still unprotected.
+// exposure. Alpaca uses "held" for a bracket's secondary orders while they
+// wait for their trigger. Once the parent is completely filled, a held stop is
+// therefore broker-resident downside protection, not an absent stop. A held
+// child under a partially-filled parent remains insufficient because Alpaca
+// does not activate bracket exits until the parent completes.
 type brokerProtectionState struct {
 	HeldQty         float64
 	WorkingEntryQty float64
@@ -434,7 +447,7 @@ func brokerBracketProtectionState(result execution.OrderResult, heldQty float64)
 		if child.Type != "stop" && child.Type != "stop_limit" {
 			continue
 		}
-		if child.Status == "held" || execution.IsTerminalOrderStatusForTimeInForce(child.Status, "gtc") || child.RemainingQty <= 0 {
+		if execution.IsTerminalOrderStatusForTimeInForce(child.Status, "gtc") || child.RemainingQty <= 0 {
 			continue
 		}
 		// Only the still-working remainder protects the position. A partially
@@ -450,12 +463,66 @@ func brokerBracketProtectionState(result execution.OrderResult, heldQty float64)
 	return state
 }
 
-// brokerBracketProtectionVerified requires an active broker stop covering the
-// exact locally held quantity. A bracket child in Alpaca's "held" state does
-// not count: it will not protect a parent that is only partially filled.
+// brokerBracketProtectionVerified requires a broker-resident stop covering the
+// exact locally held quantity. A held stop counts only after the parent has
+// completely filled; brokerBracketProtectionState enforces that distinction.
 func brokerBracketProtectionVerified(result execution.OrderResult, heldQty float64) bool {
 	state := brokerBracketProtectionState(result, heldQty)
 	return state.HeldQty <= 1e-9 || state.UnprotectedQty <= 1e-9
+}
+
+// brokerBracketProtectionDefinitivelyUnprotected adds a direct child read to
+// the final containment decision. Nested parent responses are eventually
+// consistent, so a zero-fill terminal/undersized stop shown by the parent is
+// not enough to flatten until the child endpoint agrees. A partial parent is
+// deliberately different: Alpaca's exits cannot protect its filled shares
+// until the parent completes, so containment remains the fail-safe outcome.
+func (e *Engine) brokerBracketProtectionDefinitivelyUnprotected(
+	ctx context.Context,
+	parent execution.OrderResult,
+	heldQty float64,
+) bool {
+	if heldQty <= 1e-9 {
+		return false
+	}
+	if parent.Status == "partial" || (parent.Quantity > 0 && parent.FilledQty+1e-9 < parent.Quantity) {
+		return true
+	}
+
+	var stop *execution.OrderLeg
+	for i := range parent.ChildOrders {
+		child := &parent.ChildOrders[i]
+		if child.Type == "stop" || child.Type == "stop_limit" {
+			stop = child
+			break
+		}
+	}
+	// Repeated terminal full-parent snapshots with no stop identity are the
+	// only case where a direct child confirmation is impossible.
+	if stop == nil || stop.BrokerOrderID == "" {
+		return true
+	}
+	direct, err := e.executor.GetOrderStatus(ctx, stop.BrokerOrderID)
+	if err != nil {
+		logger.Warn("broker protection: direct stop verification unavailable; retaining broker ownership",
+			"broker_order_id", stop.BrokerOrderID, "err", err)
+		return false
+	}
+	return !brokerBracketProtectionVerified(execution.OrderResult{
+		Status: "filled", Quantity: heldQty, FilledQty: heldQty,
+		ChildOrders: []execution.OrderLeg{directOrderLeg(stop.BrokerOrderID, direct)},
+	}, heldQty)
+}
+
+func directOrderLeg(brokerOrderID string, result execution.OrderResult) execution.OrderLeg {
+	return execution.OrderLeg{
+		BrokerOrderID: brokerOrderID,
+		Type:          "stop",
+		Status:        result.Status,
+		Quantity:      result.Quantity,
+		RemainingQty:  result.RemainingQty,
+		FilledQty:     result.FilledQty,
+	}
 }
 
 // containRecoveredUnprotectedBracket is called after a durable recovery
@@ -486,22 +553,12 @@ func (e *Engine) containRecoveredUnprotectedBracketWithPolicy(ctx context.Contex
 	if policyErr != nil || (!required && !forceProtection) {
 		return
 	}
-	status, err := e.executor.GetOrderStatus(ctx, intent.BrokerOrderID)
-	if err != nil {
-		// A transient parent lookup says nothing about an existing bracket's
-		// coverage. Recovery will revisit this durable intent; do not turn an
-		// unknown snapshot into a destructive containment attempt.
-		logger.Warn("broker protection: cannot verify recovered bracket; retaining broker ownership",
-			"intent_key", intentKey, "broker_order_id", intent.BrokerOrderID, "err", err)
-		return
-	}
 	trade, err := store.GetTradeByID(ctx, intent.TradeID)
 	if err != nil || trade == nil || trade.Status != "open" {
 		return
 	}
-	if brokerBracketProtectionVerified(status, trade.Quantity) {
-		return
-	}
-	e.containUnprotectedBrokerEntryAsync(trade.ID, intent.BrokerOrderID, trade.Ticker,
-		brokerProtectionFailureReason(status, req.Quantity))
+	// Recovery used to perform one snapshot and immediately contain a held
+	// bracket child. Route it through the same stateful verifier as normal
+	// placement so recovery cannot bypass the protection semantics above.
+	e.verifyOrContainBrokerEntryAsync(trade.ID, intent.BrokerOrderID, trade.Ticker, req.Quantity)
 }
