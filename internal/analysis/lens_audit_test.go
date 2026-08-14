@@ -69,3 +69,31 @@ func TestValidateFinalLensSelectionProfileBoundAbsentSelectionSuppressesBuy(t *t
 		t.Fatalf("profile-bound absent selection action = %q, want HOLD", resp.Action)
 	}
 }
+
+// A scanner-owned execution profile authorises entries, not exits. An absent,
+// invalid, or explicit no-fit lens must suppress a BUY so it cannot fall back
+// to a legacy strategy, but it must never discard a protective SELL.
+func TestValidateFinalLensSelectionPreservesProfileBoundSells(t *testing.T) {
+	tests := []struct {
+		name     string
+		selected string
+		status   LensSelectionStatus
+	}{
+		{name: "admissible", selected: "momentum", status: LensSelectionSelected},
+		{name: "invalid", selected: "news_sentiment", status: LensSelectionInvalid},
+		{name: "none", selected: "none", status: LensSelectionNone},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := AnalysisResponse{Action: ActionSell, SelectedStrategy: tt.selected}
+			audit := ValidateFinalLensSelection(&resp, AnalysisRequest{ExecutionProfile: profileForLensAudit()}, false)
+			if audit.SelectionStatus != tt.status {
+				t.Fatalf("status = %q, want %q", audit.SelectionStatus, tt.status)
+			}
+			if resp.Action != ActionSell {
+				t.Fatalf("SELL action = %q, want SELL", resp.Action)
+			}
+		})
+	}
+}

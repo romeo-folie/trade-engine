@@ -84,15 +84,16 @@ func ValidateFinalLensSelection(
 	return audit
 }
 
-// suppressProfileBoundAction prevents a scanner-profiled result without a
-// valid selected lens from reaching a legacy configured-strategy fallback. A
-// lens is the authorisation for an actionable trade on those rows; "none" or
-// no consensus is explicitly not such an authorisation.
+// suppressProfileBoundAction prevents a scanner-profiled BUY without a valid
+// selected lens from reaching a legacy configured-strategy fallback. A lens is
+// the authorisation for a new entry on those rows; "none" or no consensus is
+// explicitly not such an authorisation. SELL decisions remain intact: exits
+// must never depend on a scanner execution lens selection.
 func suppressProfileBoundAction(response *AnalysisResponse, allowed map[string]struct{}) {
 	if allowed == nil {
 		return
 	}
-	if response.Action != ActionHold && response.Action != ActionWait {
+	if response.Action == ActionBuy {
 		response.Action = ActionHold
 	}
 }
