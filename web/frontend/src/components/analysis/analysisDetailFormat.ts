@@ -16,6 +16,12 @@ export function shouldShowEntryChecks(action: string | undefined, checkCount: nu
   return action?.toUpperCase() === 'BUY' && checkCount > 0;
 }
 
+// Keep native disclosure controls keyboard-reachable inside the modal focus
+// trap. <summary> is interactive even though it is not one of the traditional
+// form controls covered by many focusable-element selectors.
+export const ANALYSIS_MODAL_FOCUSABLE_SELECTOR =
+  'button, summary, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])';
+
 interface DecisionAnalyst {
   role?: string;
   description?: string;

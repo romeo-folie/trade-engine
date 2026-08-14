@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  ANALYSIS_MODAL_FOCUSABLE_SELECTOR,
   decisionSummary,
   formatIndicator,
   shouldShowEntryChecks,
@@ -66,6 +67,10 @@ test('entry checks appear only for BUY analyses that have decisions', () => {
   assert.equal(shouldShowEntryChecks('HOLD', 2), false);
   assert.equal(shouldShowEntryChecks('SELL', 2), false);
   assert.equal(shouldShowEntryChecks('BUY', 0), false);
+});
+
+test('analysis modal focus trap includes native disclosure controls', () => {
+  assert.match(ANALYSIS_MODAL_FOCUSABLE_SELECTOR, /(^|,\s*)summary(,|$)/);
 });
 
 test('specialist decision summary shows the final risk-manager rationale once', () => {

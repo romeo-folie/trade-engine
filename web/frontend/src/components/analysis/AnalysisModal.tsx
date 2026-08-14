@@ -4,7 +4,13 @@ import { ChamferedBox } from '../common/ChamferedBox';
 import CornerCard from '../CornerCard';
 import { colors } from '../../styles/tokens';
 import { verdictColor } from '../../utils/verdict';
-import { decisionSummary, formatIndicator, shouldShowEntryChecks, titleCase } from './analysisDetailFormat';
+import {
+  ANALYSIS_MODAL_FOCUSABLE_SELECTOR,
+  decisionSummary,
+  formatIndicator,
+  shouldShowEntryChecks,
+  titleCase,
+} from './analysisDetailFormat';
 import styles from './AnalysisModal.module.css';
 
 const ANALYST_PALETTE = [
@@ -170,7 +176,7 @@ export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps)
       }
       if (e.key === 'Tab' && panelRef.current) {
         const focusable = panelRef.current.querySelectorAll<HTMLElement>(
-          'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+          ANALYSIS_MODAL_FOCUSABLE_SELECTOR,
         );
         if (focusable.length === 0) return;
         const first = focusable[0];
