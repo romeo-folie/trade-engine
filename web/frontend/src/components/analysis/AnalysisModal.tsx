@@ -7,6 +7,7 @@ import { verdictColor } from '../../utils/verdict';
 import {
   ANALYSIS_MODAL_FOCUSABLE_SELECTOR,
   decisionSummary,
+  displayStrategy,
   formatIndicator,
   shouldShowEntryChecks,
   titleCase,
@@ -483,7 +484,13 @@ export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps)
               </div>
               <div className={styles.kvRow}>
                 <span className={styles.kvKey}>Strategy</span>
-                <span className={styles.kvVal}>{titleCase(detail?.SelectedLens || analysis.Strategy)}</span>
+                <span className={styles.kvVal}>
+                  {titleCase(displayStrategy(
+                    analysis.Strategy,
+                    detail?.SelectedLens,
+                    detail?.LensSelectionStatus,
+                  ))}
+                </span>
               </div>
             </div>
           </div>

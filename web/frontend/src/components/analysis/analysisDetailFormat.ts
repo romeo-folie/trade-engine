@@ -16,6 +16,16 @@ export function shouldShowEntryChecks(action: string | undefined, checkCount: nu
   return action?.toUpperCase() === 'BUY' && checkCount > 0;
 }
 
+export function displayStrategy(
+  configuredStrategy: string,
+  selectedLens?: string,
+  selectionStatus?: string,
+): string {
+  return selectionStatus?.toLowerCase() === 'selected' && selectedLens?.trim()
+    ? selectedLens.trim()
+    : configuredStrategy;
+}
+
 // Keep native disclosure controls keyboard-reachable inside the modal focus
 // trap. <summary> is interactive even though it is not one of the traditional
 // form controls covered by many focusable-element selectors.

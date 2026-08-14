@@ -4,6 +4,7 @@ import test from 'node:test';
 import {
   ANALYSIS_MODAL_FOCUSABLE_SELECTOR,
   decisionSummary,
+  displayStrategy,
   formatIndicator,
   shouldShowEntryChecks,
   titleCase,
@@ -71,6 +72,13 @@ test('entry checks appear only for BUY analyses that have decisions', () => {
 
 test('analysis modal focus trap includes native disclosure controls', () => {
   assert.match(ANALYSIS_MODAL_FOCUSABLE_SELECTOR, /(^|,\s*)summary(,|$)/);
+});
+
+test('strategy label uses only a validated selected lens', () => {
+  assert.equal(displayStrategy('momentum', 'pullback_strength', 'selected'), 'pullback_strength');
+  assert.equal(displayStrategy('momentum', 'news_sentiment', 'invalid'), 'momentum');
+  assert.equal(displayStrategy('momentum', 'none', 'none'), 'momentum');
+  assert.equal(displayStrategy('momentum', undefined, 'absent'), 'momentum');
 });
 
 test('specialist decision summary shows the final risk-manager rationale once', () => {
