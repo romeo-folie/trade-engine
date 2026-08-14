@@ -3,6 +3,7 @@ import SettingsSection from '../components/settings/SettingsSection';
 import SegmentSelect from '../components/settings/SegmentSelect';
 import Toggle from '../components/settings/Toggle';
 import StrategyRow from '../components/settings/StrategyRow';
+import { resetConfigPreservingStrategies } from '../components/settings/configReset';
 import { APP_VERSION } from '../version';
 import styles from './Config.module.css';
 
@@ -237,7 +238,10 @@ export default function ConfigScreen() {
   }, [showToast]);
 
   const handleReset = useCallback(() => {
-    setConfig({ ...DEFAULTS });
+    // Strategy rows are a read-only projection of config.yaml. Reset only the
+    // mutable form fields so their displayed state cannot drift from the
+    // effective configuration returned by the server.
+    setConfig(current => resetConfigPreservingStrategies(DEFAULTS, current));
     showToast('Reset to defaults. Use Save Changes to persist, or Discard to restore your last saved config.');
   }, [showToast]);
 

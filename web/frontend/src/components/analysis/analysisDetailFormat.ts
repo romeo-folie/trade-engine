@@ -3,7 +3,9 @@ export function titleCase(value: string): string {
 }
 
 export function formatIndicator(value: number | undefined, digits = 2): string {
-  if (value == null || !Number.isFinite(value)) return 'Unavailable';
+  // IndicatorSet uses zero as its unavailable sentinel when there was not
+  // enough candle history to compute a value.
+  if (value == null || !Number.isFinite(value) || value === 0) return 'Unavailable';
   return value.toLocaleString('en-US', {
     minimumFractionDigits: digits,
     maximumFractionDigits: digits,
