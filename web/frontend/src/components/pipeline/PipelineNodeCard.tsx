@@ -7,6 +7,7 @@ import { colors } from '../../styles/tokens';
 import styles from './PipelineNodeCard.module.css';
 import type { WatchlistTicker } from '../../hooks/useWatchlist';
 import type { RiskCheckResult, LastTrade, PortfolioState, VerdictEntry } from '../../hooks/useEngineSocket';
+import { INDICATOR_NAMES } from './indicatorCatalog';
 
 function lastTickLabel(lastEventAt: string | null): string {
   if (!lastEventAt) return '—';
@@ -181,11 +182,7 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
         {d.kind === 'arbiter' && (
           <div className={styles.arbiter}>
             <div className={styles.subValue}>INDICATOR ENGINE</div>
-            <div className={styles.routingBox}>
-              {['RSI', 'EMA', 'MACD', 'ADX', 'ATR', 'OBV'].map(ind => (
-                <div key={ind} className={`${styles.routeBadge} ${nodeActive ? styles.routeActive : ''}`}>{ind}</div>
-              ))}
-            </div>
+            <IndicatorMarquee active={nodeActive} />
             <div className={styles.subValue} style={{ marginTop: 6 }}>
               {d.eventCount > 0 ? `${d.eventCount.toLocaleString()} COMPUTATIONS` : 'WAITING FOR DATA'}
             </div>
@@ -548,6 +545,36 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
         )}
       </div>
     </ChamferedBox>
+  );
+}
+
+function IndicatorMarquee({ active }: { active: boolean }) {
+  const items = [...INDICATOR_NAMES, ...INDICATOR_NAMES];
+
+  return (
+    <div className={styles.indicatorMarquee} aria-label={`Indicators checked: ${INDICATOR_NAMES.join(', ')}`}>
+      <div
+        className={`${styles.indicatorTrack} ${styles.marqueeTrack}`}
+        style={{ animationDuration: '36s' }}
+        aria-hidden="true"
+      >
+        {items.map((indicator, index) => (
+          <span
+            key={`${indicator}-${index}`}
+            className={`${styles.routeBadge} ${active ? styles.routeActive : ''}`}
+          >
+            {indicator}
+          </span>
+        ))}
+      </div>
+      <div className={styles.indicatorReduced} aria-hidden="true">
+        {INDICATOR_NAMES.map(indicator => (
+          <span key={indicator} className={`${styles.routeBadge} ${active ? styles.routeActive : ''}`}>
+            {indicator}
+          </span>
+        ))}
+      </div>
+    </div>
   );
 }
 

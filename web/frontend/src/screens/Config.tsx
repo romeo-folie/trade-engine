@@ -3,6 +3,7 @@ import SettingsSection from '../components/settings/SettingsSection';
 import SegmentSelect from '../components/settings/SegmentSelect';
 import Toggle from '../components/settings/Toggle';
 import StrategyRow from '../components/settings/StrategyRow';
+import { resetConfigPreservingStrategies } from '../components/settings/configReset';
 import { APP_VERSION } from '../version';
 import styles from './Config.module.css';
 
@@ -27,6 +28,7 @@ const DEFAULTS = {
     meanReversion: true,
     momentum: true,
     newsSentiment: false,
+    pullbackStrength: false,
   },
   analystCheap: 'gpt-4o',
   analystMid: 'gemini-2.5-flash',
@@ -97,15 +99,6 @@ export default function ConfigScreen() {
     [],
   );
 
-  const setStrategy = useCallback(
-    (key: keyof Config['strategies'], value: boolean) =>
-      setConfig((prev) => ({
-        ...prev,
-        strategies: { ...prev.strategies, [key]: value },
-      })),
-    [],
-  );
-
   const showToast = useCallback((msg: string) => {
     clearTimeout(toastTimerRef.current);
     setToast(msg);
@@ -138,6 +131,7 @@ export default function ConfigScreen() {
             meanReversion: data.strategies?.mean_reversion?.enabled ?? DEFAULTS.strategies.meanReversion,
             momentum: data.strategies?.momentum?.enabled ?? DEFAULTS.strategies.momentum,
             newsSentiment: data.strategies?.news_sentiment?.enabled ?? DEFAULTS.strategies.newsSentiment,
+            pullbackStrength: data.strategies?.pullback_strength?.enabled ?? DEFAULTS.strategies.pullbackStrength,
           },
           analystCheap: data.models?.roles?.analysts?.[0] || DEFAULTS.analystCheap,
           analystMid: data.models?.roles?.analysts?.[1] || DEFAULTS.analystMid,
@@ -204,11 +198,6 @@ export default function ConfigScreen() {
       analyst_frontier: config.analystFrontier,
       arbiter: config.arbiter,
       classifier: config.classifier,
-      // Strategy maps
-      'strategies.trend_following.enabled': config.strategies.trendFollowing,
-      'strategies.mean_reversion.enabled': config.strategies.meanReversion,
-      'strategies.momentum.enabled': config.strategies.momentum,
-      'strategies.news_sentiment.enabled': config.strategies.newsSentiment,
     };
 
     try {
@@ -249,7 +238,10 @@ export default function ConfigScreen() {
   }, [showToast]);
 
   const handleReset = useCallback(() => {
-    setConfig({ ...DEFAULTS });
+    // Strategy rows are a read-only projection of config.yaml. Reset only the
+    // mutable form fields so their displayed state cannot drift from the
+    // effective configuration returned by the server.
+    setConfig(current => resetConfigPreservingStrategies(DEFAULTS, current));
     showToast('Reset to defaults. Use Save Changes to persist, or Discard to restore your last saved config.');
   }, [showToast]);
 
@@ -389,27 +381,22 @@ export default function ConfigScreen() {
             <StrategyRow
               name="Trend Following"
               enabled={config.strategies.trendFollowing}
-              onToggle={(v) => setStrategy('trendFollowing', v)}
-              params="EMA Period: 20 · ADX Min: 25 · RSI Min: 45 · RSI Max: 65"
-              defaultExpanded
             />
             <StrategyRow
               name="Mean Reversion"
               enabled={config.strategies.meanReversion}
-              onToggle={(v) => setStrategy('meanReversion', v)}
-              params="BB Period: 20 · BB Std: 2.0 · RSI Period: 14"
             />
             <StrategyRow
               name="Momentum"
               enabled={config.strategies.momentum}
-              onToggle={(v) => setStrategy('momentum', v)}
-              params="ROC Period: 12 · MACD Fast: 12 · MACD Slow: 26"
             />
             <StrategyRow
               name="News Sentiment"
               enabled={config.strategies.newsSentiment}
-              onToggle={(v) => setStrategy('newsSentiment', v)}
-              params="Min Score: 0.6 · Lookback: 24h · Sources: 5"
+            />
+            <StrategyRow
+              name="Pullback Strength"
+              enabled={config.strategies.pullbackStrength}
             />
           </SettingsSection>
         </div>

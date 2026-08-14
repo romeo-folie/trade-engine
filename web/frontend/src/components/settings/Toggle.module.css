@@ -15,6 +15,10 @@
   background: var(--emerald);
 }
 
+.track:disabled {
+  cursor: default;
+}
+
 .knob {
   position: absolute;
   top: 2px;

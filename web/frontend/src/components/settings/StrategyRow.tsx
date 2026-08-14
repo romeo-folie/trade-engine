@@ -1,41 +1,24 @@
-import { useState } from 'react';
 import Toggle from './Toggle';
 import styles from './StrategyRow.module.css';
 
 interface StrategyRowProps {
   name: string;
   enabled: boolean;
-  onToggle: (enabled: boolean) => void;
-  params?: string;
-  defaultExpanded?: boolean;
 }
 
-export default function StrategyRow({
-  name,
-  enabled,
-  onToggle,
-  params,
-  defaultExpanded = false,
-}: StrategyRowProps) {
-  const [expanded, setExpanded] = useState(defaultExpanded);
-
+export default function StrategyRow({ name, enabled }: StrategyRowProps) {
   return (
     <div className={styles.wrapper}>
       <div className={styles.row}>
-        <button
-          type="button"
-          className={styles.chevron}
-          onClick={() => setExpanded(!expanded)}
-          aria-label={expanded ? 'Collapse' : 'Expand'}
-        >
-          {expanded ? '▼' : '▶'}
-        </button>
         <span className={styles.name}>{name}</span>
-        <Toggle checked={enabled} onChange={onToggle} aria-label={`${name} strategy`} />
+        <span className={styles.status}>{enabled ? 'ENABLED' : 'DISABLED'}</span>
+        <Toggle
+          checked={enabled}
+          onChange={() => undefined}
+          disabled
+          aria-label={`${name} strategy is ${enabled ? 'enabled' : 'disabled'} in config`}
+        />
       </div>
-      {expanded && params && (
-        <div className={styles.params}>{params}</div>
-      )}
     </div>
   );
 }

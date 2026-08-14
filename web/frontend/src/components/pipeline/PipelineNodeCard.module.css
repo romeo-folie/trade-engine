@@ -142,6 +142,28 @@
   margin-top: 2px;
 }
 
+.indicatorMarquee {
+  width: 100%;
+  margin-top: 2px;
+  overflow: hidden;
+}
+
+.indicatorTrack,
+.indicatorReduced {
+  display: flex;
+  gap: 6px;
+  width: max-content;
+  white-space: nowrap;
+}
+
+.indicatorTrack:hover {
+  animation-play-state: paused;
+}
+
+.indicatorReduced {
+  display: none;
+}
+
 .routeBadge {
   padding: 2px 6px;
   font-size: 9px;
@@ -155,6 +177,23 @@
 .routeActive {
   background: rgba(57, 255, 20, 0.1);
   border-color: rgba(57, 255, 20, 0.3);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .indicatorTrack {
+    display: none;
+  }
+
+  .indicatorMarquee {
+    max-height: 42px;
+    overflow-y: auto;
+  }
+
+  .indicatorReduced {
+    display: flex;
+    flex-wrap: wrap;
+    width: 100%;
+  }
 }
 
 /* Analyst Nodes */

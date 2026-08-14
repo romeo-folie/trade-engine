@@ -1007,10 +1007,63 @@ func (s *Server) handleRecentTrades(w http.ResponseWriter, r *http.Request) {
 // reasoning fields derived from the JSONB ensemble columns.
 type analysisSummaryResponse struct {
 	store.AnalysisSummary
-	AnalystResults   []APIAnalystResult `json:"AnalystResults,omitempty"`
-	ArbiterReasoning string             `json:"ArbiterReasoning,omitempty"`
-	DissentSummary   string             `json:"DissentSummary,omitempty"`
-	FastPathed       bool               `json:"FastPathed"`
+	AnalystResults           []APIAnalystResult            `json:"AnalystResults,omitempty"`
+	ArbiterReasoning         string                        `json:"ArbiterReasoning,omitempty"`
+	DissentSummary           string                        `json:"DissentSummary,omitempty"`
+	FastPathed               bool                          `json:"FastPathed"`
+	Indicators               json.RawMessage               `json:"Indicators,omitempty"`
+	SelectedLens             string                        `json:"SelectedLens,omitempty"`
+	RejectedLenses           map[string]string             `json:"RejectedLenses,omitempty"`
+	Regime                   string                        `json:"Regime,omitempty"`
+	LensSelectionStatus      string                        `json:"LensSelectionStatus,omitempty"`
+	TimeframeWorkflow        *store.TimeframeWorkflowAudit `json:"TimeframeWorkflow,omitempty"`
+	RelatedSignalAction      string                        `json:"RelatedSignalAction,omitempty"`
+	RelatedSignalStatus      string                        `json:"RelatedSignalStatus,omitempty"`
+	RelatedSignalBlockReason string                        `json:"RelatedSignalBlockReason,omitempty"`
+	EntrySetup               string                        `json:"EntrySetup,omitempty"`
+	EntrySetupEvidence       string                        `json:"EntrySetupEvidence,omitempty"`
+	EntryGateDecisions       []store.EntryGateDecision     `json:"EntryGateDecisions,omitempty"`
+}
+
+func newAnalysisDetailResponse(a *store.AnalysisSummary) analysisSummaryResponse {
+	out := analysisSummaryResponse{
+		AnalysisSummary:          *a,
+		FastPathed:               a.FastPathed,
+		DissentSummary:           a.DissentSummaryRaw,
+		SelectedLens:             a.SelectedLens,
+		Regime:                   a.Regime,
+		LensSelectionStatus:      a.LensSelectionStatus,
+		RelatedSignalAction:      a.RelatedSignalAction,
+		RelatedSignalStatus:      a.RelatedSignalStatus,
+		RelatedSignalBlockReason: a.RelatedSignalBlockReason,
+		EntrySetup:               a.EntrySetup,
+		EntrySetupEvidence:       a.EntrySetupEvidence,
+	}
+	if json.Valid(a.IndicatorsRaw) && string(a.IndicatorsRaw) != "{}" {
+		out.Indicators = json.RawMessage(a.IndicatorsRaw)
+	}
+	if len(a.RejectedLensesRaw) > 0 {
+		_ = json.Unmarshal(a.RejectedLensesRaw, &out.RejectedLenses)
+	}
+	if len(a.TimeframeWorkflowRaw) > 0 {
+		var workflow store.TimeframeWorkflowAudit
+		if json.Unmarshal(a.TimeframeWorkflowRaw, &workflow) == nil && workflow.Version > 0 {
+			out.TimeframeWorkflow = &workflow
+		}
+	}
+	if len(a.EntryGateDecisionsRaw) > 0 {
+		_ = json.Unmarshal(a.EntryGateDecisionsRaw, &out.EntryGateDecisions)
+	}
+	if analysts, _ := mapAnalystResults(a.EnsembleResultsRaw); len(analysts) > 0 {
+		out.AnalystResults = analysts
+	}
+	if len(a.ArbiterResponseRaw) > 0 {
+		var arb arbiterFinalWrapper
+		if json.Unmarshal(a.ArbiterResponseRaw, &arb) == nil {
+			out.ArbiterReasoning = arb.Final.Reasoning
+		}
+	}
+	return out
 }
 
 // arbiterFinalWrapper mirrors the top-level shape of a serialised ArbiterResult
@@ -1078,20 +1131,7 @@ func (s *Server) handleAnalysisDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	out := analysisSummaryResponse{
-		AnalysisSummary: *a,
-		FastPathed:      a.FastPathed,
-		DissentSummary:  a.DissentSummaryRaw,
-	}
-	if analysts, _ := mapAnalystResults(a.EnsembleResultsRaw); len(analysts) > 0 {
-		out.AnalystResults = analysts
-	}
-	if len(a.ArbiterResponseRaw) > 0 {
-		var arb arbiterFinalWrapper
-		if json.Unmarshal(a.ArbiterResponseRaw, &arb) == nil {
-			out.ArbiterReasoning = arb.Final.Reasoning
-		}
-	}
+	out := newAnalysisDetailResponse(a)
 	jsonResponse(w, out)
 }
 
@@ -1603,10 +1643,11 @@ func newSystemConfigDTO(cfg *config.Config) systemConfigDTO {
 	dto.Strategies = map[string]struct {
 		Enabled bool `json:"enabled"`
 	}{
-		"trend_following": {cfg.Strategies.TrendFollowing.Enabled},
-		"mean_reversion":  {cfg.Strategies.MeanReversion.Enabled},
-		"momentum":        {cfg.Strategies.Momentum.Enabled},
-		"news_sentiment":  {cfg.Strategies.NewsSentiment.Enabled},
+		"trend_following":   {cfg.Strategies.TrendFollowing.Enabled},
+		"mean_reversion":    {cfg.Strategies.MeanReversion.Enabled},
+		"momentum":          {cfg.Strategies.Momentum.Enabled},
+		"news_sentiment":    {cfg.Strategies.NewsSentiment.Enabled},
+		"pullback_strength": {cfg.Risk.EntryGates.PullbackStrengthEnabled},
 	}
 	dto.Models.Roles.Analysts = cfg.Models.Roles.Analysts
 	dto.Models.Roles.Arbiter = cfg.Models.Roles.Arbiter

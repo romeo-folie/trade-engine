@@ -724,10 +724,22 @@ type AnalysisSummary struct {
 	CreatedAt     time.Time `json:"CreatedAt"`
 
 	// Raw bytes for handler-side mapping; not serialized to JSON.
-	EnsembleResultsRaw []byte `json:"-"`
-	ArbiterResponseRaw []byte `json:"-"`
-	FastPathed         bool   `json:"-"`
-	DissentSummaryRaw  string `json:"-"`
+	EnsembleResultsRaw       []byte `json:"-"`
+	ArbiterResponseRaw       []byte `json:"-"`
+	FastPathed               bool   `json:"-"`
+	DissentSummaryRaw        string `json:"-"`
+	IndicatorsRaw            []byte `json:"-"`
+	SelectedLens             string `json:"-"`
+	RejectedLensesRaw        []byte `json:"-"`
+	Regime                   string `json:"-"`
+	LensSelectionStatus      string `json:"-"`
+	TimeframeWorkflowRaw     []byte `json:"-"`
+	RelatedSignalAction      string `json:"-"`
+	RelatedSignalStatus      string `json:"-"`
+	RelatedSignalBlockReason string `json:"-"`
+	EntrySetup               string `json:"-"`
+	EntrySetupEvidence       string `json:"-"`
+	EntryGateDecisionsRaw    []byte `json:"-"`
 }
 
 // GetRecentAnalysesSummary retrieves summary fields for the most recent analyses.
@@ -791,7 +803,13 @@ func GetAnalysisDetail(ctx context.Context, id string) (*AnalysisSummary, error)
 		       COALESCE(a.token_count_input, 0), COALESCE(a.token_count_output, 0), COALESCE(a.latency_ms, 0),
 		       a.created_at,
 		       a.ensemble_results, a.arbiter_response,
-		       COALESCE(a.fast_pathed, false), COALESCE(a.dissent_summary, '')
+		       COALESCE(a.fast_pathed, false), COALESCE(a.dissent_summary, ''),
+		       COALESCE(a.indicators, '{}'::jsonb), COALESCE(a.selected_lens, ''),
+		       COALESCE(a.rejected_lenses, '{}'::jsonb), COALESCE(a.regime, ''),
+		       COALESCE(a.lens_selection_status, ''), COALESCE(a.timeframe_workflow, '{}'::jsonb),
+		       COALESCE(sig.action::text, ''), COALESCE(sig.status::text, ''), COALESCE(sig.block_reason, ''),
+		       COALESCE(sig.entry_setup, ''), COALESCE(sig.entry_setup_evidence, ''),
+		       COALESCE(sig.entry_gate_decisions, '[]'::jsonb)
 		FROM analyses a
 		LEFT JOIN LATERAL (
 			SELECT name FROM entities
@@ -799,6 +817,13 @@ func GetAnalysisDetail(ctx context.Context, id string) (*AnalysisSummary, error)
 			ORDER BY (entity_type = 'company') DESC, name
 			LIMIT 1
 		) e ON TRUE
+		LEFT JOIN LATERAL (
+			SELECT action, status, block_reason, entry_setup, entry_setup_evidence, entry_gate_decisions
+			FROM signals
+			WHERE analysis_ids @> ARRAY[a.id]
+			ORDER BY created_at DESC
+			LIMIT 1
+		) sig ON TRUE
 		WHERE a.id = $1`
 	var a AnalysisSummary
 	err := GetDB().QueryRow(ctx, q, id).Scan(
@@ -809,6 +834,10 @@ func GetAnalysisDetail(ctx context.Context, id string) (*AnalysisSummary, error)
 		&a.CreatedAt,
 		&a.EnsembleResultsRaw, &a.ArbiterResponseRaw,
 		&a.FastPathed, &a.DissentSummaryRaw,
+		&a.IndicatorsRaw, &a.SelectedLens, &a.RejectedLensesRaw, &a.Regime,
+		&a.LensSelectionStatus, &a.TimeframeWorkflowRaw,
+		&a.RelatedSignalAction, &a.RelatedSignalStatus, &a.RelatedSignalBlockReason,
+		&a.EntrySetup, &a.EntrySetupEvidence, &a.EntryGateDecisionsRaw,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

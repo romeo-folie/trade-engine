@@ -232,6 +232,7 @@ func TestSystemConfigGet_ServesFrontendKeys(t *testing.T) {
 	cfg.Engine.TickIntervalSec = 1800
 	cfg.Risk.ConfidenceThreshold = 0.72
 	cfg.Risk.MinRiskReward = 1.8
+	cfg.Risk.EntryGates.PullbackStrengthEnabled = true
 	cfg.Cost.Profile = "balanced"
 	cfg.Models.Roles.Analysts = []string{"cheap", "mid", "frontier"}
 
@@ -264,6 +265,11 @@ func TestSystemConfigGet_ServesFrontendKeys(t *testing.T) {
 	if risk == nil || risk["min_risk_reward"] != 1.8 {
 		t.Errorf("risk.min_risk_reward = %v; want 1.8", risk["min_risk_reward"])
 	}
+	strategies, _ := got["strategies"].(map[string]any)
+	pullback, _ := strategies["pullback_strength"].(map[string]any)
+	if pullback == nil || pullback["enabled"] != true {
+		t.Errorf("strategies.pullback_strength.enabled = %v; want true", pullback["enabled"])
+	}
 	cost, _ := got["cost"].(map[string]any)
 	if cost == nil || cost["profile"] != "balanced" {
 		t.Errorf("cost.profile = %v; want balanced", cost["profile"])
@@ -286,6 +292,37 @@ func TestSystemConfigGet_ServesFrontendKeys(t *testing.T) {
 		if strings.Contains(body, leak) {
 			t.Errorf("response leaks %q section: %s", leak, body)
 		}
+	}
+}
+
+func TestNewAnalysisDetailResponseMapsStructuredEvidence(t *testing.T) {
+	a := &store.AnalysisSummary{
+		IndicatorsRaw:            []byte(`{"RSI":61.25,"EMA20":102.5}`),
+		SelectedLens:             "momentum",
+		RejectedLensesRaw:        []byte(`{"trend_following":"trend was weak"}`),
+		Regime:                   "expansion",
+		LensSelectionStatus:      "selected",
+		TimeframeWorkflowRaw:     []byte(`{"version":1,"routing_source":"profile","mode":"enforce","primary":{"timeframe":"1D","action":"BUY"},"confirmation":{"timeframe":"4H","status":"confirmed"},"final_action":"BUY"}`),
+		RelatedSignalAction:      "BUY",
+		RelatedSignalStatus:      "pending",
+		RelatedSignalBlockReason: "",
+		EntrySetup:               "standard",
+		EntrySetupEvidence:       "entry level reclaimed",
+		EntryGateDecisionsRaw:    []byte(`[{"name":"momentum_anti_chase","status":"passed","reason":"extension acceptable"}]`),
+	}
+
+	got := newAnalysisDetailResponse(a)
+	if string(got.Indicators) != string(a.IndicatorsRaw) {
+		t.Fatalf("indicators = %s; want %s", got.Indicators, a.IndicatorsRaw)
+	}
+	if got.SelectedLens != "momentum" || got.RejectedLenses["trend_following"] != "trend was weak" {
+		t.Fatalf("lens audit = selected %q rejected %#v", got.SelectedLens, got.RejectedLenses)
+	}
+	if got.TimeframeWorkflow == nil || got.TimeframeWorkflow.Confirmation == nil || got.TimeframeWorkflow.Confirmation.Status != "confirmed" {
+		t.Fatalf("workflow = %+v", got.TimeframeWorkflow)
+	}
+	if len(got.EntryGateDecisions) != 1 || got.EntryGateDecisions[0].Name != "momentum_anti_chase" {
+		t.Fatalf("entry gates = %+v", got.EntryGateDecisions)
 	}
 }
 

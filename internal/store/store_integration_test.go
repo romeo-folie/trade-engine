@@ -286,13 +286,33 @@ func TestAnalysis_InsertAndQuery(t *testing.T) {
 
 func TestAnalysis_TimeframeWorkflowRoundTrip(t *testing.T) {
 	ctx := context.Background()
+	var hasSignalAnalysisIndex bool
+	if err := store.GetDB().QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM pg_indexes
+			WHERE schemaname = current_schema()
+			  AND indexname = 'idx_signals_analysis_ids_gin'
+		)`).Scan(&hasSignalAnalysisIndex); err != nil {
+		t.Fatalf("inspect signal analysis index: %v", err)
+	}
+	if !hasSignalAnalysisIndex {
+		t.Fatal("idx_signals_analysis_ids_gin is missing")
+	}
 	wf := store.TimeframeWorkflowAudit{
 		Version: 1, RoutingSource: "profile", Mode: "enforce",
 		Primary:      store.TimeframePassAudit{Timeframe: "1d", Action: "BUY", Confidence: .82, SelectedLens: "momentum"},
 		Confirmation: &store.TimeframePassAudit{Timeframe: "4h", Status: "confirmed", Action: "BUY", Confidence: .76, SelectedLens: "momentum"},
 		FinalAction:  "BUY",
 	}
-	id, err := store.InsertAnalysisWithScannerRunAudit(ctx, "TEST_TF_AUDIT", "momentum", testAnalysisResp(analysis.ActionBuy), testModelMeta(), "", store.AnalysisAudit{SelectionStatus: analysis.LensSelectionSelected, SelectedLens: "momentum", TimeframeWorkflow: &wf})
+	meta := testModelMeta()
+	meta.IndicatorJSON = []byte(`{"RSI":62.5,"EMA20":101.25}`)
+	id, err := store.InsertAnalysisWithScannerRunAudit(ctx, "TEST_TF_AUDIT", "momentum", testAnalysisResp(analysis.ActionBuy), meta, "", store.AnalysisAudit{
+		SelectionStatus:   analysis.LensSelectionSelected,
+		SelectedLens:      "momentum",
+		RejectedLenses:    map[string]string{"trend_following": "trend was not established"},
+		Regime:            "expansion",
+		TimeframeWorkflow: &wf,
+	})
 	if err != nil {
 		t.Fatalf("insert workflow audit: %v", err)
 	}
@@ -306,6 +326,34 @@ func TestAnalysis_TimeframeWorkflowRoundTrip(t *testing.T) {
 	}
 	if decoded.RoutingSource != "profile" || decoded.Confirmation == nil || decoded.Confirmation.Status != "confirmed" {
 		t.Fatalf("workflow audit = %+v", decoded)
+	}
+
+	gateJSON, err := json.Marshal([]store.EntryGateDecision{{Name: "momentum_anti_chase", Status: "passed", Reason: "extension acceptable"}})
+	if err != nil {
+		t.Fatalf("marshal entry gates: %v", err)
+	}
+	if _, err := store.InsertSignal(ctx, store.Signal{
+		Ticker: "TEST_TF_AUDIT", Action: "BUY", Strategy: "momentum",
+		SignalPrice: 400, StopLoss: 395, TakeProfit: 415, Confidence: .8, SizePct: 5,
+		Status: "pending", ExpiresAt: time.Now().Add(time.Hour), StalePriceMovePct: 2,
+		AnalysisIDs: []string{id}, EntrySetup: store.EntrySetupStandard,
+		EntrySetupEvidence: "price reclaimed the configured entry level",
+		EntryGateDecisions: gateJSON,
+	}); err != nil {
+		t.Fatalf("insert linked signal: %v", err)
+	}
+	detail, err := store.GetAnalysisDetail(ctx, id)
+	if err != nil || detail == nil {
+		t.Fatalf("get analysis detail: %v", err)
+	}
+	if detail.SelectedLens != "momentum" || detail.Regime != "expansion" || detail.RelatedSignalAction != "BUY" {
+		t.Fatalf("detail audit fields = %+v", detail)
+	}
+	if !strings.Contains(string(detail.IndicatorsRaw), `"RSI": 62.5`) && !strings.Contains(string(detail.IndicatorsRaw), `"RSI":62.5`) {
+		t.Fatalf("detail indicators = %s", detail.IndicatorsRaw)
+	}
+	if !strings.Contains(string(detail.EntryGateDecisionsRaw), "momentum_anti_chase") {
+		t.Fatalf("detail entry gates = %s", detail.EntryGateDecisionsRaw)
 	}
 }
 
