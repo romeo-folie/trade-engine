@@ -90,6 +90,9 @@ func TestValidateFinalLensSelectionRequiresCompleteProfileRejectionsForBuy(t *te
 		{name: "duplicate normalized lens", rejected: map[string]string{
 			"pullback_strength": "not enough confirmation", " PULLBACK_STRENGTH ": "duplicate",
 		}},
+		{name: "blank rejection reason", rejected: map[string]string{
+			"pullback_strength": " \t ",
+		}},
 	}
 
 	for _, tt := range tests {

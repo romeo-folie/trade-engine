@@ -3,11 +3,30 @@ package scanner
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
+
+func TestCompactScannerTextTruncatesAtUTF8RuneBoundary(t *testing.T) {
+	const limit = 282
+	// The byte budget after reserving the ellipsis ends inside the euro sign.
+	value := strings.Repeat("a", 277) + "€ trailing"
+
+	got := compactScannerText(value, limit)
+	if !utf8.ValidString(got) {
+		t.Fatalf("compactScannerText returned invalid UTF-8: %q", got)
+	}
+	if len(got) > limit {
+		t.Fatalf("compactScannerText length = %d, want at most %d", len(got), limit)
+	}
+	if !strings.HasSuffix(got, "…") {
+		t.Fatalf("compactScannerText = %q, want truncation ellipsis", got)
+	}
+}
 
 func TestBuildScannerTradeProfileUsesSourceOwnedMenus(t *testing.T) {
 	tests := []struct {

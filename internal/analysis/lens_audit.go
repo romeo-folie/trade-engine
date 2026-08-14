@@ -126,9 +126,9 @@ func hasCompleteRejectionCoverage(rejected map[string]string, selected string, a
 	}
 
 	seen := make(map[string]struct{}, len(rejected))
-	for lens := range rejected {
+	for lens, reason := range rejected {
 		lens = strings.ToLower(strings.TrimSpace(lens))
-		if lens == "" || lens == selected {
+		if lens == "" || lens == selected || strings.TrimSpace(reason) == "" {
 			return false
 		}
 		if _, ok := allowed[lens]; !ok {

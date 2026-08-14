@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/romeo-folie/trade-engine/internal/tradeprofile"
 )
@@ -240,7 +241,18 @@ func compactScannerText(value string, limit int) string {
 	if len(value) <= limit {
 		return value
 	}
-	return strings.TrimSpace(value[:limit-1]) + "…"
+	if limit <= len("…") {
+		return "…"
+	}
+
+	// limit is a byte limit because these values are stored in bounded text
+	// fields. Trim at a rune boundary after reserving room for the ellipsis so
+	// the result remains valid UTF-8 and never exceeds the requested limit.
+	end := limit - len("…")
+	for end > 0 && !utf8.RuneStart(value[end]) {
+		end--
+	}
+	return strings.TrimSpace(value[:end]) + "…"
 }
 
 func containsSource(sources []string, target string) bool {
