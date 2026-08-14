@@ -27,7 +27,7 @@ func TestAnalysisRequestLensSetPrefersExecutionProfile(t *testing.T) {
 
 func TestValidateFinalLensSelectionRejectsProfileExternalLens(t *testing.T) {
 	resp := AnalysisResponse{
-		SelectedStrategy: "news_sentiment", Regime: "trending",
+		Action: ActionBuy, SelectedStrategy: "news_sentiment", Regime: "trending",
 		RejectedStrategies: map[string]string{"momentum": "no follow-through"},
 	}
 	audit := ValidateFinalLensSelection(&resp, AnalysisRequest{ExecutionProfile: profileForLensAudit()}, true)
@@ -36,6 +36,9 @@ func TestValidateFinalLensSelectionRejectsProfileExternalLens(t *testing.T) {
 	}
 	if resp.SelectedStrategy != "" {
 		t.Fatalf("invalid response selection = %q, want cleared before downstream use", resp.SelectedStrategy)
+	}
+	if resp.Action != ActionHold {
+		t.Fatalf("invalid response action = %q, want non-actionable HOLD", resp.Action)
 	}
 }
 

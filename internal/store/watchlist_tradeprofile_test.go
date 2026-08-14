@@ -147,6 +147,98 @@ func TestWatchlistTradeProfileNilUpsertPreservesAndCompleteUpsertReplaces(t *tes
 	}
 }
 
+func TestLegacyWatchlistUpsertReplacesLineageWithoutContract(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping store integration test")
+	}
+	ctx := context.Background()
+	const ticker = "PROFILE_LEGACY_REPLACE_RT"
+	t.Cleanup(func() { _, _ = store.GetDB().Exec(ctx, "DELETE FROM watchlist WHERE ticker=$1", ticker) })
+	runID := beginWatchlistTradeProfileRun(t, ctx)
+	expiresAt := time.Now().Add(time.Hour).UTC().Truncate(time.Microsecond)
+	if err := store.AddWatchlistItem(ctx, store.WatchlistItem{
+		Ticker: ticker, Platform: "stock", Source: "scanner", GraphContext: "legacy scanner origin",
+		ScannerRunID: runID, ExpiresAt: &expiresAt,
+		Strategies: []string{"momentum"}, Timeframes: []string{"1D"},
+	}); err != nil {
+		t.Fatalf("insert legacy scanner row: %v", err)
+	}
+
+	if err := store.AddWatchlistItem(ctx, store.WatchlistItem{
+		Ticker: ticker, Platform: "stock", Source: "manual",
+		Strategies: []string{"mean_reversion"}, Timeframes: []string{"4H"},
+	}); err != nil {
+		t.Fatalf("manual legacy refresh: %v", err)
+	}
+	stored, err := store.GetWatchlistItem(ctx, ticker, "stock")
+	if err != nil || stored == nil {
+		t.Fatalf("read legacy refresh = %#v, %v", stored, err)
+	}
+	if stored.Source != "manual" || stored.GraphContext != "" || stored.ScannerRunID != "" ||
+		stored.ExpiresAt != nil || stored.DiscoveryContext != nil || stored.ExecutionProfile != nil {
+		t.Fatalf("legacy refresh retained scanner lineage: %+v", stored)
+	}
+}
+
+func TestInvalidPersistedWatchlistContractDegradesOnlyThatRow(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping store integration test")
+	}
+	ctx := context.Background()
+	const invalidTicker = "PROFILE_INVALID_DEGRADE_RT"
+	const legacyTicker = "PROFILE_LIST_SURVIVES_RT"
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(ctx, "DELETE FROM watchlist WHERE ticker IN ($1, $2)", invalidTicker, legacyTicker)
+	})
+	runID := beginWatchlistTradeProfileRun(t, ctx)
+	expiresAt := time.Now().Add(time.Hour).UTC().Truncate(time.Microsecond)
+	if err := store.AddWatchlistItem(ctx, store.WatchlistItem{
+		Ticker: invalidTicker, Platform: "stock", Source: "scanner", ScannerRunID: runID, ExpiresAt: &expiresAt,
+		Strategies: []string{"momentum"}, Timeframes: []string{"1D"},
+		DiscoveryContext: &tradeprofile.DiscoveryContext{
+			Version: tradeprofile.DiscoveryContextVersion, Sources: []string{"weekly_leader"}, Thesis: "Valid before corruption",
+			EvidenceBySource: map[string]json.RawMessage{"weekly_leader": json.RawMessage(`{"rank":1}`)},
+		},
+		ExecutionProfile: &tradeprofile.ExecutionProfile{
+			Version: tradeprofile.ExecutionProfileVersion, RecommendedLens: "momentum", AdmissibleLenses: []string{"momentum"},
+			PrimaryTimeframe: "1D", ScorerRationale: "Valid before corruption.",
+		},
+	}); err != nil {
+		t.Fatalf("insert profile row: %v", err)
+	}
+	if err := store.AddWatchlistItem(ctx, store.WatchlistItem{
+		Ticker: legacyTicker, Platform: "stock", Source: "manual",
+		Strategies: []string{"mean_reversion"}, Timeframes: []string{"1D"},
+	}); err != nil {
+		t.Fatalf("insert unaffected row: %v", err)
+	}
+	if _, err := store.GetDB().Exec(ctx,
+		"UPDATE watchlist SET discovery_context=$2::jsonb WHERE ticker=$1", invalidTicker, `{"version":999}`,
+	); err != nil {
+		t.Fatalf("corrupt persisted discovery context: %v", err)
+	}
+
+	items, err := store.GetWatchlistItems(ctx, false)
+	if err != nil {
+		t.Fatalf("GetWatchlistItems failed for one invalid contract: %v", err)
+	}
+	var invalid, unaffected *store.WatchlistItem
+	for i := range items {
+		switch items[i].Ticker {
+		case invalidTicker:
+			invalid = &items[i]
+		case legacyTicker:
+			unaffected = &items[i]
+		}
+	}
+	if invalid == nil || invalid.DiscoveryContext != nil || invalid.ExecutionProfile != nil {
+		t.Fatalf("invalid row did not degrade to legacy: %+v", invalid)
+	}
+	if unaffected == nil || unaffected.Source != "manual" {
+		t.Fatalf("valid row was not returned intact: %+v", unaffected)
+	}
+}
+
 func TestWatchlistTradeProfileRejectsPartialUpsertsWithoutMutation(t *testing.T) {
 	if !store.IsConnected() {
 		t.Skip("DATABASE_URL not set; skipping store integration test")

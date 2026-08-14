@@ -16,8 +16,8 @@ const (
 )
 
 // LensSelectionAudit is the durable, validated summary of a final response.
-// SelectedLens preserves an invalid model value for investigation while the
-// response is cleared before it can affect downstream consumers.
+// SelectedLens preserves an invalid model value for investigation while an
+// actionable response is suppressed before it can affect downstream consumers.
 type LensSelectionAudit struct {
 	SelectedLens    string
 	RejectedLenses  map[string]string
@@ -63,6 +63,14 @@ func ValidateFinalLensSelection(
 			}
 			if _, ok := allowed[selected]; !ok {
 				response.SelectedStrategy = ""
+				// A profile-bound actionable response was reasoned under a lens the
+				// scanner explicitly prohibited. Clearing only SelectedStrategy would let
+				// downstream entry gates fall back to the legacy configured strategy
+				// and potentially execute that invalid recommendation. Preserve the
+				// response for audit, but make it non-actionable.
+				if response.Action != ActionHold && response.Action != ActionWait {
+					response.Action = ActionHold
+				}
 				audit.SelectionStatus = LensSelectionInvalid
 				return audit
 			}

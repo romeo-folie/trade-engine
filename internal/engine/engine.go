@@ -946,6 +946,13 @@ func (e *Engine) runAnalysisWithProfile(
 	if strategy == "" {
 		strategy = "trend_following"
 	}
+	// A valid scanner profile supersedes legacy Strategies for the analyst's
+	// candidate menu, so it must also determine the prompt history budget.
+	// Otherwise an offered long-window lens can be starved by a short legacy
+	// strategy window before the model has a chance to select it.
+	promptLenses := analysis.AnalysisRequest{
+		Strategy: strategy, Strategies: strategies, ExecutionProfile: executionProfile,
+	}.LensSet()
 
 	// Pre-LLM SELL ownership short-circuit (#319). For strategies whose primary
 	// action is SELL (close/exit-only), there is no point asking the analyst
@@ -1017,7 +1024,7 @@ func (e *Engine) runAnalysisWithProfile(
 	// starve a lens that needs more history (momentum 14 vs trend_following 20)
 	// of the bars required to confirm or reject it.
 	if windows := e.cfg.Analysis.HistoryWindowByStrategy; len(windows) > 0 {
-		if n := widestHistoryWindow(windows, strategy, strategies); n > 0 {
+		if n := widestHistoryWindow(windows, strategy, promptLenses); n > 0 {
 			candleCap = n // strategy window overrides; MaxCandlesPerPrompt clamps below
 		}
 	}
@@ -1987,10 +1994,17 @@ func (e *Engine) generateSignal(
 		// A lens made available by the scanner profile cannot bypass its own
 		// deterministic qualification. Legacy qualified candidates retain the
 		// additive path below even when an older model omits selected_strategy.
-		pullbackSelected := selectedPullbackLens(
-			eg.PullbackStrengthEnabled, strategy, resp.SelectedStrategy, admissibleLenses,
-		)
-		pullbackEvaluationRequired := pullbackCandidate || pullbackSelected
+		pullbackSelected := selectedPullbackLens(strategy, resp.SelectedStrategy, admissibleLenses)
+		// A scanner profile may outlive a temporary gate disable. In that case a
+		// BUY reasoned under pullback_strength cannot silently fall back to a
+		// standard entry: qualification is integral to that lens, and disabled
+		// qualification makes the recommendation non-executable.
+		if pullbackSelectionDisabled(eg.PullbackStrengthEnabled, pullbackSelected) {
+			entryGateReason = "pullback strength: selected lens is disabled"
+			entryGateFailedCheck = "pullback_disabled"
+		}
+		pullbackEvaluationRequired := pullbackCandidate ||
+			(pullbackSelected && eg.PullbackStrengthEnabled)
 		pullbackConfirmed := false
 		pullbackFailureReason := ""
 		needsDailyEvidence := pullbackEvaluationRequired ||
@@ -2077,7 +2091,7 @@ func (e *Engine) generateSignal(
 				)
 			}
 		}
-		if pullbackSelected && !pullbackConfirmed {
+		if pullbackSelected && !pullbackConfirmed && entryGateReason == "" {
 			if pullbackFailureReason == "" {
 				pullbackFailureReason = "daily setup evidence was unavailable for deterministic qualification"
 				entryGateFailedCheck = "pullback_evidence"

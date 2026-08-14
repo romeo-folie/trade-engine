@@ -125,11 +125,16 @@ func pullbackLensAdmissible(strategies []string, profile *tradeprofile.Execution
 	return hasEntryStrategy(strategies, store.EntrySetupPullbackStrength)
 }
 
-// selectedPullbackLens is the no-bypass boundary: if the analyst selected the
-// offered pullback lens, a normal BUY may not substitute for deterministic
-// qualification. The profile-derived lens set is passed by the caller.
-func selectedPullbackLens(enabled bool, configured, selected string, admissible []string) bool {
-	return enabled && effectiveGateStrategy(configured, selected, admissible) == store.EntrySetupPullbackStrength
+// selectedPullbackLens reports whether the analyst selected the offered
+// pullback lens. It intentionally does not consider whether the gate is
+// enabled: selecting a disabled pullback lens must be blocked, not permitted
+// to fall through to the standard-entry path.
+func selectedPullbackLens(configured, selected string, admissible []string) bool {
+	return effectiveGateStrategy(configured, selected, admissible) == store.EntrySetupPullbackStrength
+}
+
+func pullbackSelectionDisabled(enabled, selected bool) bool {
+	return selected && !enabled
 }
 
 func pullbackEntryEvidence(setup pullback.Result) string {

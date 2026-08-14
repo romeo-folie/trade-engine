@@ -175,17 +175,26 @@ func addWatchlistItem(
 			timeframes     = EXCLUDED.timeframes,
 			min_confidence = EXCLUDED.min_confidence,
 			source = CASE
-				WHEN EXCLUDED.discovery_context IS NULL THEN watchlist.source
+				WHEN EXCLUDED.discovery_context IS NULL
+					AND watchlist.discovery_context IS NOT NULL
+					AND watchlist.execution_profile IS NOT NULL
+					THEN watchlist.source
 				ELSE EXCLUDED.source
 			END,
 			graph_context = CASE
-				WHEN EXCLUDED.discovery_context IS NULL THEN watchlist.graph_context
+				WHEN EXCLUDED.discovery_context IS NULL
+					AND watchlist.discovery_context IS NOT NULL
+					AND watchlist.execution_profile IS NOT NULL
+					THEN watchlist.graph_context
 				ELSE EXCLUDED.graph_context
 			END,
 			discovery_context = COALESCE(EXCLUDED.discovery_context, watchlist.discovery_context),
 			execution_profile = COALESCE(EXCLUDED.execution_profile, watchlist.execution_profile),
 			scanner_run_id = CASE
-				WHEN EXCLUDED.discovery_context IS NULL THEN watchlist.scanner_run_id
+				WHEN EXCLUDED.discovery_context IS NULL
+					AND watchlist.discovery_context IS NOT NULL
+					AND watchlist.execution_profile IS NOT NULL
+					THEN watchlist.scanner_run_id
 				ELSE EXCLUDED.scanner_run_id
 			END,
 			active         = true,
@@ -327,15 +336,21 @@ func GetWatchlistItem(ctx context.Context, ticker, platform string) (*WatchlistI
 func decodeWatchlistContracts(
 	item *WatchlistItem, discoveryContext, executionProfile []byte,
 ) error {
-	var err error
-	item.DiscoveryContext, err = tradeprofile.DecodeDiscoveryContext(discoveryContext)
-	if err != nil {
-		return fmt.Errorf("decode watchlist discovery context: %w", err)
+	discovery, discoveryErr := tradeprofile.DecodeDiscoveryContext(discoveryContext)
+	profile, profileErr := tradeprofile.DecodeExecutionProfile(executionProfile)
+	if discoveryErr != nil || profileErr != nil || (discovery == nil) != (profile == nil) {
+		// A contract can become invalid after a newer writer, a manual repair,
+		// or corruption; database constraints deliberately validate only JSONB
+		// shape and pairing. Do not let one unusable row abort an engine tick for
+		// every other ticker. Clearing the in-memory pair returns this row to the
+		// established legacy strategies/graph-context path until a scanner refresh
+		// supplies a valid replacement contract.
+		item.DiscoveryContext = nil
+		item.ExecutionProfile = nil
+		return nil
 	}
-	item.ExecutionProfile, err = tradeprofile.DecodeExecutionProfile(executionProfile)
-	if err != nil {
-		return fmt.Errorf("decode watchlist execution profile: %w", err)
-	}
+	item.DiscoveryContext = discovery
+	item.ExecutionProfile = profile
 	return nil
 }
 

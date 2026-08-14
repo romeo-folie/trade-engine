@@ -3,6 +3,7 @@ package engine
 import (
 	"testing"
 
+	"github.com/romeo-folie/trade-engine/internal/analysis"
 	"github.com/romeo-folie/trade-engine/internal/analysis/prompts"
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/risk"
@@ -72,6 +73,20 @@ func TestWidestHistoryWindow(t *testing.T) {
 	}
 }
 
+func TestProfileLensSetDrivesHistoryWindow(t *testing.T) {
+	profile := &tradeprofile.ExecutionProfile{
+		Version: tradeprofile.ExecutionProfileVersion, RecommendedLens: "momentum",
+		AdmissibleLenses: []string{"momentum", "trend_following"},
+		PrimaryTimeframe: "1D", ScorerRationale: "test profile",
+	}
+	request := analysis.AnalysisRequest{
+		Strategy: "momentum", Strategies: []string{"momentum"}, ExecutionProfile: profile,
+	}
+	if got := widestHistoryWindow(map[string]int{"momentum": 14, "trend_following": 20}, request.Strategy, request.LensSet()); got != 20 {
+		t.Fatalf("profile lens history window = %d, want 20", got)
+	}
+}
+
 func TestPullbackLensAdmissiblePrefersExecutionProfile(t *testing.T) {
 	profile := &tradeprofile.ExecutionProfile{
 		Version:          tradeprofile.ExecutionProfileVersion,
@@ -90,14 +105,20 @@ func TestPullbackLensAdmissiblePrefersExecutionProfile(t *testing.T) {
 }
 
 func TestSelectedPullbackLensCannotBypassQualification(t *testing.T) {
-	if !selectedPullbackLens(true, "momentum", "pullback_strength", []string{"momentum", "pullback_strength"}) {
+	if !selectedPullbackLens("momentum", "pullback_strength", []string{"momentum", "pullback_strength"}) {
 		t.Fatal("selected profile pullback lens did not require deterministic qualification")
 	}
-	if selectedPullbackLens(true, "momentum", "pullback_strength", []string{"momentum"}) {
+	if selectedPullbackLens("momentum", "pullback_strength", []string{"momentum"}) {
 		t.Fatal("unoffered pullback selection must not activate a gate")
 	}
-	if selectedPullbackLens(false, "pullback_strength", "pullback_strength", []string{"pullback_strength"}) {
-		t.Fatal("disabled pullback gate must not activate qualification")
+	if !selectedPullbackLens("pullback_strength", "pullback_strength", []string{"pullback_strength"}) {
+		t.Fatal("selected pullback lens must remain detectable when its gate is disabled")
+	}
+	if !pullbackSelectionDisabled(false, true) {
+		t.Fatal("disabled pullback qualification must block a selected pullback lens")
+	}
+	if pullbackSelectionDisabled(true, true) || pullbackSelectionDisabled(false, false) {
+		t.Fatal("only a disabled selected pullback lens should block")
 	}
 }
 
