@@ -173,11 +173,25 @@ func addWatchlistItem(
 		ON CONFLICT (ticker, platform) DO UPDATE SET
 			strategies     = EXCLUDED.strategies,
 			timeframes     = EXCLUDED.timeframes,
-			min_confidence = EXCLUDED.min_confidence,
+			-- A manual/config refresh of an active scanner profile must retain the
+			-- complete scanner execution contract, including its confidence floor.
+			-- Once that contract has expired (or was deactivated), the refresh is a
+			-- normal replacement and may install its own confidence value.
+			min_confidence = CASE
+				WHEN EXCLUDED.discovery_context IS NULL
+					AND watchlist.discovery_context IS NOT NULL
+					AND watchlist.execution_profile IS NOT NULL
+					AND watchlist.active
+					AND (watchlist.expires_at IS NULL OR watchlist.expires_at > NOW())
+					THEN watchlist.min_confidence
+				ELSE EXCLUDED.min_confidence
+			END,
 			source = CASE
 				WHEN EXCLUDED.discovery_context IS NULL
 					AND watchlist.discovery_context IS NOT NULL
 					AND watchlist.execution_profile IS NOT NULL
+					AND watchlist.active
+					AND (watchlist.expires_at IS NULL OR watchlist.expires_at > NOW())
 					THEN watchlist.source
 				ELSE EXCLUDED.source
 			END,
@@ -185,15 +199,35 @@ func addWatchlistItem(
 				WHEN EXCLUDED.discovery_context IS NULL
 					AND watchlist.discovery_context IS NOT NULL
 					AND watchlist.execution_profile IS NOT NULL
+					AND watchlist.active
+					AND (watchlist.expires_at IS NULL OR watchlist.expires_at > NOW())
 					THEN watchlist.graph_context
 				ELSE EXCLUDED.graph_context
 			END,
-			discovery_context = COALESCE(EXCLUDED.discovery_context, watchlist.discovery_context),
-			execution_profile = COALESCE(EXCLUDED.execution_profile, watchlist.execution_profile),
+			discovery_context = CASE
+				WHEN EXCLUDED.discovery_context IS NULL
+					AND watchlist.discovery_context IS NOT NULL
+					AND watchlist.execution_profile IS NOT NULL
+					AND watchlist.active
+					AND (watchlist.expires_at IS NULL OR watchlist.expires_at > NOW())
+					THEN watchlist.discovery_context
+				ELSE EXCLUDED.discovery_context
+			END,
+			execution_profile = CASE
+				WHEN EXCLUDED.discovery_context IS NULL
+					AND watchlist.discovery_context IS NOT NULL
+					AND watchlist.execution_profile IS NOT NULL
+					AND watchlist.active
+					AND (watchlist.expires_at IS NULL OR watchlist.expires_at > NOW())
+					THEN watchlist.execution_profile
+				ELSE EXCLUDED.execution_profile
+			END,
 			scanner_run_id = CASE
 				WHEN EXCLUDED.discovery_context IS NULL
 					AND watchlist.discovery_context IS NOT NULL
 					AND watchlist.execution_profile IS NOT NULL
+					AND watchlist.active
+					AND (watchlist.expires_at IS NULL OR watchlist.expires_at > NOW())
 					THEN watchlist.scanner_run_id
 				ELSE EXCLUDED.scanner_run_id
 			END,
@@ -207,6 +241,8 @@ func addWatchlistItem(
 				WHEN EXCLUDED.discovery_context IS NULL
 					AND watchlist.discovery_context IS NOT NULL
 					AND watchlist.execution_profile IS NOT NULL
+					AND watchlist.active
+					AND (watchlist.expires_at IS NULL OR watchlist.expires_at > NOW())
 					THEN watchlist.expires_at
 				ELSE EXCLUDED.expires_at
 			END,

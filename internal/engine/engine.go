@@ -742,12 +742,14 @@ func (e *Engine) processStockWithProfile(
 	if len(candles) > 0 {
 		latestClose = candles[len(candles)-1].Close
 	}
+	contractDigest := DiscoveryExecutionContractDigest(discoveryContext, executionProfile)
 	mcIn := MaterialChangeInput{
-		RSI:      set.RSI,
-		EMA20:    set.EMA20,
-		Price:    latestClose,
-		NewsHash: newsHash,
-		Now:      time.Now(),
+		RSI:            set.RSI,
+		EMA20:          set.EMA20,
+		Price:          latestClose,
+		NewsHash:       newsHash,
+		ContractDigest: contractDigest,
+		Now:            time.Now(),
 	}
 
 	mcCfg := applyScannerOverrides(e.cfg.Analysis, source, scannerConviction)
@@ -1412,12 +1414,13 @@ func (e *Engine) runAnalysisWithProfile(
 	}
 	e.tickerStateMu.Lock()
 	e.tickerState[ticker] = &TickerState{
-		LastRSI:        set.RSI,
-		LastEMAGapPct:  emaGapPct(latestClose, set.EMA20),
-		LastPrice:      latestClose,
-		LastNewsHash:   newsHash,
-		LastDecision:   string(resp.Action),
-		LastAnalysedAt: time.Now(),
+		LastRSI:            set.RSI,
+		LastEMAGapPct:      emaGapPct(latestClose, set.EMA20),
+		LastPrice:          latestClose,
+		LastNewsHash:       newsHash,
+		LastContractDigest: DiscoveryExecutionContractDigest(discoveryContext, executionProfile),
+		LastDecision:       string(resp.Action),
+		LastAnalysedAt:     time.Now(),
 	}
 	e.tickerStateMu.Unlock()
 }
