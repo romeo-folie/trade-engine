@@ -4,6 +4,7 @@ import { ChamferedBox } from '../common/ChamferedBox';
 import CornerCard from '../CornerCard';
 import { colors } from '../../styles/tokens';
 import { verdictColor } from '../../utils/verdict';
+import { formatIndicator, shouldShowEntryChecks, titleCase } from './analysisDetailFormat';
 import styles from './AnalysisModal.module.css';
 
 const ANALYST_PALETTE = [
@@ -68,57 +69,69 @@ function fmtPrice(v: number): string {
 interface AnalysisDetail {
   ArbiterReasoning?: string;
   AnalystResults?: AnalystResult[] | null;
+  Indicators?: IndicatorSnapshot;
+  SelectedLens?: string;
+  RejectedLenses?: Record<string, string>;
+  Regime?: string;
+  LensSelectionStatus?: string;
+  TimeframeWorkflow?: TimeframeWorkflow;
+  RelatedSignalAction?: string;
+  RelatedSignalStatus?: string;
+  RelatedSignalBlockReason?: string;
+  EntrySetup?: string;
+  EntrySetupEvidence?: string;
+  EntryGateDecisions?: EntryGateDecision[];
 }
 
-interface SpecialistOutcome {
-  method: string;
-  detail: string;
+interface IndicatorSnapshot {
+  EMA20?: number;
+  EMA50?: number;
+  EMA200?: number;
+  SMA20?: number;
+  SMA50?: number;
+  SMA200?: number;
+  RSI?: number;
+  MACDLine?: number;
+  MACDSignal?: number;
+  MACDHistogram?: number;
+  BBUpper?: number;
+  BBMiddle?: number;
+  BBLower?: number;
+  ADX?: number;
+  ATR?: number;
+  OBV?: number;
+  StochK?: number;
+  StochD?: number;
+  VWAP?: number;
+  VolSMA20?: number;
+  VolRatio?: number;
 }
 
-// Specialist reasoning is persisted as one line per role followed by a unique
-// "[specialist] resolved by …" line. The role cards already render every
-// individual explanation, so translate only that final line into an
-// outcome-oriented summary instead of repeating the full reasoning paragraph.
-function formatSpecialistOutcome(reasoning: string, action: string): SpecialistOutcome {
-  const resolution = reasoning
-    .split('\n')
-    .map(line => line.trim())
-    .find(line => line.startsWith('[specialist] resolved by '));
+interface TimeframePass {
+  timeframe: string;
+  status?: string;
+  action?: string;
+  confidence?: number;
+  selected_lens?: string;
+  reason?: string;
+}
 
-  if (resolution?.includes('mandatory risk-manager review')) {
-    return {
-      method: 'Risk Specialist review',
-      detail: `${action} was selected as the final outcome after reviewing all three specialist findings.`,
-    };
-  }
+interface TimeframeWorkflow {
+  routing_source: string;
+  mode: string;
+  primary: TimeframePass;
+  confirmation?: TimeframePass;
+  final_action: string;
+}
 
-  const majority = resolution?.match(/resolved by (3-of-\d+) majority/);
-  if (majority) {
-    return {
-      method: `${majority[1]} specialist majority`,
-      detail: `${action} received the required three-role consensus.`,
-    };
-  }
+interface EntryGateDecision {
+  name: string;
+  status: string;
+  reason?: string;
+}
 
-  const veto = resolution?.match(/resolved by risk-manager veto \(([^)]+)\)/);
-  if (veto) {
-    return {
-      method: 'Risk-manager veto',
-      detail: `No three-role majority formed; the risk manager's ${veto[1]} verdict determined the outcome.`,
-    };
-  }
-
-  if (resolution?.includes('majority-vote fallback')) {
-    return {
-      method: 'Fallback vote',
-      detail: `No three-role majority or risk veto resolved the committee; the fallback vote selected ${action}.`,
-    };
-  }
-
-  return {
-    method: 'Specialist committee',
-    detail: `${action} was selected as the final specialist outcome.`,
-  };
+function formatConfidence(value?: number): string {
+  return value == null ? '' : ` · ${(value * 100).toFixed(0)}%`;
 }
 
 
@@ -177,13 +190,12 @@ export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps)
   const confPct = (analysis.Confidence * 100).toFixed(0);
   const action = analysis.Action.toUpperCase();
   const analystResults = detail?.AnalystResults ?? [];
-  const hasSpecialistResolution = analysis.Reasoning
-    .split('\n')
-    .some(line => line.trim().startsWith('[specialist] resolved by '));
-  const isSpecialist = hasSpecialistResolution || analystResults.some(a => !!a.role);
-  const specialistOutcome = isSpecialist
-    ? formatSpecialistOutcome(analysis.Reasoning, action)
-    : null;
+  const decisionReasoning = detail?.ArbiterReasoning || analysis.Reasoning;
+  const rejectedLenses = Object.entries(detail?.RejectedLenses ?? {});
+  const availableEntryChecks = detail?.EntryGateDecisions ?? [];
+  const entryChecks = shouldShowEntryChecks(detail?.RelatedSignalAction, availableEntryChecks.length)
+    ? availableEntryChecks
+    : [];
 
   // DissentSummary is not independent content: the arbiter prompt asks the
   // model to BEGIN its reasoning with "DISSENT:" (ensemble.go), and
@@ -252,39 +264,101 @@ export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps)
 
         {/* Body */}
         <div className={styles.body}>
-          {specialistOutcome ? (
+          <div className={styles.section}>
+            <div className={styles.sectionLabel}>
+              DECISION SUMMARY
+              {hasDissent && <span className={styles.dissentLabel}>DISSENT</span>}
+            </div>
+            <div className={styles.decisionMeta}>
+              {detail?.SelectedLens && (
+                <span className={styles.metaChip}>Lens: {titleCase(detail.SelectedLens)}</span>
+              )}
+              {detail?.Regime && (
+                <span className={styles.metaChip}>Regime: {titleCase(detail.Regime)}</span>
+              )}
+              {detail?.LensSelectionStatus && detail.LensSelectionStatus !== 'absent' && (
+                <span className={styles.metaChip}>Selection: {titleCase(detail.LensSelectionStatus)}</span>
+              )}
+            </div>
+            <div className={styles.reasoning}>{decisionReasoning || 'No decision reasoning was recorded.'}</div>
+            {detailLoading && !detail && (
+              <div className={styles.detailLoading} aria-live="polite">Loading structured evidence…</div>
+            )}
+            {detail?.TimeframeWorkflow && (
+              <div className={styles.workflow}>
+                <div className={styles.workflowRow}>
+                  <span>Primary · {detail.TimeframeWorkflow.primary.timeframe}</span>
+                  <strong>
+                    {detail.TimeframeWorkflow.primary.action || action}
+                    {formatConfidence(detail.TimeframeWorkflow.primary.confidence)}
+                  </strong>
+                </div>
+                {detail.TimeframeWorkflow.confirmation && (
+                  <div className={styles.workflowRow}>
+                    <span>Entry · {detail.TimeframeWorkflow.confirmation.timeframe}</span>
+                    <strong>{titleCase(detail.TimeframeWorkflow.confirmation.status || 'not requested')}</strong>
+                  </div>
+                )}
+              </div>
+            )}
+            {rejectedLenses.length > 0 && (
+              <details className={styles.disclosure}>
+                <summary>{rejectedLenses.length} rejected {rejectedLenses.length === 1 ? 'lens' : 'lenses'}</summary>
+                <div className={styles.rejectionList}>
+                  {rejectedLenses.map(([lens, reason]) => (
+                    <div key={lens} className={styles.rejectionRow}>
+                      <strong>{titleCase(lens)}</strong>
+                      <span>{reason}</span>
+                    </div>
+                  ))}
+                </div>
+              </details>
+            )}
+          </div>
+
+          {detail?.Indicators && (
             <div className={styles.section}>
-              <div className={styles.sectionLabel}>DECISION OUTCOME</div>
-              <div
-                className={styles.outcomeCard}
-                style={{ borderLeftColor: actionColors(analysis.Action) }}
-              >
-                <span
-                  className={styles.outcomeAction}
-                  style={{ color: actionColors(analysis.Action) }}
-                >
-                  {action}
-                </span>
-                <div className={styles.outcomeCopy}>
-                  <div className={styles.outcomeMethod}>{specialistOutcome.method}</div>
-                  <div className={styles.outcomeDetail}>{specialistOutcome.detail}</div>
+              <div className={styles.sectionLabel}>TECHNICAL EVIDENCE</div>
+              <div className={styles.evidenceGroups}>
+                <div className={styles.evidenceGroup}>
+                  <span className={styles.evidenceLabel}>Trend</span>
+                  <span>EMA 20/50/200</span>
+                  <strong>{formatIndicator(detail.Indicators.EMA20)} / {formatIndicator(detail.Indicators.EMA50)} / {formatIndicator(detail.Indicators.EMA200)}</strong>
+                  <span>SMA 20/50/200</span>
+                  <strong>{formatIndicator(detail.Indicators.SMA20)} / {formatIndicator(detail.Indicators.SMA50)} / {formatIndicator(detail.Indicators.SMA200)}</strong>
+                  <span>ADX 14</span>
+                  <strong>{formatIndicator(detail.Indicators.ADX)}</strong>
+                </div>
+                <div className={styles.evidenceGroup}>
+                  <span className={styles.evidenceLabel}>Momentum</span>
+                  <span>RSI 14</span>
+                  <strong>{formatIndicator(detail.Indicators.RSI)}</strong>
+                  <span>MACD line / signal / histogram</span>
+                  <strong>{formatIndicator(detail.Indicators.MACDLine, 4)} / {formatIndicator(detail.Indicators.MACDSignal, 4)} / {formatIndicator(detail.Indicators.MACDHistogram, 4)}</strong>
+                  <span>Stochastic K / D</span>
+                  <strong>{formatIndicator(detail.Indicators.StochK)} / {formatIndicator(detail.Indicators.StochD)}</strong>
+                </div>
+                <div className={styles.evidenceGroup}>
+                  <span className={styles.evidenceLabel}>Volatility and volume</span>
+                  <span>Bollinger upper / middle / lower</span>
+                  <strong>{formatIndicator(detail.Indicators.BBUpper)} / {formatIndicator(detail.Indicators.BBMiddle)} / {formatIndicator(detail.Indicators.BBLower)}</strong>
+                  <span>ATR 14</span>
+                  <strong>{formatIndicator(detail.Indicators.ATR, 4)}</strong>
+                  <span>VWAP</span>
+                  <strong>{formatIndicator(detail.Indicators.VWAP)}</strong>
+                  <span>OBV</span>
+                  <strong>{formatIndicator(detail.Indicators.OBV, 0)}</strong>
+                  <span>Volume SMA 20 / ratio</span>
+                  <strong>{formatIndicator(detail.Indicators.VolSMA20, 0)} / {formatIndicator(detail.Indicators.VolRatio)}×</strong>
                 </div>
               </div>
             </div>
-          ) : !isSpecialist && (
-            /* Generalist ensembles retain the useful arbiter synthesis. */
+          )}
+
+          {detail?.EntrySetupEvidence && (
             <div className={styles.section}>
-              <div className={styles.sectionLabel}>
-                FULL REASONING
-                {hasDissent && <span className={styles.dissentLabel}>DISSENT</span>}
-              </div>
-              {detail?.ArbiterReasoning ? (
-                <div className={styles.reasoning}>{detail.ArbiterReasoning}</div>
-              ) : detailLoading ? (
-                <div className={styles.reasoning} aria-busy="true">Loading reasoning…</div>
-              ) : (
-                <div className={styles.reasoning}>{analysis.Reasoning}</div>
-              )}
+              <div className={styles.sectionLabel}>MARKET STRUCTURE</div>
+              <div className={styles.structureFinding}>{detail.EntrySetupEvidence}</div>
             </div>
           )}
 
@@ -325,8 +399,36 @@ export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps)
                         />
                       </div>
                     )}
-                    {a.description && <div className={styles.analystDesc}>{a.description}</div>}
+                    {a.description && (
+                      <details className={styles.disclosure}>
+                        <summary>View analyst reasoning</summary>
+                        <div className={styles.analystDesc}>{a.description}</div>
+                      </details>
+                    )}
                   </CornerCard>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {entryChecks.length > 0 && (
+            <div className={styles.section}>
+              <div className={styles.sectionLabel}>ENTRY CHECKS</div>
+              <div className={styles.entryContext}>
+                <span>{titleCase(detail?.RelatedSignalStatus || 'evaluated')}</span>
+                {detail?.RelatedSignalBlockReason && <span>{detail.RelatedSignalBlockReason}</span>}
+              </div>
+              <div className={styles.checkList}>
+                {entryChecks.map((check, index) => (
+                  <div key={`${check.name}-${index}`} className={styles.checkRow}>
+                    <span className={`${styles.checkStatus} ${styles[`check_${check.status}`] ?? ''}`}>
+                      {titleCase(check.status)}
+                    </span>
+                    <div>
+                      <strong>{titleCase(check.name)}</strong>
+                      {check.reason && <span>{check.reason}</span>}
+                    </div>
+                  </div>
                 ))}
               </div>
             </div>
@@ -371,7 +473,7 @@ export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps)
               </div>
               <div className={styles.kvRow}>
                 <span className={styles.kvKey}>Strategy</span>
-                <span className={styles.kvVal}>{analysis.Strategy}</span>
+                <span className={styles.kvVal}>{titleCase(detail?.SelectedLens || analysis.Strategy)}</span>
               </div>
             </div>
           </div>

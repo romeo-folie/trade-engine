@@ -3,11 +3,12 @@ import styles from './Toggle.module.css';
 interface ToggleProps {
   checked: boolean;
   onChange: (checked: boolean) => void;
+  disabled?: boolean;
   id?: string;
   'aria-label'?: string;
 }
 
-export default function Toggle({ checked, onChange, id, 'aria-label': ariaLabel }: ToggleProps) {
+export default function Toggle({ checked, onChange, disabled = false, id, 'aria-label': ariaLabel }: ToggleProps) {
   return (
     <button
       id={id}
@@ -15,6 +16,7 @@ export default function Toggle({ checked, onChange, id, 'aria-label': ariaLabel 
       role="switch"
       aria-checked={checked}
       aria-label={ariaLabel}
+      disabled={disabled}
       className={`${styles.track} ${checked ? styles.on : ''}`}
       onClick={() => onChange(!checked)}
     >

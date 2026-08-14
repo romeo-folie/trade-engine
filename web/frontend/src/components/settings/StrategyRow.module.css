@@ -17,22 +17,9 @@
   color: var(--text-primary);
 }
 
-.chevron {
-  background: none;
-  border: none;
-  color: var(--accent);
-  font-size: 10px;
-  cursor: pointer;
-  padding: 0 var(--space-1);
-  line-height: 1;
-}
-
-.params {
+.status {
   font-family: var(--font-mono);
-  font-size: var(--font-size-xs);
+  font-size: 10px;
   color: var(--text-dim);
-  padding: var(--space-1) 0 var(--space-3) var(--space-3);
-  background: var(--panel-bg);
-  border-radius: 4px;
-  margin-bottom: var(--space-2);
+  letter-spacing: 0.08em;
 }
