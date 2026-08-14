@@ -1,69 +1,80 @@
 # internal/analysis — LLM Analysis Engine
 
-Implements Phase 3 analysis flow: prompt construction → model call → structured JSON parsing → metadata capture for storage.
+Builds prompt-safe market context, dispatches configured model providers, and
+returns an auditable provider or aggregate decision. The package supports
+single analysts, adaptive-depth ensembles, arbitration, and sequential
+specialists; the caller owns final lens validation.
 
 ## Components
 
-| File | Purpose |
+| Area | Purpose |
 |---|---|
-| `models.go` | `ModelProvider` interface, `AnalysisRequest`, `AnalysisResponse`, metadata types |
-| `anthropic.go` | Claude adapter via Anthropic Messages API (`net/http`) |
-| `analyzer.go` | Provider registry/factory + primary dispatch |
-| `openai.go` | Stub provider (`not implemented`) |
-| `ollama.go` | Stub provider (`not implemented`) |
-| `prompts/stock.go` | PRD §8.1 stock prompt template builder |
+| `models.go` | Provider interface plus request, response, and call-metadata contracts |
+| `analyzer.go`, `ensemble.go` | Single/ensemble routing, fast path, majority fallback, and arbitration |
+| `specialist.go`, `prompts/roles.go` | Sequential specialist and risk-manager workflow |
+| `lens_audit.go` | Validates selected/rejected lenses against an execution profile |
+| `prompts/stock.go` | Generalist stock prompt and strategy guidance |
+| `prompts/timeframe_context.go` | Primary-thesis context for entry-confirmation passes |
+| `anthropic.go`, `openai.go`, `gemini.go`, `deepseek.go`, `ollama.go` | Model-provider adapters |
+| `cache/`, `classifier/`, `depth/` | Prompt caching, impact classification, and adaptive analyst depth |
 
-## Data Flow
+## Request Context
+
+`AnalysisRequest` can carry:
+
+- recent candles, computed indicators, news, and portfolio state;
+- knowledge-graph, similar-analysis, and performance context;
+- scanner discovery provenance and a validated execution profile;
+- deterministic pullback facts when `pullback_strength` is admissible; and
+- a timeframe role plus the completed primary thesis for entry confirmation.
+
+A valid execution profile owns the ordered analyst menu. Discovery-source
+labels explain why the candidate was found and are never offered as strategies.
+Legacy callers can still supply `Strategy`/`Strategies` without a profile.
+
+## Decision Contract
+
+The stock response contains:
+
+- `action`: `BUY`, `SELL`, `HOLD`, or `WAIT`;
+- confidence, sizing, stop, target, and reasoning;
+- the observed regime;
+- one selected admissible lens, or `none`; and
+- a reason for rejecting every other admissible lens on actionable BUYs.
+
+`Analyzer.Analyze` and `Analyzer.AnalyzeFull` do not perform the final lens
+audit. Callers must pass their result to `ValidateFinalLensSelection` before
+trusting a profile-bound BUY. The engine does this before persistence and
+execution: invalid lens selection or incomplete rejection coverage becomes a
+non-directional HOLD. SELL decisions are exits and are not suppressed by
+ordinary entry-lens validation.
+
+## Analysis Workflows
 
 ```mermaid
-sequenceDiagram
-    participant E as engine.runAnalysis
-    participant A as analysis.Analyzer
-    participant C as AnthropicClient
-    participant P as prompts.BuildStockPrompt
-    participant API as Anthropic Messages API
-
-    E->>A: Analyze(request)
-    A->>C: Analyze(request)
-    C->>P: BuildStockPrompt(...)
-    P-->>C: system + user prompt
-    C->>API: POST /v1/messages
-    API-->>C: text response + token usage
-    C->>C: extract JSON (fenced or bare)
-    C-->>A: AnalysisResponse + ModelCallMeta
-    A-->>E: result
+flowchart LR
+    R[AnalysisRequest] --> D{Configured workflow}
+    D -->|single| S[One analyst]
+    D -->|ensemble| E[Parallel analysts]
+    D -->|specialist| P[Sequential specialists]
+    E --> A[Fast path / arbiter / majority]
+    P --> M[Risk-manager synthesis]
+    S --> V[Caller runs lens audit]
+    A --> V
+    M --> V
+    V --> O[Validated response + metadata]
 ```
 
-## Prompt Contract (PRD §8)
+For scanner profiles with an entry-timing timeframe, the engine can issue a
+second request with role `entry_confirmation`. That request evaluates timing
+for the already-selected thesis; it cannot substitute a new lens or create an
+independent exit. The engine owns the fail-closed merge policy.
 
-Prompt sections are always emitted in this order:
-1. system rules (strict JSON output)
-2. market data (recent OHLCV)
-3. indicators
-4. portfolio context (placeholder in Phase 3)
-5. recent news (last 48h)
-6. knowledge graph context (placeholder)
-7. similar past analyses (placeholder)
+## Audit Metadata
 
-## Output Contract
-
-`AnalysisResponse` fields:
-- `action`: `BUY | SELL | HOLD`
-- `confidence`: `0.0..1.0`
-- `size_pct`
-- `stop_loss`
-- `take_profit`
-- `reasoning`
-
-Adapter validation rejects invalid action/confidence ranges.
-
-## Metadata Captured
-
-`ModelCallMeta` includes:
-- prompt hash (SHA-256)
-- raw prompt + raw model response
-- token usage (input/output)
-- latency (ms)
-- indicator snapshot JSON
-
-This metadata is persisted to `analyses` for auditability and later backtesting.
+`ModelCallMeta` captures provider/model identity, prompt hash, raw prompt and
+response, token counts, latency, and the indicator snapshot. The store retains
+that raw metadata for the primary analysis plus selected/rejected lenses,
+regime, scanner lineage, and the compact timeframe-workflow audit. Entry
+confirmation records cost and compact status/action/lens/reason fields in that
+workflow audit; its raw prompt and provider response are not persisted.

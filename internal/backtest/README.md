@@ -78,4 +78,4 @@ A gap through the low is recorded as `gap_invalidation`; widened stops, degraded
 confidence tiers, and degraded R:R are recorded as `fill_stop_width`,
 `fill_confidence_tier`, and `fill_risk_reward`.
 Run options and entry diagnostics are persisted with `backtest_runs`, so list
-and comparison output can distinguish Phase 2 experiments from baselines.
+and comparison output can distinguish pullback experiments from baselines.

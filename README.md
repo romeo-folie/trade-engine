@@ -1,27 +1,36 @@
 # TradeEngine
 
-LLM-powered algorithmic trading system. Monitors stock markets, runs AI analysis via Claude (and optionally other models), manages a paper or live portfolio, and delivers signals via a terminal dashboard and Telegram.
+LLM-powered algorithmic trading system for US equities, options, forex/CFDs,
+and futures. TradeEngine discovers candidates, computes technical evidence,
+runs bounded multi-model analysis, applies deterministic risk and entry controls,
+and manages broker-authoritative execution in paper or live deployments.
 
-> **Note:** Prediction market functionality (Polymarket, Kalshi) has been moved to [`polymarket-geopolitical-agent`](https://github.com/romeo-folie/polymarket-geopolitical-agent).
-
-**Status:** Phases 1–13 complete — full trading system live, paper trading in progress ahead of live deployment.
+**Status:** The core engine is operational in paper trading. Live-stock controls,
+broker preflight, durable order intents, reconciliation, and emergency buy
+controls are implemented; enabling a live deployment remains an explicit
+operator decision.
 
 ## Architecture
 
 ```mermaid
 graph TD
     CLI[te CLI<br/>cmd/te/] --> Engine[Engine Loop<br/>internal/engine/]
+    Universe[Universe + Scanner<br/>internal/universe · internal/scanner] --> Profiles[Discovery Context + Execution Profile]
+    Profiles --> Engine
     Engine --> DataPipeline[Data Pipeline<br/>internal/data/]
-    DataPipeline -->|candles| Alpaca[Alpaca API]
+    DataPipeline -->|stocks + options| Alpaca[Alpaca APIs]
+    Engine -->|forex + futures data| IBKR[IBKR Client Portal]
     DataPipeline -->|news| Finnhub[Finnhub API]
     Engine --> Indicators[Indicator Engine<br/>internal/indicators/]
     Engine --> Store[PostgreSQL + pgvector<br/>internal/store/]
-    Engine --> Analysis[Ensemble Analysis<br/>internal/analysis/]
+    Engine --> Analysis[Profile-bound Analysis<br/>internal/analysis/]
     Analysis --> LLM[Claude · GPT-4o · Gemini · Ollama]
-    Analysis --> Risk[Risk Manager<br/>internal/risk/]
+    Analysis --> Gates[Timeframe Confirmation + Entry Gates]
+    Gates --> Risk[Portfolio Risk Manager<br/>internal/risk/]
     Risk --> Executor[Order Executor<br/>internal/execution/]
-    Executor -->|paper / live| AlpacaBroker[Alpaca Broker API]
-    Executor -->|forex / CFD| IBKRBroker[IBKR Client Portal API]
+    Executor -->|equities + options| AlpacaBroker[Alpaca Broker API]
+    Executor -->|forex · CFDs · futures| IBKRBroker[IBKR Client Portal API]
+    Engine --> Reconcile[Intent Recovery + Broker Reconciliation]
     Engine --> Backtest[Backtesting Engine<br/>internal/backtest/]
     Engine --> Knowledge[Knowledge Graph<br/>internal/knowledge/]
     Engine --> Embeddings[Vector Embeddings<br/>internal/embeddings/]
@@ -36,15 +45,25 @@ graph TD
 cmd/te/              — CLI entry point (Cobra commands)
 internal/
   config/            — YAML + env var + DB-override config system
-  data/              — Market data providers (Alpaca) + news (Finnhub)
-  engine/            — Core engine loop, scheduler
-  indicators/        — 20 technical indicators (EMA, RSI, MACD, Bollinger, ADX, ATR, OBV, Stochastic, VWAP, …)
+  data/              — Candle, quote, trade, and news provider interfaces
+  universe/          — Immutable swing-universe construction
+  scanner/           — Multi-source candidate discovery, scoring, and promotion
+  tradeprofile/      — Discovery provenance + bounded execution-profile contract
+  engine/            — Core engine loop, timeframe workflow, and entry gates
+  indicators/        — Technical indicator calculations and evidence snapshots
   store/             — PostgreSQL + pgvector access layer (pgx/v5)
   logger/            — Structured slog dual-output (stdout + file)
-  analysis/          — Multi-model ensemble analysis (Claude · GPT-4o · Gemini · Ollama)
-  risk/              — 7-check risk manager (confidence, R/R, position size, drawdown, …)
-  execution/         — PaperExecutor + AlpacaBroker + IBKRBroker executors
-  orb/               — Shared ORB lifecycle for options, forex, and futures
+  analysis/          — Single, ensemble, specialist, and confirmation analysis
+  risk/              — Portfolio, exposure, drawdown, sizing, and admission controls
+  execution/         — Broker execution, trailing exits, and bracket management
+  stockorders/       — Durable stock-order intents, attempts, and crash recovery
+  recon/             — Broker/database drift reconciliation
+  events/            — Typed internal event bus and observability payloads
+  cost/              — Model-cost accounting and budget enforcement
+  orb/               — Shared options, forex/CFD, and futures strategy lifecycle
+  strategy/          — Pullback-strength and currency-strength evaluators
+  earnings/          — Earnings calendar and options blackout support
+  options/           — Options market-data and IV workflows
   feedback/          — Performance feedback pipeline (nightly review + prompt enrichment)
   portfolio/         — Portfolio tracker + position monitoring
   tui/               — Bubble Tea terminal dashboard
@@ -53,9 +72,66 @@ internal/
   embeddings/        — pgvector embedding pipeline (OpenAI / Ollama)
   knowledge/         — Entity relationship graph + news enrichment
   reports/           — Self-contained HTML report generation (go-echarts)
-migrations/          — SQL migration files (001–020)
-docs/                — PRD + implementation plan + local-first embeddings guide
+migrations/          — Ordered, versioned SQL migrations
+docs/                — Architecture notes, research results, and operator runbooks
 ```
+
+## Implemented Strategies
+
+TradeEngine keeps discovery sources separate from execution strategies. A
+weekly leader, premarket catalyst, potent industry, or graph/news-sympathy match
+explains **why** a stock entered the pipeline; it does not become the strategy
+used to trade it.
+
+### Stock analysis lenses
+
+Scanner-promoted stocks receive a bounded execution profile. Analysts may select
+only an admissible lens from that profile (or select none):
+
+| Lens | Intended use | Deterministic controls |
+|------|--------------|------------------------|
+| `trend_following` | Established directional trends | Daily trend alignment and portfolio/risk admission |
+| `mean_reversion` | Reversion toward a statistically stretched range | Profile validation and standard risk admission |
+| `momentum` | Continuation with confirmed strength | Anti-chase/run-up limits and standard risk admission |
+| `news_sentiment` | Catalyst-driven directional setups | Minimum tape reaction and standard risk admission |
+| `pullback_strength` | Strong trend pulling back into defined support | Daily AVWAP/EMA/structure qualification, refreshed before entry |
+
+Swing profiles normally form the thesis on `1D` and may require a named `4H`
+entry-confirmation pass. Event-driven profiles can use `4H` with optional `1H`
+timing. The selected lens, rejected alternatives, timeframe workflow, and entry
+gate outcomes are retained as audit lineage.
+
+### Session and market strategies
+
+| Strategy | Market / venue | State |
+|----------|----------------|-------|
+| Opening Range Breakout (`orb`) | Alpaca options; IBKR forex/CFDs and futures | Implemented |
+| Trend continuation | IBKR forex/CFDs and futures | Implemented per instrument |
+| Sweep/reclaim | IBKR forex/CFDs and futures | Implemented per instrument |
+| Opening shock | IBKR forex/CFDs and futures | Implemented per instrument |
+| Currency-strength rotation | IBKR forex | Implemented in paper mode; shadow skips execution and live mode is rejected |
+| Equity ORB | Alpaca equities | Retired; direct-equity ORB entries are disabled |
+
+Strategy availability is configuration-driven. An implemented strategy is not
+necessarily enabled on a particular host; inspect the resolved configuration
+with `te config show` before operating it.
+
+## Core Capabilities
+
+- Immutable swing universes and multi-source scanner snapshots with evidence,
+  scores, promotion lineage, and expiring watchlist ownership.
+- Profile-bound single, ensemble, adaptive-depth, or sequential-specialist LLM
+  analysis with deterministic lens validation and optional entry confirmation.
+- Technical evidence covering moving averages, momentum, volatility, volume,
+  VWAP, and deterministic pullback structure.
+- Broker-authoritative stock sizing, durable intents and attempts, idempotent
+  recovery, whole-share protection, trailing/bracket exits, and exit ownership.
+- Account-aware risk baselines, drawdown and daily-loss controls, exposure and
+  concentration limits, buy pause/resume controls, and broker preflight.
+- ORB/session execution for options, forex/CFDs, and futures, with research
+  variants and replay tooling for continuation, sweep/reclaim, and opening shock.
+- PostgreSQL/pgvector persistence, knowledge-graph enrichment, similar-setup
+  retrieval, performance feedback, reports, Telegram, and terminal operations.
 
 ## Quick Start
 
@@ -249,6 +325,7 @@ te run --web [--web-port 8080]       Start the engine with web observability
 te stop                              Stop the running engine process (SIGTERM)
 te status                            Show process, database, and configured/DB mode
 te mode <manual|auto|paper>          Persist the startup mode override; restart required
+te buys pause|resume|status          Control new stock buys without disabling exits
 te dashboard                         Open the terminal dashboard (aliases: ui, tui)
 te web                               Start the standalone web observability interface
 te logs tail                         Tail the engine log
@@ -275,6 +352,8 @@ te config set engine.mode <mode> --runtime
 te config validate                   Validate the resolved configuration
 te migrate                           Apply pending database migrations
 te db --help                         Database reset and summary-backfill operations
+te stocks preflight                  Verify stock broker identity and account readiness
+te risk reset-baseline               Reset an account risk baseline after verified cash changes
 ```
 
 `engine.mode` is currently the only DB runtime-override key consumed by the
@@ -294,6 +373,8 @@ te universe refresh|list              Build or inspect immutable swing universes
 te earnings sync|seed|list            Manage the options earnings calendar
 te options backfill-iv                Backfill options implied-volatility history
 te orb stats                          Inspect opening-range performance
+te orb repair-trades --plan <file>             Preview a reviewed YAML repair plan (default)
+te orb repair-trades --plan <file> --apply     Apply the plan transactionally
 ```
 
 `te reconcile broker` is intentionally limited to Alpaca equities and the
@@ -349,6 +430,7 @@ te backtest opening-shock               Replay opening-shock reversals
 te backtest trend-continuation          Replay delayed trend continuation
 te backtest sweep-reclaim               Replay liquidity sweep/reclaim entries
 te backtest currency-strength           Replay FX currency-strength rotation
+te backtest currency-strength-research  Run the walk-forward currency-strength research harness
 ```
 
 ### Offline studies
@@ -360,29 +442,20 @@ te study execution                      Replay stock trades against 1m bars
 te study pullback-frequency             Measure deterministic pullback frequency
 ```
 
-## Build Phase Status
+## Capability Status
 
-| Phase | Description | Status |
-|-------|-------------|--------|
-| 1 | Foundation (scaffold, config, migrations, CLI) | ✅ Complete |
-| 2 | Data pipeline (market data, indicators, news) | ✅ Complete |
-| 3 | Analysis engine (LLM integration, prompt engineering) | ✅ Complete |
-| 4 | Trading core (signals, risk, execution, portfolio) | ✅ Complete |
-| 5 | Terminal dashboard (Bubble Tea TUI) | ✅ Complete |
-| 6 | Telegram notifications + signal approval flow | ✅ Complete |
-| 7 | Backtesting engine + prompt cache + metrics | ✅ Complete |
-| 8 | HTML reports (go-echarts, offline self-contained) | ✅ Complete |
-| 9 | ~~Prediction markets~~ (moved to `polymarket-geopolitical-agent`) | ➡️ Moved |
-| 10 | Knowledge graph (entity relationships + news enrichment) | ✅ Complete |
-| 11 | Vector embeddings (pgvector, similar-setup injection) | ✅ Complete |
-| 12 | Multi-model ensemble deliberation (Claude · GPT-4o · Gemini · Ollama) | ✅ Complete |
-| 13 | Go-live operational (paper trading run → live switch) | 🔄 In progress |
-| 14 | Web visualisation dashboard | ⏳ Planned |
-| 15 | Opening Range Breakout — equities (Alpaca) | ✅ Complete |
-| 16 | IBKR integration — forex + CFD ORB (EUR/USD, XAU/USD, etc.) | ✅ Complete |
-| 17 | Feedback pipeline — nightly review, flags, prompt enrichment | ✅ Complete |
+| Area | Status |
+|------|--------|
+| Equity swing discovery, analysis, risk, and Alpaca execution | ✅ Operational in paper mode |
+| Broker-authoritative live-stock safeguards and operator controls | ✅ Implemented; deployment-controlled |
+| Options ORB via Alpaca | ✅ Implemented; real-time OPRA feed required |
+| Forex/CFD ORB and specialized session strategies via IBKR | ✅ Implemented |
+| Futures ORB and specialized per-contract strategies via IBKR | ✅ Implemented; configuration-gated |
+| Currency-strength rotation | 🧪 Paper mode only; shadow does not execute |
+| Equity ORB | ⛔ Retired |
+| Backtesting, studies, reports, feedback, knowledge graph, and embeddings | ✅ Implemented |
 
-## Module READMEs
+## Further Documentation
 
 - [`internal/config/`](internal/config/) — config system
 - [`internal/data/`](internal/data/) — market data + news providers
@@ -395,3 +468,12 @@ te study pullback-frequency             Measure deterministic pullback frequency
 - [`internal/knowledge/`](internal/knowledge/) — entity relationship graph
 - [`internal/logger/`](internal/logger/) — structured logger
 - [`internal/reports/`](internal/reports/) — HTML report generation
+- [`docs/issue-550-discovery-execution-profile.md`](docs/issue-550-discovery-execution-profile.md) — scanner provenance, execution profiles, timeframe confirmation, and gate audit
+- [`docs/live-operator-runbook.md`](docs/live-operator-runbook.md) — live-stock preflight, risk controls, and emergency operations
+- [`docs/swing-universe-foundation.md`](docs/swing-universe-foundation.md) — immutable swing-universe design
+- [`docs/weekly-leader-scanner.md`](docs/weekly-leader-scanner.md) — weekly leadership discovery
+- [`docs/potent-industry-scanner.md`](docs/potent-industry-scanner.md) — industry potency and breadth scanner
+- [`docs/premarket-episodic-scanner.md`](docs/premarket-episodic-scanner.md) — premarket event discovery
+- [`docs/options-orb.md`](docs/options-orb.md) — options ORB operations and safeguards
+- [`docs/exit-policy-study.md`](docs/exit-policy-study.md) — stock exit-policy research and rollout history
+- [`docs/currency-strength-research-2026-08.md`](docs/currency-strength-research-2026-08.md) — currency-strength walk-forward research

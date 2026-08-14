@@ -6,7 +6,7 @@ Portfolio state tracking, snapshots, daily summaries, independent poller, and Al
 
 Maintains an in-memory view of the current portfolio (total value, cash, positions, P&L) and
 persists periodic snapshots and daily summaries to the database for historical analysis and
-reporting. As of Phase 18, snapshots are also written by an independent poller goroutine that
+reporting. Snapshots are also written by an independent poller goroutine that
 runs regardless of engine tick cadence — so the equity chart has no gaps during sleep windows.
 
 ## Components
@@ -17,8 +17,8 @@ runs regardless of engine tick cadence — so the equity chart has no gaps durin
 | `State` | Snapshot of current portfolio values (exported for reads by risk manager and CLI). |
 | `MaybeSnapshot` | Writes a `portfolio_snapshots` row at the configured interval (default: 5 min). Tags rows with `source='engine'`, plus `mode` and `broker` set via `SetTags`. |
 | `MaybeDailySummary` | Writes a `daily_summaries` row once per calendar day. Uses `ON CONFLICT` upsert. |
-| `Poller` | Background goroutine (Phase 18). Calls broker `AccountSnapshot` on a configurable interval (default 60 s) and writes extra snapshot rows tagged `source='poller'`. Also writes when equity moves >0.05% (configurable). Runs independently of the engine tick loop. |
-| `Backfill` | One-time job (Phase 18). Fetches up to 1 Y of Alpaca equity history and seeds `portfolio_snapshots` for any calendar-day gaps, tagged `source='backfill'`. Idempotent — existing rows are never modified. |
+| `Poller` | Background goroutine. Calls broker `AccountSnapshot` on a configurable interval (default 60 s) and writes extra snapshot rows tagged `source='poller'`. Also writes when equity moves >0.05% (configurable). Runs independently of the engine tick loop. |
+| `Backfill` | One-time job. Fetches up to 1 Y of Alpaca equity history and seeds `portfolio_snapshots` for any calendar-day gaps, tagged `source='backfill'`. Idempotent — existing rows are never modified. |
 
 ## Portfolio Snapshot Sources
 
@@ -33,7 +33,7 @@ Each row in `portfolio_snapshots` carries a `source` column indicating its origi
 The `mode` column (`live`/`paper`) and `broker` column (`alpaca`/`ibkr`) are set by `SetTags`
 and passed through by the poller and backfill.
 
-## Data Flow (Phase 18)
+## Data Flow
 
 ```
 Engine tick loop:

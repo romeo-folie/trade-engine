@@ -35,7 +35,14 @@ Covers a single backtest run:
 te report daily [--date YYYY-MM-DD]           # single trading day summary
 te report weekly [--from YYYY-MM-DD]          # 7-day rolling summary
 te report compare <label1> <label2>           # side-by-side backtest comparison
+te report scanner-funnel                      # scanner conversion and outcomes
+te report weekly-leaders                      # leadership research observations
+te report potent-industries                   # industry potency and breadth
+te report premarket-episodic                   # premarket gap/catalyst observations
 ```
+
+Scanner research commands share the report command tree but may render their
+own tabular/CSV-style outputs rather than the generic go-echarts page builders.
 
 ## Usage
 
