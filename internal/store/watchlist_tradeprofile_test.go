@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"testing"
 	"time"
 
@@ -119,7 +120,9 @@ func TestWatchlistTradeProfileNilUpsertPreservesAndCompleteUpsertReplaces(t *tes
 		stored.ExecutionProfile == nil || stored.ExecutionProfile.RecommendedLens != "momentum" ||
 		stored.ScannerRunID != initialRunID || stored.Source != "scanner" ||
 		stored.GraphContext != "Original graph context" || stored.ExpiresAt == nil ||
-		!stored.ExpiresAt.Equal(firstExpiry) || stored.MinConfidence != initial.MinConfidence {
+		!stored.ExpiresAt.Equal(firstExpiry) || stored.MinConfidence != initial.MinConfidence ||
+		!slices.Equal(stored.Strategies, initial.Strategies) ||
+		!slices.Equal(stored.Timeframes, initial.Timeframes) {
 		t.Fatalf("legacy refresh erased scanner contracts: %+v", stored)
 	}
 
@@ -189,7 +192,8 @@ func TestManualUpsertReplacesExpiredWatchlistTradeProfile(t *testing.T) {
 	}
 	if !stored.Active || stored.Source != "manual" || stored.GraphContext != "" || stored.ScannerRunID != "" ||
 		stored.ExpiresAt != nil || stored.DiscoveryContext != nil || stored.ExecutionProfile != nil ||
-		stored.MinConfidence != 0.37 {
+		stored.MinConfidence != 0.37 || !slices.Equal(stored.Strategies, []string{"mean_reversion"}) ||
+		!slices.Equal(stored.Timeframes, []string{"4H"}) {
 		t.Fatalf("manual upsert retained expired scanner contract: %+v", stored)
 	}
 }

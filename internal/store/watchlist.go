@@ -171,8 +171,26 @@ func addWatchlistItem(
 		)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, true, $11)
 		ON CONFLICT (ticker, platform) DO UPDATE SET
-			strategies     = EXCLUDED.strategies,
-			timeframes     = EXCLUDED.timeframes,
+			-- A manual/config refresh of an active scanner profile must retain the
+			-- scheduling fields with the rest of the scanner execution contract.
+			strategies = CASE
+				WHEN EXCLUDED.discovery_context IS NULL
+					AND watchlist.discovery_context IS NOT NULL
+					AND watchlist.execution_profile IS NOT NULL
+					AND watchlist.active
+					AND (watchlist.expires_at IS NULL OR watchlist.expires_at > NOW())
+					THEN watchlist.strategies
+				ELSE EXCLUDED.strategies
+			END,
+			timeframes = CASE
+				WHEN EXCLUDED.discovery_context IS NULL
+					AND watchlist.discovery_context IS NOT NULL
+					AND watchlist.execution_profile IS NOT NULL
+					AND watchlist.active
+					AND (watchlist.expires_at IS NULL OR watchlist.expires_at > NOW())
+					THEN watchlist.timeframes
+				ELSE EXCLUDED.timeframes
+			END,
 			-- A manual/config refresh of an active scanner profile must retain the
 			-- complete scanner execution contract, including its confidence floor.
 			-- Once that contract has expired (or was deactivated), the refresh is a
