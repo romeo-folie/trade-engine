@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/romeo-folie/trade-engine/internal/analysis"
@@ -9,6 +10,41 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/risk"
 	"github.com/romeo-folie/trade-engine/internal/tradeprofile"
 )
+
+func TestLensSelectionTelemetryUsesCanonicalExecutionProfile(t *testing.T) {
+	profile := &tradeprofile.ExecutionProfile{
+		Version:              tradeprofile.ExecutionProfileVersion,
+		RecommendedLens:      " MOMENTUM ",
+		AdmissibleLenses:     []string{" MOMENTUM ", "TREND_FOLLOWING"},
+		PrimaryTimeframe:     "1d",
+		EntryTimingTimeframe: "4h",
+		ScorerRationale:      "scanner selected a momentum setup",
+	}
+
+	configured, admissible := lensSelectionTelemetry(
+		"mean_reversion",
+		[]string{"mean_reversion", "news_sentiment"},
+		profile,
+	)
+	if configured != "momentum" {
+		t.Fatalf("configured lens = %q, want canonical profile recommendation %q", configured, "momentum")
+	}
+	if want := []string{"momentum", "trend_following"}; !reflect.DeepEqual(admissible, want) {
+		t.Fatalf("admissible lenses = %v, want canonical profile menu %v", admissible, want)
+	}
+
+	legacyConfigured, legacyAdmissible := lensSelectionTelemetry(
+		"mean_reversion",
+		[]string{"mean_reversion", "news_sentiment"},
+		nil,
+	)
+	if legacyConfigured != "mean_reversion" {
+		t.Fatalf("legacy configured lens = %q, want legacy strategy", legacyConfigured)
+	}
+	if want := []string{"mean_reversion", "news_sentiment"}; !reflect.DeepEqual(legacyAdmissible, want) {
+		t.Fatalf("legacy admissible lenses = %v, want legacy menu %v", legacyAdmissible, want)
+	}
+}
 
 // TestWidestHistoryWindow: with every admissible lens now selectable by the
 // analyst, the candle budget must satisfy the most demanding one. Capping at

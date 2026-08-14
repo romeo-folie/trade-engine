@@ -79,6 +79,18 @@ func ValidateFinalLensSelection(
 			audit.SelectionStatus = LensSelectionInvalid
 			return audit
 		}
+		if response.Action == ActionBuy && !hasCompleteRejectionCoverage(response.RejectedStrategies, selected, allowed) {
+			// A profile offers a bounded decision set, not a menu from which the
+			// model may silently omit inconvenient alternatives. A BUY is valid
+			// only when every non-selected lens was explicitly rejected and no
+			// other lens was introduced. Preserve the original selection and map
+			// in the audit record, but do not let this incomplete decision reach
+			// downstream entry handling.
+			response.SelectedStrategy = ""
+			suppressProfileBoundAction(response, allowed)
+			audit.SelectionStatus = LensSelectionInvalid
+			return audit
+		}
 	}
 	audit.SelectionStatus = LensSelectionSelected
 	return audit
@@ -95,7 +107,48 @@ func suppressProfileBoundAction(response *AnalysisResponse, allowed map[string]s
 	}
 	if response.Action == ActionBuy {
 		response.Action = ActionHold
+		// A HOLD cannot carry entry sizing or bracket prices. This function runs
+		// after JSON extraction, so it must re-establish the same invariant the
+		// parser applies to model-originated HOLD responses.
+		response.SizePct = 0
+		response.StopLoss = 0
+		response.TakeProfit = 0
 	}
+}
+
+// hasCompleteRejectionCoverage verifies the rejection side of a selected
+// profile-bound BUY. It intentionally canonicalizes the model's keys here as
+// a defence for callers that construct AnalysisResponse directly rather than
+// through extractAnalysisJSON, which normally does that normalization.
+func hasCompleteRejectionCoverage(rejected map[string]string, selected string, allowed map[string]struct{}) bool {
+	if len(rejected) != len(allowed)-1 {
+		return false
+	}
+
+	seen := make(map[string]struct{}, len(rejected))
+	for lens := range rejected {
+		lens = strings.ToLower(strings.TrimSpace(lens))
+		if lens == "" || lens == selected {
+			return false
+		}
+		if _, ok := allowed[lens]; !ok {
+			return false
+		}
+		if _, duplicate := seen[lens]; duplicate {
+			return false
+		}
+		seen[lens] = struct{}{}
+	}
+
+	for lens := range allowed {
+		if lens == selected {
+			continue
+		}
+		if _, rejected := seen[lens]; !rejected {
+			return false
+		}
+	}
+	return true
 }
 
 func cloneRejectedLenses(in map[string]string) map[string]string {

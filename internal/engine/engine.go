@@ -1289,13 +1289,14 @@ func (e *Engine) runAnalysisWithProfile(
 	// for. This is the phase-1 evidence that decides whether persisting
 	// selected_strategy is worth a migration.
 	if resp.SelectedStrategy != "" {
+		configuredLens, admissibleLenses := lensSelectionTelemetry(strategy, strategies, executionProfile)
 		logger.Info("lens selection",
 			"ticker", ticker,
-			"configured", strategy,
+			"configured", configuredLens,
 			"selected", resp.SelectedStrategy,
 			"regime", resp.Regime,
-			"divergent", resp.SelectedStrategy != strategy,
-			"admissible", strings.Join(prompts.Lenses(strategies), ","),
+			"divergent", resp.SelectedStrategy != configuredLens,
+			"admissible", strings.Join(admissibleLenses, ","),
 			"rejected_count", len(resp.RejectedStrategies),
 		)
 	}
@@ -1423,6 +1424,24 @@ func (e *Engine) runAnalysisWithProfile(
 		LastAnalysedAt:     time.Now(),
 	}
 	e.tickerStateMu.Unlock()
+}
+
+// lensSelectionTelemetry returns the scanner-owned recommendation and bounded
+// menu that a profile-bound analyst was asked to choose from. Legacy rows
+// retain the historical strategy-derived telemetry. Canonicalizing here keeps
+// log fields consistent with the durable execution-profile contract even when
+// callers constructed the profile with non-canonical casing or whitespace.
+func lensSelectionTelemetry(
+	strategy string,
+	strategies []string,
+	executionProfile *tradeprofile.ExecutionProfile,
+) (configured string, admissible []string) {
+	if executionProfile != nil {
+		if canonical, err := executionProfile.Canonicalize(); err == nil {
+			return canonical.RecommendedLens, canonical.AdmissibleLenses
+		}
+	}
+	return strategy, prompts.Lenses(strategies)
 }
 
 // analysisSourceNode identifies the configured analysis stage that produced the
