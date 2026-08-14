@@ -46,7 +46,6 @@ cmd/te/              — CLI entry point (Cobra commands)
 internal/
   config/            — YAML + env var + DB-override config system
   data/              — Candle, quote, trade, and news provider interfaces
-  discovery/         — Shared discovery candidate contracts
   universe/          — Immutable swing-universe construction
   scanner/           — Multi-source candidate discovery, scoring, and promotion
   tradeprofile/      — Discovery provenance + bounded execution-profile contract
@@ -374,7 +373,8 @@ te universe refresh|list              Build or inspect immutable swing universes
 te earnings sync|seed|list            Manage the options earnings calendar
 te options backfill-iv                Backfill options implied-volatility history
 te orb stats                          Inspect opening-range performance
-te orb repair-trades                  Apply a reviewed YAML repair plan to supported ORB trades
+te orb repair-trades --plan <file>             Preview a reviewed YAML repair plan (default)
+te orb repair-trades --plan <file> --apply     Apply the plan transactionally
 ```
 
 `te reconcile broker` is intentionally limited to Alpaca equities and the

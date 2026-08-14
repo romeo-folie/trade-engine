@@ -2,10 +2,13 @@
 
 Owns durable engine state through pgx/v5. Call `store.Connect(ctx)` before using
 package-level helpers and `store.Close()` on shutdown. `te migrate` reads the
-ordered SQL files from the repository/installed `migrations/` directory and
-tracks them in `schema_migrations`. Migrations run transactionally unless their
-first non-empty line is the explicit `-- no-transaction` directive; those files
-must be idempotent because their DDL cannot be rolled back as a unit.
+ordered SQL files from `./migrations`, falling back to a `migrations/` directory
+beside the binary, and tracks them in `schema_migrations`. The current
+`make install` target copies only the binary, so an installed `te` must run
+migrations from a repository checkout unless the migration directory is copied
+beside it. Migrations run transactionally unless their first non-empty line is
+the explicit `-- no-transaction` directive; those files must be idempotent
+because their DDL cannot be rolled back as a unit.
 
 ## Storage Areas
 
@@ -36,13 +39,14 @@ must be idempotent because their DDL cannot be rolled back as a unit.
 
 ### Analysis and signals
 
-- Analysis rows retain raw prompts/responses, token usage, indicator evidence,
-  configured and selected lenses, rejected alternatives, regime, scanner run,
-  and the compact timeframe-workflow audit.
+- Analysis rows retain primary-pass raw prompts/responses, token usage,
+  indicator evidence, configured and selected lenses, rejected alternatives,
+  regime, scanner run, and the compact timeframe-workflow audit. Confirmation
+  raw prompts/responses are not persisted.
 - Signals link to all contributing analysis IDs and persist ordered entry-gate
   decisions plus the effective execution strategy.
-- Raw provider output remains available even when the validated live decision
-  is downgraded.
+- Primary-pass raw provider output remains available even when the validated
+  live decision is downgraded.
 
 ### Durable stock orders
 

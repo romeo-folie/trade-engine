@@ -1,8 +1,9 @@
 # internal/analysis — LLM Analysis Engine
 
 Builds prompt-safe market context, dispatches configured model providers, and
-returns a validated, auditable trading decision. The package supports single
-analysts, adaptive-depth ensembles, arbitration, and sequential specialists.
+returns an auditable provider or aggregate decision. The package supports
+single analysts, adaptive-depth ensembles, arbitration, and sequential
+specialists; the caller owns final lens validation.
 
 ## Components
 
@@ -41,10 +42,12 @@ The stock response contains:
 - one selected admissible lens, or `none`; and
 - a reason for rejecting every other admissible lens on actionable BUYs.
 
-Profile-bound BUYs are sanitized before persistence and execution. Invalid lens
-selection or incomplete rejection coverage becomes a non-directional HOLD;
-raw provider output remains available for forensic review. SELL decisions are
-exit decisions and are not suppressed by ordinary entry-lens validation.
+`Analyzer.Analyze` and `Analyzer.AnalyzeFull` do not perform the final lens
+audit. Callers must pass their result to `ValidateFinalLensSelection` before
+trusting a profile-bound BUY. The engine does this before persistence and
+execution: invalid lens selection or incomplete rejection coverage becomes a
+non-directional HOLD. SELL decisions are exits and are not suppressed by
+ordinary entry-lens validation.
 
 ## Analysis Workflows
 
@@ -56,7 +59,7 @@ flowchart LR
     D -->|specialist| P[Sequential specialists]
     E --> A[Fast path / arbiter / majority]
     P --> M[Risk-manager synthesis]
-    S --> V[Lens audit]
+    S --> V[Caller runs lens audit]
     A --> V
     M --> V
     V --> O[Validated response + metadata]
@@ -70,6 +73,8 @@ independent exit. The engine owns the fail-closed merge policy.
 ## Audit Metadata
 
 `ModelCallMeta` captures provider/model identity, prompt hash, raw prompt and
-response, token counts, latency, and the indicator snapshot. The store layer
-also retains selected/rejected lenses, regime, scanner lineage, and the compact
-timeframe-workflow audit for the final decision.
+response, token counts, latency, and the indicator snapshot. The store retains
+that raw metadata for the primary analysis plus selected/rejected lenses,
+regime, scanner lineage, and the compact timeframe-workflow audit. Entry
+confirmation records cost and compact status/action/lens/reason fields in that
+workflow audit; its raw prompt and provider response are not persisted.
