@@ -1,11 +1,29 @@
 package disclosures
 
 import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestHouseFetchPDFRejectsOversizedResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprint(maxHouseResponseSize+1))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := &HouseClient{BaseURL: server.URL, HTTP: server.Client()}
+	_, _, err := client.FetchPDF(context.Background(), HouseFiling{Year: 2026, DocumentID: "oversized"})
+	if err == nil || !strings.Contains(err.Error(), "response exceeds") {
+		t.Fatalf("FetchPDF error = %v, want response-size rejection", err)
+	}
+}
 
 func TestPDFiumHousePTRFixture(t *testing.T) {
 	path := os.Getenv("HOUSE_PTR_FIXTURE")

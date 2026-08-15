@@ -44,6 +44,27 @@ func TestOGEListFilingsKeepsTimestampedInclusiveEndDate(t *testing.T) {
 	}
 }
 
+func TestOGEListFilingsSkipsMalformedDateWithoutEndingPageRange(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"recordsTotal":2,"data":[{"type":"<a href='https://example.test/malformed.pdf'>278 Transaction</a>","name":"Malformed","docDate":"not-a-date"},{"type":"<a href='https://example.test/valid.pdf'>278 Transaction</a>","name":"Valid","docDate":"2026-07-15T17:45:00.123-04:00"}]}`))
+	}))
+	defer server.Close()
+
+	client := NewOGEClient(server.URL, time.Second)
+	page, err := client.ListFilingsPage(
+		context.Background(),
+		time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC), 0, 100,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.BeforeRange || len(page.Filings) != 1 || page.Filings[0].FilerName != "Valid" {
+		t.Fatalf("page = %+v", page)
+	}
+}
+
 func TestParseOGEPDFReconstructsRows(t *testing.T) {
 	filing := OGEFiling{ExternalID: "oge-test", ReportType: "periodic_transaction", FilingDate: time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)}
 	report := ParseOGEPDF(filing, []byte("pdf"), []PageText{{Number: 2, Boxes: []TextBox{{Text: "07/01/2026", Left: 1, Top: 10}, {Text: "Purchase", Left: 80, Top: 10}, {Text: "Acme Corp (ACME)", Left: 140, Top: 10}, {Text: "$1,001 - $15,000", Left: 260, Top: 10}}}})

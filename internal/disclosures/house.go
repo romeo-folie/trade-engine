@@ -77,6 +77,8 @@ type HouseClient struct {
 	pacer        requestPacer
 }
 
+const maxHouseResponseSize = 25 << 20
+
 func (c *HouseClient) FetchIndex(ctx context.Context, year int) ([]HouseFiling, error) {
 	endpoint := strings.TrimRight(c.BaseURL, "/") +
 		fmt.Sprintf("/financial-pdfs/%dFD.txt", year)
@@ -112,7 +114,17 @@ func (c *HouseClient) get(ctx context.Context, endpoint string) ([]byte, error) 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("GET %s: HTTP %s", endpoint, resp.Status)
 	}
-	return io.ReadAll(io.LimitReader(resp.Body, 25<<20))
+	if resp.ContentLength > maxHouseResponseSize {
+		return nil, fmt.Errorf("GET %s: response exceeds %d-byte limit", endpoint, maxHouseResponseSize)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxHouseResponseSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxHouseResponseSize {
+		return nil, fmt.Errorf("GET %s: response exceeds %d-byte limit", endpoint, maxHouseResponseSize)
+	}
+	return body, nil
 }
 
 func ParseHousePTR(filing HouseFiling, documentURL string, pdfData []byte, pages []PageText) Report {

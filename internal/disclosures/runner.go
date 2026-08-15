@@ -138,28 +138,27 @@ func (r *Runner) SyncRange(
 	if limit <= 0 {
 		return result, fmt.Errorf("disclosure sync limit must be positive")
 	}
-	remaining := limit
+	budgets := distributeSyncBudget(limit,
+		r.House != nil, r.Senate != nil, r.OGE != nil,
+	)
 	var failures []error
-	if r.House != nil && remaining > 0 {
-		processed, err := r.syncHouse(ctx, since, until, remaining)
+	if budgets[0] > 0 {
+		processed, err := r.syncHouse(ctx, since, until, budgets[0])
 		result.HouseProcessed = processed
-		remaining -= processed
 		if err != nil {
 			failures = append(failures, err)
 		}
 	}
-	if r.Senate != nil && remaining > 0 {
-		processed, err := r.syncSenate(ctx, since, until, remaining)
+	if budgets[1] > 0 {
+		processed, err := r.syncSenate(ctx, since, until, budgets[1])
 		result.SenateProcessed = processed
-		remaining -= processed
 		if err != nil {
 			failures = append(failures, err)
 		}
 	}
-	if r.OGE != nil && remaining > 0 {
-		processed, err := r.syncOGE(ctx, since, until, remaining)
+	if budgets[2] > 0 {
+		processed, err := r.syncOGE(ctx, since, until, budgets[2])
 		result.OGEProcessed = processed
-		remaining -= processed
 		if err != nil {
 			failures = append(failures, err)
 		}
@@ -168,6 +167,33 @@ func (r *Runner) SyncRange(
 		return result, fmt.Errorf("congressional disclosure sync: %v", failures)
 	}
 	return result, nil
+}
+
+// distributeSyncBudget partitions the cross-source limit so one source cannot
+// consume all capacity while another enabled source has pending filings.
+func distributeSyncBudget(limit int, enabled ...bool) []int {
+	budgets := make([]int, len(enabled))
+	enabledCount := 0
+	for _, isEnabled := range enabled {
+		if isEnabled {
+			enabledCount++
+		}
+	}
+	if enabledCount == 0 {
+		return budgets
+	}
+	share, remainder := limit/enabledCount, limit%enabledCount
+	for index, isEnabled := range enabled {
+		if !isEnabled {
+			continue
+		}
+		budgets[index] = share
+		if remainder > 0 {
+			budgets[index]++
+			remainder--
+		}
+	}
+	return budgets
 }
 
 func (r *Runner) syncHouse(

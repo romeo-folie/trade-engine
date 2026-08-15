@@ -118,9 +118,11 @@ func (c *OGEClient) ListFilingsPage(ctx context.Context, since, until time.Time,
 		if link == "" {
 			continue
 		}
-		d, _ := time.Parse("2006-01-02T15:04:05", row.DocDate)
-		if d.IsZero() {
-			d, _ = time.Parse("2006-01-02", row.DocDate)
+		d, ok := parseOGEFilingDate(row.DocDate)
+		if !ok {
+			// A malformed row must not masquerade as an old filing and stop
+			// pagination before later valid rows are inspected.
+			continue
 		}
 		filingDay := disclosureCalendarDay(d)
 		if filingDay.Before(disclosureCalendarDay(since)) {
@@ -135,6 +137,20 @@ func (c *OGEClient) ListFilingsPage(ctx context.Context, since, until time.Time,
 		out = append(out, OGEFiling{ExternalID: "oge-" + hex.EncodeToString(sum[:8]), FilerName: html.UnescapeString(row.Name), Office: strings.Trim(strings.Join([]string{row.Title, row.Agency}, " — "), " —"), ReportType: normalizeOGEReportType(row.Type), FilingDate: d, DocumentURL: link, RawMetadata: meta})
 	}
 	return OGEFilingPage{Filings: out, RowCount: len(raw.Data), Total: raw.RecordsTotal, BeforeRange: beforeRange}, nil
+}
+
+func parseOGEFilingDate(value string) (time.Time, bool) {
+	for _, layout := range []string{
+		time.RFC3339Nano,
+		"2006-01-02T15:04:05",
+		"2006-01-02",
+	} {
+		parsed, err := time.Parse(layout, strings.TrimSpace(value))
+		if err == nil {
+			return parsed, true
+		}
+	}
+	return time.Time{}, false
 }
 
 func disclosureCalendarDay(value time.Time) time.Time {

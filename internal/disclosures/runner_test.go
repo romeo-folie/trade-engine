@@ -2,11 +2,33 @@ package disclosures
 
 import (
 	"context"
+	"reflect"
 	"testing"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/config"
 )
+
+func TestDistributeSyncBudgetReservesCapacityForEnabledSources(t *testing.T) {
+	tests := []struct {
+		name    string
+		limit   int
+		enabled []bool
+		want    []int
+	}{
+		{name: "all sources", limit: 8, enabled: []bool{true, true, true}, want: []int{3, 3, 2}},
+		{name: "two sources", limit: 5, enabled: []bool{true, false, true}, want: []int{3, 0, 2}},
+		{name: "single source", limit: 4, enabled: []bool{false, true, false}, want: []int{0, 4, 0}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := distributeSyncBudget(test.limit, test.enabled...)
+			if !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("budgets = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
 
 func TestSenateSyncSkipsTerminalFailureWithoutConsumingBudget(t *testing.T) {
 	client, err := NewSenateClient("https://efdsearch.senate.gov", time.Second)

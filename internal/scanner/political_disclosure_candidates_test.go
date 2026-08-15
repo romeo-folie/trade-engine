@@ -63,7 +63,9 @@ func TestStandaloneDisclosurePromptDoesNotInventMarketData(t *testing.T) {
 }
 
 func TestHydratePoliticalDisclosureMarketData(t *testing.T) {
-	daily := data.Candle{Close: 25, Volume: 100_000}
+	// DailyBar is the still-open session and must not be used for a terminal
+	// liquidity decision; PreviousDailyBar is the completed-session evidence.
+	daily := data.Candle{Close: 25, Volume: 100}
 	previous := data.Candle{Close: 20, Volume: 90_000}
 	scanner := &MarketScanner{
 		StockAssets: politicalAssetProvider{assets: []data.StockAsset{{
@@ -84,8 +86,8 @@ func TestHydratePoliticalDisclosureMarketData(t *testing.T) {
 		PoliticalDisclosureEvidence:       "two filings", PoliticalDisclosureScore: .8,
 	}
 	got := scanner.hydratePoliticalDisclosureMarketData(context.Background(), []SwingCandidate{candidate})
-	if len(got) != 1 || got[0].Price != 25 || got[0].Volume != 100_000 ||
-		got[0].DollarVolume != 2_500_000 || got[0].ChangePct != 25 {
+	if len(got) != 1 || got[0].Price != 25 || got[0].Volume != 90_000 ||
+		got[0].DollarVolume != 1_800_000 || got[0].ChangePct != 25 {
 		t.Fatalf("hydrated = %+v", got)
 	}
 	claims := scannerSourcePromotionClaims(got[0])
@@ -97,6 +99,19 @@ func TestHydratePoliticalDisclosureMarketData(t *testing.T) {
 	bad.Ticker = "IRA"
 	if got := scanner.hydratePoliticalDisclosureMarketData(context.Background(), []SwingCandidate{bad}); len(got) != 0 {
 		t.Fatalf("non-tradeable standalone candidate survived: %+v", got)
+	}
+
+	missingCompletedSession := candidate
+	scanner.StockSnapshots = politicalSnapshotProvider{result: data.StockSnapshotBatchResult{
+		Snapshots: map[string]data.StockSnapshotEvidence{
+			"GOOD": {Symbol: "GOOD", LatestTradePrice: 25, DailyBar: &daily},
+		},
+		Failures: map[string]error{},
+	}}
+	if got := scanner.hydratePoliticalDisclosureMarketData(
+		context.Background(), []SwingCandidate{missingCompletedSession},
+	); len(got) != 0 {
+		t.Fatalf("candidate without completed-session liquidity survived: %+v", got)
 	}
 }
 

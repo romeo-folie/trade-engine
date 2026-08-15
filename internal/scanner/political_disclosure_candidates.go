@@ -256,9 +256,20 @@ func (s *MarketScanner) hydratePoliticalDisclosureMarketData(
 				"political disclosure symbol has no current market snapshot")
 			continue
 		}
+		if snapshot.PreviousDailyBar == nil ||
+			snapshot.PreviousDailyBar.Close <= 0 ||
+			snapshot.PreviousDailyBar.Volume <= 0 {
+			s.releasePoliticalDisclosureMarketData(ctx, candidate,
+				"political disclosure completed-session liquidity is unavailable")
+			continue
+		}
 		hydratePoliticalSnapshot(&candidate, snapshot)
-		if candidate.Price <= 0 || candidate.Volume <= 0 ||
-			candidate.DollarVolume < pullbackMinDollarVolume {
+		if candidate.Price <= 0 {
+			s.releasePoliticalDisclosureMarketData(ctx, candidate,
+				"political disclosure current price is unavailable")
+			continue
+		}
+		if candidate.DollarVolume < pullbackMinDollarVolume {
 			s.rejectPoliticalDisclosureMarketData(ctx, candidate, fmt.Sprintf(
 				"political disclosure market evidence failed liquidity gate: price=%.4f volume=%d dollar_volume=%.2f minimum=%.2f",
 				candidate.Price, candidate.Volume, candidate.DollarVolume,
@@ -279,24 +290,15 @@ func hydratePoliticalSnapshot(candidate *SwingCandidate, snapshot data.StockSnap
 	if price <= 0 && snapshot.DailyBar != nil {
 		price = snapshot.DailyBar.Close
 	}
-	volume := int64(0)
-	if snapshot.DailyBar != nil {
-		volume = snapshot.DailyBar.Volume
-	}
-	if volume <= 0 && snapshot.PreviousDailyBar != nil {
-		volume = snapshot.PreviousDailyBar.Volume
-	}
 	if price > 0 {
 		candidate.Price = price
 	}
-	if volume > 0 {
-		candidate.Volume = volume
+	if snapshot.PreviousDailyBar != nil {
+		candidate.Volume = snapshot.PreviousDailyBar.Volume
+		candidate.DollarVolume = snapshot.PreviousDailyBar.Close *
+			float64(snapshot.PreviousDailyBar.Volume)
 	}
-	if candidate.Price > 0 && candidate.Volume > 0 {
-		candidate.DollarVolume = candidate.Price * float64(candidate.Volume)
-	}
-	if snapshot.PreviousDailyBar != nil && snapshot.PreviousDailyBar.Close > 0 &&
-		candidate.Price > 0 {
+	if snapshot.PreviousDailyBar != nil && snapshot.PreviousDailyBar.Close > 0 && candidate.Price > 0 {
 		candidate.ChangePct = (candidate.Price/snapshot.PreviousDailyBar.Close - 1) * 100
 	}
 }
