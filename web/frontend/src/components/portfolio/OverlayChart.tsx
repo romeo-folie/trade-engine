@@ -19,6 +19,7 @@ import {
   CartesianGrid,
   ResponsiveContainer,
   Tooltip,
+  type TooltipProps,
 } from 'recharts';
 import { TOKENS } from '../../styles/tokens';
 import { paddedEquityDomain } from './equityDomain';
@@ -95,12 +96,11 @@ function equityDomain(
   return paddedEquityDomain(vals);
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function CustomTooltip({ active, payload, label }: any) {
+function CustomTooltip({ active, payload, label }: TooltipProps<number, string>) {
   if (!active || !payload?.length) return null;
 
-  const alpacaEntry = payload.find((p: any) => p.dataKey === 'alpaca');
-  const teEntry     = payload.find((p: any) => p.dataKey === 'te');
+  const alpacaEntry = payload.find(p => p.dataKey === 'alpaca');
+  const teEntry     = payload.find(p => p.dataKey === 'te');
   const alpacaVal   = alpacaEntry?.value as number | undefined;
   const teVal       = teEntry?.value as number | undefined;
   const delta       = alpacaVal != null && teVal != null ? alpacaVal - teVal : null;

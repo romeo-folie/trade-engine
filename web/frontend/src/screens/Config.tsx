@@ -155,11 +155,11 @@ export default function ConfigScreen() {
         
         setConfig(mapped);
         savedRef.current = { ...mapped };
-      } catch (err) {
+      } catch {
         showToast('Failed to load system config.');
       }
     }
-    loadConfig();
+    void loadConfig();
   }, [showToast]);
 
   const handleSave = useCallback(async () => {
@@ -212,7 +212,7 @@ export default function ConfigScreen() {
       } else {
         showToast('Failed to persist configuration.');
       }
-    } catch (e) {
+    } catch {
       showToast('Connection error failed to save.');
     } finally {
       setIsSaving(false);
@@ -313,7 +313,7 @@ export default function ConfigScreen() {
                   value={rawInput.initialCapital ?? formatNumber(config.initialCapital)}
                   onFocus={() => setRawInput((prev) => ({ ...prev, initialCapital: String(config.initialCapital) }))}
                   onChange={(e) => setRawInput((prev) => ({ ...prev, initialCapital: e.target.value }))}
-                  onBlur={() => { set('initialCapital', parseFormattedNumber(rawInput.initialCapital ?? '')); setRawInput((prev) => { const { initialCapital: _, ...rest } = prev; return rest; }); }}
+                  onBlur={() => { set('initialCapital', parseFormattedNumber(rawInput.initialCapital ?? '')); setRawInput((prev) => { const next = { ...prev }; delete next.initialCapital; return next; }); }}
                 />
               </div>
             </div>
@@ -441,7 +441,7 @@ export default function ConfigScreen() {
                   value={rawInput.dailyTokenBudget ?? formatNumber(config.dailyTokenBudget)}
                   onFocus={() => setRawInput((prev) => ({ ...prev, dailyTokenBudget: String(config.dailyTokenBudget) }))}
                   onChange={(e) => setRawInput((prev) => ({ ...prev, dailyTokenBudget: e.target.value }))}
-                  onBlur={() => { set('dailyTokenBudget', parseFormattedNumber(rawInput.dailyTokenBudget ?? '')); setRawInput((prev) => { const { dailyTokenBudget: _, ...rest } = prev; return rest; }); }}
+                  onBlur={() => { set('dailyTokenBudget', parseFormattedNumber(rawInput.dailyTokenBudget ?? '')); setRawInput((prev) => { const next = { ...prev }; delete next.dailyTokenBudget; return next; }); }}
                 />
               </div>
             </div>
@@ -453,7 +453,7 @@ export default function ConfigScreen() {
                   value={rawInput.weeklyTokenBudget ?? formatNumber(config.weeklyTokenBudget)}
                   onFocus={() => setRawInput((prev) => ({ ...prev, weeklyTokenBudget: String(config.weeklyTokenBudget) }))}
                   onChange={(e) => setRawInput((prev) => ({ ...prev, weeklyTokenBudget: e.target.value }))}
-                  onBlur={() => { set('weeklyTokenBudget', parseFormattedNumber(rawInput.weeklyTokenBudget ?? '')); setRawInput((prev) => { const { weeklyTokenBudget: _, ...rest } = prev; return rest; }); }}
+                  onBlur={() => { set('weeklyTokenBudget', parseFormattedNumber(rawInput.weeklyTokenBudget ?? '')); setRawInput((prev) => { const next = { ...prev }; delete next.weeklyTokenBudget; return next; }); }}
                 />
               </div>
             </div>
@@ -550,7 +550,7 @@ export default function ConfigScreen() {
         </button>
         <button
           type="button"
-          onClick={isSaving ? undefined : handleSave}
+          onClick={isSaving ? undefined : () => { void handleSave(); }}
           className={styles.saveBtn}
           style={{ 
             opacity: isSaving ? 0.5 : 1, 
@@ -584,7 +584,7 @@ export default function ConfigScreen() {
               <button
                 type="button"
                 className={styles.confirmBtn}
-                onClick={handleRestart}
+                onClick={() => { void handleRestart(); }}
               >
                 Confirm Restart
               </button>

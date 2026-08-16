@@ -115,7 +115,7 @@ export function ChamferedBox({
         width: '100%', 
         height: '100%',
         display: centerContent ? 'flex' : (style?.display?.includes('flex') ? style.display : undefined),
-        flexDirection: style?.flexDirection as any || (centerContent ? 'row' : (style?.display?.includes('flex') ? 'row' : undefined)),
+        flexDirection: style?.flexDirection || (centerContent ? 'row' : (style?.display?.includes('flex') ? 'row' : undefined)),
         alignItems: style?.alignItems || (centerContent ? 'center' : (style?.display?.includes('flex') ? 'center' : undefined)),
         justifyContent: style?.justifyContent || (centerContent ? 'center' : (style?.display?.includes('flex') ? 'center' : undefined)),
       }}>

@@ -626,8 +626,8 @@ export default function HubGraph({ nodes, topology, nodeMetrics, recentEventSign
         onNodeClick={handleNodeClick}
         onViewportChange={handleViewportChange}
         onInit={(instance) => {
-          setViewportRef.current = instance.setViewport;
-          fitViewRef.current = instance.fitView;
+          setViewportRef.current = (viewport) => { void instance.setViewport(viewport); };
+          fitViewRef.current = (options) => { void instance.fitView(options); };
         }}
         nodeTypes={NODE_TYPES}
         edgeTypes={EDGE_TYPES}

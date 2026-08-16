@@ -16,7 +16,7 @@ import { useEngineSocketContext } from '../contexts/EngineSocketContext';
 import { TOKENS } from '../styles/tokens';
 import KpiCard from '../components/portfolio/KpiCard';
 import OverlayChart, { ChartMode } from '../components/portfolio/OverlayChart';
-import PositionsTable from '../components/portfolio/PositionsTable';
+import PositionsTable, { type Position } from '../components/portfolio/PositionsTable';
 import DailyCountersCard from '../components/portfolio/DailyCountersCard';
 import ErrorBoundary from '../components/ErrorBoundary';
 import styles from './Portfolio.module.css';
@@ -165,7 +165,7 @@ export default function PortfolioScreen() {
   const { data: summariesData,     error: summariesError } = useSWR<{ summaries?: DailySummary[] }>('/api/portfolio/summaries?limit=7', jsonFetcher, swrOpts);
   const summaries = useMemo(() => summariesData?.summaries ?? [], [summariesData]);
   const { data: stats = null,      error: statsError }     = useSWR<PortfolioStats>('/api/portfolio/stats', jsonFetcher, swrOpts);
-  const { data: positionsData,     error: positionsError } = useSWR<{ positions?: any[] }>('/api/portfolio/positions', jsonFetcher, swrOpts);
+  const { data: positionsData,     error: positionsError } = useSWR<{ positions?: Position[] }>('/api/portfolio/positions', jsonFetcher, swrOpts);
   const positions = useMemo(() => positionsData?.positions ?? [], [positionsData]);
   // Surface ANY failing endpoint so the alert banner + chart placeholder
   // reflect a real error state (not just positions). Mirrors the prior

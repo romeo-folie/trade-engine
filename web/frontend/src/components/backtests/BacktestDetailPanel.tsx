@@ -72,7 +72,6 @@ export default function BacktestDetailPanel({ run, onClose }: BacktestDetailPane
     return () => controller.abort();
   // Depend only on run.ID — the object reference changes on every parent render
   // (BacktestsScreen re-renders on its 30s poll), which would cause repeated fetches.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [run.ID]);
 
   const handleKey = useCallback((e: KeyboardEvent) => {

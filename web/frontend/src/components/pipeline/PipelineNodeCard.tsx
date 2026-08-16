@@ -53,7 +53,7 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
     if (!d.lastEventAt) return false;
     const ms = typeof d.lastEventAt === 'string' ? new Date(d.lastEventAt).getTime() : d.lastEventAt;
     return Date.now() - ms < 5_000;
-  }, [d.lastEventAt, d.kind, d.nodeId, d.lastTrade, d.portfolioState]);
+  }, [d.allRiskPassed, d.lastEventAt, d.kind, d.nodeId, d.lastTrade, d.portfolioState]);
 
   const statusDot = useMemo(() => {
     if (!d.lastEventAt) return styles.dotGrey;
@@ -639,6 +639,11 @@ interface WatchlistMarqueeProps {
 }
 
 function WatchlistMarquee({ tickers }: WatchlistMarqueeProps) {
+  // These are cheap derivations; memoizing them previously put Hooks after the
+  // empty-state early return and violated the Rules of Hooks.
+  const items = [...tickers, ...tickers];
+  const duration = Math.max(tickers.length * 2.5, 10);
+
   if (tickers.length === 0) {
     return (
       <div className={styles.tickerPillsWrapper}>
@@ -647,11 +652,6 @@ function WatchlistMarquee({ tickers }: WatchlistMarqueeProps) {
       </div>
     );
   }
-
-  // Duplicate for seamless 50% loop
-  const items = useMemo(() => [...tickers, ...tickers], [tickers]);
-  // Speed — scale duration by set length (e.g. 2.5s per ticker)
-  const duration = useMemo(() => Math.max(tickers.length * 2.5, 10), [tickers.length]);
 
   return (
     <div className={styles.tickerPillsWrapper}>
