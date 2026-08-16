@@ -304,7 +304,7 @@ export default function SignalsScreen() {
       <span className={styles.footerCount}>SHOWING {signals.length}</span>
       <button
         className={styles.loadMoreBtn}
-        onClick={handleLoadMore}
+        onClick={() => { void handleLoadMore(); }}
         disabled={!nextCursor || isLoadingMore}
       >
         {isLoadingMore ? 'LOADING…' : nextCursor ? 'LOAD MORE' : 'ALL LOADED'}

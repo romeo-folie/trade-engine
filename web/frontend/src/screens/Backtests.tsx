@@ -108,7 +108,7 @@ export default function BacktestsScreen() {
       }
     }
 
-    load();
+    void load();
     return () => { fetchControllerRef.current?.abort(); };
   }, []);
 
