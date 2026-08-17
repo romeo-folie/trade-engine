@@ -39,7 +39,7 @@ func ParseHouseIndex(data []byte) ([]HouseFiling, error) {
 	reader.LazyQuotes = true
 	records, err := reader.ReadAll()
 	if err != nil {
-		return nil, fmt.Errorf("parse House filing index: %w", err)
+		return nil, fmt.Errorf("parse house filing index: %w", err)
 	}
 	if len(records) == 0 {
 		return nil, nil
@@ -47,18 +47,18 @@ func ParseHouseIndex(data []byte) ([]HouseFiling, error) {
 	var out []HouseFiling
 	for rowIndex, row := range records[1:] {
 		if len(row) < 9 {
-			return nil, fmt.Errorf("House filing index row %d has %d fields", rowIndex+2, len(row))
+			return nil, fmt.Errorf("house filing index row %d has %d fields", rowIndex+2, len(row))
 		}
 		if strings.TrimSpace(row[4]) != "P" {
 			continue
 		}
 		year, err := strconv.Atoi(strings.TrimSpace(row[6]))
 		if err != nil {
-			return nil, fmt.Errorf("House filing index row %d year: %w", rowIndex+2, err)
+			return nil, fmt.Errorf("house filing index row %d year: %w", rowIndex+2, err)
 		}
 		filedAt, err := parseDate(row[7])
 		if err != nil {
-			return nil, fmt.Errorf("House filing index row %d date: %w", rowIndex+2, err)
+			return nil, fmt.Errorf("house filing index row %d date: %w", rowIndex+2, err)
 		}
 		out = append(out, HouseFiling{
 			Prefix: strings.TrimSpace(row[0]), Last: strings.TrimSpace(row[1]),

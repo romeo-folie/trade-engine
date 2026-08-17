@@ -46,7 +46,7 @@ func ParseSenateBrowserCookies(data []byte) ([]*http.Cookie, error) {
 func ParseSenateBrowserSession(data []byte) (SenateBrowserSession, error) {
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) == 0 {
-		return SenateBrowserSession{}, fmt.Errorf("Senate browser session file is empty")
+		return SenateBrowserSession{}, fmt.Errorf("senate browser session file is empty")
 	}
 	if trimmed[0] == '[' || trimmed[0] == '{' {
 		cookies, err := parseSenateJSONCookies(trimmed)
@@ -204,7 +204,7 @@ func validateSenateBrowserCookies(cookies []*http.Cookie) ([]*http.Cookie, error
 		}
 	}
 	if !csrf || !session {
-		return nil, fmt.Errorf("Senate cookie file must contain csrftoken and sessionid")
+		return nil, fmt.Errorf("senate cookie file must contain csrftoken and sessionid")
 	}
 	return cookies, nil
 }
@@ -213,7 +213,7 @@ func (c *SenateClient) ImportBrowserSession(
 	cookies []*http.Cookie, userAgent string,
 ) error {
 	if c == nil || c.HTTP == nil || c.HTTP.Jar == nil {
-		return fmt.Errorf("Senate client cookie jar is unavailable")
+		return fmt.Errorf("senate client cookie jar is unavailable")
 	}
 	if _, err := validateSenateBrowserCookies(cookies); err != nil {
 		return err
@@ -232,7 +232,7 @@ func (c *SenateClient) ImportBrowserSession(
 	c.UserAgent = strings.TrimSpace(userAgent)
 	c.UseImportedSession = true
 	if c.csrfCookie() == "" || c.sessionCookie() == "" {
-		return fmt.Errorf("Senate browser cookies were rejected by the cookie jar")
+		return fmt.Errorf("senate browser cookies were rejected by the cookie jar")
 	}
 	return nil
 }

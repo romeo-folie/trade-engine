@@ -3,6 +3,7 @@ package disclosures
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	stdhtml "html"
 	"io"
@@ -17,9 +18,28 @@ import (
 	"golang.org/x/net/html"
 )
 
+// SenateSourceBlockedError means the source needs explicit browser
+// authorization. It is deliberately distinct from a transient document error.
+type SenateSourceBlockedError struct{ Err error }
+
+func (e *SenateSourceBlockedError) Error() string { return "Senate source blocked: " + e.Err.Error() }
+func (e *SenateSourceBlockedError) Unwrap() error { return e.Err }
+func senateSourceBlocked(err error) error {
+	if errors.Is(err, ErrSenateAuthorizationRequired) {
+		return &SenateSourceBlockedError{Err: ErrSenateAuthorizationRequired}
+	}
+	return err
+}
+
 var (
 	senatePTRLinkPattern = regexp.MustCompile(`(?i)href=["']([^"']*/search/view/ptr/([^/"']+)/?)["']`)
 	dateInTextPattern    = regexp.MustCompile(`\b\d{2}/\d{2}/\d{4}\b`)
+)
+
+const (
+	maxSenateAgreementResponseSize = 2 << 20
+	maxSenateSearchResponseSize    = 10 << 20
+	maxSenatePTRResponseSize       = 10 << 20
 )
 
 type SenateFiling struct {
@@ -86,7 +106,7 @@ func (c *SenateClient) searchPTRsHTTP(
 	if c.UseImportedSession {
 		token = c.csrfCookie()
 		if token == "" {
-			return nil, fmt.Errorf("imported Senate session has no CSRF cookie")
+			return nil, &SenateSourceBlockedError{Err: ErrSenateAuthorizationRequired}
 		}
 	} else {
 		token, err = c.acceptAgreement(ctx)
@@ -145,20 +165,16 @@ func parseSenateSearchPage(baseURL string, body []byte) (SenateFilingPage, error
 	}
 	filings := make([]SenateFiling, 0, len(response.Data))
 	if len(response.Data) > 0 {
-		parsed := 0
-		for _, row := range response.Data {
+		for index, row := range response.Data {
 			cells := make([]string, 0, len(row))
 			for _, value := range row {
 				cells = append(cells, fmt.Sprint(value))
 			}
 			filing, ok := parseSenateSearchRow(baseURL, cells)
-			if ok {
-				filings = append(filings, filing)
-				parsed++
+			if !ok {
+				return SenateFilingPage{}, fmt.Errorf("senate eFD search row %d did not match the expected filing shape", index+1)
 			}
-		}
-		if parsed == 0 {
-			return SenateFilingPage{}, fmt.Errorf("Senate eFD returned %d rows but none matched the expected filing shape", len(response.Data))
+			filings = append(filings, filing)
 		}
 	}
 	return SenateFilingPage{Filings: filings, RowCount: len(response.Data), Total: response.RecordsFiltered}, nil
@@ -195,9 +211,9 @@ func (c *SenateClient) FetchPTR(ctx context.Context, filing SenateFiling) (Repor
 	}
 	if resp.Request != nil && resp.Request.URL != nil &&
 		resp.Request.URL.Path == "/search/home/" {
-		return Report{}, fmt.Errorf("Senate eFD session expired while fetching PTR")
+		return Report{}, &SenateSourceBlockedError{Err: ErrSenateAuthorizationRequired}
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+	body, err := readBoundedSenateResponse(resp.Body, resp.ContentLength, maxSenatePTRResponseSize, "PTR")
 	if err != nil {
 		return Report{}, err
 	}
@@ -229,7 +245,7 @@ func (c *SenateClient) acceptAgreement(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	body, readErr := readBoundedSenateResponse(resp.Body, resp.ContentLength, maxSenateAgreementResponseSize, "agreement")
 	resp.Body.Close()
 	if readErr != nil {
 		return "", readErr
@@ -239,7 +255,7 @@ func (c *SenateClient) acceptAgreement(ctx context.Context) (string, error) {
 	}
 	token := csrfToken(body)
 	if token == "" {
-		return "", fmt.Errorf("Senate eFD agreement did not contain a CSRF token")
+		return "", &SenateSourceBlockedError{Err: ErrSenateAuthorizationRequired}
 	}
 	_, err = c.postForm(ctx, homeURL, url.Values{
 		"csrfmiddlewaretoken":   {token},
@@ -287,9 +303,23 @@ func (c *SenateClient) postForm(
 	}
 	if !strings.HasSuffix(endpoint, "/search/home/") && resp.Request != nil &&
 		resp.Request.URL != nil && resp.Request.URL.Path == "/search/home/" {
-		return nil, fmt.Errorf("Senate eFD session expired while posting search")
+		return nil, &SenateSourceBlockedError{Err: ErrSenateAuthorizationRequired}
 	}
-	return io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+	return readBoundedSenateResponse(resp.Body, resp.ContentLength, maxSenateSearchResponseSize, "search")
+}
+
+func readBoundedSenateResponse(body io.Reader, contentLength int64, limit int, resource string) ([]byte, error) {
+	if contentLength > int64(limit) {
+		return nil, fmt.Errorf("senate eFD %s response exceeds %d-byte limit", resource, limit)
+	}
+	data, err := io.ReadAll(io.LimitReader(body, int64(limit)+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > limit {
+		return nil, fmt.Errorf("senate eFD %s response exceeds %d-byte limit", resource, limit)
+	}
+	return data, nil
 }
 
 func (c *SenateClient) csrfCookie() string {
@@ -386,7 +416,10 @@ func ParseSenatePTR(filing SenateFiling, body []byte) (Report, error) {
 	if err != nil {
 		return Report{}, fmt.Errorf("parse Senate PTR HTML: %w", err)
 	}
-	transactions := senateTransactions(document)
+	transactions, parseErr := senateTransactions(document)
+	if parseErr != nil {
+		return Report{}, parseErr
+	}
 	report := Report{
 		Source: "senate", ExternalID: filing.ExternalID, Chamber: "senate",
 		FilerName: filing.FilerName, Office: filing.Office,
@@ -401,63 +434,125 @@ func ParseSenatePTR(filing SenateFiling, body []byte) (Report, error) {
 	return report, nil
 }
 
-func senateTransactions(document *html.Node) []Transaction {
-	for _, table := range htmlTables(document) {
-		if len(table) < 2 {
-			continue
-		}
-		headers := make(map[string]int)
-		for index, value := range table[0] {
-			headers[normalizeHeader(value)] = index
-		}
-		assetIndex := headerIndex(headers, "asset name", "asset")
-		transactionIndex := headerIndex(headers, "transaction type", "type")
-		dateIndex := headerIndex(headers, "transaction date", "date")
-		amountIndex := headerIndex(headers, "amount")
-		if assetIndex < 0 || transactionIndex < 0 || dateIndex < 0 || amountIndex < 0 {
-			continue
-		}
-		ownerIndex := headerIndex(headers, "owner")
-		tickerIndex := headerIndex(headers, "ticker")
-		commentIndex := headerIndex(headers, "comment")
-		assetTypeIndex := headerIndex(headers, "asset type")
-		var out []Transaction
-		for _, row := range table[1:] {
-			asset, ok := cell(row, assetIndex)
-			if !ok || strings.TrimSpace(asset) == "" {
-				continue
-			}
-			dateText, ok := cell(row, dateIndex)
-			if !ok {
-				continue
-			}
-			transactionDate, err := parseDate(dateInTextPattern.FindString(dateText))
-			if err != nil {
-				continue
-			}
-			amount, _ := cell(row, amountIndex)
-			minimum, maximum := parseAmount(amount)
-			ticker, _ := cell(row, tickerIndex)
-			ticker = sanitizeSenateTicker(ticker)
-			if ticker == "" {
-				ticker = tickerFromAsset(asset)
-			}
-			owner, _ := cell(row, ownerIndex)
-			assetType, _ := cell(row, assetTypeIndex)
-			transactionType, _ := cell(row, transactionIndex)
-			comment, _ := cell(row, commentIndex)
-			raw, _ := json.Marshal(row)
-			out = append(out, Transaction{
-				Ordinal: len(out) + 1, Owner: owner, AssetName: asset,
-				Ticker: strings.ToUpper(strings.TrimSpace(ticker)), AssetType: assetType,
-				TransactionType: normalizeTransactionType(transactionType),
-				TransactionDate: transactionDate, AmountMin: minimum, AmountMax: maximum,
-				AmountText: amount, Comment: comment, RawData: raw,
-			})
-		}
-		return out
+func senateTransactions(document *html.Node) ([]Transaction, error) {
+	type canonicalTable struct {
+		number int
+		rows   [][]string
+		index  map[string]int
 	}
-	return nil
+	var canonical []canonicalTable
+	for tableNumber, table := range htmlTables(document) {
+		if len(table) == 0 {
+			continue
+		}
+		indexes := senateRequiredHeaderIndexes(table[0])
+		if indexes == nil {
+			continue
+		}
+		canonical = append(canonical, canonicalTable{number: tableNumber + 1, rows: table, index: indexes})
+	}
+	if len(canonical) == 0 {
+		return nil, fmt.Errorf("senate PTR has no canonical transaction table")
+	}
+	if len(canonical) != 1 {
+		return nil, fmt.Errorf("senate PTR has %d canonical transaction tables", len(canonical))
+	}
+	table := canonical[0]
+	if len(table.rows) == 1 {
+		return nil, nil
+	}
+	optional := senateOptionalHeaderIndexes(table.rows[0])
+	var out []Transaction
+	for rowIndex, row := range table.rows[1:] {
+		context := fmt.Sprintf("table %d row %d", table.number, rowIndex+2)
+		asset, ok := cell(row, table.index["asset"])
+		if !ok || strings.TrimSpace(asset) == "" {
+			return nil, fmt.Errorf("senate PTR has malformed transaction %s: asset is required", context)
+		}
+		dateText, ok := cell(row, table.index["date"])
+		if !ok || strings.TrimSpace(dateText) == "" {
+			return nil, fmt.Errorf("senate PTR has malformed transaction %s: date is required", context)
+		}
+		transactionDate, err := parseDate(dateInTextPattern.FindString(dateText))
+		if err != nil {
+			return nil, fmt.Errorf("senate PTR has malformed transaction %s: invalid date", context)
+		}
+		amount, ok := cell(row, table.index["amount"])
+		if !ok || strings.TrimSpace(amount) == "" {
+			return nil, fmt.Errorf("senate PTR has malformed transaction %s: amount is required", context)
+		}
+		transactionType, ok := cell(row, table.index["type"])
+		transactionType = normalizeTransactionType(transactionType)
+		if !ok || (transactionType != "purchase" && transactionType != "sale" && transactionType != "exchange") {
+			return nil, fmt.Errorf("senate PTR has malformed transaction %s: unknown action %q", context, transactionType)
+		}
+		minimum, maximum := parseAmount(amount)
+		ticker, _ := cell(row, optional["ticker"])
+		ticker = sanitizeSenateTicker(ticker)
+		if ticker == "" {
+			ticker = tickerFromAsset(asset)
+		}
+		owner, _ := cell(row, optional["owner"])
+		assetType, _ := cell(row, optional["asset type"])
+		comment, _ := cell(row, optional["comment"])
+		raw, _ := json.Marshal(row)
+		out = append(out, Transaction{
+			Ordinal: len(out) + 1, Owner: owner, AssetName: asset,
+			Ticker: strings.ToUpper(strings.TrimSpace(ticker)), AssetType: assetType,
+			TransactionType: transactionType,
+			TransactionDate: transactionDate, AmountMin: minimum, AmountMax: maximum,
+			AmountText: amount, Comment: comment, RawData: raw,
+		})
+	}
+	return out, nil
+}
+
+func senateRequiredHeaderIndexes(header []string) map[string]int {
+	required := map[string][]string{
+		"asset":  {"asset name", "asset"},
+		"type":   {"transaction type", "type"},
+		"date":   {"transaction date", "date"},
+		"amount": {"amount"},
+	}
+	indexes := make(map[string]int, len(required))
+	for field, names := range required {
+		for column, value := range header {
+			for _, name := range names {
+				if normalizeHeader(value) == name {
+					if _, duplicate := indexes[field]; duplicate {
+						return nil
+					}
+					indexes[field] = column
+				}
+			}
+		}
+		if _, found := indexes[field]; !found {
+			return nil
+		}
+	}
+	seen := make(map[int]bool, len(indexes))
+	for _, index := range indexes {
+		if seen[index] {
+			return nil
+		}
+		seen[index] = true
+	}
+	return indexes
+}
+
+func senateOptionalHeaderIndexes(header []string) map[string]int {
+	indexes := make(map[string]int)
+	for column, value := range header {
+		name := normalizeHeader(value)
+		for _, field := range []string{"owner", "ticker", "comment", "asset type"} {
+			if name == field {
+				if _, duplicate := indexes[field]; !duplicate {
+					indexes[field] = column
+				}
+			}
+		}
+	}
+	return indexes
 }
 
 func sanitizeSenateTicker(value string) string {
@@ -540,25 +635,6 @@ func stripHTML(value string) string {
 
 func normalizeHeader(value string) string {
 	return strings.ToLower(strings.Join(strings.Fields(value), " "))
-}
-
-func headerIndex(headers map[string]int, names ...string) int {
-	// Prefer exact labels across every synonym before considering substring
-	// matches. Otherwise the live Senate "Type" column can randomly resolve to
-	// "Asset Type" because Go map iteration order is intentionally unstable.
-	for _, name := range names {
-		if index, ok := headers[name]; ok {
-			return index
-		}
-	}
-	for _, name := range names {
-		for header, index := range headers {
-			if strings.Contains(header, name) {
-				return index
-			}
-		}
-	}
-	return -1
 }
 
 func cell(row []string, index int) (string, bool) {

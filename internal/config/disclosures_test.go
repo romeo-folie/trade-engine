@@ -59,6 +59,36 @@ func TestValidateDisclosureBudgetCoversEnabledSources(t *testing.T) {
 	}
 }
 
+func TestValidateDisclosuresConfigReportsInvalidEnabledSettingsDeterministically(t *testing.T) {
+	cfg := Defaults().Disclosures
+	cfg.Enabled = true
+	cfg.AcknowledgeUseRestrictions = false
+	cfg.RequestTimeoutSeconds = 0
+	cfg.House.BaseURL = ""
+	cfg.House.RequestDelayMilliseconds = -1
+	got := ValidateDisclosuresConfig(cfg)
+	want := []string{
+		"disclosures.acknowledge_use_restrictions must be true",
+		"disclosures.request_timeout_seconds must be a safe positive duration",
+		"disclosures.house.base_url must not be blank",
+		"disclosures.house.request_delay_milliseconds must be >= 0",
+	}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("errors=%v, want %v", got, want)
+	}
+}
+
+func TestValidateDisclosuresConfigRejectsOverflowingRequestDelay(t *testing.T) {
+	cfg := Defaults().Disclosures
+	cfg.Enabled = true
+	cfg.AcknowledgeUseRestrictions = true
+	cfg.Senate.RequestDelayMilliseconds = int(^uint(0) >> 1)
+	got := ValidateDisclosuresConfig(cfg)
+	if !containsConfigError(got, "disclosures.senate.request_delay_milliseconds must be a safe nonnegative duration") {
+		t.Fatalf("errors=%v", got)
+	}
+}
+
 func containsConfigError(errors []string, part string) bool {
 	for _, err := range errors {
 		if strings.Contains(err, part) {

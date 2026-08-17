@@ -2,6 +2,7 @@ package disclosures
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -54,6 +55,16 @@ func TestParseSenatePTRTable(t *testing.T) {
 	}
 }
 
+func TestParseSenateSearchPageRejectsMixedValidAndMalformedRows(t *testing.T) {
+	page, err := parseSenateSearchPage("https://efdsearch.senate.gov", []byte(`{"recordsFiltered":2,"data":[["Jane","Senator","Office","<a href='/search/view/ptr/valid/'>PTR</a>","03/05/2026"],["broken"]]}`))
+	if err == nil {
+		t.Fatal("mixed valid/malformed Senate page was accepted")
+	}
+	if len(page.Filings) != 0 || page.RowCount != 0 || page.Total != 0 {
+		t.Fatalf("partial page = %+v, want zero value", page)
+	}
+}
+
 func TestSanitizeSenateTicker(t *testing.T) {
 	if got := sanitizeSenateTicker("-- AMCR"); got != "AMCR" {
 		t.Fatalf("ticker = %q", got)
@@ -78,6 +89,25 @@ func TestParseSenatePTRLiveTypeHeaderDoesNotMatchAssetType(t *testing.T) {
 		report.Transactions[0].TransactionType != "purchase" ||
 		report.Transactions[0].AssetType != "Stock" {
 		t.Fatalf("transactions = %+v", report.Transactions)
+	}
+}
+
+func TestParseSenatePTRRejectsMalformedCanonicalTablesAtomically(t *testing.T) {
+	filing := SenateFiling{ExternalID: "strict", FilerName: "Jane Senator", FilingDate: time.Date(2026, 8, 7, 0, 0, 0, 0, time.UTC), DocumentURL: "https://efdsearch.senate.gov/search/view/ptr/strict/"}
+	header := `<tr><th>Asset Name</th><th>Transaction Type</th><th>Transaction Date</th><th>Amount</th></tr>`
+	valid := `<tr><td>Microsoft</td><td>Purchase</td><td>07/23/2026</td><td>$1,001 - $15,000</td></tr>`
+	for name, body := range map[string]string{
+		"blank amount":         `<table>` + header + `<tr><td>Microsoft</td><td>Purchase</td><td>07/23/2026</td><td></td></tr></table>`,
+		"malformed middle row": `<table>` + header + valid + `<tr><td>Apple</td><td>Unknown</td><td>07/24/2026</td><td>$1,001</td></tr>` + valid + `</table>`,
+		"multiple tables":      `<table>` + header + valid + `</table><table>` + header + valid + `</table>`,
+		"duplicate header":     `<table><tr><th>Asset Name</th><th>Asset</th><th>Transaction Type</th><th>Transaction Date</th><th>Amount</th></tr>` + valid + `</table>`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			report, err := ParseSenatePTR(filing, []byte("<html>"+body+"</html>"))
+			if err == nil || len(report.Transactions) != 0 {
+				t.Fatalf("report=%+v err=%v, want atomic parse rejection", report, err)
+			}
+		})
 	}
 }
 
@@ -165,6 +195,46 @@ func TestSenateClientImportedBrowserSessionSkipsConsent(t *testing.T) {
 	if len(filings) != 1 || filings[0].ExternalID != "imported-123" {
 		t.Fatalf("filings = %+v", filings)
 	}
+}
+
+func TestSenateImportedSessionAuthorizationFailuresAreSourceBlocked(t *testing.T) {
+	t.Run("missing csrf", func(t *testing.T) {
+		client, err := NewSenateClient("https://efdsearch.senate.gov", time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		client.UseImportedSession = true
+		home, _ := url.Parse(client.BaseURL)
+		client.HTTP.Jar.SetCookies(home, []*http.Cookie{{Name: "sessionid", Value: "session-value", Path: "/"}})
+		_, err = client.ListPTRs(context.Background(), time.Now().AddDate(0, 0, -1), time.Now(), 1)
+		if !errors.Is(err, ErrSenateAuthorizationRequired) {
+			t.Fatalf("missing csrf error=%v, want source block", err)
+		}
+	})
+	t.Run("search redirect", func(t *testing.T) {
+		client, err := NewSenateClient("https://efdsearch.senate.gov", time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		client.HTTP.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			resp := response(req, http.StatusOK, "", nil)
+			redirected := req.Clone(req.Context())
+			redirected.URL, _ = url.Parse("https://efdsearch.senate.gov/search/home/")
+			resp.Request = redirected
+			return resp, nil
+		})
+		cookies, err := ParseSenateBrowserCookies([]byte(`[{"domain":"efdsearch.senate.gov","name":"csrftoken","value":"csrf","path":"/","secure":true},{"domain":"efdsearch.senate.gov","name":"sessionid","value":"session","path":"/","secure":true}]`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := client.ImportBrowserSession(cookies, "Fixture"); err != nil {
+			t.Fatal(err)
+		}
+		_, err = client.ListPTRs(context.Background(), time.Now().AddDate(0, 0, -1), time.Now(), 1)
+		if !errors.Is(err, ErrSenateAuthorizationRequired) {
+			t.Fatalf("redirect error=%v, want source block", err)
+		}
+	})
 }
 
 func TestSenateClientImportedSessionPagePreservesServerTotal(t *testing.T) {
@@ -260,6 +330,45 @@ func TestSenateFetchPTRRejectsCrossOriginAndRedirectingDocumentURLs(t *testing.T
 		ExternalID: "ok", FilerName: "Fixture", FilingDate: time.Now(), DocumentURL: server.URL + "/search/view/ptr/ok/",
 	}); err != nil {
 		t.Fatalf("FetchPTR trusted document: %v", err)
+	}
+}
+
+func TestSenateFetchPTRRejectsOversizedHTTPResponse(t *testing.T) {
+	client, err := NewSenateClient("https://efdsearch.senate.gov", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.HTTP.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			Status:        "200 OK",
+			ContentLength: maxSenatePTRResponseSize + 1,
+			Request:       req,
+			Header:        make(http.Header),
+			Body:          io.NopCloser(strings.NewReader("not read")),
+		}, nil
+	})
+	_, err = client.FetchPTR(context.Background(), SenateFiling{
+		ExternalID: "oversized", FilerName: "Fixture", FilingDate: time.Now(),
+		DocumentURL: "https://efdsearch.senate.gov/search/view/ptr/oversized/",
+	})
+	if err == nil || !strings.Contains(err.Error(), "response exceeds") {
+		t.Fatalf("FetchPTR error = %v, want size rejection", err)
+	}
+}
+
+func TestReadBoundedSenateResponseAcceptsExactLimit(t *testing.T) {
+	body := strings.Repeat("x", maxSenatePTRResponseSize)
+	got, err := readBoundedSenateResponse(strings.NewReader(body), -1, maxSenatePTRResponseSize, "PTR")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != maxSenatePTRResponseSize {
+		t.Fatalf("body length = %d, want %d", len(got), maxSenatePTRResponseSize)
+	}
+	_, err = readBoundedSenateResponse(strings.NewReader(body+"x"), -1, maxSenatePTRResponseSize, "PTR")
+	if err == nil || !strings.Contains(err.Error(), "response exceeds") {
+		t.Fatalf("limit+1 error = %v, want size rejection", err)
 	}
 }
 

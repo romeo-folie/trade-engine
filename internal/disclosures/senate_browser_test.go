@@ -2,6 +2,7 @@ package disclosures
 
 import (
 	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -54,20 +55,93 @@ func TestValidateSenateBrowserResponse(t *testing.T) {
 	if err := validateSenateBrowserResponse(senateBrowserResponse{
 		Status: 200,
 		URL:    "https://efdsearch.senate.gov/search/view/ptr/report-id/",
-	}, "/search/view/ptr/report-id/"); err != nil {
+	}, "https://efdsearch.senate.gov", "/search/view/ptr/report-id/", maxSenatePTRResponseSize); err != nil {
 		t.Fatal(err)
 	}
 	if err := validateSenateBrowserResponse(senateBrowserResponse{
 		Status: 200,
 		URL:    "https://efdsearch.senate.gov/search/home/",
-	}, "/search/report/data/"); !errors.Is(err, ErrSenateAuthorizationRequired) {
+	}, "https://efdsearch.senate.gov", "/search/report/data/", maxSenateSearchResponseSize); !errors.Is(err, ErrSenateAuthorizationRequired) {
 		t.Fatalf("error = %v", err)
 	}
-	if err := validateSenateBrowserResponse(senateBrowserResponse{
-		Status: 403,
-		URL:    "https://efdsearch.senate.gov/search/report/data/",
-	}, "/search/report/data/"); err == nil || !strings.Contains(err.Error(), "403") {
-		t.Fatalf("error = %v", err)
+	for _, test := range []struct {
+		status int
+		retry  bool
+	}{
+		{status: http.StatusBadRequest, retry: false},
+		{status: http.StatusNotFound, retry: false},
+		{status: http.StatusRequestTimeout, retry: true},
+		{status: http.StatusTooManyRequests, retry: true},
+		{status: http.StatusInternalServerError, retry: true},
+		{status: http.StatusServiceUnavailable, retry: true},
+		{status: 599, retry: true},
+	} {
+		t.Run(http.StatusText(test.status), func(t *testing.T) {
+			err := validateSenateBrowserResponse(senateBrowserResponse{
+				Status: test.status,
+				URL:    "https://efdsearch.senate.gov/search/report/data/",
+			}, "https://efdsearch.senate.gov", "/search/report/data/", maxSenateSearchResponseSize)
+			var statusErr *disclosureHTTPError
+			if !errors.As(err, &statusErr) || statusErr.StatusCode != test.status {
+				t.Fatalf("error = %T %v, want typed HTTP status %d", err, err, test.status)
+			}
+			if got := shouldRetryDisclosureFailure(err); got != test.retry {
+				t.Fatalf("retryable = %v, want %v for HTTP %d", got, test.retry, test.status)
+			}
+			if test.status == 599 && statusErr.Status != "599" {
+				t.Fatalf("unknown HTTP status = %q, want numeric status without trailing space", statusErr.Status)
+			}
+		})
+	}
+}
+
+func TestValidateSenateBrowserResponseRejectsOversizedBody(t *testing.T) {
+	base := senateBrowserResponse{
+		Status:    http.StatusOK,
+		URL:       "https://efdsearch.senate.gov/search/view/ptr/report-id/",
+		BodyBytes: maxSenatePTRResponseSize,
+	}
+	if err := validateSenateBrowserResponse(base, "https://efdsearch.senate.gov", "/search/view/ptr/report-id/", maxSenatePTRResponseSize); err != nil {
+		t.Fatalf("exact limit error = %v", err)
+	}
+
+	base.BodyBytes++
+	base.Oversized = true
+	if err := validateSenateBrowserResponse(base, "https://efdsearch.senate.gov", "/search/view/ptr/report-id/", maxSenatePTRResponseSize); err == nil ||
+		!strings.Contains(err.Error(), "response exceeds") {
+		t.Fatalf("oversized response error = %v, want size rejection", err)
+	}
+}
+
+func TestValidateSenateBrowserResponseUsesResourceSpecificLimit(t *testing.T) {
+	response := senateBrowserResponse{Status: http.StatusOK, URL: "https://efdsearch.senate.gov/search/report/data/", BodyBytes: 11}
+	if err := validateSenateBrowserResponse(response, "https://efdsearch.senate.gov", "/search/report/data/", 10); err == nil || !strings.Contains(err.Error(), "10-byte") {
+		t.Fatalf("resource-specific limit error=%v", err)
+	}
+}
+
+func TestValidateSenateBrowserResponseTrustsOnlyExpectedSameOriginPath(t *testing.T) {
+	base := "https://efdsearch.senate.gov"
+	for _, responseURL := range []string{
+		"https://evil.example/search/report/data/",
+		"http://efdsearch.senate.gov/search/report/data/",
+		"https://efdsearch.senate.gov:444/search/report/data/",
+		"https://user@efdsearch.senate.gov/search/report/data/",
+		"https://efdsearch.senate.gov/search/%2freport/data/",
+		"https://efdsearch.senate.gov/search/../search/report/data/",
+		"https://efdsearch.senate.gov/search/other/",
+	} {
+		err := validateSenateBrowserResponse(senateBrowserResponse{Status: http.StatusOK, URL: responseURL}, base, "/search/report/data/", maxSenateSearchResponseSize)
+		if err == nil || errors.Is(err, ErrSenateAuthorizationRequired) {
+			t.Fatalf("validate(%q) error = %v, want trust/path rejection", responseURL, err)
+		}
+	}
+
+	if err := validateSenateBrowserResponse(senateBrowserResponse{Status: http.StatusOK, URL: "https://evil.example/search/home/"}, base, "/search/report/data/", maxSenateSearchResponseSize); err == nil || errors.Is(err, ErrSenateAuthorizationRequired) {
+		t.Fatalf("cross-origin home error = %v, want trust rejection", err)
+	}
+	if err := validateSenateBrowserResponse(senateBrowserResponse{Status: http.StatusOK, URL: base + "/search/home/"}, base, "/search/report/data/", maxSenateSearchResponseSize); !errors.Is(err, ErrSenateAuthorizationRequired) {
+		t.Fatalf("same-origin home error = %v, want authorization required", err)
 	}
 }
 

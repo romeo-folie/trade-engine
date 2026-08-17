@@ -62,6 +62,7 @@ type politicalDisclosureAggregate struct {
 	latestTransactionDate       time.Time
 	latestTransactionFilingDate time.Time
 	lagKnown                    bool
+	independentTransactionCount int
 }
 
 type politicalDisclosureFilerAggregate struct {
@@ -70,6 +71,8 @@ type politicalDisclosureFilerAggregate struct {
 	latestTransactionDate       time.Time
 	latestTransactionFilingDate time.Time
 	lagKnown                    bool
+	independentTransactionCount int
+	independentPurchaseCount    int
 }
 
 func buildPoliticalDisclosureCandidate(
@@ -87,7 +90,9 @@ func buildPoliticalDisclosureCandidate(
 	}
 	reportIDs := make([]string, 0, len(items))
 	for _, item := range items {
-		reportIDs = append(reportIDs, item.ReportID)
+		if item.Claimed {
+			reportIDs = append(reportIDs, item.ReportID)
+		}
 		aggregate.addReport(item)
 	}
 	aggregate.finish()
@@ -107,9 +112,13 @@ func buildPoliticalDisclosureCandidate(
 func (a *politicalDisclosureAggregate) addReport(item store.PoliticalDisclosureCandidate) {
 	a.evidence.ReportCount++
 	a.evidence.TransactionCount += item.TransactionCount
-	isAmendment := isPoliticalDisclosureAmendment(item.ReportType)
+	// is_amendment is canonical. The suffix fallback preserves evidence from
+	// rows ingested before the explicit column was added.
+	isAmendment := item.IsAmendment || isPoliticalDisclosureAmendment(item.ReportType)
 	if isAmendment {
 		a.evidence.AmendmentReportCount++
+	} else {
+		a.evidence.IndependentReportCount++
 	}
 	reportIdentity := strings.TrimSpace(item.ExternalID)
 	if reportIdentity == "" {
@@ -121,7 +130,7 @@ func (a *politicalDisclosureAggregate) addReport(item store.PoliticalDisclosureC
 	if item.FilingDate.After(parseEvidenceDate(a.evidence.LatestFilingOrPublicationDate)) {
 		a.evidence.LatestFilingOrPublicationDate = evidenceDate(item.FilingDate)
 	}
-	if item.LatestTransaction.After(parseEvidenceDate(a.evidence.LatestTransactionDate)) {
+	if !isAmendment && item.LatestTransaction.After(parseEvidenceDate(a.evidence.LatestTransactionDate)) {
 		a.evidence.LatestTransactionDate = evidenceDate(item.LatestTransaction)
 	}
 
@@ -141,12 +150,21 @@ func (a *politicalDisclosureAggregate) addReport(item store.PoliticalDisclosureC
 	filer.evidence.ReportCount++
 	if isAmendment {
 		filer.evidence.AmendmentReportCount++
+	} else {
+		filer.evidence.IndependentReportCount++
 	}
 	filer.evidence.TransactionCount += item.TransactionCount
+	if isAmendment {
+		a.evidence.AmendmentTransactionCount += item.TransactionCount
+		filer.evidence.AmendmentTransactionCount += item.TransactionCount
+	} else {
+		a.evidence.IndependentTransactionCount += item.TransactionCount
+		filer.evidence.IndependentTransactionCount += item.TransactionCount
+	}
 	if item.FilingDate.After(parseEvidenceDate(filer.evidence.LatestFilingOrPublicationDate)) {
 		filer.evidence.LatestFilingOrPublicationDate = evidenceDate(item.FilingDate)
 	}
-	if item.LatestTransaction.After(parseEvidenceDate(filer.evidence.LatestTransactionDate)) {
+	if !isAmendment && item.LatestTransaction.After(parseEvidenceDate(filer.evidence.LatestTransactionDate)) {
 		filer.evidence.LatestTransactionDate = evidenceDate(item.LatestTransaction)
 	}
 
@@ -168,7 +186,7 @@ func (a *politicalDisclosureAggregate) addReport(item store.PoliticalDisclosureC
 			))
 		}
 		for _, transaction := range transactions {
-			a.addTransaction(filer, &report, item.FilingDate, transaction)
+			a.addTransaction(filer, &report, item.FilingDate, !isAmendment, transaction)
 		}
 	}
 	report.ReportedOwners = sortedSet(filerOwnersForReport(transactions))
@@ -183,39 +201,50 @@ func (a *politicalDisclosureAggregate) addReport(item store.PoliticalDisclosureC
 	}
 }
 
-func isPoliticalDisclosureAmendment(reportType string) bool {
-	value := strings.ToLower(strings.TrimSpace(reportType))
-	return strings.Contains(value, "amend") || strings.Contains(value, "correct")
-}
-
 func (a *politicalDisclosureAggregate) addTransaction(
 	filer *politicalDisclosureFilerAggregate,
 	report *tradeprofile.PoliticalDisclosureReportEvidence,
-	filingDate time.Time,
+	filingDate time.Time, independent bool,
 	transaction store.PoliticalDisclosureTransaction,
 ) {
 	action := strings.ToLower(strings.TrimSpace(transaction.TransactionType))
 	switch action {
 	case "purchase":
-		a.evidence.PurchaseCount++
-		filer.evidence.PurchaseCount++
 		report.PurchaseCount++
-		addPoliticalAmount(&a.evidence.PurchaseAmounts, transaction)
-		addPoliticalAmount(&filer.evidence.PurchaseAmounts, transaction)
+		if independent {
+			a.evidence.PurchaseCount++
+			filer.evidence.PurchaseCount++
+			filer.independentPurchaseCount++
+			addPoliticalAmount(&a.evidence.PurchaseAmounts, transaction)
+			addPoliticalAmount(&filer.evidence.PurchaseAmounts, transaction)
+		}
 	case "sale":
-		a.evidence.SaleCount++
-		filer.evidence.SaleCount++
 		report.SaleCount++
-		addPoliticalAmount(&a.evidence.SaleAmounts, transaction)
-		addPoliticalAmount(&filer.evidence.SaleAmounts, transaction)
+		if independent {
+			a.evidence.SaleCount++
+			filer.evidence.SaleCount++
+			addPoliticalAmount(&a.evidence.SaleAmounts, transaction)
+			addPoliticalAmount(&filer.evidence.SaleAmounts, transaction)
+		}
 	case "exchange":
-		a.evidence.ExchangeCount++
-		filer.evidence.ExchangeCount++
 		report.ExchangeCount++
+		if independent {
+			a.evidence.ExchangeCount++
+			filer.evidence.ExchangeCount++
+		}
 	default:
-		a.evidence.OtherTransactionCount++
-		filer.evidence.OtherTransactionCount++
-		a.addLimitation("one or more transaction actions were unrecognized")
+		if independent {
+			a.evidence.OtherTransactionCount++
+			filer.evidence.OtherTransactionCount++
+			a.addLimitation("one or more transaction actions were unrecognized")
+		}
+	}
+	if independent {
+		a.independentTransactionCount++
+		filer.independentTransactionCount++
+	}
+	if !independent {
+		return
 	}
 	if owner := strings.TrimSpace(transaction.Owner); owner != "" {
 		filer.owners[owner] = struct{}{}
@@ -247,6 +276,11 @@ func (a *politicalDisclosureAggregate) addTransaction(
 	}
 }
 
+func isPoliticalDisclosureAmendment(reportType string) bool {
+	value := strings.ToLower(strings.TrimSpace(reportType))
+	return strings.HasSuffix(value, "_amendment") || strings.HasSuffix(value, "_correction")
+}
+
 func (a *politicalDisclosureAggregate) finish() {
 	ids := make([]string, 0, len(a.filers))
 	for id := range a.filers {
@@ -256,9 +290,9 @@ func (a *politicalDisclosureAggregate) finish() {
 	for _, id := range ids {
 		filer := a.filers[id]
 		filer.evidence.ReportedOwners = sortedSet(filer.owners)
-		filer.evidence.RepeatedActivity = filer.evidence.ReportCount > 1 || filer.evidence.TransactionCount > 1
+		filer.evidence.RepeatedActivity = filer.evidence.IndependentReportCount > 1 || filer.independentTransactionCount > 1
 		filer.evidence.ContradictoryActivity = filer.evidence.PurchaseCount > 0 && filer.evidence.SaleCount > 0
-		if filer.evidence.PurchaseCount > 0 {
+		if filer.independentPurchaseCount > 0 {
 			a.evidence.DistinctBuyerCount++
 		}
 		if filer.evidence.RepeatedActivity {
@@ -273,11 +307,14 @@ func (a *politicalDisclosureAggregate) finish() {
 	a.evidence.DistinctFilerCount = len(ids)
 	a.evidence.IndependentBuyerActivity = a.evidence.DistinctBuyerCount > 1
 	a.evidence.ContradictoryActivity = a.evidence.PurchaseCount > 0 && a.evidence.SaleCount > 0
+	if a.evidence.AmendmentReportCount > 0 {
+		a.addLimitation("amendment rows remain in report detail and raw transaction counts, but are excluded from independent semantic action, amount, owner, timing, repetition, and contradiction aggregates because no authoritative supersession relationship is available")
+	}
 	if a.evidence.PurchaseAmounts.UnknownTransactionCount > 0 || a.evidence.SaleAmounts.UnknownTransactionCount > 0 {
 		a.addLimitation("amount totals exclude transactions without a complete reported range")
 	}
 	if a.evidence.DataQuality.OmittedFilerDetailCount > 0 || a.evidence.DataQuality.OmittedReportDetailCount > 0 {
-		a.addLimitation("per-filer or per-report details were bounded; aggregate counts include all claimed evidence")
+		a.addLimitation("per-filer or per-report details were bounded; aggregate counts include all eligible evidence")
 	}
 }
 
@@ -373,9 +410,10 @@ func sortedSet(values map[string]struct{}) []string {
 
 func summarizePoliticalDisclosure(evidence tradeprofile.PoliticalDisclosureEvidence) string {
 	summary := fmt.Sprintf(
-		"%d report(s), %d transaction(s), %d canonical filer(s), %d distinct buyer(s): %d purchase(s), %d sale(s), %d exchange(s)",
-		evidence.ReportCount, evidence.TransactionCount, evidence.DistinctFilerCount,
-		evidence.DistinctBuyerCount, evidence.PurchaseCount, evidence.SaleCount,
+		"%d report(s) (%d independent; %d amendment), %d raw transaction row(s) (%d independent; %d amendment), %d canonical filer(s), %d distinct buyer(s): %d independent purchase(s), %d independent sale(s), %d independent exchange(s)",
+		evidence.ReportCount, evidence.IndependentReportCount, evidence.AmendmentReportCount,
+		evidence.TransactionCount, evidence.IndependentTransactionCount, evidence.AmendmentTransactionCount, evidence.DistinctFilerCount, evidence.DistinctBuyerCount,
+		evidence.PurchaseCount, evidence.SaleCount,
 		evidence.ExchangeCount,
 	)
 	if evidence.LatestTransactionDate != "" {
@@ -403,9 +441,14 @@ func mergePoliticalDisclosureCandidates(
 			continue
 		}
 		candidate := &out[index]
-		fallback := cloneSwingCandidate(*candidate)
+		// Keep a wholly independent no-political lineage before attaching
+		// political provenance to nested weekly/industry fallbacks. A shallow
+		// copy shares those nodes, which lets a later sequential claim loss
+		// resurrect an already-invalid political claim.
+		fallback := cloneSwingCandidateLineage(candidate)
 		fallback.politicalDisclosureFallback = nil
-		candidate.politicalDisclosureFallback = &fallback
+		fallback.politicalDisclosureSource = nil
+		candidate.politicalDisclosureFallback = fallback
 		attachPoliticalFallback(candidate.weeklyLeaderFallback, source)
 		attachPoliticalFallback(candidate.potentIndustryFallback, source)
 		candidate.Sources = mergeSources(candidate.Sources, source.Sources)

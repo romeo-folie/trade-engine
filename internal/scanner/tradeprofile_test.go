@@ -141,12 +141,13 @@ func TestScannerProfileDefaultsAssignTimeframeRolesBySource(t *testing.T) {
 func TestBuildScannerTradeProfileCarriesPoliticalDisclosureFacts(t *testing.T) {
 	facts := tradeprofile.PoliticalDisclosureEvidence{
 		Version: tradeprofile.PoliticalDisclosureEvidenceVersion, Ticker: "GOV",
-		DistinctFilerCount: 2, DistinctBuyerCount: 2, ReportCount: 3,
-		TransactionCount: 4, PurchaseCount: 3, SaleCount: 1,
-		IndependentBuyerActivity: true, ContradictoryActivity: true,
+		DistinctFilerCount: 2, DistinctBuyerCount: 2, ReportCount: 3, IndependentReportCount: 3,
+		TransactionCount: 4, IndependentTransactionCount: 4, PurchaseCount: 3, SaleCount: 1,
+		RepeatedFilerActivity: true, IndependentBuyerActivity: true, ContradictoryActivity: true,
 		Filers: []tradeprofile.PoliticalDisclosureFilerEvidence{{
 			CanonicalFilerID: "house:house:alex-example", FilerName: "Alex Example",
-			Source: "house", Chamber: "house", ReportCount: 2, TransactionCount: 3,
+			Source: "house", Chamber: "house", ReportCount: 2, IndependentReportCount: 2,
+			TransactionCount: 3, RepeatedActivity: true,
 		}},
 		DataQuality: tradeprofile.PoliticalDisclosureDataQuality{
 			CanonicalIdentityBasis: "normalized source, chamber, and filer-name tokens",
@@ -169,7 +170,9 @@ func TestBuildScannerTradeProfileCarriesPoliticalDisclosureFacts(t *testing.T) {
 		t.Fatal(err)
 	}
 	if stored.DistinctFilerCount != 2 || stored.DistinctBuyerCount != 2 ||
-		!strings.Contains(discovery.Thesis, "3 report(s), 4 transaction(s), 2 canonical filer(s), 2 distinct buyer(s)") ||
+		stored.IndependentReportCount != 3 || len(stored.Filers) != 1 ||
+		stored.Filers[0].IndependentReportCount != 2 || !stored.RepeatedFilerActivity || !stored.Filers[0].RepeatedActivity ||
+		!strings.Contains(discovery.Thesis, "3 report(s) (3 independent; 0 amendment), 4 raw transaction row(s) (4 independent; 0 amendment), 2 canonical filer(s), 2 distinct buyer(s)") ||
 		strings.Contains(discovery.Thesis, "stale flattened evidence") {
 		t.Fatalf("discovery = %+v, facts = %+v", discovery, stored)
 	}

@@ -13,6 +13,7 @@ type Report struct {
 	FilerName        string
 	Office           string
 	ReportType       string
+	IsAmendment      bool
 	FilingDate       time.Time
 	DocumentURL      string
 	ContentHash      string

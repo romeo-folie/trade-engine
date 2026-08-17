@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -19,7 +21,7 @@ import (
 )
 
 var ErrSenateAuthorizationRequired = errors.New(
-	"Senate eFD browser authorization is required; run `te disclosures senate authorize`",
+	"senate eFD browser authorization is required; run `te disclosures senate authorize`",
 )
 
 type SenateBrowserOptions struct {
@@ -52,9 +54,11 @@ type senateBrowserPageState struct {
 }
 
 type senateBrowserResponse struct {
-	Status int    `json:"status"`
-	URL    string `json:"url"`
-	Body   string `json:"body"`
+	Status    int    `json:"status"`
+	URL       string `json:"url"`
+	Body      string `json:"body"`
+	BodyBytes int    `json:"bodyBytes"`
+	Oversized bool   `json:"oversized"`
 }
 
 type senateStoredCookie struct {
@@ -109,7 +113,7 @@ func (t *SenateChromeTransport) SearchPTRs(
 	ctx context.Context, since, until time.Time, start, maxReports int,
 ) ([]byte, error) {
 	if maxReports <= 0 {
-		return nil, fmt.Errorf("Senate browser report limit must be positive")
+		return nil, fmt.Errorf("senate browser report limit must be positive")
 	}
 	form := url.Values{
 		"start":                {strconv.Itoa(start)},
@@ -154,15 +158,17 @@ func (t *SenateChromeTransport) SearchPTRs(
 			body
 		});
 		const text = await response.text();
-		return {status: response.status, url: response.url, body: text.slice(0, 10485760)};
-	})()`, string(encodedForm))
+		const bodyBytes = new TextEncoder().encode(text).byteLength;
+		const oversized = bodyBytes > %d;
+		return {status: response.status, url: response.url, body: oversized ? "" : text, bodyBytes, oversized};
+	})()`, string(encodedForm), maxSenateSearchResponseSize)
 	var response senateBrowserResponse
 	if err := t.runLocked(ctx, chromedp.Evaluate(
 		expression, &response, awaitSenateBrowserPromise,
 	)); err != nil {
 		return nil, fmt.Errorf("search Senate eFD in Chrome: %w", err)
 	}
-	if err := validateSenateBrowserResponse(response, "/search/report/data/"); err != nil {
+	if err := validateSenateBrowserResponse(response, t.opts.BaseURL, "/search/report/data/", maxSenateSearchResponseSize); err != nil {
 		return nil, err
 	}
 	if err := t.saveSessionLocked(ctx); err != nil {
@@ -200,15 +206,17 @@ func (t *SenateChromeTransport) FetchPTR(ctx context.Context, documentURL string
 	expression := fmt.Sprintf(`(async () => {
 		const response = await fetch(%s, {credentials: "same-origin", redirect: "follow"});
 		const text = await response.text();
-		return {status: response.status, url: response.url, body: text.slice(0, 10485760)};
-	})()`, string(encodedURL))
+		const bodyBytes = new TextEncoder().encode(text).byteLength;
+		const oversized = bodyBytes > %d;
+		return {status: response.status, url: response.url, body: oversized ? "" : text, bodyBytes, oversized};
+	})()`, string(encodedURL), maxSenatePTRResponseSize)
 	var response senateBrowserResponse
 	if err := t.runLocked(ctx, chromedp.Evaluate(
 		expression, &response, awaitSenateBrowserPromise,
 	)); err != nil {
 		return nil, fmt.Errorf("fetch Senate PTR in Chrome: %w", err)
 	}
-	if err := validateSenateBrowserResponse(response, document.Path); err != nil {
+	if err := validateSenateBrowserResponse(response, t.opts.BaseURL, document.Path, maxSenatePTRResponseSize); err != nil {
 		return nil, err
 	}
 	if err := t.saveSessionLocked(ctx); err != nil {
@@ -243,7 +251,7 @@ func (t *SenateChromeTransport) AuthorizationStatus(ctx context.Context) (bool, 
 // accept the eFD agreement. The profile itself owns all resulting credentials.
 func (t *SenateChromeTransport) Authorize(ctx context.Context) error {
 	if t.opts.Headless {
-		return fmt.Errorf("Senate authorization requires visible Chrome")
+		return fmt.Errorf("senate authorization requires visible Chrome")
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -429,7 +437,7 @@ func (t *SenateChromeTransport) saveSessionLocked(ctx context.Context) error {
 		})
 	}
 	if len(state.Cookies) == 0 {
-		return fmt.Errorf("Senate Chrome profile contains no eFD cookies")
+		return fmt.Errorf("senate Chrome profile contains no eFD cookies")
 	}
 	return writeSenateBrowserSessionState(t.sessionPath(), state)
 }
@@ -494,29 +502,60 @@ func awaitSenateBrowserPromise(params *cdpruntime.EvaluateParams) *cdpruntime.Ev
 	return params.WithAwaitPromise(true)
 }
 
-func validateSenateBrowserResponse(response senateBrowserResponse, expectedPath string) error {
+func validateSenateBrowserResponse(response senateBrowserResponse, baseURL, expectedPath string, limit int) error {
 	responseURL, err := url.Parse(response.URL)
-	if err != nil {
-		return fmt.Errorf("Senate eFD browser returned an invalid URL")
+	base, baseErr := url.Parse(baseURL)
+	if err != nil || baseErr != nil || responseURL.Scheme == "" || responseURL.Host == "" ||
+		base.Scheme == "" || base.Host == "" || responseURL.User != nil || base.User != nil ||
+		(responseURL.Scheme != "http" && responseURL.Scheme != "https") ||
+		base.Scheme != responseURL.Scheme || !sameURLHost(responseURL, base) ||
+		!senateBrowserPathIsClean(responseURL.Path, responseURL.EscapedPath()) {
+		return fmt.Errorf("senate eFD browser returned an invalid URL")
 	}
 	if responseURL.Path == "/search/home/" {
 		return ErrSenateAuthorizationRequired
+	}
+	if responseURL.Path != expectedPath {
+		return fmt.Errorf("senate eFD browser redirected %s to %s", expectedPath, responseURL.Path)
 	}
 	if response.Status == 0 {
 		reason := strings.TrimSpace(response.Body)
 		if reason == "" {
 			reason = "browser script returned no response"
 		}
-		return fmt.Errorf("Senate eFD browser request %s: %s (url: %s)",
+		return fmt.Errorf("senate eFD browser request %s: %s (url: %s)",
 			expectedPath, reason, response.URL)
 	}
 	if response.Status < 200 || response.Status >= 300 {
-		return fmt.Errorf("Senate eFD browser request %s: HTTP %d", expectedPath, response.Status)
+		// Keep browser failures in the same typed form as the HTTP transport so
+		// retry policy can distinguish terminal 4xx responses from 408, 429,
+		// and server failures. Authorization redirects are handled above.
+		status := strconv.Itoa(response.Status)
+		if statusText := http.StatusText(response.Status); statusText != "" {
+			status += " " + statusText
+		}
+		return disclosureHTTPStatusError(
+			"Senate", response.Status, status,
+		)
 	}
-	if expectedPath != "/search/report/data/" && responseURL.Path != expectedPath {
-		return fmt.Errorf("Senate eFD browser redirected %s to %s", expectedPath, responseURL.Path)
+	if response.Oversized || response.BodyBytes > limit {
+		return fmt.Errorf("senate eFD browser response exceeds %d-byte limit", limit)
 	}
 	return nil
+}
+
+func senateBrowserPathIsClean(rawPath, escapedPath string) bool {
+	cleanPath := path.Clean(rawPath)
+	if strings.HasSuffix(rawPath, "/") && cleanPath != "/" {
+		cleanPath += "/"
+	}
+	if rawPath == "" || cleanPath != rawPath ||
+		strings.Contains(strings.ToLower(escapedPath), "%2f") ||
+		strings.Contains(strings.ToLower(escapedPath), "%5c") ||
+		strings.Contains(strings.ToLower(escapedPath), "%2e") {
+		return false
+	}
+	return true
 }
 
 func expandSenateProfilePath(path string) (string, error) {
@@ -548,7 +587,7 @@ func readSenateBrowserSessionState(path string) (senateBrowserSessionState, erro
 	}
 	if info.Mode().Perm()&0o077 != 0 {
 		return senateBrowserSessionState{}, fmt.Errorf(
-			"Senate browser session file permissions must be 0600: %s", path,
+			"senate browser session file permissions must be 0600: %s", path,
 		)
 	}
 	data, err := os.ReadFile(path)

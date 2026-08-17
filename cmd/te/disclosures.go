@@ -68,6 +68,9 @@ persistent Chrome profile created by 'te disclosures senate authorize'.`,
 		disclosureCfg.Senate.Enabled = source == "all" || source == "senate"
 		disclosureCfg.OGE.Enabled = source == "all" || source == "oge"
 		disclosureCfg.Senate.AcknowledgeUseRestrictions = disclosureCfg.Senate.Enabled
+		if validation := config.ValidateDisclosuresConfig(disclosureCfg); len(validation) > 0 {
+			return fmt.Errorf("invalid disclosure config: %s", strings.Join(validation, "; "))
+		}
 		if err := store.Connect(cmd.Context()); err != nil {
 			return fmt.Errorf("database: %w", err)
 		}

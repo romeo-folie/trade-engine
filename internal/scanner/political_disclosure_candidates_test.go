@@ -164,19 +164,19 @@ func TestPoliticalDisclosureFactsDistinguishRepeatedAndIndependentFilers(t *test
 		t.Fatal(err)
 	}
 	if facts.DistinctFilerCount != 2 || facts.DistinctBuyerCount != 2 ||
-		facts.ReportCount != 3 || facts.AmendmentReportCount != 1 || facts.TransactionCount != 5 ||
-		facts.PurchaseCount != 3 || facts.SaleCount != 1 || facts.ExchangeCount != 1 ||
+		facts.ReportCount != 3 || facts.AmendmentReportCount != 1 || facts.IndependentReportCount != 2 || facts.IndependentTransactionCount != 4 || facts.AmendmentTransactionCount != 1 || facts.TransactionCount != 5 ||
+		facts.PurchaseCount != 2 || facts.SaleCount != 1 || facts.ExchangeCount != 1 ||
 		!facts.RepeatedFilerActivity || !facts.IndependentBuyerActivity ||
 		!facts.ContradictoryActivity {
 		t.Fatalf("aggregate facts = %+v", facts)
 	}
 	if facts.PurchaseAmounts.KnownTransactionCount != 2 ||
-		facts.PurchaseAmounts.UnknownTransactionCount != 1 ||
+		facts.PurchaseAmounts.UnknownTransactionCount != 0 ||
 		facts.PurchaseAmounts.MinimumTotal != 2_002 ||
 		facts.PurchaseAmounts.MaximumTotal != 30_000 {
 		t.Fatalf("purchase amounts = %+v", facts.PurchaseAmounts)
 	}
-	if facts.DisclosureLagDays.LatestTransactionDays != 5 {
+	if facts.DisclosureLagDays.LatestTransactionDays != 4 {
 		t.Fatalf("latest transaction disclosure lag = %+v", facts.DisclosureLagDays)
 	}
 	if len(facts.Filers) != 2 || facts.Filers[0].CanonicalFilerID == facts.Filers[1].CanonicalFilerID {
@@ -188,9 +188,9 @@ func TestPoliticalDisclosureFactsDistinguishRepeatedAndIndependentFilers(t *test
 			jane = &facts.Filers[index]
 		}
 	}
-	if jane == nil || jane.ReportCount != 2 || jane.AmendmentReportCount != 1 || !jane.RepeatedActivity ||
+	if jane == nil || jane.ReportCount != 2 || jane.AmendmentReportCount != 1 || jane.IndependentReportCount != 1 || !jane.RepeatedActivity ||
 		!jane.ContradictoryActivity || len(jane.ReportedOwners) != 2 ||
-		jane.DisclosureLagDays.LatestTransactionDays != 5 {
+		jane.DisclosureLagDays.LatestTransactionDays != 4 {
 		t.Fatalf("canonical Jane evidence = %+v", jane)
 	}
 }
@@ -224,6 +224,63 @@ func TestPoliticalDisclosureFactsReachScannerSnapshotProfile(t *testing.T) {
 	if facts.ReportCount != 1 || facts.DistinctBuyerCount != 1 ||
 		snapshot.ExecutionProfile.PrimaryTimeframe != "4H" {
 		t.Fatalf("snapshot facts=%+v profile=%+v", facts, snapshot.ExecutionProfile)
+	}
+}
+
+func TestPoliticalDisclosureAmendmentDoesNotInflateIndependentBreadthOrRepeatedActivity(t *testing.T) {
+	filing := time.Date(2026, 8, 15, 0, 0, 0, 0, time.UTC)
+	transaction := filing.AddDate(0, 0, -5)
+	items := []store.PoliticalDisclosureCandidate{
+		politicalCandidateFixture(t, "base", "base", "oge", "executive", "Alex Example", "Office", filing, []store.PoliticalDisclosureTransaction{{TransactionType: "purchase", TransactionDate: transaction}}),
+		politicalCandidateFixture(t, "amendment", "amendment", "oge", "executive", "Alex Example", "Office", filing.AddDate(0, 0, 1), []store.PoliticalDisclosureTransaction{{TransactionType: "purchase", TransactionDate: transaction}}),
+	}
+	items[1].IsAmendment = true
+	newerAmendment := filing.AddDate(0, 0, 3)
+	items[1].LatestTransaction = newerAmendment
+	items[1].Evidence, _ = json.Marshal([]store.PoliticalDisclosureTransaction{{TransactionType: "sale", TransactionDate: newerAmendment}})
+	candidate := buildPoliticalDisclosureCandidate("TEST", "claim", items)
+	var facts tradeprofile.PoliticalDisclosureEvidence
+	if err := json.Unmarshal(candidate.PoliticalDisclosureFacts, &facts); err != nil {
+		t.Fatal(err)
+	}
+	if facts.ReportCount != 2 || facts.AmendmentReportCount != 1 || facts.IndependentReportCount != 1 || facts.RepeatedFilerActivity || facts.IndependentBuyerActivity || facts.DistinctBuyerCount != 1 {
+		t.Fatalf("amendment inflated independent evidence: %+v", facts)
+	}
+	if len(facts.Filers) != 1 || facts.Filers[0].IndependentReportCount != 1 || facts.Filers[0].RepeatedActivity {
+		t.Fatalf("filer evidence=%+v", facts.Filers)
+	}
+	if facts.LatestTransactionDate != transaction.Format("2006-01-02") || facts.Filers[0].LatestTransactionDate != transaction.Format("2006-01-02") || facts.SaleCount != 0 {
+		t.Fatalf("newer amendment changed independent semantics: %+v", facts)
+	}
+	limitation := strings.Join(facts.DataQuality.Limitations, " ")
+	if !strings.Contains(limitation, "report detail and raw transaction counts") ||
+		!strings.Contains(limitation, "independent semantic action, amount, owner, timing, repetition, and contradiction") ||
+		!strings.Contains(limitation, "no authoritative supersession relationship is available") {
+		t.Fatalf("amendment data-quality limitation missing: %+v", facts.DataQuality)
+	}
+}
+
+func TestPoliticalDisclosureCandidateAggregatesHistoryButOwnsOnlyClaimedRows(t *testing.T) {
+	filing := time.Date(2026, 8, 15, 0, 0, 0, 0, time.UTC)
+	items := []store.PoliticalDisclosureCandidate{
+		politicalCandidateFixture(t, "history", "history", "house", "house", "Alex Example", "CA12", filing, []store.PoliticalDisclosureTransaction{{TransactionType: "purchase", TransactionDate: filing}}),
+		politicalCandidateFixture(t, "pending", "pending", "house", "house", "Alex Example", "CA12", filing.AddDate(0, 0, 1), []store.PoliticalDisclosureTransaction{{TransactionType: "sale", TransactionDate: filing}}),
+	}
+	items[1].Claimed = true
+	items[1].PromotionClaimToken = "claim"
+	candidate := buildPoliticalDisclosureCandidate("TEST", "claim", items)
+	if len(candidate.PoliticalDisclosureClaimReportIDs) != 1 || candidate.PoliticalDisclosureClaimReportIDs[0] != "pending" {
+		t.Fatalf("claim report IDs = %v, want only pending claim", candidate.PoliticalDisclosureClaimReportIDs)
+	}
+	var facts tradeprofile.PoliticalDisclosureEvidence
+	if err := json.Unmarshal(candidate.PoliticalDisclosureFacts, &facts); err != nil {
+		t.Fatal(err)
+	}
+	if facts.ReportCount != 2 || facts.TransactionCount != 2 || facts.PurchaseCount != 1 || facts.SaleCount != 1 {
+		t.Fatalf("history was not fully aggregated: %+v", facts)
+	}
+	if !strings.Contains(candidate.PoliticalDisclosureEvidence, "2 raw transaction row(s) (2 independent; 0 amendment)") {
+		t.Fatalf("summary does not label raw transaction rows: %q", candidate.PoliticalDisclosureEvidence)
 	}
 }
 
@@ -369,6 +426,112 @@ func TestNonPoliticalClaimLossPreservesDisclosureFactsWithoutStrategyLeak(t *tes
 		len(ordinaryAgain.PoliticalDisclosureFacts) != 0 || ordinaryAgain.PoliticalDisclosureClaimToken != "" {
 		t.Fatalf("sequential claim fallback = %+v, ok=%v", ordinaryAgain, ok)
 	}
+}
+
+func TestSequentialClaimLossDoesNotResurrectPoliticalDisclosure(t *testing.T) {
+	disclosure := SwingCandidate{
+		Ticker: "MSFT", Sources: []string{"political_disclosure"},
+		PoliticalDisclosureClaimToken:     "political-claim",
+		PoliticalDisclosureClaimReportIDs: []string{"report-1"},
+		PoliticalDisclosureEvidence:       "one purchase",
+		PoliticalDisclosureFacts:          json.RawMessage(`{"version":1,"ticker":"MSFT"}`),
+	}
+	tests := []struct {
+		name       string
+		merge      func([]SwingCandidate) []SwingCandidate
+		secondLoss string
+	}{
+		{
+			name: "weekly leader", secondLoss: "weekly_leader",
+			merge: func(existing []SwingCandidate) []SwingCandidate {
+				ordinary := SwingCandidate{Ticker: "MSFT", Sources: []string{"mover"}}
+				leader := SwingCandidate{
+					Ticker: "MSFT", Sources: []string{"weekly_leader"},
+					WeeklyLeaderRunID: "weekly-run", WeeklyLeaderClaimToken: "weekly-claim",
+				}
+				return mergeWeeklyLeaderCandidates([]SwingCandidate{ordinary}, []SwingCandidate{leader})
+			},
+		},
+		{
+			name: "potent industry", secondLoss: "potent_industry",
+			merge: func(existing []SwingCandidate) []SwingCandidate {
+				ordinary := SwingCandidate{Ticker: "MSFT", Sources: []string{"mover"}}
+				industry := SwingCandidate{
+					Ticker: "MSFT", Sources: []string{"potent_industry"},
+					PotentIndustryRunID: "industry-run", PotentIndustryClaimToken: "industry-claim",
+					SourceScores: map[string]float64{"potent_industry": 1},
+				}
+				return mergePotentIndustryCandidates([]SwingCandidate{ordinary}, []SwingCandidate{industry})
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			merged := mergePoliticalDisclosureCandidates(test.merge(nil), []SwingCandidate{disclosure})
+			withoutPolitical, ok := candidateAfterPromotionClaimLoss(merged[0], "political_disclosure")
+			if !ok {
+				t.Fatal("political claim loss did not produce source fallback")
+			}
+			ordinary, ok := candidateAfterPromotionClaimLoss(withoutPolitical, test.secondLoss)
+			if !ok {
+				t.Fatalf("%s claim loss did not produce ordinary fallback", test.secondLoss)
+			}
+			assertNoPoliticalDisclosureProvenance(t, ordinary)
+		})
+	}
+}
+
+func TestCloneSwingCandidateLineageCopiesSharedCyclesIndependently(t *testing.T) {
+	original := &SwingCandidate{Ticker: "MSFT", Sources: []string{"mover"}}
+	shared := &SwingCandidate{Ticker: "MSFT", Sources: []string{"weekly_leader"}}
+	original.weeklyLeaderFallback = shared
+	original.potentIndustryFallback = shared
+	shared.politicalDisclosureFallback = original
+
+	clone := cloneSwingCandidateLineage(original)
+	if clone == original || clone.weeklyLeaderFallback == shared {
+		t.Fatal("lineage clone retained original nodes")
+	}
+	if clone.weeklyLeaderFallback != clone.potentIndustryFallback {
+		t.Fatal("lineage clone did not retain shared fallback identity")
+	}
+	if clone.weeklyLeaderFallback.politicalDisclosureFallback != clone {
+		t.Fatal("lineage clone did not retain cyclic fallback edge")
+	}
+	clone.weeklyLeaderFallback.Sources = []string{"mutated"}
+	if strings.Join(shared.Sources, ",") != "weekly_leader" {
+		t.Fatalf("mutating lineage clone changed original fallback: %+v", shared)
+	}
+}
+
+func assertNoPoliticalDisclosureProvenance(t *testing.T, candidate SwingCandidate) {
+	t.Helper()
+	seen := make(map[*SwingCandidate]struct{})
+	var walk func(*SwingCandidate)
+	walk = func(item *SwingCandidate) {
+		if item == nil {
+			return
+		}
+		if _, exists := seen[item]; exists {
+			return
+		}
+		seen[item] = struct{}{}
+		_, hasPoliticalScore := item.SourceScores["political_disclosure"]
+		if hasSource(item.Sources, "political_disclosure") ||
+			hasPoliticalScore ||
+			item.PoliticalDisclosureClaimToken != "" ||
+			len(item.PoliticalDisclosureClaimReportIDs) != 0 ||
+			item.PoliticalDisclosureEvidence != "" || len(item.PoliticalDisclosureFacts) != 0 ||
+			item.politicalDisclosureFallback != nil || item.politicalDisclosureSource != nil {
+			t.Fatalf("political provenance resurrected in %+v", *item)
+		}
+		walk(item.weeklyLeaderFallback)
+		walk(item.potentIndustryFallback)
+		walk(item.potentIndustrySource)
+		walk(item.politicalDisclosureFallback)
+		walk(item.politicalDisclosureSource)
+	}
+	walk(&candidate)
 }
 
 func TestClaimLossFallsBackToDisclosureOnlyCandidate(t *testing.T) {

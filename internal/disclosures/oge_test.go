@@ -33,9 +33,10 @@ func TestOGEListFilingsRejectsOversizedIndexResponse(t *testing.T) {
 }
 
 func TestOGEListFilingsSkipsRequestOnly(t *testing.T) {
-	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var s *httptest.Server
+	s = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"recordsTotal":2,"data":[{"type":"<a href='https://example.test/a.pdf'>278 Transaction</a>","name":"A. Person","agency":"White House","title":"Advisor","docDate":"2026-07-09"},{"type":"Annual (2026) (<a href='https://example.test/request'>Request this Document</a>)","name":"B","docDate":"2026-07-10"}]}`))
+		_, _ = w.Write([]byte(strings.ReplaceAll(`{"recordsTotal":2,"data":[{"type":"<a href='{base}/a.pdf'>278 Transaction</a>","name":"A. Person","agency":"White House","title":"Advisor","docDate":"2026-07-09"},{"type":"Annual (2026) (<a href='{base}/request'>Request this Document</a>)","name":"B","docDate":"2026-07-10"}]}`, "{base}", s.URL)))
 	}))
 	defer s.Close()
 	c := NewOGEClient(s.URL, time.Second)
@@ -48,10 +49,71 @@ func TestOGEListFilingsSkipsRequestOnly(t *testing.T) {
 	}
 }
 
-func TestOGEListFilingsKeepsTimestampedInclusiveEndDate(t *testing.T) {
-	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func TestNormalizeOGEReportTypeKeepsStableBaseType(t *testing.T) {
+	for _, test := range []struct {
+		name, label, amended, want string
+	}{
+		{"amended label", "Amended Transaction", "no", "periodic_transaction"},
+		{"amended field", "278 Transaction", "Yes", "periodic_transaction"},
+		{"date amendment marker", "278 Transaction", "2026-07-09", "periodic_transaction"},
+		{"corrected annual", "Annual disclosure", "corrected", "annual"},
+		{"false-like amendment", "278 Transaction", "false", "periodic_transaction"},
+		{"false-like no", "278 Transaction", "no", "periodic_transaction"},
+		{"false-like zero", "278 Transaction", "0", "periodic_transaction"},
+		{"false-like n/a", "278 Transaction", "n/a", "periodic_transaction"},
+		{"false-like na", "278 Transaction", "na", "periodic_transaction"},
+		{"false-like not applicable", "278 Transaction", "not applicable", "periodic_transaction"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := normalizeOGEReportType(test.label, test.amended); got != test.want {
+				t.Fatalf("report type = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestOGEAmendedFieldRecognizesCommonFalseLikeValues(t *testing.T) {
+	for _, value := range []string{"false", "n/a", "NA", "not applicable"} {
+		if ogeAmendedFieldIsAmendment(value) {
+			t.Fatalf("amended field %q treated as amendment", value)
+		}
+	}
+}
+
+func TestOGEListFilingsPreservesAmendmentMetadata(t *testing.T) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"recordsTotal":2,"data":[{"type":"<a href='https://example.test/end-date.pdf'>278 Transaction</a>","name":"End Date","docDate":"2026-07-31T17:45:00"},{"type":"<a href='https://example.test/next-date.pdf'>278 Transaction</a>","name":"Next Date","docDate":"2026-08-01T00:00:01"}]}`))
+		_, _ = w.Write([]byte(strings.ReplaceAll(`{"recordsTotal":2,"data":[{"type":"<a href='{base}/amended-label.pdf'>Amended Transaction</a>","amended":"false","name":"Label Amendment","docDate":"2026-07-09"},{"type":"<a href='{base}/amended-field.pdf'>278 Transaction</a>","amended":"yes","name":"Field Amendment","docDate":"2026-07-10"}]}`, "{base}", server.URL)))
+	}))
+	defer server.Close()
+
+	filings, err := NewOGEClient(server.URL, time.Second).ListFilings(
+		context.Background(),
+		time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC), 10,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(filings) != 2 {
+		t.Fatalf("filings = %#v", filings)
+	}
+	for _, filing := range filings {
+		if filing.ReportType != "periodic_transaction" || !filing.IsAmendment {
+			t.Fatalf("filing = %#v, want stable type and amendment flag", filing)
+		}
+		if !strings.Contains(string(filing.RawMetadata), `"amended"`) {
+			t.Fatalf("raw metadata lost amendment field: %s", filing.RawMetadata)
+		}
+	}
+}
+
+func TestOGEListFilingsKeepsTimestampedInclusiveEndDate(t *testing.T) {
+	var s *httptest.Server
+	s = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(strings.ReplaceAll(`{"recordsTotal":2,"data":[{"type":"<a href='{base}/end-date.pdf'>278 Transaction</a>","name":"End Date","docDate":"2026-07-31T17:45:00"},{"type":"<a href='{base}/next-date.pdf'>278 Transaction</a>","name":"Next Date","docDate":"2026-08-01T00:00:01"}]}`, "{base}", s.URL)))
 	}))
 	defer s.Close()
 	c := NewOGEClient(s.URL, time.Second)
@@ -68,10 +130,11 @@ func TestOGEListFilingsKeepsTimestampedInclusiveEndDate(t *testing.T) {
 	}
 }
 
-func TestOGEListFilingsSkipsMalformedDateWithoutEndingPageRange(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+func TestOGEListFilingsRejectsMalformedDateAtomically(t *testing.T) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"recordsTotal":2,"data":[{"type":"<a href='https://example.test/malformed.pdf'>278 Transaction</a>","name":"Malformed","docDate":"not-a-date"},{"type":"<a href='https://example.test/valid.pdf'>278 Transaction</a>","name":"Valid","docDate":"2026-07-15T17:45:00.123-04:00"}]}`))
+		_, _ = w.Write([]byte(strings.ReplaceAll(`{"recordsTotal":2,"data":[{"type":"<a href='{base}/malformed.pdf'>278 Transaction</a>","name":"Malformed","docDate":"not-a-date"},{"type":"<a href='{base}/valid.pdf'>278 Transaction</a>","name":"Valid","docDate":"2026-07-15T17:45:00.123-04:00"}]}`, "{base}", server.URL)))
 	}))
 	defer server.Close()
 
@@ -81,11 +144,67 @@ func TestOGEListFilingsSkipsMalformedDateWithoutEndingPageRange(t *testing.T) {
 		time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC),
 		time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC), 0, 100,
 	)
+	if err == nil || len(page.Filings) != 0 || page.RowCount != 0 {
+		t.Fatalf("page=%+v err=%v", page, err)
+	}
+}
+
+func TestOGEListFilingsRejectsUntrustedPDFAtomically(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"recordsTotal":2,"data":[{"type":"<a href='https://untrusted.example/document.pdf'>278 Transaction</a>","name":"Untrusted","docDate":"2026-07-15"},{"type":"<a href='https://untrusted.example/other.pdf'>278 Transaction</a>","name":"Also Untrusted","docDate":"2026-07-15"}]}`))
+	}))
+	defer server.Close()
+
+	page, err := NewOGEClient(server.URL, time.Second).ListFilingsPage(context.Background(), time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC), 0, 100)
+	if err == nil || len(page.Filings) != 0 || page.RowCount != 0 {
+		t.Fatalf("page=%+v err=%v, want atomic untrusted URL rejection", page, err)
+	}
+}
+
+func TestOGEListFilingsRejectsNegativeRecordsTotal(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"recordsTotal":-1,"data":[]}`))
+	}))
+	defer server.Close()
+	page, err := NewOGEClient(server.URL, time.Second).ListFilingsPage(context.Background(), time.Time{}, time.Now(), 0, 100)
+	if err == nil || page.RowCount != 0 {
+		t.Fatalf("page=%+v err=%v, want recordsTotal rejection", page, err)
+	}
+}
+
+func TestOGEListFilingsContinuesPastMixedOrderOldRows(t *testing.T) {
+	var starts []string
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		starts = append(starts, r.URL.Query().Get("start"))
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Query().Get("start") {
+		case "0":
+			_, _ = w.Write([]byte(strings.ReplaceAll(`{"recordsTotal":4,"data":[{"type":"<a href='{base}/old.pdf'>278 Transaction</a>","name":"Old","docDate":"2026-06-30"},{"type":"<a href='{base}/in-range-one.pdf'>278 Transaction</a>","name":"In Range One","docDate":"2026-07-10"}]}`, "{base}", server.URL)))
+		case "2":
+			_, _ = w.Write([]byte(strings.ReplaceAll(`{"recordsTotal":4,"data":[{"type":"<a href='{base}/in-range-two.pdf'>278 Transaction</a>","name":"In Range Two","docDate":"2026-07-11"},{"type":"<a href='{base}/older.pdf'>278 Transaction</a>","name":"Older","docDate":"2026-06-29"}]}`, "{base}", server.URL)))
+		default:
+			t.Fatalf("unexpected page start %q", r.URL.Query().Get("start"))
+		}
+	}))
+	defer server.Close()
+
+	client := NewOGEClient(server.URL, time.Second)
+	filings, err := client.ListFilings(
+		context.Background(),
+		time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC), 10,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if page.BeforeRange || len(page.Filings) != 1 || page.Filings[0].FilerName != "Valid" {
-		t.Fatalf("page = %+v", page)
+	if len(starts) != 2 || starts[0] != "0" || starts[1] != "2" {
+		t.Fatalf("page starts = %v, want [0 2]", starts)
+	}
+	if len(filings) != 2 || filings[0].FilerName != "In Range One" || filings[1].FilerName != "In Range Two" {
+		t.Fatalf("filings = %#v", filings)
 	}
 }
 

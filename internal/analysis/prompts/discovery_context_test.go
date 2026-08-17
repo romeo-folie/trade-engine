@@ -47,15 +47,15 @@ func testPoliticalDiscoveryContext() *tradeprofile.DiscoveryContext {
 		Thesis:  "GOV surfaced by structured political-disclosure facts.",
 		EvidenceBySource: map[string]json.RawMessage{
 			"political_disclosure": json.RawMessage(`{
-				"version":1,"ticker":"GOV","distinct_filer_count":2,"distinct_buyer_count":2,
-				"report_count":3,"amendment_report_count":1,"transaction_count":4,"purchase_count":3,"sale_count":1,
+				"version":2,"ticker":"GOV","distinct_filer_count":2,"distinct_buyer_count":2,
+				"report_count":3,"independent_report_count":2,"amendment_report_count":1,"transaction_count":4,"independent_transaction_count":3,"amendment_transaction_count":1,"purchase_count":3,"sale_count":1,
 				"exchange_count":0,"other_transaction_count":0,
 				"purchase_amounts":{"known_transaction_count":3,"unknown_transaction_count":0,"minimum_total":3003,"maximum_total":45000},
 				"sale_amounts":{"known_transaction_count":1,"unknown_transaction_count":0,"minimum_total":1001,"maximum_total":15000},
 				"latest_transaction_date":"2026-08-10","latest_filing_or_publication_date":"2026-08-15",
 				"disclosure_lag_days":{"known_transaction_count":4,"minimum_days":2,"maximum_days":20,"latest_transaction_days":5},
 				"repeated_activity_by_one_filer":true,"independent_buyer_activity":true,"contradictory_buying_and_selling":true,
-				"filers":[{"canonical_filer_id":"house:house:alex-example","filer_name":"Hon. Alex Example","office":"CA12","chamber":"house","source":"house","reported_owners":["Self","Spouse"],"report_count":2,"amendment_report_count":1,"transaction_count":3,"purchase_count":2,"sale_count":1,"exchange_count":0,"other_transaction_count":0,"purchase_amounts":{"known_transaction_count":2,"unknown_transaction_count":0,"minimum_total":2002,"maximum_total":30000},"sale_amounts":{"known_transaction_count":1,"unknown_transaction_count":0,"minimum_total":1001,"maximum_total":15000},"latest_transaction_date":"2026-08-10","latest_filing_or_publication_date":"2026-08-15","disclosure_lag_days":{"known_transaction_count":3,"minimum_days":2,"maximum_days":20,"latest_transaction_days":5},"repeated_activity":true,"contradictory_buying_and_selling":true,"reports":[{"report_id":"house-report-123","report_type":"periodic_transaction_amendment","is_amendment":true,"document_url":"https://example.test/house-report-123.pdf","filing_or_publication_date":"2026-08-15","latest_transaction_date":"2026-08-10","disclosure_lag_days":5,"transaction_count":3,"purchase_count":2,"sale_count":1,"exchange_count":0,"reported_owners":["Self","Spouse"],"extraction_status":"completed"}]}],
+				"filers":[{"canonical_filer_id":"house:house:alex-example","filer_name":"Hon. Alex Example","office":"CA12","chamber":"house","source":"house","reported_owners":["Self","Spouse"],"report_count":2,"independent_report_count":1,"amendment_report_count":1,"transaction_count":3,"independent_transaction_count":2,"amendment_transaction_count":1,"purchase_count":2,"sale_count":1,"exchange_count":0,"other_transaction_count":0,"purchase_amounts":{"known_transaction_count":2,"unknown_transaction_count":0,"minimum_total":2002,"maximum_total":30000},"sale_amounts":{"known_transaction_count":1,"unknown_transaction_count":0,"minimum_total":1001,"maximum_total":15000},"latest_transaction_date":"2026-08-10","latest_filing_or_publication_date":"2026-08-15","disclosure_lag_days":{"known_transaction_count":3,"minimum_days":2,"maximum_days":20,"latest_transaction_days":5},"repeated_activity":true,"contradictory_buying_and_selling":true,"reports":[{"report_id":"house-report-123","report_type":"periodic_transaction_amendment","is_amendment":true,"document_url":"https://example.test/house-report-123.pdf","filing_or_publication_date":"2026-08-15","latest_transaction_date":"2026-08-10","disclosure_lag_days":5,"transaction_count":3,"purchase_count":2,"sale_count":1,"exchange_count":0,"reported_owners":["Self","Spouse"],"extraction_status":"completed"}]}],
 				"data_quality":{"canonical_identity_basis":"normalized source, chamber, and filer-name tokens","limitations":["amount totals exclude missing ranges"]}
 			}`),
 		},
@@ -80,7 +80,7 @@ func TestPoliticalDisclosureFactsReachAllDeepAnalysisPrompts(t *testing.T) {
 		"standard": standard, "directional specialist": directional, "risk manager": risk,
 	} {
 		for _, want := range []string{
-			"filers=2; buyers=2; reports=3; amendments=1; transactions=4",
+			"filers=2; buyers=2; reports=3; independent_reports=2; amendments=1; raw_transaction_rows=4",
 			"repeated_filer=true; independent_buyers=true; contradictory_buying_and_selling=true",
 			"id=house:house:alex-example", "owners=Self, Spouse",
 			"id=house-report-123", "https://example.test/house-report-123.pdf",

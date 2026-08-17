@@ -18,6 +18,7 @@ import (
 
 type OGEFiling struct {
 	ExternalID, FilerName, Office, ReportType, DocumentURL string
+	IsAmendment                                            bool
 	FilingDate                                             time.Time
 	RawMetadata                                            []byte
 }
@@ -55,7 +56,6 @@ func NewOGEClient(base string, timeout time.Duration) *OGEClient {
 type OGEFilingPage struct {
 	Filings         []OGEFiling
 	RowCount, Total int
-	BeforeRange     bool
 }
 
 func (c *OGEClient) ListFilings(ctx context.Context, since, until time.Time, limit int) ([]OGEFiling, error) {
@@ -76,7 +76,7 @@ func (c *OGEClient) ListFilings(ctx context.Context, since, until time.Time, lim
 			out = append(out, filing)
 		}
 		start += page.RowCount
-		if page.RowCount == 0 || page.BeforeRange || start >= page.Total {
+		if page.RowCount == 0 || start >= page.Total {
 			break
 		}
 	}
@@ -122,32 +122,48 @@ func (c *OGEClient) ListFilingsPage(ctx context.Context, since, until time.Time,
 	if err := json.Unmarshal(b, &raw); err != nil {
 		return OGEFilingPage{}, err
 	}
+	if raw.RecordsTotal < 0 || (raw.RecordsTotal > 0 && start > raw.RecordsTotal) {
+		return OGEFilingPage{}, fmt.Errorf("OGE API returned inconsistent recordsTotal %d for start %d", raw.RecordsTotal, start)
+	}
 	out := make([]OGEFiling, 0, len(raw.Data))
-	beforeRange := false
-	for _, row := range raw.Data {
+	for index, row := range raw.Data {
 		link := ogePDF.FindString(html.UnescapeString(row.Type))
 		if link == "" {
-			continue
+			label := strings.ToLower(stripHTML(html.UnescapeString(row.Type)))
+			if strings.Contains(label, "request") || strings.Contains(label, "not available") {
+				continue
+			}
+			return OGEFilingPage{}, fmt.Errorf("OGE filing row %d has no downloadable PDF", index+1)
+		}
+		document, err := trustedDocumentURL(c.BaseURL, link, ogeDocumentPathPrefix(c.BaseURL))
+		if err != nil || !strings.HasSuffix(strings.ToLower(document.Path), ".pdf") {
+			return OGEFilingPage{}, fmt.Errorf("OGE filing row %d has an untrusted PDF URL", index+1)
+		}
+		name := strings.TrimSpace(html.UnescapeString(row.Name))
+		if name == "" {
+			return OGEFilingPage{}, fmt.Errorf("OGE filing row %d has no filer name", index+1)
 		}
 		d, ok := parseOGEFilingDate(row.DocDate)
 		if !ok {
-			// A malformed row must not masquerade as an old filing and stop
-			// pagination before later valid rows are inspected.
-			continue
+			return OGEFilingPage{}, fmt.Errorf("OGE filing row %d has invalid filing date", index+1)
 		}
 		filingDay := disclosureCalendarDay(d)
 		if filingDay.Before(disclosureCalendarDay(since)) {
-			beforeRange = true
 			continue
 		}
 		if filingDay.After(disclosureCalendarDay(until)) {
 			continue
 		}
-		sum := sha256.Sum256([]byte(link))
+		documentURL := document.String()
+		sum := sha256.Sum256([]byte(documentURL))
 		meta, _ := json.Marshal(row)
-		out = append(out, OGEFiling{ExternalID: "oge-" + hex.EncodeToString(sum[:8]), FilerName: html.UnescapeString(row.Name), Office: strings.Trim(strings.Join([]string{row.Title, row.Agency}, " — "), " —"), ReportType: normalizeOGEReportType(row.Type), FilingDate: d, DocumentURL: link, RawMetadata: meta})
+		isAmendment := ogeLabelIsAmendment(strings.ToLower(stripHTML(html.UnescapeString(row.Type)))) || ogeAmendedFieldIsAmendment(row.Amended)
+		if len(meta) == 0 {
+			return OGEFilingPage{}, fmt.Errorf("OGE filing row %d metadata is invalid", index+1)
+		}
+		out = append(out, OGEFiling{ExternalID: "oge-" + hex.EncodeToString(sum[:8]), FilerName: name, Office: strings.Trim(strings.Join([]string{row.Title, row.Agency}, " — "), " —"), ReportType: normalizeOGEReportType(row.Type, row.Amended), IsAmendment: isAmendment, FilingDate: d, DocumentURL: documentURL, RawMetadata: meta})
 	}
-	return OGEFilingPage{Filings: out, RowCount: len(raw.Data), Total: raw.RecordsTotal, BeforeRange: beforeRange}, nil
+	return OGEFilingPage{Filings: out, RowCount: len(raw.Data), Total: raw.RecordsTotal}, nil
 }
 
 func parseOGEFilingDate(value string) (time.Time, bool) {
@@ -196,22 +212,38 @@ func (c *OGEClient) FetchPDF(ctx context.Context, f OGEFiling) ([]byte, error) {
 	}
 	return b, nil
 }
-func normalizeOGEReportType(v string) string {
-	v = stripHTML(html.UnescapeString(v))
-	v = strings.ToLower(strings.TrimSpace(v))
+func normalizeOGEReportType(v, amended string) string {
+	label := strings.ToLower(strings.TrimSpace(stripHTML(html.UnescapeString(v))))
+
+	var base string
 	switch {
-	case strings.Contains(v, "transaction"):
-		return "periodic_transaction"
-	case strings.Contains(v, "annual"):
-		return "annual"
-	case strings.Contains(v, "termination"):
-		return "termination"
+	case strings.Contains(label, "transaction"):
+		base = "periodic_transaction"
+	case strings.Contains(label, "annual"):
+		base = "annual"
+	case strings.Contains(label, "termination"):
+		base = "termination"
 	default:
-		return v
+		base = strings.Trim(strings.ReplaceAll(label, "amended", ""), " -_()")
 	}
+	return base
 }
+
+func ogeLabelIsAmendment(label string) bool {
+	return strings.Contains(label, "amend") || strings.Contains(label, "correct")
+}
+
+func ogeAmendedFieldIsAmendment(value string) bool {
+	v := strings.ToLower(strings.TrimSpace(stripHTML(html.UnescapeString(value))))
+	switch v {
+	case "", "0", "false", "f", "no", "n", "none", "null", "nil", "not amended", "n/a", "na", "not applicable":
+		return false
+	}
+	return true
+}
+
 func ParseOGEPDF(f OGEFiling, pdf []byte, pages []PageText) Report {
-	r := Report{Source: "oge", ExternalID: f.ExternalID, Chamber: "executive", FilerName: f.FilerName, Office: f.Office, ReportType: f.ReportType, FilingDate: f.FilingDate, DocumentURL: f.DocumentURL, RawMetadata: f.RawMetadata, ContentHash: hashBytes(pdf), ExtractionStatus: "no_text"}
+	r := Report{Source: "oge", ExternalID: f.ExternalID, Chamber: "executive", FilerName: f.FilerName, Office: f.Office, ReportType: f.ReportType, IsAmendment: f.IsAmendment, FilingDate: f.FilingDate, DocumentURL: f.DocumentURL, RawMetadata: f.RawMetadata, ContentHash: hashBytes(pdf), ExtractionStatus: "no_text"}
 	for _, p := range pages {
 		lines := ogeLines(p)
 		for _, text := range lines {
@@ -273,9 +305,3 @@ func firstType(s string) string {
 	return ""
 }
 func hashBytes(b []byte) string { sum := sha256.Sum256(b); return hex.EncodeToString(sum[:]) }
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}

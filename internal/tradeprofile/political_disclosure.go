@@ -2,7 +2,7 @@ package tradeprofile
 
 // PoliticalDisclosureEvidenceVersion identifies the structured disclosure
 // provenance schema carried from scanner discovery into deep analysis.
-const PoliticalDisclosureEvidenceVersion = 1
+const PoliticalDisclosureEvidenceVersion = 2
 
 // PoliticalDisclosureEvidence contains filing facts only. None of these fields
 // are an execution signal or permission to trade.
@@ -13,6 +13,9 @@ type PoliticalDisclosureEvidence struct {
 	DistinctBuyerCount            int                                `json:"distinct_buyer_count"`
 	ReportCount                   int                                `json:"report_count"`
 	AmendmentReportCount          int                                `json:"amendment_report_count"`
+	IndependentReportCount        int                                `json:"independent_report_count"`
+	IndependentTransactionCount   int                                `json:"independent_transaction_count"`
+	AmendmentTransactionCount     int                                `json:"amendment_transaction_count"`
 	TransactionCount              int                                `json:"transaction_count"`
 	PurchaseCount                 int                                `json:"purchase_count"`
 	SaleCount                     int                                `json:"sale_count"`
@@ -53,6 +56,9 @@ type PoliticalDisclosureFilerEvidence struct {
 	ReportedOwners                []string                            `json:"reported_owners,omitempty"`
 	ReportCount                   int                                 `json:"report_count"`
 	AmendmentReportCount          int                                 `json:"amendment_report_count"`
+	IndependentReportCount        int                                 `json:"independent_report_count"`
+	IndependentTransactionCount   int                                 `json:"independent_transaction_count"`
+	AmendmentTransactionCount     int                                 `json:"amendment_transaction_count"`
 	TransactionCount              int                                 `json:"transaction_count"`
 	PurchaseCount                 int                                 `json:"purchase_count"`
 	SaleCount                     int                                 `json:"sale_count"`

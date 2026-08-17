@@ -40,6 +40,7 @@ func TestPoliticalDisclosurePersistenceAndClaimLifecycle(t *testing.T) {
 		Source: "house", ExternalID: "test-disclosure-claim", Chamber: "house",
 		FilerName: "Hon. Test Member", Office: "TS01",
 		ReportType: "periodic_transaction", FilingDate: now.Add(-time.Hour),
+		IsAmendment: true,
 		DocumentURL: "https://example.test/test-disclosure-claim.pdf",
 		ContentHash: "fixture", ExtractionStatus: "completed",
 		RawMetadata: json.RawMessage(`{"fixture":true}`),
@@ -75,7 +76,7 @@ func TestPoliticalDisclosurePersistenceAndClaimLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if detail == nil || len(detail.Transactions) != 1 ||
+	if detail == nil || !detail.IsAmendment || len(detail.Transactions) != 1 ||
 		detail.Transactions[0].Ticker != "TESTDISC" {
 		t.Fatalf("detail = %+v", detail)
 	}
@@ -180,6 +181,180 @@ func TestPoliticalDisclosurePersistenceAndClaimLifecycle(t *testing.T) {
 	}
 }
 
+func TestClaimDuePoliticalDisclosureRetriesLeasesWithoutIncrementingAttempts(t *testing.T) {
+	ctx := context.Background()
+	report := store.PoliticalDisclosureReport{
+		Source: "senate", ExternalID: "test-due-disclosure-retry", Chamber: "senate",
+		FilerName: "Test Senator", ReportType: "periodic_transaction",
+		FilingDate: time.Now().UTC(), DocumentURL: "https://example.test/retry",
+		ExtractionStatus: "failed", ExtractionError: "temporary", RetryableFailure: true,
+		RawMetadata: json.RawMessage(`{"fixture":true}`),
+	}
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), "DELETE FROM political_disclosure_reports WHERE source=$1 AND external_id=$2", report.Source, report.ExternalID)
+	})
+	if err := store.SavePoliticalDisclosureReport(ctx, report); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GetDB().Exec(ctx, "UPDATE political_disclosure_reports SET next_retry_at=NOW()-INTERVAL '1 second' WHERE source=$1 AND external_id=$2", report.Source, report.ExternalID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	claimed, err := store.ClaimDuePoliticalDisclosureRetries(ctx, report.Source, now, 1, 2*time.Minute)
+	if err != nil || len(claimed) != 1 || claimed[0].ExternalID != report.ExternalID || claimed[0].RetryAttemptCount != 1 {
+		t.Fatalf("claimed=%+v err=%v", claimed, err)
+	}
+	stored, err := store.GetPoliticalDisclosureReport(ctx, report.Source, report.ExternalID)
+	if err != nil || stored == nil || stored.RetryAttemptCount != 1 || stored.NextRetryAt == nil || stored.NextRetryAt.After(now) {
+		t.Fatalf("leased retry=%+v err=%v", stored, err)
+	}
+	if found, err := store.RetryPoliticalDisclosureReport(ctx, report.Source, report.ExternalID); err != nil || !found {
+		t.Fatalf("manual retry found=%v err=%v", found, err)
+	}
+	claimed, err = store.ClaimDuePoliticalDisclosureRetries(ctx, report.Source, time.Now().UTC(), 1, time.Minute)
+	if err != nil || len(claimed) != 1 || claimed[0].ExternalID != report.ExternalID {
+		t.Fatalf("manual due claim=%+v err=%v", claimed, err)
+	}
+}
+
+func TestPoliticalDisclosureRetryClaimLeaseFencingLifecycle(t *testing.T) {
+	ctx := context.Background()
+	report := store.PoliticalDisclosureReport{Source: "senate", ExternalID: "retry-lease-fence", Chamber: "senate", FilerName: "Lease Senator", ReportType: "periodic_transaction", FilingDate: time.Now().UTC(), DocumentURL: "https://example.test/lease", ExtractionStatus: "failed", ExtractionError: "temporary", RetryableFailure: true, RawMetadata: json.RawMessage(`{"fixture":true}`)}
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), "DELETE FROM political_disclosure_reports WHERE source=$1 AND external_id=$2", report.Source, report.ExternalID)
+	})
+	if err := store.SavePoliticalDisclosureReport(ctx, report); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GetDB().Exec(ctx, "UPDATE political_disclosure_reports SET next_retry_at=NOW()-INTERVAL '1 second' WHERE source=$1 AND external_id=$2", report.Source, report.ExternalID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	a, err := store.ClaimPoliticalDisclosureRetries(ctx, report.Source, now, 1, time.Minute, "token-a")
+	if err != nil || len(a) != 1 {
+		t.Fatalf("claim A=%+v err=%v", a, err)
+	}
+	if b, err := store.ClaimPoliticalDisclosureRetries(ctx, report.Source, now, 1, time.Minute, "token-b"); err != nil || len(b) != 0 {
+		t.Fatalf("active lease claimed by B=%+v err=%v", b, err)
+	}
+	if ok, err := store.RenewPoliticalDisclosureRetryLease(ctx, report.Source, report.ExternalID, "token-a", now.Add(time.Second), 2*time.Minute); err != nil || !ok {
+		t.Fatalf("renew=%v err=%v", ok, err)
+	}
+	if terminal, err := store.PoliticalDisclosureReportTerminal(ctx, report.Source, report.ExternalID); err != nil || !terminal {
+		t.Fatalf("active retry lease terminal=%v err=%v", terminal, err)
+	}
+	// An expired lease is still owned by A until a reclaimer has actually
+	// replaced its token, so A may safely commit the complete result.
+	if _, err := store.GetDB().Exec(ctx, "UPDATE political_disclosure_reports SET retry_lease_until=NOW()-INTERVAL '1 second' WHERE source=$1 AND external_id=$2", report.Source, report.ExternalID); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := store.RenewPoliticalDisclosureRetryLease(ctx, report.Source, report.ExternalID, "token-a", time.Now().UTC(), time.Minute); err != nil || !ok {
+		t.Fatalf("expired but unreclaimed token A renewal=%v err=%v", ok, err)
+	}
+	if _, err := store.GetDB().Exec(ctx, "UPDATE political_disclosure_reports SET retry_lease_until=NOW()-INTERVAL '1 second' WHERE source=$1 AND external_id=$2", report.Source, report.ExternalID); err != nil {
+		t.Fatal(err)
+	}
+	completed := report
+	completed.ExtractionStatus = "completed"
+	completed.RetryableFailure = false
+	if err := store.SavePoliticalDisclosureRetryResult(ctx, completed, "token-a"); err != nil {
+		t.Fatalf("expired unreclaimed token A completion: %v", err)
+	}
+	if err := store.SavePoliticalDisclosureReport(ctx, report); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GetDB().Exec(ctx, "UPDATE political_disclosure_reports SET next_retry_at=NOW()-INTERVAL '1 second' WHERE source=$1 AND external_id=$2", report.Source, report.ExternalID); err != nil {
+		t.Fatal(err)
+	}
+	a, err = store.ClaimPoliticalDisclosureRetries(ctx, report.Source, time.Now().UTC(), 1, time.Minute, "token-a")
+	if err != nil || len(a) != 1 {
+		t.Fatalf("second claim A=%+v err=%v", a, err)
+	}
+	if _, err := store.GetDB().Exec(ctx, "UPDATE political_disclosure_reports SET retry_lease_until=NOW()-INTERVAL '1 second' WHERE source=$1 AND external_id=$2", report.Source, report.ExternalID); err != nil {
+		t.Fatal(err)
+	}
+	b, err := store.ClaimPoliticalDisclosureRetries(ctx, report.Source, time.Now().UTC(), 1, time.Minute, "token-b")
+	if err != nil || len(b) != 1 {
+		t.Fatalf("reclaim B=%+v err=%v", b, err)
+	}
+	if ok, err := store.RenewPoliticalDisclosureRetryLease(ctx, report.Source, report.ExternalID, "token-a", time.Now().UTC(), time.Minute); err != nil || ok {
+		t.Fatalf("reclaimed token A renewal=%v err=%v, want lease lost", ok, err)
+	}
+	completed.Transactions = []store.PoliticalDisclosureTransaction{{
+		Ordinal: 1, AssetName: "Microsoft", Ticker: "MSFT",
+		TransactionType: "purchase", TransactionDate: report.FilingDate,
+	}}
+	if err := store.SavePoliticalDisclosureRetryResult(ctx, completed, "token-b"); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := store.GetPoliticalDisclosureReport(ctx, report.Source, report.ExternalID)
+	if err != nil || stored.RetryClaimToken != "" || stored.NextRetryAt != nil || stored.RetryAttemptCount != 0 || stored.ExtractionStatus != "completed" || len(stored.Transactions) != 1 {
+		t.Fatalf("B success=%+v err=%v", stored, err)
+	}
+	type candidateState struct {
+		status           string
+		transactionCount int
+		latest           time.Time
+		evidence         []byte
+	}
+	loadCandidate := func() (candidateState, error) {
+		var state candidateState
+		err := store.GetDB().QueryRow(ctx, `
+			SELECT promotion_status, transaction_count, latest_transaction_date, evidence
+			FROM political_disclosure_candidates
+			WHERE report_id=(
+				SELECT id FROM political_disclosure_reports WHERE source=$1 AND external_id=$2
+			) AND ticker='MSFT'`, report.Source, report.ExternalID).Scan(
+			&state.status, &state.transactionCount, &state.latest, &state.evidence,
+		)
+		return state, err
+	}
+	beforeCandidate, err := loadCandidate()
+	if err != nil || beforeCandidate.status != "pending" || beforeCandidate.transactionCount != 1 || beforeCandidate.latest.IsZero() || len(beforeCandidate.evidence) == 0 {
+		t.Fatalf("B candidate=%+v err=%v", beforeCandidate, err)
+	}
+	if err := store.SavePoliticalDisclosureRetryResult(ctx, report, "token-a"); !errors.Is(err, store.ErrPoliticalDisclosureRetryLeaseLost) {
+		t.Fatalf("late token A failure error=%v, want lease lost", err)
+	}
+	stored, err = store.GetPoliticalDisclosureReport(ctx, report.Source, report.ExternalID)
+	if err != nil || stored.RetryClaimToken != "" || stored.NextRetryAt != nil || stored.RetryAttemptCount != 0 || stored.ExtractionStatus != "completed" || len(stored.Transactions) != 1 {
+		t.Fatalf("late A changed B completion=%+v err=%v", stored, err)
+	}
+	afterCandidate, err := loadCandidate()
+	if err != nil || afterCandidate.status != beforeCandidate.status || afterCandidate.transactionCount != beforeCandidate.transactionCount || !afterCandidate.latest.Equal(beforeCandidate.latest) || string(afterCandidate.evidence) != string(beforeCandidate.evidence) {
+		t.Fatalf("late A changed B candidate: before=%+v after=%+v err=%v", beforeCandidate, afterCandidate, err)
+	}
+	completed.ExtractionStatus = "failed"
+	completed.RetryableFailure = true
+	completed.ExtractionError = "again"
+	if err := store.SavePoliticalDisclosureReport(ctx, completed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GetDB().Exec(ctx, "UPDATE political_disclosure_reports SET next_retry_at=NOW()-INTERVAL '1 second' WHERE source=$1 AND external_id=$2", report.Source, report.ExternalID); err != nil {
+		t.Fatal(err)
+	}
+	b, err = store.ClaimPoliticalDisclosureRetries(ctx, report.Source, time.Now().UTC(), 1, time.Minute, "token-b")
+	if err != nil || len(b) != 1 {
+		t.Fatalf("failure claim=%+v err=%v", b, err)
+	}
+	if err := store.SavePoliticalDisclosureRetryResult(ctx, completed, "token-b"); err != nil {
+		t.Fatal(err)
+	}
+	stored, err = store.GetPoliticalDisclosureReport(ctx, report.Source, report.ExternalID)
+	if err != nil || stored.RetryClaimToken != "" || stored.RetryAttemptCount != 2 || stored.NextRetryAt == nil {
+		t.Fatalf("B failure=%+v err=%v", stored, err)
+	}
+	before := *stored.NextRetryAt
+	attempts := stored.RetryAttemptCount
+	if err := store.ReleasePoliticalDisclosureRetryClaims(ctx, "token-b"); err != nil {
+		t.Fatal(err)
+	}
+	stored, err = store.GetPoliticalDisclosureReport(ctx, report.Source, report.ExternalID)
+	if err != nil || stored.RetryAttemptCount != attempts || stored.NextRetryAt == nil || !stored.NextRetryAt.Equal(before) {
+		t.Fatalf("release altered schedule=%+v err=%v", stored, err)
+	}
+}
+
 func TestPersistedTransientSenateFailureRetriesLaterWithoutStarvingOlderFiling(t *testing.T) {
 	ctx := context.Background()
 	const source = "senate"
@@ -232,6 +407,140 @@ func TestPersistedTransientSenateFailureRetriesLaterWithoutStarvingOlderFiling(t
 	if err != nil || newest == nil || newest.ExtractionStatus != "completed" ||
 		newest.RetryableFailure || newest.RetryAttemptCount != 0 || newest.NextRetryAt != nil {
 		t.Fatalf("successful re-extraction did not clear retry state: report=%+v err=%v", newest, err)
+	}
+}
+
+func TestClaimPoliticalDisclosureCandidatesExcludesFutureTickerFromSelection(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2300, time.January, 15, 12, 0, 0, 0, time.UTC)
+	current := politicalDisclosureClaimFixture("test-claim-window-current", "PDWINDOWCUR", now)
+	future := politicalDisclosureClaimFixture("test-claim-window-future", "PDWINDOWFUT", now.AddDate(0, 0, 1))
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), `
+			DELETE FROM political_disclosure_reports
+			WHERE source='house' AND external_id = ANY($1::text[])`,
+			[]string{current.ExternalID, future.ExternalID})
+	})
+	for _, report := range []store.PoliticalDisclosureReport{current, future} {
+		if err := store.SavePoliticalDisclosureReport(ctx, report); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	claimed, err := store.ClaimPoliticalDisclosureCandidates(
+		ctx, now.AddDate(0, 0, -7), now, time.Hour, 1, "window-selected-token",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 || claimed[0].Ticker != "PDWINDOWCUR" || claimed[0].ExternalID != current.ExternalID {
+		t.Fatalf("claimed = %+v, want only current in-range ticker", claimed)
+	}
+}
+
+func TestClaimPoliticalDisclosureCandidatesExcludesFutureReportsFromClaimSet(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2300, time.February, 15, 12, 0, 0, 0, time.UTC)
+	current := politicalDisclosureClaimFixture("test-claim-window-claim-current", "PDWINDOWSAME", now)
+	future := politicalDisclosureClaimFixture("test-claim-window-claim-future", "PDWINDOWSAME", now.AddDate(0, 0, 1))
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), `
+			DELETE FROM political_disclosure_reports
+			WHERE source='house' AND external_id = ANY($1::text[])`,
+			[]string{current.ExternalID, future.ExternalID})
+	})
+	for _, report := range []store.PoliticalDisclosureReport{current, future} {
+		if err := store.SavePoliticalDisclosureReport(ctx, report); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	claimed, err := store.ClaimPoliticalDisclosureCandidates(
+		ctx, now.AddDate(0, 0, -7), now, time.Hour, 1, "window-claimed-token",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 || claimed[0].Ticker != "PDWINDOWSAME" || claimed[0].ExternalID != current.ExternalID {
+		t.Fatalf("claimed = %+v, want only current in-range report", claimed)
+	}
+}
+
+func TestClaimPoliticalDisclosureCandidatesReturnsHistoryButClaimsOnlyPendingRows(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2300, time.March, 15, 12, 0, 0, 0, time.UTC)
+	history := politicalDisclosureClaimFixture("test-claim-history-terminal", "PDHISTORY", now.AddDate(0, 0, -1))
+	pending := politicalDisclosureClaimFixture("test-claim-history-pending", "PDHISTORY", now)
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), `
+			DELETE FROM political_disclosure_reports
+			WHERE source='house' AND external_id = ANY($1::text[])`,
+			[]string{history.ExternalID, pending.ExternalID})
+	})
+	for _, report := range []store.PoliticalDisclosureReport{history, pending} {
+		if err := store.SavePoliticalDisclosureReport(ctx, report); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.GetDB().Exec(ctx, `
+		UPDATE political_disclosure_candidates
+		SET promotion_status='promoted', promotion_claim_token=NULL, promotion_claimed_at=NULL
+		WHERE report_id=(SELECT id FROM political_disclosure_reports WHERE source=$1 AND external_id=$2)`, history.Source, history.ExternalID); err != nil {
+		t.Fatal(err)
+	}
+
+	claimed, err := store.ClaimPoliticalDisclosureCandidates(ctx, now.AddDate(0, 0, -7), now, time.Hour, 1, "history-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 2 {
+		t.Fatalf("rows=%+v, want history and pending rows", claimed)
+	}
+	byExternalID := make(map[string]store.PoliticalDisclosureCandidate, len(claimed))
+	for _, item := range claimed {
+		byExternalID[item.ExternalID] = item
+	}
+	claimedHistory := byExternalID[history.ExternalID]
+	if claimedHistory.Claimed || claimedHistory.PromotionClaimToken != "" {
+		t.Fatalf("terminal history row was claimed: %+v", claimedHistory)
+	}
+	claimedPending := byExternalID[pending.ExternalID]
+	if !claimedPending.Claimed || claimedPending.PromotionClaimToken != "history-token" {
+		t.Fatalf("pending row claim=%+v", claimedPending)
+	}
+	if err := store.MarkPoliticalDisclosurePromotion(ctx, "PDHISTORY", "history-token", "rejected", "", "fixture", now); err != nil {
+		t.Fatal(err)
+	}
+	var historyStatus, pendingStatus string
+	if err := store.GetDB().QueryRow(ctx, `SELECT promotion_status FROM political_disclosure_candidates WHERE report_id=$1 AND ticker=$2`, claimedHistory.ReportID, "PDHISTORY").Scan(&historyStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.GetDB().QueryRow(ctx, `SELECT promotion_status FROM political_disclosure_candidates WHERE report_id=$1 AND ticker=$2`, claimedPending.ReportID, "PDHISTORY").Scan(&pendingStatus); err != nil {
+		t.Fatal(err)
+	}
+	if historyStatus != "promoted" || pendingStatus != "rejected" {
+		t.Fatalf("history=%q pending=%q, want promoted/rejected", historyStatus, pendingStatus)
+	}
+	if rows, err := store.ClaimPoliticalDisclosureCandidates(ctx, now.AddDate(0, 0, -7), now, time.Hour, 1, "no-claim-token"); err != nil || len(rows) != 0 {
+		t.Fatalf("no claimable row returned history: rows=%+v err=%v", rows, err)
+	}
+}
+
+func politicalDisclosureClaimFixture(externalID, ticker string, filingDate time.Time) store.PoliticalDisclosureReport {
+	minimum, maximum := int64(1_001), int64(15_000)
+	return store.PoliticalDisclosureReport{
+		Source: "house", ExternalID: externalID, Chamber: "house",
+		FilerName: "Hon. Claim Window Test", Office: "TS03",
+		ReportType: "periodic_transaction", FilingDate: filingDate,
+		DocumentURL: "https://example.test/" + externalID + ".pdf",
+		ContentHash: "fixture-" + externalID, ExtractionStatus: "completed",
+		RawMetadata: json.RawMessage(`{"fixture":true}`),
+		Transactions: []store.PoliticalDisclosureTransaction{{
+			Ordinal: 1, AssetName: "Claim Window Corp (" + ticker + ")", Ticker: ticker,
+			AssetType: "ST", TransactionType: "purchase", TransactionDate: filingDate,
+			AmountMin: &minimum, AmountMax: &maximum, AmountText: "$1,001 - $15,000",
+			RawData: json.RawMessage(`{"row":1}`),
+		}},
 	}
 }
 

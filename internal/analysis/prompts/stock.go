@@ -744,16 +744,26 @@ func writeDiscoveryContext(b *strings.Builder, context *tradeprofile.DiscoveryCo
 func writePoliticalDisclosureEvidence(b *strings.Builder, raw json.RawMessage) bool {
 	var evidence tradeprofile.PoliticalDisclosureEvidence
 	if err := json.Unmarshal(raw, &evidence); err != nil ||
-		evidence.Version != tradeprofile.PoliticalDisclosureEvidenceVersion {
+		(evidence.Version != 1 && evidence.Version != tradeprofile.PoliticalDisclosureEvidenceVersion) {
 		return false
 	}
-	b.WriteString(fmt.Sprintf(
-		"Evidence[political_disclosure].aggregate: filers=%d; buyers=%d; reports=%d; amendments=%d; transactions=%d; purchases=%d; sales=%d; exchanges=%d; other=%d\n",
-		evidence.DistinctFilerCount, evidence.DistinctBuyerCount,
-		evidence.ReportCount, evidence.AmendmentReportCount,
-		evidence.TransactionCount, evidence.PurchaseCount,
-		evidence.SaleCount, evidence.ExchangeCount, evidence.OtherTransactionCount,
-	))
+	if evidence.Version == 1 {
+		b.WriteString(fmt.Sprintf(
+			"Evidence[political_disclosure].aggregate: filers=%d; buyers=%d; reports=%d; amendments=%d; transactions=%d; purchases=%d; sales=%d; exchanges=%d; other=%d\n",
+			evidence.DistinctFilerCount, evidence.DistinctBuyerCount,
+			evidence.ReportCount, evidence.AmendmentReportCount,
+			evidence.TransactionCount, evidence.PurchaseCount,
+			evidence.SaleCount, evidence.ExchangeCount, evidence.OtherTransactionCount,
+		))
+	} else {
+		b.WriteString(fmt.Sprintf(
+			"Evidence[political_disclosure].aggregate: filers=%d; buyers=%d; reports=%d; independent_reports=%d; amendments=%d; raw_transaction_rows=%d (independent=%d amendment=%d); independent_purchases=%d; independent_sales=%d; independent_exchanges=%d; independent_other=%d. Amendment rows remain in report detail/raw counts but are excluded from independent semantic aggregates.\n",
+			evidence.DistinctFilerCount, evidence.DistinctBuyerCount,
+			evidence.ReportCount, evidence.IndependentReportCount, evidence.AmendmentReportCount,
+			evidence.TransactionCount, evidence.IndependentTransactionCount, evidence.AmendmentTransactionCount, evidence.PurchaseCount,
+			evidence.SaleCount, evidence.ExchangeCount, evidence.OtherTransactionCount,
+		))
+	}
 	b.WriteString(fmt.Sprintf(
 		"Evidence[political_disclosure].amounts: purchases=%s; sales=%s\n",
 		formatPoliticalAmountSummary(evidence.PurchaseAmounts),
@@ -777,21 +787,36 @@ func writePoliticalDisclosureEvidence(b *strings.Builder, raw json.RawMessage) b
 		if index >= maxPromptFilers {
 			break
 		}
-		b.WriteString(fmt.Sprintf(
-			"Evidence[political_disclosure].filer[%d]: id=%s; name=%s; source=%s; chamber=%s; office=%s; owners=%s; reports=%d; amendments=%d; transactions=%d; purchases=%d (%s); sales=%d (%s); exchanges=%d; repeated=%t; contradictory=%t; latest_transaction=%s; latest_filing_or_publication=%s; lag=%s\n",
-			index+1, truncateStr(filer.CanonicalFilerID, 100),
-			truncateStr(filer.FilerName, 100), truncateStr(filer.Source, 30),
-			truncateStr(valueOrUnknown(filer.Chamber), 40),
-			truncateStr(valueOrUnknown(filer.Office), 100),
-			truncateStr(valueOrUnknown(strings.Join(filer.ReportedOwners, ", ")), 100),
-			filer.ReportCount, filer.AmendmentReportCount,
-			filer.TransactionCount, filer.PurchaseCount,
-			formatPoliticalAmountSummary(filer.PurchaseAmounts), filer.SaleCount,
-			formatPoliticalAmountSummary(filer.SaleAmounts), filer.ExchangeCount, filer.RepeatedActivity,
-			filer.ContradictoryActivity, valueOrUnknown(filer.LatestTransactionDate),
-			valueOrUnknown(filer.LatestFilingOrPublicationDate),
-			formatPoliticalLagSummary(filer.DisclosureLagDays),
-		))
+		if evidence.Version == 1 {
+			b.WriteString(fmt.Sprintf(
+				"Evidence[political_disclosure].filer[%d]: id=%s; name=%s; source=%s; chamber=%s; office=%s; owners=%s; reports=%d; amendments=%d; transactions=%d; purchases=%d (%s); sales=%d (%s); exchanges=%d; repeated=%t; contradictory=%t; latest_transaction=%s; latest_filing_or_publication=%s; lag=%s\n",
+				index+1, truncateStr(filer.CanonicalFilerID, 100),
+				truncateStr(filer.FilerName, 100), truncateStr(filer.Source, 30),
+				truncateStr(valueOrUnknown(filer.Chamber), 40), truncateStr(valueOrUnknown(filer.Office), 100),
+				truncateStr(valueOrUnknown(strings.Join(filer.ReportedOwners, ", ")), 100),
+				filer.ReportCount, filer.AmendmentReportCount, filer.TransactionCount, filer.PurchaseCount,
+				formatPoliticalAmountSummary(filer.PurchaseAmounts), filer.SaleCount,
+				formatPoliticalAmountSummary(filer.SaleAmounts), filer.ExchangeCount, filer.RepeatedActivity,
+				filer.ContradictoryActivity, valueOrUnknown(filer.LatestTransactionDate),
+				valueOrUnknown(filer.LatestFilingOrPublicationDate), formatPoliticalLagSummary(filer.DisclosureLagDays),
+			))
+		} else {
+			b.WriteString(fmt.Sprintf(
+				"Evidence[political_disclosure].filer[%d]: id=%s; name=%s; source=%s; chamber=%s; office=%s; owners=%s; reports=%d; independent_reports=%d; amendments=%d; transactions=%d; purchases=%d (%s); sales=%d (%s); exchanges=%d; repeated=%t; contradictory=%t; latest_transaction=%s; latest_filing_or_publication=%s; lag=%s\n",
+				index+1, truncateStr(filer.CanonicalFilerID, 100),
+				truncateStr(filer.FilerName, 100), truncateStr(filer.Source, 30),
+				truncateStr(valueOrUnknown(filer.Chamber), 40),
+				truncateStr(valueOrUnknown(filer.Office), 100),
+				truncateStr(valueOrUnknown(strings.Join(filer.ReportedOwners, ", ")), 100),
+				filer.ReportCount, filer.IndependentReportCount, filer.AmendmentReportCount,
+				filer.TransactionCount, filer.PurchaseCount,
+				formatPoliticalAmountSummary(filer.PurchaseAmounts), filer.SaleCount,
+				formatPoliticalAmountSummary(filer.SaleAmounts), filer.ExchangeCount, filer.RepeatedActivity,
+				filer.ContradictoryActivity, valueOrUnknown(filer.LatestTransactionDate),
+				valueOrUnknown(filer.LatestFilingOrPublicationDate),
+				formatPoliticalLagSummary(filer.DisclosureLagDays),
+			))
+		}
 		const maxPromptReportsPerFiler = 2
 		if len(filer.Reports) > maxPromptReportsPerFiler {
 			promptOmittedReports += len(filer.Reports) - maxPromptReportsPerFiler

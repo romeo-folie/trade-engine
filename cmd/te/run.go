@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -46,6 +48,46 @@ var (
 	runWeb     bool
 	runWebPort string
 )
+
+type disclosureRunner interface {
+	Run(context.Context) error
+}
+
+// disclosureRunnerLifecycle owns the background disclosure worker. Stop
+// cancels its private context and joins it so Runner.Run can close its Senate
+// browser before the command returns.
+type disclosureRunnerLifecycle struct {
+	cancel   context.CancelFunc
+	done     <-chan struct{}
+	stopOnce sync.Once
+}
+
+func startDisclosureRunner(
+	ctx context.Context, runner disclosureRunner, reportFailure func(error),
+) *disclosureRunnerLifecycle {
+	if runner == nil {
+		return nil
+	}
+	runnerCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := runner.Run(runnerCtx); err != nil && !errors.Is(err, context.Canceled) && reportFailure != nil {
+			reportFailure(err)
+		}
+	}()
+	return &disclosureRunnerLifecycle{cancel: cancel, done: done}
+}
+
+func (l *disclosureRunnerLifecycle) Stop() {
+	if l == nil {
+		return
+	}
+	l.stopOnce.Do(func() {
+		l.cancel()
+		<-l.done
+	})
+}
 
 var runCmd = &cobra.Command{
 	Use:   "run",
@@ -194,11 +236,10 @@ Modes:
 				if err != nil {
 					return fmt.Errorf("initialize congressional disclosure ingestion: %w", err)
 				}
-				go func() {
-					if err := disclosureRunner.Run(ctx); err != nil && err != context.Canceled {
-						logger.Warn("congressional disclosure ingestion stopped with error", "err", err.Error())
-					}
-				}()
+				disclosureLifecycle := startDisclosureRunner(ctx, disclosureRunner, func(err error) {
+					logger.Warn("congressional disclosure ingestion stopped with error", "err", err.Error())
+				})
+				defer disclosureLifecycle.Stop()
 				logger.Info("congressional disclosure ingestion started",
 					"house", cfg.Disclosures.House.Enabled,
 					"senate", cfg.Disclosures.Senate.Enabled,

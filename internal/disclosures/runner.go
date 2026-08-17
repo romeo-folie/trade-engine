@@ -2,6 +2,8 @@ package disclosures
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,15 +18,22 @@ import (
 )
 
 type Runner struct {
-	Cfg            config.DisclosuresConfig
-	House          *HouseClient
-	Senate         *SenateClient
-	OGE            *OGEClient
-	Extractor      PDFExtractor
-	Now            func() time.Time
-	reportTerminal func(context.Context, string, string) (bool, error)
-	persistReport  func(context.Context, Report) error
+	Cfg                config.DisclosuresConfig
+	House              *HouseClient
+	Senate             *SenateClient
+	OGE                *OGEClient
+	Extractor          PDFExtractor
+	Now                func() time.Time
+	RetryLease         time.Duration
+	reportTerminal     func(context.Context, string, string) (bool, error)
+	persistReport      func(context.Context, Report) error
+	claimDueRetries    func(context.Context, string, time.Time, int, time.Duration) ([]store.PoliticalDisclosureReport, error)
+	saveRetryResult    func(context.Context, store.PoliticalDisclosureReport, string) error
+	releaseRetryClaims func(context.Context, string) error
+	renewRetryLease    func(context.Context, string, string, string, time.Time, time.Duration) (bool, error)
 }
+
+const politicalDisclosureRetryLease = 15 * time.Minute
 
 type SyncResult struct {
 	HouseProcessed  int
@@ -33,6 +42,9 @@ type SyncResult struct {
 }
 
 func NewRunner(cfg config.DisclosuresConfig) (*Runner, error) {
+	if validation := config.ValidateDisclosuresConfig(cfg); len(validation) > 0 {
+		return nil, fmt.Errorf("invalid disclosure config: %s", strings.Join(validation, "; "))
+	}
 	timeout := time.Duration(cfg.RequestTimeoutSeconds) * time.Second
 	runner := &Runner{Cfg: cfg, Now: time.Now}
 	if cfg.House.Enabled {
@@ -120,8 +132,321 @@ func (r *Runner) Run(ctx context.Context) error {
 
 func (r *Runner) RunOnce(ctx context.Context) error {
 	since, until := scheduledDisclosureRange(r.now(), r.Cfg.LookbackDays)
-	_, err := r.SyncRange(ctx, since, until, r.Cfg.MaxReportsPerSync)
-	return err
+	budgets, err := distributeSyncBudget(r.Cfg.MaxReportsPerSync, r.House != nil, r.Senate != nil, r.OGE != nil)
+	if err != nil {
+		return err
+	}
+	var failures []error
+	if r.House != nil {
+		processed, retryErr := r.retryHouse(ctx, budgets[0])
+		if retryErr != nil {
+			failures = append(failures, retryErr)
+		}
+		if err := ctx.Err(); err != nil {
+			return scheduledSyncError(failures, err)
+		}
+		if remaining := budgets[0] - processed; remaining > 0 {
+			if _, syncErr := r.syncHouse(ctx, since, until, remaining); syncErr != nil {
+				failures = append(failures, syncErr)
+			}
+			if err := ctx.Err(); err != nil {
+				return scheduledSyncError(failures, err)
+			}
+		}
+	}
+	if r.Senate != nil {
+		processed, retryErr := r.retrySenate(ctx, budgets[1])
+		if retryErr != nil {
+			failures = append(failures, retryErr)
+		}
+		if err := ctx.Err(); err != nil {
+			return scheduledSyncError(failures, err)
+		}
+		if remaining := budgets[1] - processed; remaining > 0 && !errors.Is(retryErr, ErrSenateAuthorizationRequired) {
+			if _, syncErr := r.syncSenate(ctx, since, until, remaining); syncErr != nil {
+				failures = append(failures, syncErr)
+			}
+			if err := ctx.Err(); err != nil {
+				return scheduledSyncError(failures, err)
+			}
+		}
+	}
+	if r.OGE != nil {
+		processed, retryErr := r.retryOGE(ctx, budgets[2])
+		if retryErr != nil {
+			failures = append(failures, retryErr)
+		}
+		if err := ctx.Err(); err != nil {
+			return scheduledSyncError(failures, err)
+		}
+		if remaining := budgets[2] - processed; remaining > 0 {
+			if _, syncErr := r.syncOGE(ctx, since, until, remaining); syncErr != nil {
+				failures = append(failures, syncErr)
+			}
+			if err := ctx.Err(); err != nil {
+				return scheduledSyncError(failures, err)
+			}
+		}
+	}
+	if len(failures) > 0 {
+		return scheduledSyncError(failures)
+	}
+	return nil
+}
+
+func scheduledSyncError(failures []error, extra ...error) error {
+	all := append(append([]error(nil), failures...), extra...)
+	if len(all) == 0 {
+		return nil
+	}
+	return fmt.Errorf("congressional disclosure scheduled sync: %w", errors.Join(all...))
+}
+
+func (r *Runner) claimRetries(ctx context.Context, source string, limit int) ([]store.PoliticalDisclosureReport, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	now := r.now().UTC()
+	if r.claimDueRetries != nil {
+		return r.claimDueRetries(ctx, source, now, limit, r.retryLease())
+	}
+	token, err := randomRetryClaimToken()
+	if err != nil {
+		return nil, err
+	}
+	return store.ClaimPoliticalDisclosureRetries(ctx, source, now, limit, r.retryLease(), token)
+}
+
+func (r *Runner) retryLease() time.Duration {
+	if r.RetryLease > 0 {
+		return r.RetryLease
+	}
+	return politicalDisclosureRetryLease
+}
+
+func (r *Runner) heartbeatRetries(ctx context.Context, claims []store.PoliticalDisclosureReport) func() {
+	if len(claims) == 0 || claims[0].RetryClaimToken == "" {
+		return func() {}
+	}
+	hbCtx, cancel := context.WithCancel(ctx)
+	every := r.retryLease() / 3
+	if every <= 0 {
+		every = time.Millisecond
+	}
+	go func() {
+		ticker := time.NewTicker(every)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-hbCtx.Done():
+				return
+			case <-ticker.C:
+				for _, c := range claims {
+					if r.renewRetryLease != nil {
+						_, _ = r.renewRetryLease(hbCtx, c.Source, c.ExternalID, c.RetryClaimToken, r.now().UTC(), r.retryLease())
+					} else {
+						_, _ = store.RenewPoliticalDisclosureRetryLease(hbCtx, c.Source, c.ExternalID, c.RetryClaimToken, r.now().UTC(), r.retryLease())
+					}
+				}
+			}
+		}
+	}()
+	return cancel
+}
+
+func randomRetryClaimToken() (string, error) {
+	b := make([]byte, 24)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+func (r *Runner) saveRetry(ctx context.Context, report Report, token string) error {
+	stored := store.PoliticalDisclosureReport{Source: report.Source, ExternalID: report.ExternalID, Chamber: report.Chamber, FilerName: report.FilerName, Office: report.Office, ReportType: report.ReportType, IsAmendment: report.IsAmendment, FilingDate: report.FilingDate, DocumentURL: report.DocumentURL, ContentHash: report.ContentHash, ExtractionStatus: report.ExtractionStatus, ExtractionError: report.ExtractionError, RetryableFailure: report.RetryableFailure, RawMetadata: report.RawMetadata}
+	if r.saveRetryResult != nil {
+		return r.saveRetryResult(ctx, stored, token)
+	}
+	if token != "" {
+		return store.SavePoliticalDisclosureRetryResult(ctx, stored, token)
+	}
+	return r.saveReport(ctx, report)
+}
+
+func (r *Runner) releaseRetries(ctx context.Context, token string) {
+	if token == "" {
+		return
+	}
+	if r.releaseRetryClaims != nil {
+		_ = r.releaseRetryClaims(ctx, token)
+		return
+	}
+	_ = store.ReleasePoliticalDisclosureRetryClaims(ctx, token)
+}
+
+func retryFailure(report store.PoliticalDisclosureReport, cause error) Report {
+	return Report{Source: report.Source, ExternalID: report.ExternalID, Chamber: report.Chamber,
+		FilerName: report.FilerName, Office: report.Office, ReportType: report.ReportType,
+		IsAmendment: report.IsAmendment, FilingDate: report.FilingDate, DocumentURL: report.DocumentURL,
+		ContentHash: report.ContentHash, ExtractionStatus: "failed", ExtractionError: cause.Error(),
+		RetryableFailure: shouldRetryDisclosureFailure(cause), RawMetadata: report.RawMetadata}
+}
+
+func (r *Runner) retryHouse(ctx context.Context, limit int) (int, error) {
+	claims, err := r.claimRetries(ctx, "house", limit)
+	if err != nil {
+		return 0, err
+	}
+	if len(claims) > 0 {
+		defer r.releaseRetries(context.Background(), claims[0].RetryClaimToken)
+	}
+	stopHeartbeat := r.heartbeatRetries(ctx, claims)
+	defer stopHeartbeat()
+	var failures []error
+	processed := 0
+	for _, claim := range claims {
+		if err := ctx.Err(); err != nil {
+			return processed, err
+		}
+		processed++
+		var filing HouseFiling
+		if err := json.Unmarshal(claim.RawMetadata, &filing); err != nil || filing.DocumentID == "" || filing.DocumentID != claim.ExternalID {
+			if err == nil {
+				err = fmt.Errorf("house retry metadata document id %q does not match claimed external id %q", filing.DocumentID, claim.ExternalID)
+			}
+			if saveErr := r.saveRetry(ctx, retryFailure(claim, permanentDisclosureError(err)), claim.RetryClaimToken); saveErr != nil {
+				return processed, fmt.Errorf("persist failed House retry %s: %w", claim.ExternalID, saveErr)
+			}
+			failures = append(failures, err)
+			continue
+		}
+		pdf, documentURL, fetchErr := r.House.FetchPDF(ctx, filing)
+		if fetchErr == nil {
+			if r.Extractor == nil {
+				fetchErr = permanentDisclosureError(errors.New("house retry has no PDF extractor"))
+			} else {
+				pages, extractErr := r.Extractor.Extract(pdf)
+				if extractErr == nil {
+					if saveErr := r.saveRetry(ctx, ParseHousePTR(filing, documentURL, pdf, pages), claim.RetryClaimToken); saveErr != nil {
+						return processed, fmt.Errorf("persist House retry %s: %w", claim.ExternalID, saveErr)
+					}
+					continue
+				}
+				if extractErr != nil {
+					fetchErr = extractErr
+				}
+			}
+		}
+		if fetchErr != nil {
+			if saveErr := r.saveRetry(ctx, retryFailure(claim, fetchErr), claim.RetryClaimToken); saveErr != nil {
+				return processed, fmt.Errorf("persist failed House retry %s: %w", claim.ExternalID, saveErr)
+			}
+			failures = append(failures, fetchErr)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return processed, err
+	}
+	if len(failures) > 0 {
+		return processed, fmt.Errorf("%d due House retry(s) failed: %w", len(failures), errors.Join(failures...))
+	}
+	return processed, nil
+}
+
+func (r *Runner) retrySenate(ctx context.Context, limit int) (int, error) {
+	claims, err := r.claimRetries(ctx, "senate", limit)
+	if err != nil {
+		return 0, err
+	}
+	if len(claims) > 0 {
+		defer r.releaseRetries(context.Background(), claims[0].RetryClaimToken)
+	}
+	stopHeartbeat := r.heartbeatRetries(ctx, claims)
+	defer stopHeartbeat()
+	var failures []error
+	processed := 0
+	for _, claim := range claims {
+		if err := ctx.Err(); err != nil {
+			return processed, err
+		}
+		processed++
+		filing := SenateFiling{ExternalID: claim.ExternalID, FilerName: claim.FilerName, Office: claim.Office, FilingDate: claim.FilingDate, DocumentURL: claim.DocumentURL}
+		report, fetchErr := r.Senate.FetchPTR(ctx, filing)
+		if errors.Is(fetchErr, ErrSenateAuthorizationRequired) {
+			r.releaseRetries(ctx, claim.RetryClaimToken)
+			return processed - 1, senateSourceBlocked(fetchErr)
+		}
+		if fetchErr == nil {
+			report.RawMetadata = claim.RawMetadata
+			if saveErr := r.saveRetry(ctx, report, claim.RetryClaimToken); saveErr != nil {
+				return processed, fmt.Errorf("persist Senate retry %s: %w", claim.ExternalID, saveErr)
+			}
+			continue
+		}
+		if fetchErr != nil {
+			if saveErr := r.saveRetry(ctx, retryFailure(claim, fetchErr), claim.RetryClaimToken); saveErr != nil {
+				return processed, fmt.Errorf("persist failed Senate retry %s: %w", claim.ExternalID, saveErr)
+			}
+			failures = append(failures, fetchErr)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return processed, err
+	}
+	if len(failures) > 0 {
+		return processed, fmt.Errorf("%d due Senate retry(s) failed: %w", len(failures), errors.Join(failures...))
+	}
+	return processed, nil
+}
+
+func (r *Runner) retryOGE(ctx context.Context, limit int) (int, error) {
+	claims, err := r.claimRetries(ctx, "oge", limit)
+	if err != nil {
+		return 0, err
+	}
+	if len(claims) > 0 {
+		defer r.releaseRetries(context.Background(), claims[0].RetryClaimToken)
+	}
+	stopHeartbeat := r.heartbeatRetries(ctx, claims)
+	defer stopHeartbeat()
+	var failures []error
+	processed := 0
+	for _, claim := range claims {
+		if err := ctx.Err(); err != nil {
+			return processed, err
+		}
+		processed++
+		filing := OGEFiling{ExternalID: claim.ExternalID, FilerName: claim.FilerName, Office: claim.Office, ReportType: claim.ReportType, IsAmendment: claim.IsAmendment, FilingDate: claim.FilingDate, DocumentURL: claim.DocumentURL, RawMetadata: claim.RawMetadata}
+		pdf, fetchErr := r.OGE.FetchPDF(ctx, filing)
+		if fetchErr == nil {
+			if r.Extractor == nil {
+				fetchErr = permanentDisclosureError(errors.New("OGE retry has no PDF extractor"))
+			} else {
+				pages, extractErr := r.Extractor.Extract(pdf)
+				if extractErr == nil {
+					if saveErr := r.saveRetry(ctx, ParseOGEPDF(filing, pdf, pages), claim.RetryClaimToken); saveErr != nil {
+						return processed, fmt.Errorf("persist OGE retry %s: %w", claim.ExternalID, saveErr)
+					}
+					continue
+				} else {
+					fetchErr = extractErr
+				}
+			}
+		}
+		if fetchErr != nil {
+			if saveErr := r.saveRetry(ctx, retryFailure(claim, fetchErr), claim.RetryClaimToken); saveErr != nil {
+				return processed, fmt.Errorf("persist failed OGE retry %s: %w", claim.ExternalID, saveErr)
+			}
+			failures = append(failures, fetchErr)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return processed, err
+	}
+	if len(failures) > 0 {
+		return processed, fmt.Errorf("%d due OGE retry(s) failed: %w", len(failures), errors.Join(failures...))
+	}
+	return processed, nil
 }
 
 func scheduledDisclosureRange(now time.Time, lookbackDays int) (time.Time, time.Time) {
@@ -155,12 +480,18 @@ func (r *Runner) SyncRange(
 		if err != nil {
 			failures = append(failures, err)
 		}
+		if err := ctx.Err(); err != nil {
+			return result, syncRangeError(failures, err)
+		}
 	}
 	if budgets[1] > 0 {
 		processed, err := r.syncSenate(ctx, since, until, budgets[1])
 		result.SenateProcessed = processed
 		if err != nil {
 			failures = append(failures, err)
+		}
+		if err := ctx.Err(); err != nil {
+			return result, syncRangeError(failures, err)
 		}
 	}
 	if budgets[2] > 0 {
@@ -169,11 +500,22 @@ func (r *Runner) SyncRange(
 		if err != nil {
 			failures = append(failures, err)
 		}
+		if err := ctx.Err(); err != nil {
+			return result, syncRangeError(failures, err)
+		}
 	}
 	if len(failures) > 0 {
-		return result, fmt.Errorf("congressional disclosure sync: %v", failures)
+		return result, syncRangeError(failures)
 	}
 	return result, nil
+}
+
+func syncRangeError(failures []error, extra ...error) error {
+	all := append(append([]error(nil), failures...), extra...)
+	if len(all) == 0 {
+		return nil
+	}
+	return fmt.Errorf("congressional disclosure sync: %w", errors.Join(all...))
 }
 
 // distributeSyncBudget partitions the cross-source limit so one source cannot
@@ -215,6 +557,9 @@ func (r *Runner) syncHouse(
 	firstYear, lastYear := since.Year(), now.Year()
 	var filings []HouseFiling
 	for year := lastYear; year >= firstYear; year-- {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
 		rows, err := r.House.FetchIndex(ctx, year)
 		if err != nil {
 			return 0, fmt.Errorf("fetch House %d filing index: %w", year, err)
@@ -231,8 +576,11 @@ func (r *Runner) syncHouse(
 	processed := 0
 	var failures []error
 	for _, filing := range filings {
-		if processed >= limit || ctx.Err() != nil {
+		if processed >= limit {
 			break
+		}
+		if err := ctx.Err(); err != nil {
+			return processed, err
 		}
 		terminal, err := r.isReportTerminal(ctx, "house", filing.DocumentID)
 		if err != nil {
@@ -269,8 +617,11 @@ func (r *Runner) syncHouse(
 			return processed, err
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return processed, err
+	}
 	if len(failures) > 0 {
-		return processed, fmt.Errorf("%d House filing(s) failed", len(failures))
+		return processed, fmt.Errorf("%d House filing(s) failed: %w", len(failures), errors.Join(failures...))
 	}
 	return processed, nil
 }
@@ -299,16 +650,22 @@ func (r *Runner) syncSenate(
 	ctx context.Context, since, now time.Time, limit int,
 ) (int, error) {
 	processed := 0
-	var failures int
+	var failures []error
 	start, pageSize := 0, 100
-	for processed < limit && ctx.Err() == nil {
-		page, err := r.Senate.ListPTRPage(ctx, since, now, start, pageSize)
-		if err != nil {
+	for processed < limit {
+		if err := ctx.Err(); err != nil {
 			return processed, err
 		}
+		page, err := r.Senate.ListPTRPage(ctx, since, now, start, pageSize)
+		if err != nil {
+			return processed, senateSourceBlocked(err)
+		}
 		for _, filing := range page.Filings {
-			if processed >= limit || ctx.Err() != nil {
+			if processed >= limit {
 				break
+			}
+			if err := ctx.Err(); err != nil {
+				return processed, err
 			}
 			terminal, err := r.isReportTerminal(ctx, "senate", filing.ExternalID)
 			if err != nil {
@@ -323,19 +680,26 @@ func (r *Runner) syncSenate(
 				if ctx.Err() != nil {
 					return processed, ctx.Err()
 				}
-				failures++
+				if errors.Is(err, ErrSenateAuthorizationRequired) {
+					return processed - 1, senateSourceBlocked(err)
+				}
+				failures = append(failures, err)
+				metadata, _ := json.Marshal(filing)
 				failed := Report{
 					Source: "senate", ExternalID: filing.ExternalID, Chamber: "senate",
 					FilerName: filing.FilerName, Office: filing.Office,
 					ReportType: "periodic_transaction", FilingDate: filing.FilingDate,
 					DocumentURL: filing.DocumentURL, ExtractionStatus: "failed",
 					ExtractionError: err.Error(), RetryableFailure: shouldRetryDisclosureFailure(err),
+					RawMetadata: metadata,
 				}
 				if saveErr := r.saveReport(ctx, failed); saveErr != nil {
 					return processed, saveErr
 				}
 				continue
 			}
+			metadata, _ := json.Marshal(filing)
+			report.RawMetadata = metadata
 			if err := r.saveReport(ctx, report); err != nil {
 				return processed, err
 			}
@@ -345,23 +709,33 @@ func (r *Runner) syncSenate(
 			break
 		}
 	}
-	if failures > 0 {
-		return processed, fmt.Errorf("%d Senate filing(s) failed", failures)
+	if err := ctx.Err(); err != nil {
+		return processed, err
+	}
+	if len(failures) > 0 {
+		return processed, fmt.Errorf("%d Senate filing(s) failed: %w", len(failures), errors.Join(failures...))
 	}
 	return processed, nil
 }
 
 func (r *Runner) syncOGE(ctx context.Context, since, until time.Time, limit int) (int, error) {
-	processed, failures := 0, 0
+	processed := 0
+	var failures []error
 	start, pageSize := 0, 100
-	for processed < limit && ctx.Err() == nil {
+	for processed < limit {
+		if err := ctx.Err(); err != nil {
+			return processed, err
+		}
 		page, err := r.OGE.ListFilingsPage(ctx, since, until, start, pageSize)
 		if err != nil {
 			return processed, err
 		}
 		for _, filing := range page.Filings {
-			if processed >= limit || ctx.Err() != nil {
+			if processed >= limit {
 				break
+			}
+			if err := ctx.Err(); err != nil {
+				return processed, err
 			}
 			terminal, err := r.isReportTerminal(ctx, "oge", filing.ExternalID)
 			if err != nil {
@@ -376,8 +750,8 @@ func (r *Runner) syncOGE(ctx context.Context, since, until time.Time, limit int)
 				if ctx.Err() != nil {
 					return processed, ctx.Err()
 				}
-				failures++
-				if saveErr := r.saveReport(ctx, Report{Source: "oge", ExternalID: filing.ExternalID, Chamber: "executive", FilerName: filing.FilerName, Office: filing.Office, ReportType: filing.ReportType, FilingDate: filing.FilingDate, DocumentURL: filing.DocumentURL, ExtractionStatus: "failed", ExtractionError: err.Error(), RetryableFailure: shouldRetryDisclosureFailure(err), RawMetadata: filing.RawMetadata}); saveErr != nil {
+				failures = append(failures, err)
+				if saveErr := r.saveReport(ctx, Report{Source: "oge", ExternalID: filing.ExternalID, Chamber: "executive", FilerName: filing.FilerName, Office: filing.Office, ReportType: filing.ReportType, IsAmendment: filing.IsAmendment, FilingDate: filing.FilingDate, DocumentURL: filing.DocumentURL, ExtractionStatus: "failed", ExtractionError: err.Error(), RetryableFailure: shouldRetryDisclosureFailure(err), RawMetadata: filing.RawMetadata}); saveErr != nil {
 					return processed, saveErr
 				}
 				continue
@@ -387,8 +761,8 @@ func (r *Runner) syncOGE(ctx context.Context, since, until time.Time, limit int)
 				if ctx.Err() != nil {
 					return processed, ctx.Err()
 				}
-				failures++
-				if saveErr := r.saveReport(ctx, Report{Source: "oge", ExternalID: filing.ExternalID, Chamber: "executive", FilerName: filing.FilerName, Office: filing.Office, ReportType: filing.ReportType, FilingDate: filing.FilingDate, DocumentURL: filing.DocumentURL, ContentHash: hashBytes(pdf), ExtractionStatus: "failed", ExtractionError: err.Error(), RetryableFailure: true, RawMetadata: filing.RawMetadata}); saveErr != nil {
+				failures = append(failures, err)
+				if saveErr := r.saveReport(ctx, Report{Source: "oge", ExternalID: filing.ExternalID, Chamber: "executive", FilerName: filing.FilerName, Office: filing.Office, ReportType: filing.ReportType, IsAmendment: filing.IsAmendment, FilingDate: filing.FilingDate, DocumentURL: filing.DocumentURL, ContentHash: hashBytes(pdf), ExtractionStatus: "failed", ExtractionError: err.Error(), RetryableFailure: true, RawMetadata: filing.RawMetadata}); saveErr != nil {
 					return processed, saveErr
 				}
 				continue
@@ -398,12 +772,15 @@ func (r *Runner) syncOGE(ctx context.Context, since, until time.Time, limit int)
 			}
 		}
 		start += page.RowCount
-		if page.RowCount == 0 || page.BeforeRange || start >= page.Total {
+		if page.RowCount == 0 || start >= page.Total {
 			break
 		}
 	}
-	if failures > 0 {
-		return processed, fmt.Errorf("%d OGE filing(s) failed", failures)
+	if err := ctx.Err(); err != nil {
+		return processed, err
+	}
+	if len(failures) > 0 {
+		return processed, fmt.Errorf("%d OGE filing(s) failed: %w", len(failures), errors.Join(failures...))
 	}
 	return processed, nil
 }
@@ -424,7 +801,7 @@ func (r *Runner) saveReport(ctx context.Context, report Report) error {
 	stored := store.PoliticalDisclosureReport{
 		Source: report.Source, ExternalID: report.ExternalID,
 		Chamber: report.Chamber, FilerName: report.FilerName, Office: report.Office,
-		ReportType: report.ReportType, FilingDate: report.FilingDate,
+		ReportType: report.ReportType, IsAmendment: report.IsAmendment, FilingDate: report.FilingDate,
 		DocumentURL: report.DocumentURL, ContentHash: report.ContentHash,
 		ExtractionStatus: report.ExtractionStatus,
 		ExtractionError:  report.ExtractionError,

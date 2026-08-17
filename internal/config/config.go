@@ -77,6 +77,77 @@ type SenateDisclosureConfig struct {
 	BrowserExecutable string `yaml:"browser_executable"`
 }
 
+// ValidateDisclosuresConfig validates the independently runnable disclosure
+// ingester. Keeping this separate lets CLI overrides and NewRunner reject bad
+// values before constructing database, HTTP, PDFium, or Chrome resources.
+func ValidateDisclosuresConfig(disclosures DisclosuresConfig) []string {
+	if !disclosures.Enabled {
+		return nil
+	}
+	const prefix = "disclosures"
+	var errs []string
+	if !disclosures.AcknowledgeUseRestrictions {
+		errs = append(errs, prefix+".acknowledge_use_restrictions must be true")
+	}
+	if disclosures.SyncIntervalHours <= 0 || !durationConfigFits(disclosures.SyncIntervalHours, time.Hour) {
+		errs = append(errs, prefix+".sync_interval_hours must be a safe positive duration")
+	}
+	if disclosures.LookbackDays <= 0 {
+		errs = append(errs, prefix+".lookback_days must be > 0")
+	}
+	if disclosures.MaxReportsPerSync <= 0 {
+		errs = append(errs, prefix+".max_reports_per_sync must be > 0")
+	}
+	if disclosures.RequestTimeoutSeconds <= 0 || !durationConfigFits(disclosures.RequestTimeoutSeconds, time.Second) {
+		errs = append(errs, prefix+".request_timeout_seconds must be a safe positive duration")
+	}
+	enabledSources := 0
+	for _, enabled := range []bool{disclosures.House.Enabled, disclosures.Senate.Enabled, disclosures.OGE.Enabled} {
+		if enabled {
+			enabledSources++
+		}
+	}
+	if enabledSources == 0 {
+		errs = append(errs, prefix+" requires at least one enabled source")
+	}
+	if disclosures.MaxReportsPerSync > 0 && disclosures.MaxReportsPerSync < enabledSources {
+		errs = append(errs, fmt.Sprintf(prefix+".max_reports_per_sync must be >= %d enabled sources", enabledSources))
+	}
+	if disclosures.House.Enabled && strings.TrimSpace(disclosures.House.BaseURL) == "" {
+		errs = append(errs, prefix+".house.base_url must not be blank")
+	}
+	for _, delay := range []struct {
+		name  string
+		value int
+	}{
+		{"house.request_delay_milliseconds", disclosures.House.RequestDelayMilliseconds},
+		{"senate.request_delay_milliseconds", disclosures.Senate.RequestDelayMilliseconds},
+		{"oge.request_delay_milliseconds", disclosures.OGE.RequestDelayMilliseconds},
+	} {
+		if delay.value < 0 {
+			errs = append(errs, prefix+"."+delay.name+" must be >= 0")
+		} else if !durationConfigFits(delay.value, time.Millisecond) {
+			errs = append(errs, prefix+"."+delay.name+" must be a safe nonnegative duration")
+		}
+	}
+	if disclosures.Senate.Enabled {
+		if strings.TrimSpace(disclosures.Senate.BaseURL) == "" {
+			errs = append(errs, prefix+".senate.base_url must not be blank")
+		}
+		if !disclosures.Senate.AcknowledgeUseRestrictions {
+			errs = append(errs, prefix+".senate.acknowledge_use_restrictions must be true")
+		}
+		transport := strings.ToLower(strings.TrimSpace(disclosures.Senate.Transport))
+		if transport != "" && transport != "browser" && transport != "http" {
+			errs = append(errs, prefix+".senate.transport must be browser or http")
+		}
+	}
+	if disclosures.OGE.Enabled && strings.TrimSpace(disclosures.OGE.BaseURL) == "" {
+		errs = append(errs, prefix+".oge.base_url must not be blank")
+	}
+	return errs
+}
+
 // ── Portfolio ──────────────────────────────────────────────────────────────────
 
 // PortfolioConfig groups broker-direct portfolio settings (Phase 18).
@@ -2774,69 +2845,7 @@ func Validate(cfg *Config) []string {
 			}
 		}
 	}
-	if disclosures := cfg.Disclosures; disclosures.Enabled {
-		const prefix = "disclosures"
-		if !disclosures.AcknowledgeUseRestrictions {
-			errs = append(errs, prefix+".acknowledge_use_restrictions must be true")
-		}
-		if disclosures.SyncIntervalHours <= 0 ||
-			!durationConfigFits(disclosures.SyncIntervalHours, time.Hour) {
-			errs = append(errs, prefix+".sync_interval_hours must be a safe positive duration")
-		}
-		if disclosures.LookbackDays <= 0 {
-			errs = append(errs, prefix+".lookback_days must be > 0")
-		}
-		if disclosures.MaxReportsPerSync <= 0 {
-			errs = append(errs, prefix+".max_reports_per_sync must be > 0")
-		}
-		enabledSources := 0
-		for _, enabled := range []bool{
-			disclosures.House.Enabled,
-			disclosures.Senate.Enabled,
-			disclosures.OGE.Enabled,
-		} {
-			if enabled {
-				enabledSources++
-			}
-		}
-		if disclosures.MaxReportsPerSync > 0 &&
-			disclosures.MaxReportsPerSync < enabledSources {
-			errs = append(errs, fmt.Sprintf(
-				prefix+".max_reports_per_sync must be >= %d enabled sources",
-				enabledSources,
-			))
-		}
-		if disclosures.RequestTimeoutSeconds <= 0 ||
-			!durationConfigFits(disclosures.RequestTimeoutSeconds, time.Second) {
-			errs = append(errs, prefix+".request_timeout_seconds must be a safe positive duration")
-		}
-		if !disclosures.House.Enabled && !disclosures.Senate.Enabled && !disclosures.OGE.Enabled {
-			errs = append(errs, prefix+" requires at least one enabled source")
-		}
-		if disclosures.House.Enabled && strings.TrimSpace(disclosures.House.BaseURL) == "" {
-			errs = append(errs, prefix+".house.base_url must not be blank")
-		}
-		if disclosures.House.RequestDelayMilliseconds < 0 ||
-			disclosures.Senate.RequestDelayMilliseconds < 0 ||
-			disclosures.OGE.RequestDelayMilliseconds < 0 {
-			errs = append(errs, prefix+" source request delays must be >= 0")
-		}
-		if disclosures.Senate.Enabled {
-			if strings.TrimSpace(disclosures.Senate.BaseURL) == "" {
-				errs = append(errs, prefix+".senate.base_url must not be blank")
-			}
-			if !disclosures.Senate.AcknowledgeUseRestrictions {
-				errs = append(errs, prefix+".senate.acknowledge_use_restrictions must be true")
-			}
-			transport := strings.ToLower(strings.TrimSpace(disclosures.Senate.Transport))
-			if transport != "" && transport != "browser" && transport != "http" {
-				errs = append(errs, prefix+".senate.transport must be browser or http")
-			}
-		}
-		if disclosures.OGE.Enabled && strings.TrimSpace(disclosures.OGE.BaseURL) == "" {
-			errs = append(errs, prefix+".oge.base_url must not be blank")
-		}
-	}
+	errs = append(errs, ValidateDisclosuresConfig(cfg.Disclosures)...)
 	if political := cfg.Scanner.PoliticalDisclosures; political.Enabled {
 		const prefix = "scanner.political_disclosures"
 		if !cfg.Scanner.Enabled {
