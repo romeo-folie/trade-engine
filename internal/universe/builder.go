@@ -503,12 +503,15 @@ func (b *Builder) evaluate(
 	member.SourceEvidence = sourceEvidence
 
 	if taxonomy != nil {
+		taxonomy, sectorMapping := taxonomyForUniverseSnapshot(taxonomy)
 		member.Sector = taxonomy.Sector
 		member.Industry = taxonomy.Industry
 		member.TaxonomyStatus = taxonomy.Status
 		member.TaxonomyAsOf = &taxonomy.ObservedAt
 		member.TaxonomyProvider = taxonomy.Provider
-		member.TaxonomyEvidence = taxonomy.Evidence
+		member.TaxonomyEvidence = taxonomyEvidenceWithSectorMapping(
+			taxonomy.Evidence, sectorMapping,
+		)
 		if capMM := marketCapFromEvidence(taxonomy.Evidence); capMM > 0 {
 			member.MarketCapMM = &capMM
 		}
@@ -599,6 +602,45 @@ func (b *Builder) evaluate(
 	return member
 }
 
+// taxonomyForUniverseSnapshot derives the curated sector only in the immutable
+// universe projection. Historical provider observations remain append-only, so
+// a newly introduced mapping also takes effect for fresh cached observations.
+func taxonomyForUniverseSnapshot(
+	observation *store.CompanyTaxonomyObservation,
+) (*store.CompanyTaxonomyObservation, string) {
+	if observation == nil || observation.Status != "known" ||
+		(strings.TrimSpace(observation.Sector) != "" &&
+			!strings.EqualFold(strings.TrimSpace(observation.Sector), store.UnknownTaxonomy)) {
+		return observation, ""
+	}
+	sector, mapping := finnhubIndustrySector(observation.Provider, observation.Industry)
+	if mapping == "" {
+		return observation, ""
+	}
+	copy := *observation
+	copy.Sector = sector
+	return &copy, mapping
+}
+
+func taxonomyEvidenceWithSectorMapping(raw json.RawMessage, mapping string) json.RawMessage {
+	if mapping == "" {
+		return raw
+	}
+	var evidence map[string]any
+	if err := json.Unmarshal(raw, &evidence); err != nil || evidence == nil {
+		return raw
+	}
+	if existing, _ := evidence["sector_mapping"].(string); existing == mapping {
+		return raw
+	}
+	evidence["sector_mapping"] = mapping
+	encoded, err := json.Marshal(evidence)
+	if err != nil {
+		return raw
+	}
+	return encoded
+}
+
 func (b *Builder) ready() error {
 	if !b.Config.Enabled {
 		return errors.New("scanner.universe.enabled is false")
@@ -662,7 +704,6 @@ var finnhubIndustrySectors = map[string]string{
 	"COMMERCIAL SERVICES & SUPPLIES":   "Industrials",
 	"COMMUNICATIONS":                   "Communication Services",
 	"COMMUNICATION SERVICES":           "Communication Services",
-	"CONSTRUCTION":                     "Industrials",
 	"CONSUMER CYCLICAL":                "Consumer Discretionary",
 	"CONSUMER DEFENSIVE":               "Consumer Staples",
 	"DISTRIBUTORS":                     "Consumer Discretionary",
