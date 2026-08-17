@@ -269,7 +269,7 @@ func NormalizeOrderStatus(status string) string {
 		return "filled"
 	case "partially_filled":
 		return "partial"
-	case "cancelled", "canceled", "done_for_day":
+	case "cancelled", "canceled", "done_for_day", "replaced":
 		return "cancelled"
 	case "rejected", "expired":
 		return "rejected"

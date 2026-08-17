@@ -4,10 +4,10 @@ import "testing"
 
 // IsTerminalOrderStatus: a fill price appearing is NOT terminal —
 // partially_filled must keep the fill poll alive (the NOK partial-fill freeze),
-// while filled/cancelled/rejected/expired/done_for_day end it. GTC protective
-// callers must use the TIF-aware helper below.
+// while filled/cancelled/rejected/expired/replaced/done_for_day end it. GTC
+// protective callers must use the TIF-aware helper below.
 func TestIsTerminalOrderStatus(t *testing.T) {
-	terminal := []string{"filled", "canceled", "cancelled", "rejected", "expired", "done_for_day"}
+	terminal := []string{"filled", "canceled", "cancelled", "rejected", "expired", "replaced", "done_for_day"}
 	for _, s := range terminal {
 		if !IsTerminalOrderStatus(s) {
 			t.Errorf("%q must be terminal", s)
@@ -18,6 +18,12 @@ func TestIsTerminalOrderStatus(t *testing.T) {
 		if IsTerminalOrderStatus(s) {
 			t.Errorf("%q must NOT be terminal", s)
 		}
+	}
+}
+
+func TestNormalizeOrderStatusReplacedIsCancelled(t *testing.T) {
+	if got := NormalizeOrderStatus("replaced"); got != "cancelled" {
+		t.Fatalf("NormalizeOrderStatus(replaced)=%q, want cancelled", got)
 	}
 }
 

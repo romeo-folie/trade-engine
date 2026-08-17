@@ -1352,6 +1352,14 @@ func (c *Coordinator) maybeProjectReplacement(ctx context.Context, intent store.
 	// predecessor untouched so the manager can safely cancel/confirm and submit
 	// a fresh generation on its next protection pass.
 	if isTerminalZeroFillForRequest(req, res) {
+		// Recovery owns this replacement generation, and broker truth proves it
+		// can no longer provide coverage. Retire the generation so an order row
+		// that has already advanced beyond it cannot keep making the stale
+		// replacement recoverable on every startup. The predecessor projection
+		// deliberately remains untouched for the manager's normal fallback.
+		if err := store.SupersedeStockOrderIntent(ctx, intent.ID); err != nil {
+			return execution.OrderResult{}, fmt.Errorf("retire terminal replacement intent: %w", err)
+		}
 		return res, nil
 	}
 	return c.projectReplacement(ctx, intent, req, res)
