@@ -689,7 +689,9 @@ func taxonomyObservation(
 	}
 }
 
-const finnhubIndustrySectorMappingVersion = "finnhub_industry_to_gics_sector_v1"
+// Bump this whenever the closed mapping changes so universe snapshots retain
+// the exact mapping definition used for their sector projection.
+const finnhubIndustrySectorMappingVersion = "finnhub_industry_to_gics_sector_v2"
 
 // finnhubIndustrySectors is deliberately a closed, provider-specific mapping.
 // Finnhub's profile label is not a GICS hierarchy, so unknown labels must stay

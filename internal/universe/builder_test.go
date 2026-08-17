@@ -611,7 +611,7 @@ func TestTaxonomyObservationMapsCuratedFinnhubIndustries(t *testing.T) {
 
 func TestRefreshProjectsMappedSectorFromCachedFinnhubTaxonomy(t *testing.T) {
 	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
-	evidence, _ := json.Marshal(fundamentalsEvidence{MarketCapMM: 500, Industry: "Technology"})
+	evidence := json.RawMessage(`{"market_cap_mm":500,"industry":"Technology","sector_mapping":"finnhub_industry_to_gics_sector_v1"}`)
 	cached := &store.CompanyTaxonomyObservation{
 		Ticker: "TECH", Provider: "finnhub", EffectiveAt: now.Add(-time.Hour),
 		ObservedAt: now.Add(-time.Hour), Sector: store.UnknownTaxonomy,
@@ -635,7 +635,8 @@ func TestRefreshProjectsMappedSectorFromCachedFinnhubTaxonomy(t *testing.T) {
 		t.Fatalf("cached taxonomy unexpectedly refreshed: %+v", result)
 	}
 	if got := repo.members[0]; got.Sector != "Technology" ||
-		!strings.Contains(string(got.TaxonomyEvidence), finnhubIndustrySectorMappingVersion) {
+		!strings.Contains(string(got.TaxonomyEvidence), finnhubIndustrySectorMappingVersion) ||
+		strings.Contains(string(got.TaxonomyEvidence), "finnhub_industry_to_gics_sector_v1") {
 		t.Fatalf("cached mapping was not projected with provenance: %+v", got)
 	}
 	if cached.Sector != store.UnknownTaxonomy || !cached.ObservedAt.Equal(now.Add(-time.Hour)) {
