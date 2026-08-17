@@ -580,8 +580,10 @@ func TestTaxonomyObservationMapsCuratedFinnhubIndustries(t *testing.T) {
 		name, industry, wantSector string
 	}{
 		{"banking", "Banking", "Financials"},
+		{"banks alias", "Banks", "Financials"},
 		{"normalized semiconductor", "  Semiconductors ", "Technology"},
 		{"health care", "Health Care", "Health Care"},
+		{"ambiguous retail", "Retail", store.UnknownTaxonomy},
 		{"unmapped", "N/A", store.UnknownTaxonomy},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
