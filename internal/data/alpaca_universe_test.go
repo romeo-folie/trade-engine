@@ -20,7 +20,10 @@ var (
 
 func newTestAlpacaUniverseClient(serverURL string) *AlpacaUniverseClient {
 	client := newTestAlpacaClient(serverURL)
-	universe := NewAlpacaUniverseClient(client, serverURL)
+	universe := NewAlpacaUniverseClient(client, serverURL, AlpacaUniverseFeeds{
+		Snapshots: "delayed_sip", Historical: "sip",
+		SIPRecentDataDelay: 16 * time.Minute,
+	})
 	universe.now = func() time.Time {
 		return time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
 	}
@@ -86,6 +89,9 @@ func TestAlpacaUniverseSnapshotsBatchBoundPartialFailureAndDedupe(t *testing.T) 
 	var requests [][]string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		symbols := strings.Split(r.URL.Query().Get("symbols"), ",")
+		if got := r.URL.Query().Get("feed"); got != "delayed_sip" {
+			t.Errorf("snapshot feed = %q, want delayed_sip", got)
+		}
 		mu.Lock()
 		requests = append(requests, append([]string(nil), symbols...))
 		mu.Unlock()
@@ -200,6 +206,9 @@ func TestAlpacaUniverseDailyBarsPaginationBatchBoundAndDedupe(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		symbols := r.URL.Query().Get("symbols")
 		token := r.URL.Query().Get("page_token")
+		if got := r.URL.Query().Get("feed"); got != "sip" {
+			t.Errorf("historical feed = %q, want sip", got)
+		}
 		mu.Lock()
 		requests = append(requests, symbols+"|"+token)
 		mu.Unlock()
@@ -262,6 +271,65 @@ func TestAlpacaUniverseDailyBarsPaginationBatchBoundAndDedupe(t *testing.T) {
 	defer mu.Unlock()
 	if strings.Join(requests, ",") != "A,B|,A,B|next,C|" {
 		t.Fatalf("requests = %v", requests)
+	}
+}
+
+func TestAlpacaUniverseSIPHistoryClampsRecentEndWithoutSnapshotFeed(t *testing.T) {
+	now := time.Date(2026, 8, 17, 20, 30, 0, 0, time.UTC)
+	wantEnd := now.Add(-16 * time.Minute).Format(time.RFC3339)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("feed"); got != "sip" {
+			t.Errorf("historical feed = %q, want sip", got)
+		}
+		if got := r.URL.Query().Get("end"); got != wantEnd {
+			t.Errorf("historical end = %q, want entitlement-safe %q", got, wantEnd)
+		}
+		_ = json.NewEncoder(w).Encode(alpacaBulkBarsResponse{Bars: map[string][]alpacaBar{
+			"A": {{Timestamp: "2026-08-17T04:00:00Z", Close: 10}},
+		}})
+	}))
+	defer srv.Close()
+
+	client := NewAlpacaUniverseClient(newTestAlpacaClient(srv.URL), srv.URL,
+		AlpacaUniverseFeeds{Historical: "sip", SIPRecentDataDelay: 16 * time.Minute})
+	client.now = func() time.Time { return now }
+	result, err := client.FetchDailyBars(
+		context.Background(), []string{"A"}, now.AddDate(0, 0, -30), now, 10,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Bars["A"]) != 1 {
+		t.Fatalf("bars = %+v, want one", result.Bars)
+	}
+}
+
+func TestAlpacaUniverseSIPHistoryUsesRequestedEndWithRealTimeEntitlement(t *testing.T) {
+	now := time.Date(2026, 8, 17, 20, 30, 0, 0, time.UTC)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("feed"); got != "sip" {
+			t.Errorf("historical feed = %q, want sip", got)
+		}
+		if got := r.URL.Query().Get("end"); got != now.Format(time.RFC3339) {
+			t.Errorf("historical end = %q, want real-time %q", got, now.Format(time.RFC3339))
+		}
+		_ = json.NewEncoder(w).Encode(alpacaBulkBarsResponse{Bars: map[string][]alpacaBar{
+			"A": {{Timestamp: "2026-08-17T04:00:00Z", Close: 10}},
+		}})
+	}))
+	defer srv.Close()
+
+	client := NewAlpacaUniverseClient(newTestAlpacaClient(srv.URL), srv.URL,
+		AlpacaUniverseFeeds{Historical: "sip", SIPRecentDataDelay: 0})
+	client.now = func() time.Time { return now }
+	result, err := client.FetchDailyBars(
+		context.Background(), []string{"A"}, now.AddDate(0, 0, -30), now, 10,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Bars["A"]) != 1 {
+		t.Fatalf("bars = %+v, want one", result.Bars)
 	}
 }
 

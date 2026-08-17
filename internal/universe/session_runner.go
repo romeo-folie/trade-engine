@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/config"
+	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/engine"
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
@@ -64,6 +65,13 @@ func (r *SessionRunner) runSession(
 	now := r.now().UTC()
 	if now.Before(session.Close) {
 		return nil, fmt.Errorf("swing universe session has not closed")
+	}
+	marketDataReadyAt := session.Close.Add(requiredUniverseFeedDelay(r.Config))
+	if now.Before(marketDataReadyAt) {
+		return nil, fmt.Errorf(
+			"swing universe market data for session %s is not complete until %s",
+			session.Date.Format("2006-01-02"), marketDataReadyAt.Format(time.RFC3339),
+		)
 	}
 	snapshot, configHash, err := UniverseConfigEvidence(r.Config)
 	if err != nil {
@@ -151,6 +159,9 @@ func (r *SessionRunner) runSession(
 func (r *SessionRunner) sessionAuthorized(
 	now time.Time, session engine.USMarketSession, scheduled bool,
 ) bool {
+	if now.Before(session.Close.Add(requiredUniverseFeedDelay(r.Config))) {
+		return false
+	}
 	nowAtExchange := now.In(session.Date.Location())
 	sameDate := nowAtExchange.Year() == session.Date.Year() &&
 		nowAtExchange.YearDay() == session.Date.YearDay()
@@ -165,6 +176,20 @@ func (r *SessionRunner) sessionAuthorized(
 	latestCompleted := engine.MostRecentCompletedMarketSession(now, 0)
 	return sameSessionDate(expected, session) &&
 		sameSessionDate(latestCompleted, session)
+}
+
+func requiredUniverseFeedDelay(cfg config.UniverseConfig) time.Duration {
+	delay := time.Duration(0)
+	if cfg.SnapshotFeed == "delayed_sip" {
+		delay = data.AlpacaDelayedSIPSnapshotDelay
+	}
+	if cfg.HistoricalFeed == "sip" {
+		historicalDelay := time.Duration(cfg.SIPRecentDataDelayMinutes) * time.Minute
+		if historicalDelay > delay {
+			delay = historicalDelay
+		}
+	}
+	return delay
 }
 
 func sameSessionDate(left, right engine.USMarketSession) bool {

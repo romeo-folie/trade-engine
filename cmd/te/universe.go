@@ -53,8 +53,14 @@ weekend, holiday, or historical backfills from current live APIs.`,
 		alpaca := data.NewAlpacaClient(
 			cfg.Markets.Stocks.APIKey, cfg.Markets.Stocks.Secret, cfg.Markets.Stocks.DataURL,
 		)
-		provider := data.NewAlpacaUniverseClient(alpaca, cfg.Markets.Stocks.BaseURL)
 		universeCfg := cfg.Scanner.Universe
+		provider := data.NewAlpacaUniverseClient(
+			alpaca, cfg.Markets.Stocks.BaseURL, data.AlpacaUniverseFeeds{
+				Snapshots:          universeCfg.SnapshotFeed,
+				Historical:         universeCfg.HistoricalFeed,
+				SIPRecentDataDelay: time.Duration(universeCfg.SIPRecentDataDelayMinutes) * time.Minute,
+			},
+		)
 		// A manual refresh is an explicit one-shot opt-in even when the durable
 		// scheduler remains disabled in configuration.
 		universeCfg.Enabled = true

@@ -216,6 +216,9 @@ The report prints the full denominator, evaluation coverage, failures, leader
 count, normalized breadth, and added/removed/persistent turnover per session.
 Only after those diagnostics are stable should candidate promotion be enabled.
 
-Alpaca history is split-adjusted IEX data. Returns are therefore price returns,
-not dividend-total returns, and IEX volume is not consolidated SIP volume. That
-provenance is retained rather than silently overstating the evidence.
+Alpaca history is split-adjusted SIP data by default. Returns are therefore
+price returns rather than dividend-total returns, while volume-derived features
+use consolidated market volume. The configured historical feed is retained in
+the parent universe evidence. Its entitlement delay is configurable, and
+changing either setting creates a new universe identity. Algo Trader Plus can
+set the delay to zero without changing scanner code.

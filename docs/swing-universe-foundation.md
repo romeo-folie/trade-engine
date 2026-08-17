@@ -70,7 +70,15 @@ unrelated methods.
   preferred listings; these are heuristics, not a substitute for richer asset
   classification.
 - Alpaca's market-data API supplies bounded batches of split-adjusted daily bars
-  and current snapshots. Liquidity uses completed US sessions only; an
+  and snapshots. The default operation-specific feeds are `sip` for historical
+  bars and `delayed_sip` for after-close snapshots. This gives Alpaca Basic
+  accounts consolidated evidence without pretending they have real-time SIP:
+  the default 30-minute after-close schedule is beyond the 15-minute recent-data
+  restriction, and requests retain a one-minute boundary guard. Manual refreshes
+  also refuse to run until this evidence is complete. The guard is configured by
+  `sip_recent_data_delay_minutes` (default `16`). An Algo Trader Plus account can
+  set that value to `0` and `snapshot_feed` to `sip` to use real-time consolidated
+  data without a code change. Liquidity uses completed US sessions only; an
   in-progress daily candle is excluded.
 - Finnhub's free company profile supplies market capitalization and a broad
   `finnhubIndustry` label. That label is stored with provider provenance; it is
@@ -95,6 +103,12 @@ asset-master filters and therefore required evidence. The default gate requires
 daily-bar lookback. Snapshot, bar, fundamentals, and distinct-symbol failure
 counts are persisted separately. A rejected attempt and its member evidence
 remain auditable, but cannot supersede or be selected like an approved version.
+
+`scanner.universe.snapshot_feed`, `historical_feed`, and
+`sip_recent_data_delay_minutes` are part of the immutable build identity.
+Changing any of them produces a new universe attempt instead of reusing evidence
+captured under different market-data semantics. The premarket episodic scanner
+is intentionally separate and remains real-time `sip`-only.
 
 ## Eligibility stages
 

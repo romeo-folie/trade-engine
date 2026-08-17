@@ -166,6 +166,33 @@ func TestUniverseConfigEvidenceExcludesOperationalTiming(t *testing.T) {
 	if qualityHash == hash || len(hash) != 64 || len(snapshot) == 0 {
 		t.Fatalf("build identity not captured: hash=%q qualityHash=%q snapshot=%s", hash, qualityHash, snapshot)
 	}
+	changed = cfg
+	changed.HistoricalFeed = "iex"
+	_, feedHash, err := UniverseConfigEvidence(changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if feedHash == hash {
+		t.Fatal("market-data feed change must create a new universe identity")
+	}
+	changed = cfg
+	changed.SnapshotFeed = "iex"
+	_, snapshotFeedHash, err := UniverseConfigEvidence(changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshotFeedHash == hash {
+		t.Fatal("snapshot feed change must create a new universe identity")
+	}
+	changed = cfg
+	changed.SIPRecentDataDelayMinutes = 0
+	_, entitlementHash, err := UniverseConfigEvidence(changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entitlementHash == hash {
+		t.Fatal("SIP entitlement delay change must create a new universe identity")
+	}
 }
 
 func TestLatestRetryAtTraversesWrappedSiblingErrors(t *testing.T) {

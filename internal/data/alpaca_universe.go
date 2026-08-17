@@ -15,6 +15,9 @@ import (
 const (
 	defaultAlpacaTradingURL = "https://paper-api.alpaca.markets"
 	alpacaProviderName      = "alpaca"
+	// Delayed SIP snapshots trail the real-time feed by 15 minutes. The extra
+	// minute keeps after-close requests outside the boundary despite clock skew.
+	AlpacaDelayedSIPSnapshotDelay = 16 * time.Minute
 )
 
 var errAlpacaSymbolMissing = errors.New("alpaca response omitted symbol")
@@ -24,19 +27,33 @@ var errAlpacaSymbolInvalidFormat = errors.New("alpaca symbol has invalid format"
 // capabilities to an AlpacaClient. Wrapping the existing client intentionally
 // shares its authentication, retry policy, and rate limiter.
 type AlpacaUniverseClient struct {
-	client     *AlpacaClient
-	tradingURL string
-	now        func() time.Time
+	client             *AlpacaClient
+	tradingURL         string
+	snapshotFeed       string
+	historicalFeed     string
+	sipRecentDataDelay time.Duration
+	now                func() time.Time
 }
 
-func NewAlpacaUniverseClient(client *AlpacaClient, tradingURL string) *AlpacaUniverseClient {
+type AlpacaUniverseFeeds struct {
+	Snapshots          string
+	Historical         string
+	SIPRecentDataDelay time.Duration
+}
+
+func NewAlpacaUniverseClient(
+	client *AlpacaClient, tradingURL string, feeds AlpacaUniverseFeeds,
+) *AlpacaUniverseClient {
 	if tradingURL == "" {
 		tradingURL = defaultAlpacaTradingURL
 	}
 	return &AlpacaUniverseClient{
-		client:     client,
-		tradingURL: strings.TrimRight(tradingURL, "/"),
-		now:        time.Now,
+		client:             client,
+		tradingURL:         strings.TrimRight(tradingURL, "/"),
+		snapshotFeed:       strings.ToLower(strings.TrimSpace(feeds.Snapshots)),
+		historicalFeed:     strings.ToLower(strings.TrimSpace(feeds.Historical)),
+		sipRecentDataDelay: max(feeds.SIPRecentDataDelay, 0),
+		now:                time.Now,
 	}
 }
 
@@ -58,7 +75,7 @@ type alpacaAsset struct {
 // deduplicated by normalized symbol. Active/tradable status is evidence for the
 // caller's configurable filter, so this provider must not pre-filter it.
 func (c *AlpacaUniverseClient) FetchStockAssets(ctx context.Context) ([]StockAsset, error) {
-	if err := c.ready(); err != nil {
+	if err := c.readyClient(); err != nil {
 		return nil, err
 	}
 	params := url.Values{}
@@ -127,9 +144,9 @@ type alpacaBulkBarsResponse struct {
 	NextPageToken string                 `json:"next_page_token"`
 }
 
-// FetchStockSnapshots fetches the IEX snapshot evidence in deterministic,
-// caller-bounded batches. Non-context batch failures are attributed to every
-// symbol in that batch and later batches continue.
+// FetchStockSnapshots fetches snapshot evidence from the configured feed in
+// deterministic, caller-bounded batches. Non-context batch failures are
+// attributed to every symbol in that batch and later batches continue.
 func (c *AlpacaUniverseClient) FetchStockSnapshots(
 	ctx context.Context, symbols []string, batchSize int,
 ) (StockSnapshotBatchResult, error) {
@@ -137,7 +154,7 @@ func (c *AlpacaUniverseClient) FetchStockSnapshots(
 		Snapshots: make(map[string]StockSnapshotEvidence),
 		Failures:  make(map[string]error),
 	}
-	if err := c.ready(); err != nil {
+	if err := c.readySnapshots(); err != nil {
 		return result, err
 	}
 	normalized, err := normalizedSymbolList(symbols, batchSize)
@@ -176,7 +193,7 @@ func (c *AlpacaUniverseClient) fetchStockSnapshotsBatch(
 	failures := make(map[string]error)
 	params := url.Values{}
 	params.Set("symbols", strings.Join(batch, ","))
-	params.Set("feed", "iex")
+	params.Set("feed", c.snapshotFeed)
 	resp, fetchErr := c.client.get(ctx, "/v2/stocks/snapshots", params)
 	if fetchErr != nil {
 		if ctx.Err() != nil {
@@ -215,14 +232,16 @@ func (c *AlpacaUniverseClient) fetchStockSnapshotsBatch(
 			failures[symbol] = errAlpacaSymbolMissing
 			continue
 		}
-		snapshots[symbol] = stockSnapshotEvidence(symbol, raw, observedAt)
+		evidence := stockSnapshotEvidence(symbol, raw, observedAt)
+		evidence.Provider = alpacaProviderName + ":" + c.snapshotFeed
+		snapshots[symbol] = evidence
 	}
 	return snapshots, failures, nil
 }
 
-// FetchDailyBars retrieves split-adjusted IEX daily bars using Alpaca's
-// multi-symbol endpoint. Pagination is completed independently for each batch;
-// a failed batch never makes a partial page look like complete evidence.
+// FetchDailyBars retrieves split-adjusted daily bars from the configured feed
+// using Alpaca's multi-symbol endpoint. Pagination is completed independently
+// for each batch; a failed batch never makes a partial page look complete.
 func (c *AlpacaUniverseClient) FetchDailyBars(
 	ctx context.Context,
 	symbols []string,
@@ -233,8 +252,14 @@ func (c *AlpacaUniverseClient) FetchDailyBars(
 		Bars:     make(map[string][]Candle),
 		Failures: make(map[string]error),
 	}
-	if err := c.ready(); err != nil {
+	if err := c.readyHistorical(); err != nil {
 		return result, err
+	}
+	if c.historicalFeed == "sip" && c.sipRecentDataDelay > 0 {
+		entitlementCutoff := c.now().UTC().Add(-c.sipRecentDataDelay)
+		if to.After(entitlementCutoff) {
+			to = entitlementCutoff
+		}
 	}
 	if !to.After(from) {
 		return result, fmt.Errorf("daily bars end must be after start")
@@ -334,7 +359,7 @@ func (c *AlpacaUniverseClient) fetchDailyBarsBatch(
 		params.Set("end", to.UTC().Format(time.RFC3339))
 		params.Set("limit", "10000")
 		params.Set("adjustment", alpacaStockAdjustment)
-		params.Set("feed", "iex")
+		params.Set("feed", c.historicalFeed)
 		params.Set("sort", "asc")
 		if nextPageToken != "" {
 			params.Set("page_token", nextPageToken)
@@ -368,9 +393,29 @@ func (c *AlpacaUniverseClient) fetchDailyBarsBatch(
 	return collected, nil
 }
 
-func (c *AlpacaUniverseClient) ready() error {
+func (c *AlpacaUniverseClient) readyClient() error {
 	if c == nil || c.client == nil {
 		return fmt.Errorf("alpaca universe client is nil")
+	}
+	return nil
+}
+
+func (c *AlpacaUniverseClient) readySnapshots() error {
+	if err := c.readyClient(); err != nil {
+		return err
+	}
+	if c.snapshotFeed == "" {
+		return fmt.Errorf("alpaca universe snapshot feed is required")
+	}
+	return nil
+}
+
+func (c *AlpacaUniverseClient) readyHistorical() error {
+	if err := c.readyClient(); err != nil {
+		return err
+	}
+	if c.historicalFeed == "" {
+		return fmt.Errorf("alpaca universe historical feed is required")
 	}
 	return nil
 }
