@@ -3794,6 +3794,9 @@ func TestStockIntentRecoveryTerminalReplacementLookupFallsBackToFreshProtection(
 	if child.Status != "cancelled" {
 		t.Fatalf("terminal replacement intent status=%q, want cancelled", child.Status)
 	}
+	if child.Purpose != "superseded" {
+		t.Fatalf("terminal replacement intent purpose=%q, want superseded", child.Purpose)
+	}
 	if got := countForIntent(t, "orders", child.ID); got != 0 {
 		t.Fatalf("terminal replacement projected %d stop rows", got)
 	}
@@ -3835,6 +3838,90 @@ func TestStockIntentRecoveryTerminalReplacementLookupFallsBackToFreshProtection(
 	var liveStops int
 	if err := store.GetDB().QueryRow(ctx, `SELECT COUNT(*) FROM orders WHERE trade_id=$1::uuid AND is_stop_loss AND status IN ('pending','partial')`, tradeID).Scan(&liveStops); err != nil || liveStops != 1 {
 		t.Fatalf("live stop rows=%d err=%v, want one", liveStops, err)
+	}
+}
+
+func TestStockIntentRecoveryRetiresReplacedGenerationAfterProjectionAdvanced(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
+		t.Fatal(err)
+	}
+	ticker := "RINTENTADVANCEDREPLACE"
+	signalID := insertRecoverySignal(t, ticker)
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		SignalID: signalID, Ticker: ticker, Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 2, StopLoss: 97,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := store.StockOrderIntent{
+		ID: "45454545-4545-4454-8454-454545454545", IdempotencyKey: "advanced-parent:" + tradeID,
+		ClientOrderID: "advanced-parent", TradeID: tradeID, Purpose: "superseded",
+		Ticker: ticker, Side: "sell", OrderType: "stop", RequestedQty: 2,
+		RequestPayload: []byte(`{}`), PayloadHash: "advanced-parent", Status: "pending",
+	}
+	if err := store.CreateStockOrderIntent(ctx, parent); err != nil {
+		t.Fatal(err)
+	}
+	req := execution.OrderRequest{
+		Ticker: ticker, Side: execution.OrderSideSell, Type: execution.OrderTypeStop,
+		Quantity: 2, StopPrice: 97, TradeID: tradeID, TimeInForce: "gtc",
+		IntentKey:     "replace:" + parent.IdempotencyKey + ":97.00000000",
+		ClientOrderID: "advanced-replacement", ReplacesBrokerOrderID: "older-stop",
+	}
+	payload, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement := store.StockOrderIntent{
+		ID: "56565656-5656-4565-8565-565656565656", IdempotencyKey: req.IntentKey,
+		ClientOrderID: req.ClientOrderID, TradeID: tradeID, ParentIntentID: parent.ID,
+		Ticker: ticker, Side: "sell", OrderType: "stop", RequestedQty: 2,
+		RequestPayload: payload, PayloadHash: "advanced-replacement", Status: "pending",
+	}
+	if err := store.CreateStockOrderIntent(ctx, replacement); err != nil {
+		t.Fatal(err)
+	}
+	orderID, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "newer-stop", Ticker: ticker, Side: "sell",
+		OrderType: "stop", Quantity: 2, StopPrice: 99, Status: "pending",
+		IsStopLoss: true, StockIntentID: replacement.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	broker := newRecoveryBroker(execution.OrderResult{})
+	broker.lookup[replacement.ClientOrderID] = execution.OrderResult{
+		BrokerOrderID: "replaced-stop", Status: "replaced",
+	}
+	coordinator := stockorders.New(broker)
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatalf("recover advanced replacement projection: %v", err)
+	}
+
+	retired := intentForKey(t, req.IntentKey)
+	if retired.Status != "cancelled" || retired.Purpose != "superseded" {
+		t.Fatalf("retired replacement status/purpose=%q/%q, want cancelled/superseded", retired.Status, retired.Purpose)
+	}
+	var brokerID, intentID, status string
+	var stopPrice float64
+	if err := store.GetDB().QueryRow(ctx, `
+		SELECT broker_order_id, stock_intent_id::text, status, stop_price
+		FROM orders WHERE id=$1::uuid`, orderID,
+	).Scan(&brokerID, &intentID, &status, &stopPrice); err != nil {
+		t.Fatal(err)
+	}
+	if brokerID != "newer-stop" || intentID != retired.ID || status != "pending" || stopPrice != 99 {
+		t.Fatalf("advanced projection changed to %q/%q/%q/%.2f", brokerID, intentID, status, stopPrice)
+	}
+	lookups := broker.lookups
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatalf("repeat recovery: %v", err)
+	}
+	if broker.lookups != lookups {
+		t.Fatalf("retired replacement looked up again: %d -> %d", lookups, broker.lookups)
 	}
 }
 
