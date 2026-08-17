@@ -71,7 +71,7 @@ func TestDefaultsScannerUniverseDisabled(t *testing.T) {
 		universe.TaxonomyMaxAgeHours != 168 ||
 		universe.BatchSize != 200 ||
 		universe.MaxConcurrency != 4 ||
-		universe.TaxonomyRefreshLimit != 200 {
+		universe.TaxonomyRefreshLimit != 350 {
 		t.Fatalf("unexpected scanner universe defaults: %+v", universe)
 	}
 	if len(universe.AllowedSecurityTypes) != 1 ||
@@ -108,6 +108,7 @@ func TestDefaultsWeeklyLeaderDisabled(t *testing.T) {
 		leader.SelectionPercentile != 0.90 ||
 		leader.MinCompositeScore != 0.70 ||
 		leader.MinFeatureCoverage != 0.90 ||
+		leader.MinCrossSectionCoverage != 0.99 ||
 		leader.BatchSize != 200 ||
 		leader.RunLeaseMinutes != 60 {
 		t.Fatalf("unexpected weekly leader defaults: %+v", leader)
@@ -207,6 +208,8 @@ func TestValidateWeeklyLeaderConfig(t *testing.T) {
 		{"selection", "selection_percentile", func(c *Config) { c.Scanner.WeeklyLeader.SelectionPercentile = 1 }},
 		{"score", "min_composite_score", func(c *Config) { c.Scanner.WeeklyLeader.MinCompositeScore = 1.1 }},
 		{"coverage", "min_feature_coverage", func(c *Config) { c.Scanner.WeeklyLeader.MinFeatureCoverage = 0 }},
+		{"cross-section coverage", "min_cross_section_coverage", func(c *Config) { c.Scanner.WeeklyLeader.MinCrossSectionCoverage = 0 }},
+		{"cross-section coverage NaN", "min_cross_section_coverage", func(c *Config) { c.Scanner.WeeklyLeader.MinCrossSectionCoverage = math.NaN() }},
 		{"batch", "batch_size", func(c *Config) { c.Scanner.WeeklyLeader.BatchSize = 0 }},
 		{"lease", "run_lease_minutes", func(c *Config) { c.Scanner.WeeklyLeader.RunLeaseMinutes = 0 }},
 		{"lease overflow", "run_lease_minutes", func(c *Config) {

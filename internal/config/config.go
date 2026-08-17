@@ -1257,7 +1257,10 @@ type WeeklyLeaderConfig struct {
 	SelectionPercentile    float64 `yaml:"selection_percentile"`
 	MinCompositeScore      float64 `yaml:"min_composite_score"`
 	MinFeatureCoverage     float64 `yaml:"min_feature_coverage"`
-	BatchSize              int     `yaml:"batch_size"`
+	// MinCrossSectionCoverage is the minimum share of eligible symbols with
+	// valid provider history required before qualified rows can be promoted.
+	MinCrossSectionCoverage float64 `yaml:"min_cross_section_coverage"`
+	BatchSize               int     `yaml:"batch_size"`
 	// RunLeaseMinutes bounds both scheduled-run and candidate-promotion claims.
 	RunLeaseMinutes int `yaml:"run_lease_minutes"`
 	TTLDays         int `yaml:"ttl_days"`
@@ -2432,6 +2435,12 @@ func Validate(cfg *Config) []string {
 		}
 		if leader.MinFeatureCoverage <= 0 || leader.MinFeatureCoverage > 1 {
 			errs = append(errs, "scanner.weekly_leader.min_feature_coverage must be in (0,1]")
+		}
+		if math.IsNaN(leader.MinCrossSectionCoverage) ||
+			math.IsInf(leader.MinCrossSectionCoverage, 0) ||
+			leader.MinCrossSectionCoverage <= 0 || leader.MinCrossSectionCoverage > 1 {
+			errs = append(errs,
+				"scanner.weekly_leader.min_cross_section_coverage must be in (0,1]")
 		}
 		if leader.BatchSize <= 0 {
 			errs = append(errs, "scanner.weekly_leader.batch_size must be > 0")

@@ -192,9 +192,14 @@ func (r *WeeklyLeaderRunner) RunSession(
 		}
 	}
 	incompleteCoverageCount := weeklyLeaderIncompleteCoverageCount(evaluations)
-	if incompleteCoverageCount > 0 {
+	coverage := weeklyLeaderEvaluationCoverage(incompleteCoverageCount, len(members))
+	minCoverage := r.Cfg.MinCrossSectionCoverage
+	if minCoverage <= 0 || minCoverage > 1 {
+		minCoverage = .99
+	}
+	if incompleteCoverageCount > 0 && coverage < minCoverage {
 		suppressWeeklyLeaderQualificationsOnIncompleteCoverage(
-			evaluations, incompleteCoverageCount, len(members),
+			evaluations, incompleteCoverageCount, len(members), coverage, minCoverage,
 		)
 	}
 	qualifications, err := weeklyLeaderQualifications(
@@ -237,12 +242,22 @@ func weeklyLeaderIncompleteCoverageCount(evaluations []WeeklyLeaderEvaluation) i
 	return failed
 }
 
+func weeklyLeaderEvaluationCoverage(failed, eligible int) float64 {
+	if eligible <= 0 {
+		return 0
+	}
+	if failed <= 0 {
+		return 1
+	}
+	return float64(eligible-failed) / float64(eligible)
+}
+
 func suppressWeeklyLeaderQualificationsOnIncompleteCoverage(
-	evaluations []WeeklyLeaderEvaluation, failed, eligible int,
+	evaluations []WeeklyLeaderEvaluation, failed, eligible int, coverage, minimum float64,
 ) {
 	reason := fmt.Sprintf(
-		"cross-sectional provider coverage incomplete: %d of %d eligible symbols failed",
-		failed, eligible,
+		"cross-sectional provider coverage %.4f below required %.4f: %d of %d eligible symbols failed",
+		coverage, minimum, failed, eligible,
 	)
 	for i := range evaluations {
 		if !evaluations[i].Qualified {
@@ -372,23 +387,25 @@ func weeklyLeaderConfigEvidence(
 	// evaluation output. Keeping them out of the compatibility hash preserves
 	// transition history across observation/promotion and deployment changes.
 	compatibilityConfig := struct {
-		FeatureVersion      string  `json:"feature_version"`
-		HistoryCalendarDays int     `json:"history_calendar_days"`
-		MinHistorySessions  int     `json:"min_history_sessions"`
-		Benchmark           string  `json:"benchmark"`
-		IndustryMinPeers    int     `json:"industry_min_peers"`
-		SelectionPercentile float64 `json:"selection_percentile"`
-		MinCompositeScore   float64 `json:"min_composite_score"`
-		MinFeatureCoverage  float64 `json:"min_feature_coverage"`
+		FeatureVersion          string  `json:"feature_version"`
+		HistoryCalendarDays     int     `json:"history_calendar_days"`
+		MinHistorySessions      int     `json:"min_history_sessions"`
+		Benchmark               string  `json:"benchmark"`
+		IndustryMinPeers        int     `json:"industry_min_peers"`
+		SelectionPercentile     float64 `json:"selection_percentile"`
+		MinCompositeScore       float64 `json:"min_composite_score"`
+		MinFeatureCoverage      float64 `json:"min_feature_coverage"`
+		MinCrossSectionCoverage float64 `json:"min_cross_section_coverage"`
 	}{
-		FeatureVersion:      weeklyLeaderFeatureVersion,
-		HistoryCalendarDays: cfg.HistoryCalendarDays,
-		MinHistorySessions:  cfg.MinHistorySessions,
-		Benchmark:           strings.ToUpper(strings.TrimSpace(cfg.Benchmark)),
-		IndustryMinPeers:    cfg.IndustryMinPeers,
-		SelectionPercentile: cfg.SelectionPercentile,
-		MinCompositeScore:   cfg.MinCompositeScore,
-		MinFeatureCoverage:  cfg.MinFeatureCoverage,
+		FeatureVersion:          weeklyLeaderFeatureVersion,
+		HistoryCalendarDays:     cfg.HistoryCalendarDays,
+		MinHistorySessions:      cfg.MinHistorySessions,
+		Benchmark:               strings.ToUpper(strings.TrimSpace(cfg.Benchmark)),
+		IndustryMinPeers:        cfg.IndustryMinPeers,
+		SelectionPercentile:     cfg.SelectionPercentile,
+		MinCompositeScore:       cfg.MinCompositeScore,
+		MinFeatureCoverage:      cfg.MinFeatureCoverage,
+		MinCrossSectionCoverage: cfg.MinCrossSectionCoverage,
 	}
 	compatibilityEvidence, err := json.Marshal(compatibilityConfig)
 	if err != nil {
