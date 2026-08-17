@@ -4,9 +4,33 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestOGEListFilingsRejectsOversizedIndexResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		chunk := make([]byte, 32<<10)
+		remaining := maxOGEIndexSize + 1
+		for remaining > 0 {
+			writeSize := min(len(chunk), remaining)
+			if _, err := w.Write(chunk[:writeSize]); err != nil {
+				return
+			}
+			remaining -= writeSize
+		}
+	}))
+	defer server.Close()
+
+	client := NewOGEClient(server.URL, time.Second)
+	_, err := client.ListFilingsPage(
+		context.Background(), time.Time{}, time.Now(), 0, 100,
+	)
+	if err == nil || !strings.Contains(err.Error(), "response exceeds") {
+		t.Fatalf("ListFilingsPage error = %v, want response-size rejection", err)
+	}
+}
 
 func TestOGEListFilingsSkipsRequestOnly(t *testing.T) {
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

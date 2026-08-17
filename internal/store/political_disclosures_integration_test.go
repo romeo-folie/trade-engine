@@ -174,3 +174,80 @@ func TestFailedPoliticalDisclosureReportIsTerminalForAutomaticSync(t *testing.T)
 		t.Fatalf("terminal=%v err=%v", terminal, err)
 	}
 }
+
+func TestNonCompletedDisclosureReExtractionClearsChildEvidence(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2099, time.May, 5, 0, 0, 0, 0, time.UTC)
+	for _, status := range []string{"failed", "no_text"} {
+		t.Run(status, func(t *testing.T) {
+			externalID := "test-disclosure-reextract-" + status
+			report := store.PoliticalDisclosureReport{
+				Source: "house", ExternalID: externalID, Chamber: "house",
+				FilerName: "Hon. Re-extraction Test", Office: "TS02",
+				ReportType: "periodic_transaction", FilingDate: now,
+				DocumentURL: "https://example.test/" + externalID + ".pdf",
+				ContentHash: "completed-fixture", ExtractionStatus: "completed",
+				RawMetadata: json.RawMessage(`{"fixture":true}`),
+				Transactions: []store.PoliticalDisclosureTransaction{{
+					Ordinal: 1, AssetName: "Stale Evidence Corp (STALE)",
+					Ticker: "STALE", TransactionType: "purchase",
+					TransactionDate: now.AddDate(0, 0, -1), AmountText: "$1,001 - $15,000",
+					RawData: json.RawMessage(`{"row":1}`),
+				}},
+			}
+			t.Cleanup(func() {
+				_, _ = store.GetDB().Exec(context.Background(),
+					"DELETE FROM political_disclosure_reports WHERE source=$1 AND external_id=$2",
+					report.Source, report.ExternalID)
+			})
+			if err := store.SavePoliticalDisclosureReport(ctx, report); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.GetDB().Exec(ctx, `
+				UPDATE political_disclosure_candidates
+				SET promotion_status='processing', promotion_claim_token='stale-claim',
+					promotion_claimed_at=$3
+				WHERE report_id=(
+					SELECT id FROM political_disclosure_reports
+					WHERE source=$1 AND external_id=$2
+				)`, report.Source, report.ExternalID, now); err != nil {
+				t.Fatal(err)
+			}
+
+			reextracted := report
+			reextracted.ExtractionStatus = status
+			reextracted.ExtractionError = "fixture " + status
+			reextracted.ContentHash = ""
+			reextracted.Transactions = nil
+			if err := store.SavePoliticalDisclosureReport(ctx, reextracted); err != nil {
+				t.Fatal(err)
+			}
+
+			detail, err := store.GetPoliticalDisclosureReport(ctx, report.Source, report.ExternalID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if detail == nil || detail.ExtractionStatus != status || len(detail.Transactions) != 0 {
+				t.Fatalf("detail = %+v", detail)
+			}
+			var candidateStatus, claimToken, evidence string
+			var transactionCount int
+			if err := store.GetDB().QueryRow(ctx, `
+				SELECT promotion_status, COALESCE(promotion_claim_token,''),
+					transaction_count, evidence::text
+				FROM political_disclosure_candidates
+				WHERE report_id=(
+					SELECT id FROM political_disclosure_reports
+					WHERE source=$1 AND external_id=$2
+				) AND ticker='STALE'`, report.Source, report.ExternalID,
+			).Scan(&candidateStatus, &claimToken, &transactionCount, &evidence); err != nil {
+				t.Fatal(err)
+			}
+			if candidateStatus != "superseded" || claimToken != "" ||
+				transactionCount != 0 || evidence != "[]" {
+				t.Fatalf("candidate status=%q claim=%q count=%d evidence=%s",
+					candidateStatus, claimToken, transactionCount, evidence)
+			}
+		})
+	}
+}

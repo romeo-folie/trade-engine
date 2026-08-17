@@ -22,11 +22,33 @@ func TestDistributeSyncBudgetReservesCapacityForEnabledSources(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got := distributeSyncBudget(test.limit, test.enabled...)
+			got, err := distributeSyncBudget(test.limit, test.enabled...)
+			if err != nil {
+				t.Fatal(err)
+			}
 			if !reflect.DeepEqual(got, test.want) {
 				t.Fatalf("budgets = %v, want %v", got, test.want)
 			}
 		})
+	}
+}
+
+func TestDistributeSyncBudgetRejectsLimitBelowEnabledSourceCount(t *testing.T) {
+	if _, err := distributeSyncBudget(1, true, true, true); err == nil {
+		t.Fatal("undersized cross-source limit was accepted")
+	}
+}
+
+func TestScheduledDisclosureRangeUsesCalendarDayBoundaries(t *testing.T) {
+	now := time.Date(2026, time.August, 17, 16, 42, 19, 0,
+		time.FixedZone("test", -4*60*60),
+	)
+	since, until := scheduledDisclosureRange(now, 90)
+	wantUntil := time.Date(2026, time.August, 17, 0, 0, 0, 0, time.UTC)
+	wantSince := wantUntil.AddDate(0, 0, -90)
+	if !since.Equal(wantSince) || !until.Equal(wantUntil) {
+		t.Fatalf("range = %s through %s, want %s through %s",
+			since, until, wantSince, wantUntil)
 	}
 }
 

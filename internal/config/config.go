@@ -2789,6 +2789,23 @@ func Validate(cfg *Config) []string {
 		if disclosures.MaxReportsPerSync <= 0 {
 			errs = append(errs, prefix+".max_reports_per_sync must be > 0")
 		}
+		enabledSources := 0
+		for _, enabled := range []bool{
+			disclosures.House.Enabled,
+			disclosures.Senate.Enabled,
+			disclosures.OGE.Enabled,
+		} {
+			if enabled {
+				enabledSources++
+			}
+		}
+		if disclosures.MaxReportsPerSync > 0 &&
+			disclosures.MaxReportsPerSync < enabledSources {
+			errs = append(errs, fmt.Sprintf(
+				prefix+".max_reports_per_sync must be >= %d enabled sources",
+				enabledSources,
+			))
+		}
 		if disclosures.RequestTimeoutSeconds <= 0 ||
 			!durationConfigFits(disclosures.RequestTimeoutSeconds, time.Second) {
 			errs = append(errs, prefix+".request_timeout_seconds must be a safe positive duration")

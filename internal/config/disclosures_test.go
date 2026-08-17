@@ -49,6 +49,16 @@ func TestValidateSenateDisclosureAcknowledgement(t *testing.T) {
 	}
 }
 
+func TestValidateDisclosureBudgetCoversEnabledSources(t *testing.T) {
+	cfg := Defaults()
+	cfg.Disclosures.Enabled = true
+	cfg.Disclosures.AcknowledgeUseRestrictions = true
+	cfg.Disclosures.MaxReportsPerSync = 1
+	if errors := Validate(cfg); !containsConfigError(errors, "max_reports_per_sync") {
+		t.Fatalf("errors = %v", errors)
+	}
+}
+
 func containsConfigError(errors []string, part string) bool {
 	for _, err := range errors {
 		if strings.Contains(err, part) {

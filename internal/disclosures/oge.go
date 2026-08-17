@@ -43,6 +43,11 @@ type ogeRow struct {
 var ogePDF = regexp.MustCompile(`(?i)https?://[^'"<>\s]+\.pdf`)
 var ogeDate = regexp.MustCompile(`\b\d{1,2}/\d{1,2}/\d{4}\b`)
 
+const (
+	maxOGEIndexSize = 10 << 20
+	maxOGEPDFSize   = 25 << 20
+)
+
 func NewOGEClient(base string, timeout time.Duration) *OGEClient {
 	return &OGEClient{BaseURL: strings.TrimRight(base, "/"), HTTP: &http.Client{Timeout: timeout}}
 }
@@ -100,12 +105,18 @@ func (c *OGEClient) ListFilingsPage(ctx context.Context, since, until time.Time,
 		return OGEFilingPage{}, err
 	}
 	defer resp.Body.Close()
-	b, err := io.ReadAll(resp.Body)
+	if resp.StatusCode/100 != 2 {
+		return OGEFilingPage{}, fmt.Errorf("OGE API returned %s", resp.Status)
+	}
+	if resp.ContentLength > maxOGEIndexSize {
+		return OGEFilingPage{}, fmt.Errorf("OGE API response exceeds %d-byte limit", maxOGEIndexSize)
+	}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, maxOGEIndexSize+1))
 	if err != nil {
 		return OGEFilingPage{}, err
 	}
-	if resp.StatusCode/100 != 2 {
-		return OGEFilingPage{}, fmt.Errorf("OGE API returned %s", resp.Status)
+	if len(b) > maxOGEIndexSize {
+		return OGEFilingPage{}, fmt.Errorf("OGE API response exceeds %d-byte limit", maxOGEIndexSize)
 	}
 	var raw ogePage
 	if err := json.Unmarshal(b, &raw); err != nil {
@@ -153,13 +164,7 @@ func parseOGEFilingDate(value string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-func disclosureCalendarDay(value time.Time) time.Time {
-	year, month, day := value.Date()
-	return time.Date(year, month, day, 0, 0, 0, 0, time.UTC)
-}
-
 func (c *OGEClient) FetchPDF(ctx context.Context, f OGEFiling) ([]byte, error) {
-	const maxPDFSize = 25 << 20
 	if err := c.pacer.Wait(ctx, c.RequestDelay); err != nil {
 		return nil, err
 	}
@@ -175,15 +180,15 @@ func (c *OGEClient) FetchPDF(ctx context.Context, f OGEFiling) ([]byte, error) {
 	if resp.StatusCode/100 != 2 {
 		return nil, fmt.Errorf("OGE PDF returned %s", resp.Status)
 	}
-	if resp.ContentLength > maxPDFSize {
-		return nil, fmt.Errorf("OGE PDF exceeds %d-byte limit", maxPDFSize)
+	if resp.ContentLength > maxOGEPDFSize {
+		return nil, fmt.Errorf("OGE PDF exceeds %d-byte limit", maxOGEPDFSize)
 	}
-	b, err := io.ReadAll(io.LimitReader(resp.Body, maxPDFSize+1))
+	b, err := io.ReadAll(io.LimitReader(resp.Body, maxOGEPDFSize+1))
 	if err != nil {
 		return nil, err
 	}
-	if len(b) > maxPDFSize {
-		return nil, fmt.Errorf("OGE PDF exceeds %d-byte limit", maxPDFSize)
+	if len(b) > maxOGEPDFSize {
+		return nil, fmt.Errorf("OGE PDF exceeds %d-byte limit", maxOGEPDFSize)
 	}
 	return b, nil
 }

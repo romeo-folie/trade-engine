@@ -119,10 +119,14 @@ func (r *Runner) Run(ctx context.Context) error {
 }
 
 func (r *Runner) RunOnce(ctx context.Context) error {
-	now := r.now()
-	since := now.AddDate(0, 0, -r.Cfg.LookbackDays)
-	_, err := r.SyncRange(ctx, since, now, r.Cfg.MaxReportsPerSync)
+	since, until := scheduledDisclosureRange(r.now(), r.Cfg.LookbackDays)
+	_, err := r.SyncRange(ctx, since, until, r.Cfg.MaxReportsPerSync)
 	return err
+}
+
+func scheduledDisclosureRange(now time.Time, lookbackDays int) (time.Time, time.Time) {
+	until := disclosureCalendarDay(now)
+	return until.AddDate(0, 0, -lookbackDays), until
 }
 
 // SyncRange ingests filings whose official filing date falls within the
@@ -138,9 +142,12 @@ func (r *Runner) SyncRange(
 	if limit <= 0 {
 		return result, fmt.Errorf("disclosure sync limit must be positive")
 	}
-	budgets := distributeSyncBudget(limit,
+	budgets, err := distributeSyncBudget(limit,
 		r.House != nil, r.Senate != nil, r.OGE != nil,
 	)
+	if err != nil {
+		return result, err
+	}
 	var failures []error
 	if budgets[0] > 0 {
 		processed, err := r.syncHouse(ctx, since, until, budgets[0])
@@ -171,7 +178,7 @@ func (r *Runner) SyncRange(
 
 // distributeSyncBudget partitions the cross-source limit so one source cannot
 // consume all capacity while another enabled source has pending filings.
-func distributeSyncBudget(limit int, enabled ...bool) []int {
+func distributeSyncBudget(limit int, enabled ...bool) ([]int, error) {
 	budgets := make([]int, len(enabled))
 	enabledCount := 0
 	for _, isEnabled := range enabled {
@@ -180,7 +187,13 @@ func distributeSyncBudget(limit int, enabled ...bool) []int {
 		}
 	}
 	if enabledCount == 0 {
-		return budgets
+		return budgets, nil
+	}
+	if limit < enabledCount {
+		return nil, fmt.Errorf(
+			"disclosure sync limit %d is smaller than %d enabled sources",
+			limit, enabledCount,
+		)
 	}
 	share, remainder := limit/enabledCount, limit%enabledCount
 	for index, isEnabled := range enabled {
@@ -193,7 +206,7 @@ func distributeSyncBudget(limit int, enabled ...bool) []int {
 			remainder--
 		}
 	}
-	return budgets
+	return budgets, nil
 }
 
 func (r *Runner) syncHouse(

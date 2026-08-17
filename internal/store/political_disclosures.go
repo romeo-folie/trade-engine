@@ -248,6 +248,22 @@ func SavePoliticalDisclosureReport(
 		return fmt.Errorf("upsert political disclosure report: %w", err)
 	}
 	if report.ExtractionStatus != "completed" {
+		if _, err := tx.Exec(ctx,
+			`DELETE FROM political_disclosure_transactions WHERE report_id=$1`, reportID,
+		); err != nil {
+			return fmt.Errorf("clear political disclosure transactions: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE political_disclosure_candidates
+			SET transaction_count=0, evidence='[]'::jsonb,
+				promotion_status='superseded', promotion_claim_token=NULL,
+				promotion_claimed_at=NULL,
+				promotion_reason=$2
+			WHERE report_id=$1`, reportID,
+			"latest report extraction status is "+report.ExtractionStatus,
+		); err != nil {
+			return fmt.Errorf("supersede political disclosure candidates: %w", err)
+		}
 		return tx.Commit(ctx)
 	}
 	if _, err := tx.Exec(ctx,
