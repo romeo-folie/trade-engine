@@ -135,3 +135,26 @@ func TestSessionRunnerScheduledModeHonorsSameDayDelay(t *testing.T) {
 		})
 	}
 }
+
+func TestSessionRunnerWaitsForConsolidatedFeedDelayInManualMode(t *testing.T) {
+	location, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	date := time.Date(2026, 8, 10, 12, 0, 0, 0, location)
+	session, ok := engine.MarketSessionForDate(date)
+	if !ok {
+		t.Fatal("expected Monday market session")
+	}
+	runner := SessionRunner{Config: config.UniverseConfig{
+		SnapshotFeed: "delayed_sip", HistoricalFeed: "sip",
+	}}
+	if runner.sessionAuthorized(session.Close.Add(15*time.Minute), session, false) {
+		t.Fatal("manual refresh authorized before consolidated evidence was complete")
+	}
+	if !runner.sessionAuthorized(
+		session.Close.Add(requiredUniverseFeedDelay(runner.Config)), session, false,
+	) {
+		t.Fatal("manual refresh rejected after consolidated evidence was complete")
+	}
+}

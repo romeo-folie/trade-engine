@@ -885,6 +885,8 @@ scanner:
     run_lease_minutes: 120                 # Reclaim a build if its owner disappears beyond this lease
     min_market_data_coverage: 0.90         # Reject plausible-looking snapshots with incomplete provider evidence
     provider: alpaca                       # Provider adapter used for bulk membership and eligibility evidence
+    snapshot_feed: delayed_sip             # Consolidated snapshots delayed 15m; complete by this after-close schedule on Alpaca Basic
+    historical_feed: sip                   # Consolidated daily history; Basic permits requests whose end is at least 15m old
     min_price: 5.0                         # Exclude lower-priced securities once the universe is enabled
     min_market_cap_mm: 100.0               # Minimum market cap in USD millions
     min_median_dollar_volume: 1000000.0    # Minimum median daily dollar volume over the lookback

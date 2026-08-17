@@ -159,12 +159,12 @@ top members.
 
 ## Data limitations and rollout
 
-The current Alpaca stock-history adapter requests the IEX feed. IEX is not
-consolidated market volume, so volume-derived diagnostics must be treated as
-prospective research evidence rather than execution-grade proof. Promotion
-therefore defaults off and should remain in PAPER until:
+The Alpaca stock-history adapter requests consolidated SIP history by default.
+Alpaca Basic can serve these after-close requests once their end boundary is at
+least 15 minutes old; the shared universe schedule defaults to 30 minutes after
+the close. Promotion still defaults off and should remain in PAPER until:
 
 1. taxonomy and benchmark coverage are measured;
-2. data-feed limitations are resolved or explicitly accepted;
+2. consolidated feed coverage is measured prospectively;
 3. prospective conversion and outcome results are reviewed; and
 4. atomic multi-source promotion behavior passes PAPER validation.

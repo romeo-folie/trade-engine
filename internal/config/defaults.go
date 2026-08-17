@@ -408,6 +408,8 @@ func Defaults() *Config {
 				RunLeaseMinutes:           120,
 				MinMarketDataCoverage:     0.90,
 				Provider:                  "alpaca",
+				SnapshotFeed:              "delayed_sip",
+				HistoricalFeed:            "sip",
 				MinPrice:                  5,
 				MinMarketCapMM:            100,
 				MinMedianDollarVolume:     1_000_000,

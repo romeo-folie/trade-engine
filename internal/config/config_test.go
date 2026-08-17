@@ -56,6 +56,8 @@ func TestDefaultsScannerUniverseDisabled(t *testing.T) {
 		t.Fatal("full-market scanner universe must default off")
 	}
 	if universe.Provider != "alpaca" ||
+		universe.SnapshotFeed != "delayed_sip" ||
+		universe.HistoricalFeed != "sip" ||
 		universe.AfterCloseDelayMinutes != 30 ||
 		universe.RunLeaseMinutes != 120 ||
 		universe.MinMarketDataCoverage != 0.90 ||
@@ -129,6 +131,16 @@ func TestValidatePromotionCorrelationRequiresScanner(t *testing.T) {
 	cfg.Scanner.PromotionCorrelationMinOverlap = cfg.Scanner.PromotionCorrelationLookbackDays + 1
 	if errs := Validate(cfg); !containsStr(errs, "promotion_correlation_min_overlap") {
 		t.Fatalf("expected overlap validation error, got %v", errs)
+	}
+}
+
+func TestValidatePromotionCorrelationRequiresHistoricalFeed(t *testing.T) {
+	cfg := Defaults()
+	cfg.Scanner.Enabled = true
+	cfg.Scanner.PromotionCorrelationEnabled = true
+	cfg.Scanner.Universe.HistoricalFeed = ""
+	if errs := Validate(cfg); !containsStr(errs, "scanner.universe.historical_feed") {
+		t.Fatalf("missing correlation history feed accepted: %v", errs)
 	}
 }
 
@@ -270,6 +282,7 @@ func TestValidateScannerUniverseConfig(t *testing.T) {
 	}{
 		{"provider missing", func(c *UniverseConfig) { c.Provider = "" }, "provider"},
 		{"after-close delay", func(c *UniverseConfig) { c.AfterCloseDelayMinutes = -1 }, "after_close_delay_minutes"},
+		{"consolidated feed delay", func(c *UniverseConfig) { c.AfterCloseDelayMinutes = 15 }, "after_close_delay_minutes"},
 		{"run lease", func(c *UniverseConfig) { c.RunLeaseMinutes = 0 }, "run_lease_minutes"},
 		{"market-data coverage zero", func(c *UniverseConfig) { c.MinMarketDataCoverage = 0 }, "min_market_data_coverage"},
 		{"market-data coverage high", func(c *UniverseConfig) { c.MinMarketDataCoverage = 1.01 }, "min_market_data_coverage"},
@@ -277,6 +290,10 @@ func TestValidateScannerUniverseConfig(t *testing.T) {
 		{"market-data coverage +Inf", func(c *UniverseConfig) { c.MinMarketDataCoverage = math.Inf(1) }, "min_market_data_coverage"},
 		{"market-data coverage -Inf", func(c *UniverseConfig) { c.MinMarketDataCoverage = math.Inf(-1) }, "min_market_data_coverage"},
 		{"provider unknown", func(c *UniverseConfig) { c.Provider = "unknown" }, "provider"},
+		{"snapshot feed missing", func(c *UniverseConfig) { c.SnapshotFeed = "" }, "snapshot_feed"},
+		{"snapshot feed unknown", func(c *UniverseConfig) { c.SnapshotFeed = "boats" }, "snapshot_feed"},
+		{"historical feed missing", func(c *UniverseConfig) { c.HistoricalFeed = "" }, "historical_feed"},
+		{"historical delayed feed", func(c *UniverseConfig) { c.HistoricalFeed = "delayed_sip" }, "historical_feed"},
 		{"min price", func(c *UniverseConfig) { c.MinPrice = -1 }, "min_price"},
 		{"market cap", func(c *UniverseConfig) { c.MinMarketCapMM = -1 }, "min_market_cap_mm"},
 		{"dollar volume", func(c *UniverseConfig) { c.MinMedianDollarVolume = -1 }, "min_median_dollar_volume"},

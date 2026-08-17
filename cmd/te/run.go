@@ -881,9 +881,15 @@ Modes:
 				logger.Warn("scanner disabled — requires Alpaca market data provider")
 			} else {
 				scanAnalyzer := analysis.NewAnalyzer(cfg.Models, eng.Bus())
+				universeProvider := data.NewAlpacaUniverseClient(
+					alpacaClient, cfg.Markets.Stocks.BaseURL, data.AlpacaUniverseFeeds{
+						Snapshots:  cfg.Scanner.Universe.SnapshotFeed,
+						Historical: cfg.Scanner.Universe.HistoricalFeed,
+					},
+				)
 				mscanner := &scanner.MarketScanner{
 					AlpacaClient:                 alpacaClient,
-					DailyBars:                    data.NewAlpacaUniverseClient(alpacaClient, cfg.Markets.Stocks.BaseURL),
+					DailyBars:                    universeProvider,
 					Analyzer:                     scanAnalyzer,
 					News:                         newsProvider,
 					Bus:                          eng.Bus(),
@@ -897,9 +903,6 @@ Modes:
 				if tgBot != nil {
 					mscanner.Notifier = tgBot
 				}
-				universeProvider := data.NewAlpacaUniverseClient(
-					alpacaClient, cfg.Markets.Stocks.BaseURL,
-				)
 				var afterCloseJobs []swinguniverse.ApprovedUniverseJob
 				if cfg.Scanner.WeeklyLeader.Enabled && store.IsConnected() {
 					leaderRunner := &scanner.WeeklyLeaderRunner{
@@ -954,6 +957,8 @@ Modes:
 					logger.Info("swing universe pipeline started",
 						"after_close_delay_minutes", cfg.Scanner.Universe.AfterCloseDelayMinutes,
 						"min_market_data_coverage", cfg.Scanner.Universe.MinMarketDataCoverage,
+						"snapshot_feed", cfg.Scanner.Universe.SnapshotFeed,
+						"historical_feed", cfg.Scanner.Universe.HistoricalFeed,
 						"dependent_scanners", len(afterCloseJobs))
 				} else if cfg.Scanner.Universe.Enabled {
 					logger.Warn("swing universe pipeline requested but DB not connected; skipping startup")
