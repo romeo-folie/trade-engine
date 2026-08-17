@@ -162,7 +162,9 @@ top members.
 The Alpaca stock-history adapter requests consolidated SIP history by default.
 Alpaca Basic can serve these after-close requests once their end boundary is at
 least 15 minutes old; the shared universe schedule defaults to 30 minutes after
-the close. Promotion still defaults off and should remain in PAPER until:
+the close. `sip_recent_data_delay_minutes` defaults to a boundary-safe 16 and
+can be set to zero for an Algo Trader Plus account. Promotion still defaults off
+and should remain in PAPER until:
 
 1. taxonomy and benchmark coverage are measured;
 2. consolidated feed coverage is measured prospectively;

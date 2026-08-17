@@ -15,9 +15,9 @@ import (
 const (
 	defaultAlpacaTradingURL = "https://paper-api.alpaca.markets"
 	alpacaProviderName      = "alpaca"
-	// Alpaca Basic restricts the latest 15 minutes of SIP history. The extra
-	// minute keeps requests safely outside the boundary despite clock skew.
-	AlpacaSIPRecentDataDelay = 16 * time.Minute
+	// Delayed SIP snapshots trail the real-time feed by 15 minutes. The extra
+	// minute keeps after-close requests outside the boundary despite clock skew.
+	AlpacaDelayedSIPSnapshotDelay = 16 * time.Minute
 )
 
 var errAlpacaSymbolMissing = errors.New("alpaca response omitted symbol")
@@ -27,16 +27,18 @@ var errAlpacaSymbolInvalidFormat = errors.New("alpaca symbol has invalid format"
 // capabilities to an AlpacaClient. Wrapping the existing client intentionally
 // shares its authentication, retry policy, and rate limiter.
 type AlpacaUniverseClient struct {
-	client         *AlpacaClient
-	tradingURL     string
-	snapshotFeed   string
-	historicalFeed string
-	now            func() time.Time
+	client             *AlpacaClient
+	tradingURL         string
+	snapshotFeed       string
+	historicalFeed     string
+	sipRecentDataDelay time.Duration
+	now                func() time.Time
 }
 
 type AlpacaUniverseFeeds struct {
-	Snapshots  string
-	Historical string
+	Snapshots          string
+	Historical         string
+	SIPRecentDataDelay time.Duration
 }
 
 func NewAlpacaUniverseClient(
@@ -46,11 +48,12 @@ func NewAlpacaUniverseClient(
 		tradingURL = defaultAlpacaTradingURL
 	}
 	return &AlpacaUniverseClient{
-		client:         client,
-		tradingURL:     strings.TrimRight(tradingURL, "/"),
-		snapshotFeed:   strings.ToLower(strings.TrimSpace(feeds.Snapshots)),
-		historicalFeed: strings.ToLower(strings.TrimSpace(feeds.Historical)),
-		now:            time.Now,
+		client:             client,
+		tradingURL:         strings.TrimRight(tradingURL, "/"),
+		snapshotFeed:       strings.ToLower(strings.TrimSpace(feeds.Snapshots)),
+		historicalFeed:     strings.ToLower(strings.TrimSpace(feeds.Historical)),
+		sipRecentDataDelay: max(feeds.SIPRecentDataDelay, 0),
+		now:                time.Now,
 	}
 }
 
@@ -252,8 +255,8 @@ func (c *AlpacaUniverseClient) FetchDailyBars(
 	if err := c.readyHistorical(); err != nil {
 		return result, err
 	}
-	if c.historicalFeed == "sip" {
-		entitlementCutoff := c.now().UTC().Add(-AlpacaSIPRecentDataDelay)
+	if c.historicalFeed == "sip" && c.sipRecentDataDelay > 0 {
+		entitlementCutoff := c.now().UTC().Add(-c.sipRecentDataDelay)
 		if to.After(entitlementCutoff) {
 			to = entitlementCutoff
 		}

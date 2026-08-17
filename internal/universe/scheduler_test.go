@@ -184,6 +184,15 @@ func TestUniverseConfigEvidenceExcludesOperationalTiming(t *testing.T) {
 	if snapshotFeedHash == hash {
 		t.Fatal("snapshot feed change must create a new universe identity")
 	}
+	changed = cfg
+	changed.SIPRecentDataDelayMinutes = 0
+	_, entitlementHash, err := UniverseConfigEvidence(changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entitlementHash == hash {
+		t.Fatal("SIP entitlement delay change must create a new universe identity")
+	}
 }
 
 func TestLatestRetryAtTraversesWrappedSiblingErrors(t *testing.T) {

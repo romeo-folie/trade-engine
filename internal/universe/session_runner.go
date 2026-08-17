@@ -179,10 +179,17 @@ func (r *SessionRunner) sessionAuthorized(
 }
 
 func requiredUniverseFeedDelay(cfg config.UniverseConfig) time.Duration {
-	if cfg.SnapshotFeed == "delayed_sip" || cfg.HistoricalFeed == "sip" {
-		return data.AlpacaSIPRecentDataDelay
+	delay := time.Duration(0)
+	if cfg.SnapshotFeed == "delayed_sip" {
+		delay = data.AlpacaDelayedSIPSnapshotDelay
 	}
-	return 0
+	if cfg.HistoricalFeed == "sip" {
+		historicalDelay := time.Duration(cfg.SIPRecentDataDelayMinutes) * time.Minute
+		if historicalDelay > delay {
+			delay = historicalDelay
+		}
+	}
+	return delay
 }
 
 func sameSessionDate(left, right engine.USMarketSession) bool {

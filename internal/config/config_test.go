@@ -58,6 +58,7 @@ func TestDefaultsScannerUniverseDisabled(t *testing.T) {
 	if universe.Provider != "alpaca" ||
 		universe.SnapshotFeed != "delayed_sip" ||
 		universe.HistoricalFeed != "sip" ||
+		universe.SIPRecentDataDelayMinutes != 16 ||
 		universe.AfterCloseDelayMinutes != 30 ||
 		universe.RunLeaseMinutes != 120 ||
 		universe.MinMarketDataCoverage != 0.90 ||
@@ -141,6 +142,11 @@ func TestValidatePromotionCorrelationRequiresHistoricalFeed(t *testing.T) {
 	cfg.Scanner.Universe.HistoricalFeed = ""
 	if errs := Validate(cfg); !containsStr(errs, "scanner.universe.historical_feed") {
 		t.Fatalf("missing correlation history feed accepted: %v", errs)
+	}
+	cfg.Scanner.Universe.HistoricalFeed = "sip"
+	cfg.Scanner.Universe.SIPRecentDataDelayMinutes = -1
+	if errs := Validate(cfg); !containsStr(errs, "scanner.universe.sip_recent_data_delay_minutes") {
+		t.Fatalf("invalid correlation SIP entitlement delay accepted: %v", errs)
 	}
 }
 
@@ -294,6 +300,7 @@ func TestValidateScannerUniverseConfig(t *testing.T) {
 		{"snapshot feed unknown", func(c *UniverseConfig) { c.SnapshotFeed = "boats" }, "snapshot_feed"},
 		{"historical feed missing", func(c *UniverseConfig) { c.HistoricalFeed = "" }, "historical_feed"},
 		{"historical delayed feed", func(c *UniverseConfig) { c.HistoricalFeed = "delayed_sip" }, "historical_feed"},
+		{"SIP recent-data delay", func(c *UniverseConfig) { c.SIPRecentDataDelayMinutes = -1 }, "sip_recent_data_delay_minutes"},
 		{"min price", func(c *UniverseConfig) { c.MinPrice = -1 }, "min_price"},
 		{"market cap", func(c *UniverseConfig) { c.MinMarketCapMM = -1 }, "min_market_cap_mm"},
 		{"dollar volume", func(c *UniverseConfig) { c.MinMedianDollarVolume = -1 }, "min_median_dollar_volume"},
@@ -321,6 +328,44 @@ func TestValidateScannerUniverseConfig(t *testing.T) {
 				t.Fatalf("invalid %s not rejected: %v", tt.field, Validate(cfg))
 			}
 		})
+	}
+}
+
+func TestValidateScannerUniverseAllowsRealTimeSIPEntitlement(t *testing.T) {
+	cfg := Defaults()
+	cfg.Scanner.Enabled = true
+	cfg.Scanner.Universe.Enabled = true
+	cfg.Scanner.Universe.SnapshotFeed = "sip"
+	cfg.Scanner.Universe.HistoricalFeed = "sip"
+	cfg.Scanner.Universe.SIPRecentDataDelayMinutes = 0
+	cfg.Scanner.Universe.AfterCloseDelayMinutes = 0
+	if errs := Validate(cfg); containsStr(errs, "scanner.universe") {
+		t.Fatalf("real-time SIP entitlement config rejected: %v", errs)
+	}
+}
+
+func TestValidateScannerUniverseScheduleCoversConfiguredSIPDelay(t *testing.T) {
+	cfg := Defaults()
+	cfg.Scanner.Enabled = true
+	cfg.Scanner.Universe.Enabled = true
+	cfg.Scanner.Universe.SnapshotFeed = "sip"
+	cfg.Scanner.Universe.SIPRecentDataDelayMinutes = 20
+	cfg.Scanner.Universe.AfterCloseDelayMinutes = 19
+	if errs := Validate(cfg); !containsStr(errs, "scanner.universe.after_close_delay_minutes") {
+		t.Fatalf("schedule shorter than configured SIP delay accepted: %v", errs)
+	}
+}
+
+func TestValidateScannerUniverseScheduleCoversDelayedSnapshots(t *testing.T) {
+	cfg := Defaults()
+	cfg.Scanner.Enabled = true
+	cfg.Scanner.Universe.Enabled = true
+	cfg.Scanner.Universe.SnapshotFeed = "delayed_sip"
+	cfg.Scanner.Universe.HistoricalFeed = "iex"
+	cfg.Scanner.Universe.SIPRecentDataDelayMinutes = 0
+	cfg.Scanner.Universe.AfterCloseDelayMinutes = 15
+	if errs := Validate(cfg); !containsStr(errs, "scanner.universe.after_close_delay_minutes") {
+		t.Fatalf("schedule shorter than delayed snapshot boundary accepted: %v", errs)
 	}
 }
 

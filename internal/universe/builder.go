@@ -349,12 +349,13 @@ func (b *Builder) Refresh(ctx context.Context) (result RefreshResult, err error)
 
 	asOf := b.now()
 	sourceEvidence, _ := json.Marshal(map[string]any{
-		"asset_provider":  b.Config.Provider,
-		"snapshot_feed":   b.Config.SnapshotFeed,
-		"historical_feed": b.Config.HistoricalFeed,
-		"started_at":      startedAt,
-		"snapshot_error":  errorString(snapshotErr),
-		"bars_error":      errorString(barsErr),
+		"asset_provider":                b.Config.Provider,
+		"snapshot_feed":                 b.Config.SnapshotFeed,
+		"historical_feed":               b.Config.HistoricalFeed,
+		"sip_recent_data_delay_minutes": b.Config.SIPRecentDataDelayMinutes,
+		"started_at":                    startedAt,
+		"snapshot_error":                errorString(snapshotErr),
+		"bars_error":                    errorString(barsErr),
 	})
 	if updateErr := b.Repository.UpdateMetadata(ctx, versionID, store.SwingUniverseVersion{
 		Provider:       b.Config.Provider,

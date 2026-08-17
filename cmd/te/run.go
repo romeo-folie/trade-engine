@@ -883,8 +883,9 @@ Modes:
 				scanAnalyzer := analysis.NewAnalyzer(cfg.Models, eng.Bus())
 				universeProvider := data.NewAlpacaUniverseClient(
 					alpacaClient, cfg.Markets.Stocks.BaseURL, data.AlpacaUniverseFeeds{
-						Snapshots:  cfg.Scanner.Universe.SnapshotFeed,
-						Historical: cfg.Scanner.Universe.HistoricalFeed,
+						Snapshots:          cfg.Scanner.Universe.SnapshotFeed,
+						Historical:         cfg.Scanner.Universe.HistoricalFeed,
+						SIPRecentDataDelay: time.Duration(cfg.Scanner.Universe.SIPRecentDataDelayMinutes) * time.Minute,
 					},
 				)
 				mscanner := &scanner.MarketScanner{
@@ -959,6 +960,7 @@ Modes:
 						"min_market_data_coverage", cfg.Scanner.Universe.MinMarketDataCoverage,
 						"snapshot_feed", cfg.Scanner.Universe.SnapshotFeed,
 						"historical_feed", cfg.Scanner.Universe.HistoricalFeed,
+						"sip_recent_data_delay_minutes", cfg.Scanner.Universe.SIPRecentDataDelayMinutes,
 						"dependent_scanners", len(afterCloseJobs))
 				} else if cfg.Scanner.Universe.Enabled {
 					logger.Warn("swing universe pipeline requested but DB not connected; skipping startup")

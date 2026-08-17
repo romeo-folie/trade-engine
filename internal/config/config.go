@@ -1347,12 +1347,13 @@ type UniverseConfig struct {
 	Provider string `yaml:"provider"`
 
 	// SnapshotFeed and HistoricalFeed select Alpaca feeds by operation. Universe
-	// snapshots run after the close and can use delayed consolidated evidence;
-	// historical bars use SIP only after their end boundary is outside Alpaca's
-	// recent-data restriction. Keeping these separate prevents an accidental
-	// real-time SIP entitlement requirement.
-	SnapshotFeed   string `yaml:"snapshot_feed"`
-	HistoricalFeed string `yaml:"historical_feed"`
+	// snapshots run after the close and can use delayed consolidated evidence.
+	// SIPRecentDataDelayMinutes keeps historical requests outside the account's
+	// entitlement window; set it to zero when real-time SIP is entitled. Keeping
+	// these settings separate prevents an accidental real-time SIP requirement.
+	SnapshotFeed              string `yaml:"snapshot_feed"`
+	HistoricalFeed            string `yaml:"historical_feed"`
+	SIPRecentDataDelayMinutes int    `yaml:"sip_recent_data_delay_minutes"`
 
 	// Objective eligibility thresholds. A zero MaxSpreadBPS disables only the
 	// spread ceiling; the remaining defaults are active once Enabled is true.
@@ -2180,6 +2181,8 @@ func validUniverseHistoricalFeed(feed string) bool {
 	return feed == "iex" || feed == "sip"
 }
 
+const delayedSIPSnapshotDelayMinutes = 16
+
 func Validate(cfg *Config) []string {
 	var errs []string
 	if cfg.Scanner.PromotionMaxPerIndustry < 0 {
@@ -2208,6 +2211,16 @@ func Validate(cfg *Config) []string {
 			errs = append(errs, fmt.Sprintf(
 				"scanner.universe.historical_feed must be one of iex|sip when promotion correlation is enabled, got %q",
 				cfg.Scanner.Universe.HistoricalFeed))
+		}
+	}
+	if cfg.Scanner.Universe.Enabled || cfg.Scanner.PromotionCorrelationEnabled {
+		delay := cfg.Scanner.Universe.SIPRecentDataDelayMinutes
+		if delay < 0 {
+			errs = append(errs,
+				"scanner.universe.sip_recent_data_delay_minutes must be >= 0")
+		} else if !durationConfigFits(delay, time.Minute) {
+			errs = append(errs,
+				"scanner.universe.sip_recent_data_delay_minutes overflows time.Duration")
 		}
 	}
 
@@ -2268,10 +2281,18 @@ func Validate(cfg *Config) []string {
 				"scanner.universe.historical_feed must be one of iex|sip, got %q",
 				universe.HistoricalFeed))
 		}
-		if (universe.SnapshotFeed == "delayed_sip" ||
-			universe.HistoricalFeed == "sip") && universe.AfterCloseDelayMinutes < 16 {
-			errs = append(errs,
-				"scanner.universe.after_close_delay_minutes must be >= 16 for delayed_sip snapshots or SIP history")
+		requiredFeedDelayMinutes := 0
+		if universe.SnapshotFeed == "delayed_sip" {
+			requiredFeedDelayMinutes = delayedSIPSnapshotDelayMinutes
+		}
+		if universe.HistoricalFeed == "sip" &&
+			universe.SIPRecentDataDelayMinutes > requiredFeedDelayMinutes {
+			requiredFeedDelayMinutes = universe.SIPRecentDataDelayMinutes
+		}
+		if universe.AfterCloseDelayMinutes < requiredFeedDelayMinutes {
+			errs = append(errs, fmt.Sprintf(
+				"scanner.universe.after_close_delay_minutes must be >= %d for the configured market-data delays",
+				requiredFeedDelayMinutes))
 		}
 		if universe.MinPrice < 0 {
 			errs = append(errs, "scanner.universe.min_price must be >= 0")

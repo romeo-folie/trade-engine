@@ -410,6 +410,7 @@ func Defaults() *Config {
 				Provider:                  "alpaca",
 				SnapshotFeed:              "delayed_sip",
 				HistoricalFeed:            "sip",
+				SIPRecentDataDelayMinutes: 16,
 				MinPrice:                  5,
 				MinMarketCapMM:            100,
 				MinMedianDollarVolume:     1_000_000,

@@ -56,8 +56,9 @@ weekend, holiday, or historical backfills from current live APIs.`,
 		universeCfg := cfg.Scanner.Universe
 		provider := data.NewAlpacaUniverseClient(
 			alpaca, cfg.Markets.Stocks.BaseURL, data.AlpacaUniverseFeeds{
-				Snapshots:  universeCfg.SnapshotFeed,
-				Historical: universeCfg.HistoricalFeed,
+				Snapshots:          universeCfg.SnapshotFeed,
+				Historical:         universeCfg.HistoricalFeed,
+				SIPRecentDataDelay: time.Duration(universeCfg.SIPRecentDataDelayMinutes) * time.Minute,
 			},
 		)
 		// A manual refresh is an explicit one-shot opt-in even when the durable

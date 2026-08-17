@@ -219,4 +219,6 @@ Only after those diagnostics are stable should candidate promotion be enabled.
 Alpaca history is split-adjusted SIP data by default. Returns are therefore
 price returns rather than dividend-total returns, while volume-derived features
 use consolidated market volume. The configured historical feed is retained in
-the parent universe evidence, and changing it creates a new universe identity.
+the parent universe evidence. Its entitlement delay is configurable, and
+changing either setting creates a new universe identity. Algo Trader Plus can
+set the delay to zero without changing scanner code.

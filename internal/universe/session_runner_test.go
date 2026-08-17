@@ -148,6 +148,7 @@ func TestSessionRunnerWaitsForConsolidatedFeedDelayInManualMode(t *testing.T) {
 	}
 	runner := SessionRunner{Config: config.UniverseConfig{
 		SnapshotFeed: "delayed_sip", HistoricalFeed: "sip",
+		SIPRecentDataDelayMinutes: 16,
 	}}
 	if runner.sessionAuthorized(session.Close.Add(15*time.Minute), session, false) {
 		t.Fatal("manual refresh authorized before consolidated evidence was complete")
@@ -156,5 +157,24 @@ func TestSessionRunnerWaitsForConsolidatedFeedDelayInManualMode(t *testing.T) {
 		session.Close.Add(requiredUniverseFeedDelay(runner.Config)), session, false,
 	) {
 		t.Fatal("manual refresh rejected after consolidated evidence was complete")
+	}
+}
+
+func TestSessionRunnerAllowsImmediateRealTimeSIPInManualMode(t *testing.T) {
+	location, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	date := time.Date(2026, 8, 10, 12, 0, 0, 0, location)
+	session, ok := engine.MarketSessionForDate(date)
+	if !ok {
+		t.Fatal("expected Monday market session")
+	}
+	runner := SessionRunner{Config: config.UniverseConfig{
+		SnapshotFeed: "sip", HistoricalFeed: "sip",
+		SIPRecentDataDelayMinutes: 0,
+	}}
+	if !runner.sessionAuthorized(session.Close, session, false) {
+		t.Fatal("manual refresh rejected at close with real-time SIP entitlement")
 	}
 }
