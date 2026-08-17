@@ -529,6 +529,82 @@ func TestTaxonomyRefreshPrioritizesUnattemptedSymbols(t *testing.T) {
 	}
 }
 
+func TestTaxonomyRefreshPrioritizesOldestStaleObservation(t *testing.T) {
+	now := time.Date(2026, 7, 26, 21, 0, 0, 0, time.UTC)
+	cfg := testConfig()
+	cfg.TaxonomyRefreshLimit = 1
+	evidence, _ := json.Marshal(fundamentalsEvidence{MarketCapMM: 500})
+	repo := &fakeRepository{taxonomy: map[string]*store.CompanyTaxonomyObservation{
+		"A": {
+			Ticker: "A", Provider: "finnhub", EffectiveAt: now.Add(-8 * 24 * time.Hour),
+			ObservedAt: now.Add(-8 * 24 * time.Hour), Sector: store.UnknownTaxonomy,
+			Industry: "Technology", Status: "stale", Evidence: evidence,
+		},
+		"B": {
+			Ticker: "B", Provider: "finnhub", EffectiveAt: now.Add(-9 * 24 * time.Hour),
+			ObservedAt: now.Add(-9 * 24 * time.Hour), Sector: store.UnknownTaxonomy,
+			Industry: "Banking", Status: "stale", Evidence: evidence,
+		},
+	}}
+	market := completeMarkets([]string{"A", "B"}, 20)
+	builder := Builder{
+		Config: cfg,
+		Assets: fakeAssets{assets: []data.StockAsset{
+			{Symbol: "A", Status: "active", AssetClass: "us_equity", Exchange: "NASDAQ", Tradable: true},
+			{Symbol: "B", Status: "active", AssetClass: "us_equity", Exchange: "NASDAQ", Tradable: true},
+		}},
+		Snapshots: market, Bars: market,
+		Fundamentals: fakeFundamentals{
+			"A": {MarketCapitalization: 500, Industry: "Technology", Provider: "finnhub"},
+			"B": {MarketCapitalization: 500, Industry: "Banking", Provider: "finnhub"},
+		},
+		Repository: repo, Now: func() time.Time { return now },
+	}
+	if _, err := builder.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := repo.taxonomy["B"].ObservedAt; !got.Equal(now) {
+		t.Fatalf("oldest stale observation was not refreshed first: B observed at %s", got)
+	}
+	if _, err := builder.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := repo.taxonomy["A"].ObservedAt; !got.Equal(now) {
+		t.Fatalf("later stale observation was not refreshed on the next run: A observed at %s", got)
+	}
+}
+
+func TestTaxonomyObservationMapsCuratedFinnhubIndustries(t *testing.T) {
+	now := time.Date(2026, 8, 17, 21, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name, industry, wantSector string
+	}{
+		{"banking", "Banking", "Financials"},
+		{"normalized semiconductor", "  Semiconductors ", "Technology"},
+		{"health care", "Health Care", "Health Care"},
+		{"unmapped", "N/A", store.UnknownTaxonomy},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := taxonomyObservation("TEST", data.CompanyFundamentals{
+				Industry: tc.industry, Provider: "finnhub",
+			}, now)
+			if got.Industry != strings.TrimSpace(tc.industry) || got.Sector != tc.wantSector {
+				t.Fatalf("taxonomy = %+v, want raw industry %q and sector %q", got,
+					strings.TrimSpace(tc.industry), tc.wantSector)
+			}
+			if tc.wantSector == store.UnknownTaxonomy && strings.Contains(string(got.Evidence), finnhubIndustrySectorMappingVersion) {
+				t.Fatalf("unmapped industry unexpectedly recorded a mapping: %s", got.Evidence)
+			}
+		})
+	}
+	otherProvider := taxonomyObservation("TEST", data.CompanyFundamentals{
+		Industry: "Banking", Provider: "other",
+	}, now)
+	if otherProvider.Sector != store.UnknownTaxonomy {
+		t.Fatalf("non-Finnhub provider was mapped: %+v", otherProvider)
+	}
+}
+
 func TestTaxonomyLookupFailureAbortsRefresh(t *testing.T) {
 	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
 	lookupErr := errors.New("taxonomy database unavailable")

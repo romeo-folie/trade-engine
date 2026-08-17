@@ -57,10 +57,12 @@ type RefreshResult struct {
 }
 
 type fundamentalsEvidence struct {
-	Name        string  `json:"name,omitempty"`
-	MarketCapMM float64 `json:"market_cap_mm,omitempty"`
-	Country     string  `json:"country,omitempty"`
-	Exchange    string  `json:"exchange,omitempty"`
+	Name          string  `json:"name,omitempty"`
+	MarketCapMM   float64 `json:"market_cap_mm,omitempty"`
+	Country       string  `json:"country,omitempty"`
+	Exchange      string  `json:"exchange,omitempty"`
+	Industry      string  `json:"industry,omitempty"`
+	SectorMapping string  `json:"sector_mapping,omitempty"`
 }
 
 // Refresh builds a current snapshot. It intentionally has no historical as-of
@@ -230,8 +232,9 @@ func (b *Builder) Refresh(ctx context.Context) (result RefreshResult, err error)
 	}
 	fundamentalsRequiredSymbols := make([]string, 0, len(marketSymbols))
 	type refreshCandidate struct {
-		symbol   string
-		priority int
+		symbol     string
+		priority   int
+		observedAt time.Time
 	}
 	refreshCandidates := make([]refreshCandidate, 0, len(marketSymbols))
 	marketSymbolSet := make(map[string]struct{}, len(marketSymbols))
@@ -260,13 +263,20 @@ func (b *Builder) Refresh(ctx context.Context) (result RefreshResult, err error)
 		}
 		fundamentalsRequiredSymbols = append(fundamentalsRequiredSymbols, symbol)
 		if priority := taxonomyRefreshPriority(observation, lookupAt, maxTaxonomyAge); priority > 0 {
+			observedAt := time.Time{}
+			if observation != nil {
+				observedAt = observation.ObservedAt
+			}
 			refreshCandidates = append(refreshCandidates, refreshCandidate{
-				symbol: symbol, priority: priority,
+				symbol: symbol, priority: priority, observedAt: observedAt,
 			})
 		}
 	}
 	sort.SliceStable(refreshCandidates, func(i, j int) bool {
 		if refreshCandidates[i].priority == refreshCandidates[j].priority {
+			if !refreshCandidates[i].observedAt.Equal(refreshCandidates[j].observedAt) {
+				return refreshCandidates[i].observedAt.Before(refreshCandidates[j].observedAt)
+			}
 			return refreshCandidates[i].symbol < refreshCandidates[j].symbol
 		}
 		return refreshCandidates[i].priority < refreshCandidates[j].priority
@@ -609,11 +619,13 @@ func (b *Builder) now() time.Time {
 func taxonomyObservation(
 	ticker string, fundamentals data.CompanyFundamentals, observedAt time.Time,
 ) *store.CompanyTaxonomyObservation {
+	industry := strings.TrimSpace(fundamentals.Industry)
+	sector, mapping := finnhubIndustrySector(fundamentals.Provider, industry)
 	evidence, _ := json.Marshal(fundamentalsEvidence{
 		Name: fundamentals.Name, MarketCapMM: fundamentals.MarketCapitalization,
 		Country: fundamentals.Country, Exchange: fundamentals.Exchange,
+		Industry: industry, SectorMapping: mapping,
 	})
-	industry := strings.TrimSpace(fundamentals.Industry)
 	status := "known"
 	if industry == "" {
 		industry = store.UnknownTaxonomy
@@ -625,9 +637,79 @@ func taxonomyObservation(
 	return &store.CompanyTaxonomyObservation{
 		Ticker: ticker, Provider: fundamentals.Provider,
 		EffectiveAt: observedAt, ObservedAt: observedAt,
-		Sector: store.UnknownTaxonomy, Industry: industry, Status: status,
+		Sector: sector, Industry: industry, Status: status,
 		Evidence: evidence,
 	}
+}
+
+const finnhubIndustrySectorMappingVersion = "finnhub_industry_to_gics_sector_v1"
+
+// finnhubIndustrySectors is deliberately a closed, provider-specific mapping.
+// Finnhub's profile label is not a GICS hierarchy, so unknown labels must stay
+// unknown instead of being guessed into a benchmark family.
+var finnhubIndustrySectors = map[string]string{
+	"AEROSPACE & DEFENSE":              "Industrials",
+	"AIRLINES":                         "Industrials",
+	"AUTO COMPONENTS":                  "Consumer Discretionary",
+	"AUTOMOBILES":                      "Consumer Discretionary",
+	"BANKING":                          "Financials",
+	"BASIC MATERIALS":                  "Materials",
+	"BEVERAGES":                        "Consumer Staples",
+	"BIOTECHNOLOGY":                    "Health Care",
+	"BUILDING":                         "Industrials",
+	"CHEMICALS":                        "Materials",
+	"COMMERCIAL SERVICES & SUPPLIES":   "Industrials",
+	"COMMUNICATIONS":                   "Communication Services",
+	"COMMUNICATION SERVICES":           "Communication Services",
+	"CONSTRUCTION":                     "Industrials",
+	"CONSUMER CYCLICAL":                "Consumer Discretionary",
+	"CONSUMER DEFENSIVE":               "Consumer Staples",
+	"CONSUMER PRODUCTS":                "Consumer Discretionary",
+	"DISTRIBUTORS":                     "Consumer Discretionary",
+	"DIVERSIFIED CONSUMER SERVICES":    "Consumer Discretionary",
+	"ELECTRICAL EQUIPMENT":             "Industrials",
+	"ENERGY":                           "Energy",
+	"FINANCIAL SERVICES":               "Financials",
+	"FOOD PRODUCTS":                    "Consumer Staples",
+	"HEALTH CARE":                      "Health Care",
+	"HEALTHCARE":                       "Health Care",
+	"HOTELS, RESTAURANTS & LEISURE":    "Consumer Discretionary",
+	"INDUSTRIAL CONGLOMERATES":         "Industrials",
+	"INDUSTRIALS":                      "Industrials",
+	"INSURANCE":                        "Financials",
+	"LEISURE PRODUCTS":                 "Consumer Discretionary",
+	"LIFE SCIENCES TOOLS & SERVICES":   "Health Care",
+	"LOGISTICS & TRANSPORTATION":       "Industrials",
+	"MACHINERY":                        "Industrials",
+	"MARINE":                           "Industrials",
+	"MEDIA":                            "Communication Services",
+	"METALS & MINING":                  "Materials",
+	"PACKAGING":                        "Materials",
+	"PAPER & FOREST":                   "Materials",
+	"PHARMACEUTICALS":                  "Health Care",
+	"PROFESSIONAL SERVICES":            "Industrials",
+	"REAL ESTATE":                      "Real Estate",
+	"RETAIL":                           "Consumer Discretionary",
+	"ROAD & RAIL":                      "Industrials",
+	"SEMICONDUCTORS":                   "Technology",
+	"TECHNOLOGY":                       "Technology",
+	"TELECOMMUNICATION":                "Communication Services",
+	"TEXTILES, APPAREL & LUXURY GOODS": "Consumer Discretionary",
+	"TOBACCO":                          "Consumer Staples",
+	"TRADING COMPANIES & DISTRIBUTORS": "Industrials",
+	"TRANSPORTATION INFRASTRUCTURE":    "Industrials",
+	"UTILITIES":                        "Utilities",
+}
+
+func finnhubIndustrySector(provider, industry string) (string, string) {
+	if !strings.EqualFold(strings.TrimSpace(provider), "finnhub") {
+		return store.UnknownTaxonomy, ""
+	}
+	label := strings.ToUpper(strings.Join(strings.Fields(industry), " "))
+	if sector, ok := finnhubIndustrySectors[label]; ok {
+		return sector, finnhubIndustrySectorMappingVersion
+	}
+	return store.UnknownTaxonomy, ""
 }
 
 func taxonomyUnavailableObservation(

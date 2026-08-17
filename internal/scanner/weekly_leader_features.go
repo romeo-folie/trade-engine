@@ -16,7 +16,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
-const weeklyLeaderFeatureVersion = "weekly-leader-v3"
+const weeklyLeaderFeatureVersion = "weekly-leader-v4"
 
 // WeeklyLeaderFeatures are immutable, auditable measurements derived only from
 // bars completed by the run's decision cutoff. Returns are decimal fractions.

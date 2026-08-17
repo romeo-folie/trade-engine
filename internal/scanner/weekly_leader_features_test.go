@@ -153,6 +153,9 @@ func TestWeeklyLeaderCompatibilityHashIncludesEvaluationSettings(t *testing.T) {
 		{"minimum feature coverage", func(c *config.WeeklyLeaderConfig) {
 			c.MinFeatureCoverage += 0.01
 		}},
+		{"minimum cross-section coverage", func(c *config.WeeklyLeaderConfig) {
+			c.MinCrossSectionCoverage -= 0.01
+		}},
 	}
 	for _, tc := range evaluationChanges {
 		t.Run(tc.name, func(t *testing.T) {
@@ -179,7 +182,7 @@ func TestProviderFailureSuppressesCrossSectionalQualification(t *testing.T) {
 	if failed != 1 {
 		t.Fatalf("incomplete coverage count = %d, want 1", failed)
 	}
-	suppressWeeklyLeaderQualificationsOnIncompleteCoverage(evaluations, failed, 2)
+	suppressWeeklyLeaderQualificationsOnIncompleteCoverage(evaluations, failed, 2, .5, .99)
 	if evaluations[0].Qualified || evaluations[0].Outcome != "not_qualified" ||
 		evaluations[0].FailureStage != "cross_section_incomplete" {
 		t.Fatalf("partial provider survivors remained promotable: %+v", evaluations[0])
@@ -187,6 +190,32 @@ func TestProviderFailureSuppressesCrossSectionalQualification(t *testing.T) {
 	if evaluations[1].Outcome != "failed" ||
 		evaluations[1].FailureStage != "provider_history" {
 		t.Fatalf("original provider failure was overwritten: %+v", evaluations[1])
+	}
+}
+
+func TestWeeklyLeaderCoverageThresholdRetainsBoundedProviderFailures(t *testing.T) {
+	score := .9
+	evaluations := make([]WeeklyLeaderEvaluation, 0, 100)
+	for i := 0; i < 99; i++ {
+		evaluations = append(evaluations, WeeklyLeaderEvaluation{
+			Outcome: "qualified", Qualified: true, CompositeScore: &score,
+		})
+	}
+	evaluations = append(evaluations, WeeklyLeaderEvaluation{
+		Outcome: "failed", FailureStage: "bar_validation",
+	})
+	failed := weeklyLeaderIncompleteCoverageCount(evaluations)
+	coverage := weeklyLeaderEvaluationCoverage(failed, len(evaluations))
+	if coverage != .99 {
+		t.Fatalf("coverage = %.4f, want .99", coverage)
+	}
+	if coverage < .99 {
+		suppressWeeklyLeaderQualificationsOnIncompleteCoverage(
+			evaluations, failed, len(evaluations), coverage, .99,
+		)
+	}
+	if !evaluations[0].Qualified || evaluations[0].Outcome != "qualified" {
+		t.Fatalf("bounded provider failure suppressed qualified row: %+v", evaluations[0])
 	}
 }
 
@@ -247,9 +276,10 @@ func TestTargetSessionBarFailureSuppressesPromotionsButShortHistoryDoesNot(t *te
 				t.Fatalf("incomplete coverage count = %d, want %d",
 					failed, tc.wantIncomplete)
 			}
-			if failed > 0 {
+			coverage := weeklyLeaderEvaluationCoverage(failed, len(evaluations))
+			if failed > 0 && coverage < cfg.MinCrossSectionCoverage {
 				suppressWeeklyLeaderQualificationsOnIncompleteCoverage(
-					evaluations, failed, len(evaluations),
+					evaluations, failed, len(evaluations), coverage, cfg.MinCrossSectionCoverage,
 				)
 			}
 			qualifications, err := weeklyLeaderQualifications(
@@ -636,6 +666,6 @@ func leaderTestConfig() config.WeeklyLeaderConfig {
 	return config.WeeklyLeaderConfig{
 		MinHistorySessions: 253, IndustryMinPeers: 2,
 		SelectionPercentile: 0.50, MinCompositeScore: 0.01,
-		MinFeatureCoverage: 0.90,
+		MinFeatureCoverage: 0.90, MinCrossSectionCoverage: .99,
 	}
 }
