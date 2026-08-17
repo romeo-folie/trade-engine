@@ -643,6 +643,40 @@ func TestRefreshProjectsMappedSectorFromCachedFinnhubTaxonomy(t *testing.T) {
 	}
 }
 
+func TestRefreshRemovesObsoleteCachedFinnhubSectorMapping(t *testing.T) {
+	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	evidence := json.RawMessage(`{"market_cap_mm":500,"industry":"Construction","sector_mapping":"finnhub_industry_to_gics_sector_v1"}`)
+	cached := &store.CompanyTaxonomyObservation{
+		Ticker: "BUILD", Provider: "finnhub", EffectiveAt: now.Add(-time.Hour),
+		ObservedAt: now.Add(-time.Hour), Sector: "Industrials",
+		Industry: "Construction", Status: "known", Evidence: evidence,
+	}
+	repo := &fakeRepository{taxonomy: map[string]*store.CompanyTaxonomyObservation{"BUILD": cached}}
+	market := completeMarket("BUILD", 20)
+	builder := Builder{
+		Config: testConfig(),
+		Assets: fakeAssets{assets: []data.StockAsset{{
+			Symbol: "BUILD", Status: "active", AssetClass: "us_equity", Exchange: "NASDAQ", Tradable: true,
+		}}},
+		Snapshots: market, Bars: market, Fundamentals: fakeFundamentals{},
+		Repository: repo, Now: func() time.Time { return now },
+	}
+	result, err := builder.Refresh(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.TaxonomyRefreshes != 0 {
+		t.Fatalf("cached taxonomy unexpectedly refreshed: %+v", result)
+	}
+	if got := repo.members[0]; got.Sector != store.UnknownTaxonomy ||
+		strings.Contains(string(got.TaxonomyEvidence), "sector_mapping") {
+		t.Fatalf("obsolete cached mapping was retained: %+v", got)
+	}
+	if cached.Sector != "Industrials" || string(cached.Evidence) != string(evidence) {
+		t.Fatalf("cached observation was mutated: %+v", cached)
+	}
+}
+
 func TestTaxonomyLookupFailureAbortsRefresh(t *testing.T) {
 	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
 	lookupErr := errors.New("taxonomy database unavailable")

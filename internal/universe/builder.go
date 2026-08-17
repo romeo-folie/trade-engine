@@ -503,14 +503,14 @@ func (b *Builder) evaluate(
 	member.SourceEvidence = sourceEvidence
 
 	if taxonomy != nil {
-		taxonomy, sectorMapping := taxonomyForUniverseSnapshot(taxonomy)
+		taxonomy, sectorMapping, projected := taxonomyForUniverseSnapshot(taxonomy)
 		member.Sector = taxonomy.Sector
 		member.Industry = taxonomy.Industry
 		member.TaxonomyStatus = taxonomy.Status
 		member.TaxonomyAsOf = &taxonomy.ObservedAt
 		member.TaxonomyProvider = taxonomy.Provider
 		member.TaxonomyEvidence = taxonomyEvidenceWithSectorMapping(
-			taxonomy.Evidence, sectorMapping,
+			taxonomy.Evidence, sectorMapping, projected,
 		)
 		if capMM := marketCapFromEvidence(taxonomy.Evidence); capMM > 0 {
 			member.MarketCapMM = &capMM
@@ -607,33 +607,38 @@ func (b *Builder) evaluate(
 // a newly introduced mapping also takes effect for fresh cached observations.
 func taxonomyForUniverseSnapshot(
 	observation *store.CompanyTaxonomyObservation,
-) (*store.CompanyTaxonomyObservation, string) {
+) (*store.CompanyTaxonomyObservation, string, bool) {
 	if observation == nil || observation.Status != "known" ||
-		(strings.TrimSpace(observation.Sector) != "" &&
-			!strings.EqualFold(strings.TrimSpace(observation.Sector), store.UnknownTaxonomy)) {
-		return observation, ""
+		!strings.EqualFold(strings.TrimSpace(observation.Provider), "finnhub") {
+		return observation, "", false
 	}
 	sector, mapping := finnhubIndustrySector(observation.Provider, observation.Industry)
-	if mapping == "" {
-		return observation, ""
-	}
 	copy := *observation
 	copy.Sector = sector
-	return &copy, mapping
+	return &copy, mapping, true
 }
 
-func taxonomyEvidenceWithSectorMapping(raw json.RawMessage, mapping string) json.RawMessage {
-	if mapping == "" {
+func taxonomyEvidenceWithSectorMapping(
+	raw json.RawMessage, mapping string, projected bool,
+) json.RawMessage {
+	if !projected {
 		return raw
 	}
 	var evidence map[string]any
 	if err := json.Unmarshal(raw, &evidence); err != nil || evidence == nil {
 		return raw
 	}
-	if existing, _ := evidence["sector_mapping"].(string); existing == mapping {
+	existing, _ := evidence["sector_mapping"].(string)
+	if mapping == "" {
+		if existing == "" {
+			return raw
+		}
+		delete(evidence, "sector_mapping")
+	} else if existing == mapping {
 		return raw
+	} else {
+		evidence["sector_mapping"] = mapping
 	}
-	evidence["sector_mapping"] = mapping
 	encoded, err := json.Marshal(evidence)
 	if err != nil {
 		return raw
