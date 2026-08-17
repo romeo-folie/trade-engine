@@ -665,7 +665,6 @@ var finnhubIndustrySectors = map[string]string{
 	"CONSTRUCTION":                     "Industrials",
 	"CONSUMER CYCLICAL":                "Consumer Discretionary",
 	"CONSUMER DEFENSIVE":               "Consumer Staples",
-	"CONSUMER PRODUCTS":                "Consumer Discretionary",
 	"DISTRIBUTORS":                     "Consumer Discretionary",
 	"DIVERSIFIED CONSUMER SERVICES":    "Consumer Discretionary",
 	"ELECTRICAL EQUIPMENT":             "Industrials",

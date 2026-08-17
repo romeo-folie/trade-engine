@@ -584,6 +584,7 @@ func TestTaxonomyObservationMapsCuratedFinnhubIndustries(t *testing.T) {
 		{"normalized semiconductor", "  Semiconductors ", "Technology"},
 		{"health care", "Health Care", "Health Care"},
 		{"ambiguous retail", "Retail", store.UnknownTaxonomy},
+		{"ambiguous consumer products", "Consumer Products", store.UnknownTaxonomy},
 		{"unmapped", "N/A", store.UnknownTaxonomy},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
