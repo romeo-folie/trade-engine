@@ -540,19 +540,7 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 		if len(timeframes) == 0 {
 			timeframes = []string{"1H", "4H"}
 		}
-		strategies := candidateStrategies(sc.score.Strategy, sc.candidate.PullbackQualified)
-		if hasSource(sc.candidate.Sources, "weekly_leader") {
-			strategies = appendUniqueStrategy(strategies, "weekly_leader")
-		}
-		if hasSource(sc.candidate.Sources, "potent_industry") {
-			strategies = appendUniqueStrategy(strategies, "potent_industry")
-		}
-		if hasSource(sc.candidate.Sources, "premarket_episodic") {
-			strategies = appendUniqueStrategy(strategies, "premarket_episodic")
-		}
-		if hasSource(sc.candidate.Sources, "political_disclosure") {
-			strategies = appendUniqueStrategy(strategies, "political_disclosure")
-		}
+		strategies := scannerCandidateStrategies(sc.candidate, sc.score)
 		discoveryContext, executionProfile, profileErr := buildScannerTradeProfile(
 			sc.candidate, sc.score,
 		)
@@ -649,21 +637,7 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			if len(timeframes) == 0 {
 				timeframes = []string{"1H", "4H"}
 			}
-			strategies = candidateStrategies(
-				fallbackScore.Strategy, fallback.PullbackQualified,
-			)
-			if hasSource(fallback.Sources, "weekly_leader") {
-				strategies = appendUniqueStrategy(strategies, "weekly_leader")
-			}
-			if hasSource(fallback.Sources, "potent_industry") {
-				strategies = appendUniqueStrategy(strategies, "potent_industry")
-			}
-			if hasSource(fallback.Sources, "premarket_episodic") {
-				strategies = appendUniqueStrategy(strategies, "premarket_episodic")
-			}
-			if hasSource(fallback.Sources, "political_disclosure") {
-				strategies = appendUniqueStrategy(strategies, "political_disclosure")
-			}
+			strategies = scannerCandidateStrategies(fallback, fallbackScore)
 			item.Strategies = strategies
 			item.Timeframes = timeframes
 			item.MinConfidence = fallbackScore.Conviction
@@ -1051,30 +1025,35 @@ func applyUniverseTaxonomyToLineage(candidate *SwingCandidate, member *store.Swi
 	if candidate == nil || member == nil {
 		return
 	}
-	applyUniverseTaxonomy(candidate, member)
-	for _, nested := range []*SwingCandidate{
-		candidate.weeklyLeaderFallback,
-		candidate.potentIndustryFallback,
-		candidate.potentIndustrySource,
-	} {
-		applyUniverseTaxonomy(nested, member)
-	}
+	visitCandidateLineage(candidate, func(item *SwingCandidate) { applyUniverseTaxonomy(item, member) })
 }
 
 func excludeUniverseTaxonomyFromPromotion(candidate *SwingCandidate) {
 	if candidate == nil {
 		return
 	}
-	candidate.promotionTaxonomyExcluded = true
-	for _, nested := range []*SwingCandidate{
-		candidate.weeklyLeaderFallback,
-		candidate.potentIndustryFallback,
-		candidate.potentIndustrySource,
-	} {
-		if nested != nil {
-			nested.promotionTaxonomyExcluded = true
+	visitCandidateLineage(candidate, func(item *SwingCandidate) { item.promotionTaxonomyExcluded = true })
+}
+
+func visitCandidateLineage(candidate *SwingCandidate, visit func(*SwingCandidate)) {
+	seen := make(map[*SwingCandidate]struct{})
+	var walk func(*SwingCandidate)
+	walk = func(item *SwingCandidate) {
+		if item == nil {
+			return
 		}
+		if _, exists := seen[item]; exists {
+			return
+		}
+		seen[item] = struct{}{}
+		visit(item)
+		walk(item.weeklyLeaderFallback)
+		walk(item.potentIndustryFallback)
+		walk(item.potentIndustrySource)
+		walk(item.politicalDisclosureFallback)
+		walk(item.politicalDisclosureSource)
 	}
+	walk(candidate)
 }
 
 func applyUniverseTaxonomy(candidate *SwingCandidate, member *store.SwingUniverseMember) {
@@ -1467,10 +1446,6 @@ func (s *MarketScanner) candidateTTLDays(candidate SwingCandidate) int {
 	if hasSource(candidate.Sources, "potent_industry") && s.Cfg.PotentIndustry.TTLDays > days {
 		days = s.Cfg.PotentIndustry.TTLDays
 	}
-	if hasSource(candidate.Sources, "political_disclosure") &&
-		s.Cfg.PoliticalDisclosures.TTLDays > days {
-		days = s.Cfg.PoliticalDisclosures.TTLDays
-	}
 	if days > 0 {
 		return days
 	}
@@ -1509,12 +1484,18 @@ type scoredCandidate struct {
 // sortByConviction sorts in-place, highest conviction first.
 func sortByConviction(items []scoredCandidate) {
 	for i := 1; i < len(items); i++ {
-		for j := i; j > 0 && promotionPriority(items[j]) > promotionPriority(items[j-1]); j-- {
+		for j := i; j > 0 && items[j].score.Conviction > items[j-1].score.Conviction; j-- {
 			items[j], items[j-1] = items[j-1], items[j]
 		}
 	}
 }
 
-func promotionPriority(item scoredCandidate) float64 {
-	return item.score.Conviction + 0.10*item.candidate.PoliticalDisclosureScore
+func scannerCandidateStrategies(candidate SwingCandidate, score SwingScoreResult) []string {
+	strategies := candidateStrategies(score.Strategy, candidate.PullbackQualified)
+	for _, source := range []string{"weekly_leader", "potent_industry", "premarket_episodic"} {
+		if hasSource(candidate.Sources, source) {
+			strategies = appendUniqueStrategy(strategies, source)
+		}
+	}
+	return strategies
 }

@@ -74,8 +74,9 @@ type SwingCandidate struct {
 	PoliticalDisclosureClaimToken     string
 	PoliticalDisclosureClaimReportIDs []string
 	PoliticalDisclosureEvidence       string
-	PoliticalDisclosureScore          float64
+	PoliticalDisclosureFacts          json.RawMessage
 	politicalDisclosureFallback       *SwingCandidate
+	politicalDisclosureSource         *SwingCandidate
 	UniverseVersionID                 string
 	UniverseAsOf                      time.Time
 	RemovalStage                      string
@@ -202,7 +203,6 @@ Rules:
 			"Political disclosure evidence: %s\n",
 			candidate.PoliticalDisclosureEvidence,
 		))
-		sb.WriteString(fmt.Sprintf("Political disclosure priority: %.2f (review signal only; does not override conviction/risk gates)\n", candidate.PoliticalDisclosureScore))
 	}
 	sb.WriteString("\n")
 

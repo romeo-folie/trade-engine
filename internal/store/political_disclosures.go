@@ -10,19 +10,22 @@ import (
 )
 
 type PoliticalDisclosureReport struct {
-	Source           string
-	ExternalID       string
-	Chamber          string
-	FilerName        string
-	Office           string
-	ReportType       string
-	FilingDate       time.Time
-	DocumentURL      string
-	ContentHash      string
-	ExtractionStatus string
-	ExtractionError  string
-	RawMetadata      json.RawMessage
-	Transactions     []PoliticalDisclosureTransaction
+	Source            string
+	ExternalID        string
+	Chamber           string
+	FilerName         string
+	Office            string
+	ReportType        string
+	FilingDate        time.Time
+	DocumentURL       string
+	ContentHash       string
+	ExtractionStatus  string
+	ExtractionError   string
+	RetryableFailure  bool
+	RetryAttemptCount int
+	NextRetryAt       *time.Time
+	RawMetadata       json.RawMessage
+	Transactions      []PoliticalDisclosureTransaction
 }
 
 type PoliticalDisclosureTransaction struct {
@@ -43,11 +46,16 @@ type PoliticalDisclosureTransaction struct {
 
 type PoliticalDisclosureCandidate struct {
 	ReportID            string
+	ExternalID          string
 	Ticker              string
 	Source              string
+	Chamber             string
 	FilerName           string
+	Office              string
+	ReportType          string
 	FilingDate          time.Time
 	DocumentURL         string
+	ExtractionStatus    string
 	TransactionCount    int
 	LatestTransaction   time.Time
 	Evidence            json.RawMessage
@@ -65,17 +73,20 @@ type PoliticalDisclosureReportFilter struct {
 }
 
 type PoliticalDisclosureReportSummary struct {
-	Source           string
-	ExternalID       string
-	FilerName        string
-	Office           string
-	FilingDate       time.Time
-	DocumentURL      string
-	ExtractionStatus string
-	ExtractionError  string
-	TransactionCount int
-	DistinctTickers  int
-	Tickers          []string
+	Source            string
+	ExternalID        string
+	FilerName         string
+	Office            string
+	FilingDate        time.Time
+	DocumentURL       string
+	ExtractionStatus  string
+	ExtractionError   string
+	RetryableFailure  bool
+	RetryAttemptCount int
+	NextRetryAt       *time.Time
+	TransactionCount  int
+	DistinctTickers   int
+	Tickers           []string
 }
 
 func ListPoliticalDisclosureReports(
@@ -88,7 +99,8 @@ func ListPoliticalDisclosureReports(
 	rows, err := GetDB().Query(ctx, `
 		SELECT r.source, r.external_id, r.filer_name, COALESCE(r.office,''),
 			r.filing_date, r.document_url, r.extraction_status,
-			COALESCE(r.extraction_error,''), COUNT(t.id)::int,
+			COALESCE(r.extraction_error,''), r.retryable_failure,
+			r.retry_attempt_count, r.next_retry_at, COUNT(t.id)::int,
 			COUNT(DISTINCT t.ticker) FILTER (WHERE t.ticker IS NOT NULL)::int,
 			COALESCE(array_agg(DISTINCT t.ticker ORDER BY t.ticker)
 				FILTER (WHERE t.ticker IS NOT NULL), ARRAY[]::text[]),
@@ -120,7 +132,8 @@ func ListPoliticalDisclosureReports(
 		if err := rows.Scan(
 			&item.Source, &item.ExternalID, &item.FilerName, &item.Office,
 			&item.FilingDate, &item.DocumentURL, &item.ExtractionStatus,
-			&item.ExtractionError, &item.TransactionCount,
+			&item.ExtractionError, &item.RetryableFailure,
+			&item.RetryAttemptCount, &item.NextRetryAt, &item.TransactionCount,
 			&item.DistinctTickers, &item.Tickers, &total,
 		); err != nil {
 			return nil, 0, err
@@ -138,7 +151,8 @@ func GetPoliticalDisclosureReport(
 	err := GetDB().QueryRow(ctx, `
 		SELECT source, external_id, chamber, filer_name, COALESCE(office,''),
 			report_type, filing_date, document_url, COALESCE(content_hash,''),
-			extraction_status, COALESCE(extraction_error,''), raw_metadata
+			extraction_status, COALESCE(extraction_error,''), retryable_failure,
+			retry_attempt_count, next_retry_at, raw_metadata
 		FROM political_disclosure_reports
 		WHERE source=$1 AND external_id=$2`,
 		strings.ToLower(strings.TrimSpace(source)), strings.TrimSpace(externalID),
@@ -146,7 +160,8 @@ func GetPoliticalDisclosureReport(
 		&report.Source, &report.ExternalID, &report.Chamber, &report.FilerName,
 		&report.Office, &report.ReportType, &report.FilingDate,
 		&report.DocumentURL, &report.ContentHash, &report.ExtractionStatus,
-		&report.ExtractionError, &rawMetadata,
+		&report.ExtractionError, &report.RetryableFailure,
+		&report.RetryAttemptCount, &report.NextRetryAt, &rawMetadata,
 	)
 	if IsNoRows(err) {
 		return nil, nil
@@ -186,16 +201,34 @@ func GetPoliticalDisclosureReport(
 	return &report, rows.Err()
 }
 
-// PoliticalDisclosureReportTerminal reports whether a filing has reached a
-// durable extraction disposition. Failed filings remain visible for manual
-// review but are not retried on every sync, where they could otherwise consume
-// the bounded work budget forever and starve older filings.
+// MaxPoliticalDisclosureRetryAttempts bounds automatic retries for transient
+// disclosure ingestion failures. Further attempts require an operator reset.
+const MaxPoliticalDisclosureRetryAttempts = 3
+
+func politicalDisclosureRetryBackoff(attempt int) time.Duration {
+	switch {
+	case attempt <= 1:
+		return time.Hour
+	case attempt == 2:
+		return 6 * time.Hour
+	default:
+		return 24 * time.Hour
+	}
+}
+
+// PoliticalDisclosureReportTerminal reports whether the report should be
+// skipped by this automatic sync. Retryable failures are eligible again only
+// once their bounded backoff is due; exhausted failures require an explicit
+// operator retry.
 func PoliticalDisclosureReportTerminal(
 	ctx context.Context, source, externalID string,
 ) (bool, error) {
 	var terminal bool
 	err := GetDB().QueryRow(ctx, `
-		SELECT extraction_status IN ('completed', 'no_text', 'failed')
+		SELECT extraction_status IN ('completed', 'no_text') OR
+			(extraction_status='failed' AND (
+				NOT retryable_failure OR next_retry_at IS NULL OR next_retry_at > NOW()
+			))
 		FROM political_disclosure_reports
 		WHERE source=$1 AND external_id=$2`, source, externalID,
 	).Scan(&terminal)
@@ -203,6 +236,25 @@ func PoliticalDisclosureReportTerminal(
 		return false, nil
 	}
 	return terminal, err
+}
+
+// RetryPoliticalDisclosureReport explicitly re-queues an exhausted or
+// operator-reviewed report. The next sync that sees the filing will ingest it.
+func RetryPoliticalDisclosureReport(
+	ctx context.Context, source, externalID string,
+) (bool, error) {
+	result, err := GetDB().Exec(ctx, `
+		UPDATE political_disclosure_reports
+		SET extraction_status='pending', extraction_error=NULL,
+			retryable_failure=FALSE, retry_attempt_count=0, next_retry_at=NULL,
+			updated_at=NOW()
+		WHERE source=$1 AND external_id=$2 AND extraction_status='failed'`,
+		strings.ToLower(strings.TrimSpace(source)), strings.TrimSpace(externalID),
+	)
+	if err != nil {
+		return false, err
+	}
+	return result.RowsAffected() > 0, nil
 }
 
 // SavePoliticalDisclosureReport replaces extracted child evidence atomically.
@@ -224,13 +276,22 @@ func SavePoliticalDisclosureReport(
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
+	retryableFailure := report.ExtractionStatus == "failed" && report.RetryableFailure
+	retryAttempts := 0
+	var nextRetryAt *time.Time
+	if retryableFailure {
+		retryAttempts = 1
+		next := time.Now().UTC().Add(politicalDisclosureRetryBackoff(retryAttempts))
+		nextRetryAt = &next
+	}
+
 	var reportID string
 	err = tx.QueryRow(ctx, `
 		INSERT INTO political_disclosure_reports (
 			source, external_id, chamber, filer_name, office, report_type,
 			filing_date, document_url, content_hash, extraction_status,
-			extraction_error, raw_metadata
-		) VALUES ($1,$2,$3,$4,NULLIF($5,''),$6,$7,$8,NULLIF($9,''),$10,NULLIF($11,''),$12)
+			extraction_error, retryable_failure, retry_attempt_count, next_retry_at, raw_metadata
+		) VALUES ($1,$2,$3,$4,NULLIF($5,''),$6,$7,$8,NULLIF($9,''),$10,NULLIF($11,''),$12,$13,$14,$15)
 		ON CONFLICT (source, external_id) DO UPDATE SET
 			chamber=EXCLUDED.chamber, filer_name=EXCLUDED.filer_name,
 			office=EXCLUDED.office, report_type=EXCLUDED.report_type,
@@ -238,11 +299,35 @@ func SavePoliticalDisclosureReport(
 			content_hash=EXCLUDED.content_hash,
 			extraction_status=EXCLUDED.extraction_status,
 			extraction_error=EXCLUDED.extraction_error,
+			retry_attempt_count=CASE
+				WHEN EXCLUDED.extraction_status='failed' AND EXCLUDED.retryable_failure THEN
+					CASE WHEN political_disclosure_reports.extraction_status='failed'
+						THEN political_disclosure_reports.retry_attempt_count + 1 ELSE 1 END
+				ELSE 0 END,
+			retryable_failure=CASE
+				WHEN EXCLUDED.extraction_status='failed' AND EXCLUDED.retryable_failure THEN
+					(CASE WHEN political_disclosure_reports.extraction_status='failed'
+						THEN political_disclosure_reports.retry_attempt_count + 1 ELSE 1 END) < $16
+				ELSE FALSE END,
+			next_retry_at=CASE
+				WHEN EXCLUDED.extraction_status='failed' AND EXCLUDED.retryable_failure AND
+					(CASE WHEN political_disclosure_reports.extraction_status='failed'
+						THEN political_disclosure_reports.retry_attempt_count + 1 ELSE 1 END) < $16
+				THEN NOW() + CASE
+					WHEN (CASE WHEN political_disclosure_reports.extraction_status='failed'
+						THEN political_disclosure_reports.retry_attempt_count + 1 ELSE 1 END) = 1
+						THEN INTERVAL '1 hour'
+					WHEN (CASE WHEN political_disclosure_reports.extraction_status='failed'
+						THEN political_disclosure_reports.retry_attempt_count + 1 ELSE 1 END) = 2
+						THEN INTERVAL '6 hours'
+					ELSE INTERVAL '24 hours' END
+				ELSE NULL END,
 			raw_metadata=EXCLUDED.raw_metadata, updated_at=NOW()
 		RETURNING id`, report.Source, report.ExternalID, report.Chamber,
 		report.FilerName, report.Office, report.ReportType, report.FilingDate,
 		report.DocumentURL, report.ContentHash, report.ExtractionStatus,
-		report.ExtractionError, report.RawMetadata,
+		report.ExtractionError, retryableFailure, retryAttempts, nextRetryAt,
+		report.RawMetadata, MaxPoliticalDisclosureRetryAttempts,
 	).Scan(&reportID)
 	if err != nil {
 		return fmt.Errorf("upsert political disclosure report: %w", err)
@@ -383,8 +468,9 @@ func ClaimPoliticalDisclosureCandidates(
 			))
 			RETURNING c.*
 		)
-		SELECT claimed.report_id, claimed.ticker, r.source, r.filer_name,
-			r.filing_date, r.document_url, claimed.transaction_count,
+		SELECT claimed.report_id, r.external_id, claimed.ticker, r.source,
+			r.chamber, r.filer_name, COALESCE(r.office,''), r.report_type, r.filing_date,
+			r.document_url, r.extraction_status, claimed.transaction_count,
 			claimed.latest_transaction_date, claimed.evidence,
 			COALESCE(claimed.promotion_claim_token,'')
 		FROM claimed
@@ -400,8 +486,10 @@ func ClaimPoliticalDisclosureCandidates(
 	for rows.Next() {
 		var candidate PoliticalDisclosureCandidate
 		if err := rows.Scan(
-			&candidate.ReportID, &candidate.Ticker, &candidate.Source,
-			&candidate.FilerName, &candidate.FilingDate, &candidate.DocumentURL,
+			&candidate.ReportID, &candidate.ExternalID, &candidate.Ticker,
+			&candidate.Source, &candidate.Chamber, &candidate.FilerName,
+			&candidate.Office, &candidate.ReportType, &candidate.FilingDate, &candidate.DocumentURL,
+			&candidate.ExtractionStatus,
 			&candidate.TransactionCount, &candidate.LatestTransaction,
 			&candidate.Evidence, &candidate.PromotionClaimToken,
 		); err != nil {

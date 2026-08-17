@@ -244,14 +244,24 @@ func (r *Runner) syncHouse(
 		processed++
 		pdfData, documentURL, err := r.House.FetchPDF(ctx, filing)
 		if err != nil {
+			if ctx.Err() != nil {
+				return processed, ctx.Err()
+			}
 			failures = append(failures, err)
-			r.saveFailure(ctx, filing, documentURL, err)
+			if saveErr := r.saveFailure(ctx, filing, documentURL, err); saveErr != nil {
+				return processed, saveErr
+			}
 			continue
 		}
 		pages, err := r.Extractor.Extract(pdfData)
 		if err != nil {
+			if ctx.Err() != nil {
+				return processed, ctx.Err()
+			}
 			failures = append(failures, err)
-			r.saveFailure(ctx, filing, documentURL, err)
+			if saveErr := r.saveFailure(ctx, filing, documentURL, err); saveErr != nil {
+				return processed, saveErr
+			}
 			continue
 		}
 		report := ParseHousePTR(filing, documentURL, pdfData, pages)
@@ -267,19 +277,22 @@ func (r *Runner) syncHouse(
 
 func (r *Runner) saveFailure(
 	ctx context.Context, filing HouseFiling, documentURL string, cause error,
-) {
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	metadata, _ := json.Marshal(filing)
 	report := Report{
 		Source: "house", ExternalID: filing.DocumentID, Chamber: "house",
 		FilerName: filing.FilerName(), Office: filing.StateDistrict,
 		ReportType: "periodic_transaction", FilingDate: filing.FilingDate,
 		DocumentURL: documentURL, ExtractionStatus: "failed",
-		ExtractionError: cause.Error(), RawMetadata: metadata,
+		ExtractionError: cause.Error(), RetryableFailure: shouldRetryDisclosureFailure(cause), RawMetadata: metadata,
 	}
 	if err := r.saveReport(ctx, report); err != nil {
-		slog.Warn("persist failed House disclosure extraction",
-			"document_id", filing.DocumentID, "err", err)
+		return fmt.Errorf("persist failed House disclosure extraction %s: %w", filing.DocumentID, err)
 	}
+	return nil
 }
 
 func (r *Runner) syncSenate(
@@ -307,13 +320,16 @@ func (r *Runner) syncSenate(
 			processed++
 			report, err := r.Senate.FetchPTR(ctx, filing)
 			if err != nil {
+				if ctx.Err() != nil {
+					return processed, ctx.Err()
+				}
 				failures++
 				failed := Report{
 					Source: "senate", ExternalID: filing.ExternalID, Chamber: "senate",
 					FilerName: filing.FilerName, Office: filing.Office,
 					ReportType: "periodic_transaction", FilingDate: filing.FilingDate,
 					DocumentURL: filing.DocumentURL, ExtractionStatus: "failed",
-					ExtractionError: err.Error(),
+					ExtractionError: err.Error(), RetryableFailure: shouldRetryDisclosureFailure(err),
 				}
 				if saveErr := r.saveReport(ctx, failed); saveErr != nil {
 					return processed, saveErr
@@ -357,16 +373,22 @@ func (r *Runner) syncOGE(ctx context.Context, since, until time.Time, limit int)
 			processed++
 			pdf, err := r.OGE.FetchPDF(ctx, filing)
 			if err != nil {
+				if ctx.Err() != nil {
+					return processed, ctx.Err()
+				}
 				failures++
-				if saveErr := r.saveReport(ctx, Report{Source: "oge", ExternalID: filing.ExternalID, Chamber: "executive", FilerName: filing.FilerName, Office: filing.Office, ReportType: filing.ReportType, FilingDate: filing.FilingDate, DocumentURL: filing.DocumentURL, ExtractionStatus: "failed", ExtractionError: err.Error(), RawMetadata: filing.RawMetadata}); saveErr != nil {
+				if saveErr := r.saveReport(ctx, Report{Source: "oge", ExternalID: filing.ExternalID, Chamber: "executive", FilerName: filing.FilerName, Office: filing.Office, ReportType: filing.ReportType, FilingDate: filing.FilingDate, DocumentURL: filing.DocumentURL, ExtractionStatus: "failed", ExtractionError: err.Error(), RetryableFailure: shouldRetryDisclosureFailure(err), RawMetadata: filing.RawMetadata}); saveErr != nil {
 					return processed, saveErr
 				}
 				continue
 			}
 			pages, err := r.Extractor.Extract(pdf)
 			if err != nil {
+				if ctx.Err() != nil {
+					return processed, ctx.Err()
+				}
 				failures++
-				if saveErr := r.saveReport(ctx, Report{Source: "oge", ExternalID: filing.ExternalID, Chamber: "executive", FilerName: filing.FilerName, Office: filing.Office, ReportType: filing.ReportType, FilingDate: filing.FilingDate, DocumentURL: filing.DocumentURL, ContentHash: hashBytes(pdf), ExtractionStatus: "failed", ExtractionError: err.Error(), RawMetadata: filing.RawMetadata}); saveErr != nil {
+				if saveErr := r.saveReport(ctx, Report{Source: "oge", ExternalID: filing.ExternalID, Chamber: "executive", FilerName: filing.FilerName, Office: filing.Office, ReportType: filing.ReportType, FilingDate: filing.FilingDate, DocumentURL: filing.DocumentURL, ContentHash: hashBytes(pdf), ExtractionStatus: "failed", ExtractionError: err.Error(), RetryableFailure: true, RawMetadata: filing.RawMetadata}); saveErr != nil {
 					return processed, saveErr
 				}
 				continue
@@ -405,7 +427,8 @@ func (r *Runner) saveReport(ctx context.Context, report Report) error {
 		ReportType: report.ReportType, FilingDate: report.FilingDate,
 		DocumentURL: report.DocumentURL, ContentHash: report.ContentHash,
 		ExtractionStatus: report.ExtractionStatus,
-		ExtractionError:  report.ExtractionError, RawMetadata: report.RawMetadata,
+		ExtractionError:  report.ExtractionError,
+		RetryableFailure: report.RetryableFailure, RawMetadata: report.RawMetadata,
 	}
 	for _, item := range report.Transactions {
 		stored.Transactions = append(stored.Transactions, store.PoliticalDisclosureTransaction{

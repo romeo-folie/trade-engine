@@ -5,13 +5,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"math"
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/store"
+	"github.com/romeo-folie/trade-engine/internal/tradeprofile"
+)
+
+const (
+	maxPoliticalDisclosureFilerDetails  = 8
+	maxPoliticalDisclosureReportDetails = 4
 )
 
 func (s *MarketScanner) politicalDisclosureCandidates(
@@ -45,95 +51,340 @@ func (s *MarketScanner) politicalDisclosureCandidates(
 	sort.Strings(tickers)
 	out := make([]SwingCandidate, 0, len(tickers))
 	for _, ticker := range tickers {
-		items := byTicker[ticker]
-		reportIDs := make([]string, 0, len(items))
-		parts := make([]string, 0, len(items))
-		var transactionParts []string
-		transactionCount := 0
-		purchaseCount := 0
-		latest := time.Time{}
-		for _, item := range items {
-			reportIDs = append(reportIDs, item.ReportID)
-			transactionCount += item.TransactionCount
-			if item.LatestTransaction.After(latest) {
-				latest = item.LatestTransaction
-			}
-			var transactions []store.PoliticalDisclosureTransaction
-			if err := json.Unmarshal(item.Evidence, &transactions); err == nil {
-				for _, transaction := range transactions {
-					if transaction.TransactionType == "purchase" {
-						purchaseCount++
-					}
-					if len(transactionParts) < 8 {
-						transactionParts = append(transactionParts, fmt.Sprintf(
-							"%s %s %s (%s)", transaction.TransactionType,
-							transaction.TransactionDate.Format("2006-01-02"),
-							transaction.AmountText, transaction.AssetName,
-						))
-					}
-				}
-			}
-			sourceLabel := item.Source
-			if sourceLabel == "house" {
-				sourceLabel = "House"
-			} else if sourceLabel == "senate" {
-				sourceLabel = "Senate"
-			}
-			parts = append(parts, fmt.Sprintf(
-				"%s filing by %s on %s (%d transaction(s), source: %s)",
-				sourceLabel, item.FilerName,
-				item.FilingDate.Format("2006-01-02"), item.TransactionCount,
-				item.DocumentURL,
-			))
-		}
-		disclosureScore := scorePoliticalDisclosure(
-			now, cfg.TTLDays, latest, transactionCount, purchaseCount, len(items),
-		)
-		out = append(out, SwingCandidate{
-			Ticker: ticker, Sources: []string{"political_disclosure"},
-			SourceScores:                      map[string]float64{"political_disclosure": disclosureScore},
-			PoliticalDisclosureClaimToken:     token,
-			PoliticalDisclosureClaimReportIDs: reportIDs,
-			PoliticalDisclosureEvidence: disclosureEvidence(
-				transactionCount, parts, transactionParts,
-			),
-			PoliticalDisclosureScore: disclosureScore,
-		})
+		out = append(out, buildPoliticalDisclosureCandidate(ticker, token, byTicker[ticker]))
 	}
 	return s.hydratePoliticalDisclosureMarketData(ctx, out), nil
 }
 
-func scorePoliticalDisclosure(
-	now time.Time, ttlDays int, latest time.Time,
-	transactionCount, purchaseCount, filingCount int,
-) float64 {
-	recency := 0.0
-	if !latest.IsZero() {
-		recency = 1 - math.Min(1, math.Max(0,
-			now.Sub(latest).Hours()/(24*float64(maxInt(1, ttlDays))),
-		))
-	}
-	purchaseSignal := 0.0
-	if transactionCount > 0 {
-		purchaseSignal = float64(purchaseCount) / float64(transactionCount)
-	}
-	corroboration := math.Min(1, float64(filingCount)/3)
-	return 0.45*recency + 0.35*purchaseSignal + 0.20*corroboration
+type politicalDisclosureAggregate struct {
+	evidence                    tradeprofile.PoliticalDisclosureEvidence
+	filers                      map[string]*politicalDisclosureFilerAggregate
+	latestTransactionDate       time.Time
+	latestTransactionFilingDate time.Time
+	lagKnown                    bool
 }
 
-func maxInt(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
+type politicalDisclosureFilerAggregate struct {
+	evidence                    tradeprofile.PoliticalDisclosureFilerEvidence
+	owners                      map[string]struct{}
+	latestTransactionDate       time.Time
+	latestTransactionFilingDate time.Time
+	lagKnown                    bool
 }
 
-func disclosureEvidence(count int, filings, transactions []string) string {
-	evidence := fmt.Sprintf("%d disclosed transaction(s): %s", count, strings.Join(filings, "; "))
-	if len(transactions) > 0 {
-		evidence += ". Transactions: " + strings.Join(transactions, "; ")
+func buildPoliticalDisclosureCandidate(
+	ticker, token string, items []store.PoliticalDisclosureCandidate,
+) SwingCandidate {
+	aggregate := politicalDisclosureAggregate{
+		evidence: tradeprofile.PoliticalDisclosureEvidence{
+			Version: tradeprofile.PoliticalDisclosureEvidenceVersion,
+			Ticker:  ticker,
+			DataQuality: tradeprofile.PoliticalDisclosureDataQuality{
+				CanonicalIdentityBasis: "normalized source, chamber, and filer-name tokens",
+			},
+		},
+		filers: make(map[string]*politicalDisclosureFilerAggregate),
 	}
-	return evidence
+	reportIDs := make([]string, 0, len(items))
+	for _, item := range items {
+		reportIDs = append(reportIDs, item.ReportID)
+		aggregate.addReport(item)
+	}
+	aggregate.finish()
+	facts, err := json.Marshal(aggregate.evidence)
+	if err != nil {
+		facts = json.RawMessage(`{}`)
+	}
+	return SwingCandidate{
+		Ticker: ticker, Sources: []string{"political_disclosure"},
+		PoliticalDisclosureClaimToken:     token,
+		PoliticalDisclosureClaimReportIDs: reportIDs,
+		PoliticalDisclosureEvidence:       summarizePoliticalDisclosure(aggregate.evidence),
+		PoliticalDisclosureFacts:          facts,
+	}
+}
+
+func (a *politicalDisclosureAggregate) addReport(item store.PoliticalDisclosureCandidate) {
+	a.evidence.ReportCount++
+	a.evidence.TransactionCount += item.TransactionCount
+	isAmendment := isPoliticalDisclosureAmendment(item.ReportType)
+	if isAmendment {
+		a.evidence.AmendmentReportCount++
+	}
+	reportIdentity := strings.TrimSpace(item.ExternalID)
+	if reportIdentity == "" {
+		reportIdentity = item.ReportID
+	}
+	if status := strings.ToLower(strings.TrimSpace(item.ExtractionStatus)); status != "" && status != "completed" {
+		a.addLimitation(fmt.Sprintf("report %s extraction status is %s", reportIdentity, status))
+	}
+	if item.FilingDate.After(parseEvidenceDate(a.evidence.LatestFilingOrPublicationDate)) {
+		a.evidence.LatestFilingOrPublicationDate = evidenceDate(item.FilingDate)
+	}
+	if item.LatestTransaction.After(parseEvidenceDate(a.evidence.LatestTransactionDate)) {
+		a.evidence.LatestTransactionDate = evidenceDate(item.LatestTransaction)
+	}
+
+	filerID := canonicalPoliticalFilerID(item.Source, item.Chamber, item.FilerName)
+	filer := a.filers[filerID]
+	if filer == nil {
+		filer = &politicalDisclosureFilerAggregate{
+			evidence: tradeprofile.PoliticalDisclosureFilerEvidence{
+				CanonicalFilerID: filerID, FilerName: strings.TrimSpace(item.FilerName),
+				Office: strings.TrimSpace(item.Office), Chamber: strings.TrimSpace(item.Chamber),
+				Source: strings.ToLower(strings.TrimSpace(item.Source)),
+			},
+			owners: make(map[string]struct{}),
+		}
+		a.filers[filerID] = filer
+	}
+	filer.evidence.ReportCount++
+	if isAmendment {
+		filer.evidence.AmendmentReportCount++
+	}
+	filer.evidence.TransactionCount += item.TransactionCount
+	if item.FilingDate.After(parseEvidenceDate(filer.evidence.LatestFilingOrPublicationDate)) {
+		filer.evidence.LatestFilingOrPublicationDate = evidenceDate(item.FilingDate)
+	}
+	if item.LatestTransaction.After(parseEvidenceDate(filer.evidence.LatestTransactionDate)) {
+		filer.evidence.LatestTransactionDate = evidenceDate(item.LatestTransaction)
+	}
+
+	report := tradeprofile.PoliticalDisclosureReportEvidence{
+		ReportID: reportIdentity, ReportType: strings.TrimSpace(item.ReportType),
+		IsAmendment: isAmendment, DocumentURL: strings.TrimSpace(item.DocumentURL),
+		FilingOrPublicationDate: evidenceDate(item.FilingDate),
+		LatestTransactionDate:   evidenceDate(item.LatestTransaction),
+		TransactionCount:        item.TransactionCount, ExtractionStatus: item.ExtractionStatus,
+	}
+	var transactions []store.PoliticalDisclosureTransaction
+	if err := json.Unmarshal(item.Evidence, &transactions); err != nil {
+		a.addLimitation(fmt.Sprintf("report %s transaction evidence could not be decoded", report.ReportID))
+	} else {
+		if len(transactions) != item.TransactionCount {
+			a.addLimitation(fmt.Sprintf(
+				"report %s declared %d transactions but exposed %d evidence rows",
+				report.ReportID, item.TransactionCount, len(transactions),
+			))
+		}
+		for _, transaction := range transactions {
+			a.addTransaction(filer, &report, item.FilingDate, transaction)
+		}
+	}
+	report.ReportedOwners = sortedSet(filerOwnersForReport(transactions))
+	if !item.LatestTransaction.IsZero() && !item.FilingDate.IsZero() {
+		lag := calendarDayDifference(item.LatestTransaction, item.FilingDate)
+		report.DisclosureLagDays = &lag
+	}
+	if len(filer.evidence.Reports) < maxPoliticalDisclosureReportDetails {
+		filer.evidence.Reports = append(filer.evidence.Reports, report)
+	} else {
+		a.evidence.DataQuality.OmittedReportDetailCount++
+	}
+}
+
+func isPoliticalDisclosureAmendment(reportType string) bool {
+	value := strings.ToLower(strings.TrimSpace(reportType))
+	return strings.Contains(value, "amend") || strings.Contains(value, "correct")
+}
+
+func (a *politicalDisclosureAggregate) addTransaction(
+	filer *politicalDisclosureFilerAggregate,
+	report *tradeprofile.PoliticalDisclosureReportEvidence,
+	filingDate time.Time,
+	transaction store.PoliticalDisclosureTransaction,
+) {
+	action := strings.ToLower(strings.TrimSpace(transaction.TransactionType))
+	switch action {
+	case "purchase":
+		a.evidence.PurchaseCount++
+		filer.evidence.PurchaseCount++
+		report.PurchaseCount++
+		addPoliticalAmount(&a.evidence.PurchaseAmounts, transaction)
+		addPoliticalAmount(&filer.evidence.PurchaseAmounts, transaction)
+	case "sale":
+		a.evidence.SaleCount++
+		filer.evidence.SaleCount++
+		report.SaleCount++
+		addPoliticalAmount(&a.evidence.SaleAmounts, transaction)
+		addPoliticalAmount(&filer.evidence.SaleAmounts, transaction)
+	case "exchange":
+		a.evidence.ExchangeCount++
+		filer.evidence.ExchangeCount++
+		report.ExchangeCount++
+	default:
+		a.evidence.OtherTransactionCount++
+		filer.evidence.OtherTransactionCount++
+		a.addLimitation("one or more transaction actions were unrecognized")
+	}
+	if owner := strings.TrimSpace(transaction.Owner); owner != "" {
+		filer.owners[owner] = struct{}{}
+	} else {
+		a.addLimitation("one or more transactions did not identify a reported owner")
+	}
+	if transaction.TransactionDate.IsZero() || filingDate.IsZero() {
+		return
+	}
+	lag := calendarDayDifference(transaction.TransactionDate, filingDate)
+	if lag < 0 {
+		a.addLimitation("one or more transaction dates follow the filing or publication date")
+	}
+	addPoliticalLag(&a.evidence.DisclosureLagDays, &a.lagKnown, lag)
+	addPoliticalLag(&filer.evidence.DisclosureLagDays, &filer.lagKnown, lag)
+	if transaction.TransactionDate.After(a.latestTransactionDate) ||
+		(transaction.TransactionDate.Equal(a.latestTransactionDate) &&
+			filingDate.After(a.latestTransactionFilingDate)) {
+		a.latestTransactionDate = transaction.TransactionDate
+		a.latestTransactionFilingDate = filingDate
+		a.evidence.DisclosureLagDays.LatestTransactionDays = lag
+	}
+	if transaction.TransactionDate.After(filer.latestTransactionDate) ||
+		(transaction.TransactionDate.Equal(filer.latestTransactionDate) &&
+			filingDate.After(filer.latestTransactionFilingDate)) {
+		filer.latestTransactionDate = transaction.TransactionDate
+		filer.latestTransactionFilingDate = filingDate
+		filer.evidence.DisclosureLagDays.LatestTransactionDays = lag
+	}
+}
+
+func (a *politicalDisclosureAggregate) finish() {
+	ids := make([]string, 0, len(a.filers))
+	for id := range a.filers {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		filer := a.filers[id]
+		filer.evidence.ReportedOwners = sortedSet(filer.owners)
+		filer.evidence.RepeatedActivity = filer.evidence.ReportCount > 1 || filer.evidence.TransactionCount > 1
+		filer.evidence.ContradictoryActivity = filer.evidence.PurchaseCount > 0 && filer.evidence.SaleCount > 0
+		if filer.evidence.PurchaseCount > 0 {
+			a.evidence.DistinctBuyerCount++
+		}
+		if filer.evidence.RepeatedActivity {
+			a.evidence.RepeatedFilerActivity = true
+		}
+		if len(a.evidence.Filers) < maxPoliticalDisclosureFilerDetails {
+			a.evidence.Filers = append(a.evidence.Filers, filer.evidence)
+		} else {
+			a.evidence.DataQuality.OmittedFilerDetailCount++
+		}
+	}
+	a.evidence.DistinctFilerCount = len(ids)
+	a.evidence.IndependentBuyerActivity = a.evidence.DistinctBuyerCount > 1
+	a.evidence.ContradictoryActivity = a.evidence.PurchaseCount > 0 && a.evidence.SaleCount > 0
+	if a.evidence.PurchaseAmounts.UnknownTransactionCount > 0 || a.evidence.SaleAmounts.UnknownTransactionCount > 0 {
+		a.addLimitation("amount totals exclude transactions without a complete reported range")
+	}
+	if a.evidence.DataQuality.OmittedFilerDetailCount > 0 || a.evidence.DataQuality.OmittedReportDetailCount > 0 {
+		a.addLimitation("per-filer or per-report details were bounded; aggregate counts include all claimed evidence")
+	}
+}
+
+func (a *politicalDisclosureAggregate) addLimitation(value string) {
+	for _, existing := range a.evidence.DataQuality.Limitations {
+		if existing == value {
+			return
+		}
+	}
+	a.evidence.DataQuality.Limitations = append(a.evidence.DataQuality.Limitations, value)
+}
+
+func addPoliticalAmount(summary *tradeprofile.PoliticalDisclosureAmountSummary, transaction store.PoliticalDisclosureTransaction) {
+	if transaction.AmountMin == nil || transaction.AmountMax == nil {
+		summary.UnknownTransactionCount++
+		return
+	}
+	summary.KnownTransactionCount++
+	summary.MinimumTotal += *transaction.AmountMin
+	summary.MaximumTotal += *transaction.AmountMax
+}
+
+func addPoliticalLag(summary *tradeprofile.PoliticalDisclosureLagSummary, known *bool, lag int) {
+	summary.KnownTransactionCount++
+	if !*known || lag < summary.MinimumDays {
+		summary.MinimumDays = lag
+	}
+	if !*known || lag > summary.MaximumDays {
+		summary.MaximumDays = lag
+	}
+	*known = true
+}
+
+func canonicalPoliticalFilerID(source, chamber, name string) string {
+	tokens := strings.FieldsFunc(strings.ToLower(strings.TrimSpace(name)), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
+	ignored := map[string]struct{}{
+		"hon": {}, "honorable": {}, "mr": {}, "mrs": {}, "ms": {}, "dr": {},
+		"sen": {}, "senator": {}, "rep": {}, "representative": {},
+	}
+	canonicalTokens := tokens[:0]
+	for _, token := range tokens {
+		if _, skip := ignored[token]; !skip {
+			canonicalTokens = append(canonicalTokens, token)
+		}
+	}
+	sort.Strings(canonicalTokens)
+	identity := strings.Join(canonicalTokens, "-")
+	if identity == "" {
+		identity = "unknown"
+	}
+	return strings.ToLower(strings.TrimSpace(source)) + ":" +
+		strings.ToLower(strings.TrimSpace(chamber)) + ":" + identity
+}
+
+func calendarDayDifference(transactionDate, filingDate time.Time) int {
+	transactionDay := time.Date(transactionDate.UTC().Year(), transactionDate.UTC().Month(), transactionDate.UTC().Day(), 0, 0, 0, 0, time.UTC)
+	filingDay := time.Date(filingDate.UTC().Year(), filingDate.UTC().Month(), filingDate.UTC().Day(), 0, 0, 0, 0, time.UTC)
+	return int(filingDay.Sub(transactionDay).Hours() / 24)
+}
+
+func evidenceDate(value time.Time) string {
+	if value.IsZero() {
+		return ""
+	}
+	return value.UTC().Format("2006-01-02")
+}
+
+func parseEvidenceDate(value string) time.Time {
+	parsed, _ := time.Parse("2006-01-02", value)
+	return parsed
+}
+
+func filerOwnersForReport(transactions []store.PoliticalDisclosureTransaction) map[string]struct{} {
+	owners := make(map[string]struct{})
+	for _, transaction := range transactions {
+		if owner := strings.TrimSpace(transaction.Owner); owner != "" {
+			owners[owner] = struct{}{}
+		}
+	}
+	return owners
+}
+
+func sortedSet(values map[string]struct{}) []string {
+	out := make([]string, 0, len(values))
+	for value := range values {
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func summarizePoliticalDisclosure(evidence tradeprofile.PoliticalDisclosureEvidence) string {
+	summary := fmt.Sprintf(
+		"%d report(s), %d transaction(s), %d canonical filer(s), %d distinct buyer(s): %d purchase(s), %d sale(s), %d exchange(s)",
+		evidence.ReportCount, evidence.TransactionCount, evidence.DistinctFilerCount,
+		evidence.DistinctBuyerCount, evidence.PurchaseCount, evidence.SaleCount,
+		evidence.ExchangeCount,
+	)
+	if evidence.LatestTransactionDate != "" {
+		summary += "; latest transaction " + evidence.LatestTransactionDate
+	}
+	if evidence.ContradictoryActivity {
+		summary += "; includes both buying and selling"
+	}
+	return summary
 }
 
 func mergePoliticalDisclosureCandidates(
@@ -158,16 +409,18 @@ func mergePoliticalDisclosureCandidates(
 		attachPoliticalFallback(candidate.weeklyLeaderFallback, source)
 		attachPoliticalFallback(candidate.potentIndustryFallback, source)
 		candidate.Sources = mergeSources(candidate.Sources, source.Sources)
-		if candidate.SourceScores == nil {
-			candidate.SourceScores = make(map[string]float64)
-		}
-		candidate.SourceScores["political_disclosure"] = source.PoliticalDisclosureScore
 		candidate.PoliticalDisclosureClaimToken = source.PoliticalDisclosureClaimToken
 		candidate.PoliticalDisclosureClaimReportIDs = append(
 			[]string(nil), source.PoliticalDisclosureClaimReportIDs...,
 		)
 		candidate.PoliticalDisclosureEvidence = source.PoliticalDisclosureEvidence
-		candidate.PoliticalDisclosureScore = source.PoliticalDisclosureScore
+		candidate.PoliticalDisclosureFacts = append(
+			json.RawMessage(nil), source.PoliticalDisclosureFacts...,
+		)
+		politicalSource := cloneSwingCandidate(source)
+		politicalSource.politicalDisclosureFallback = nil
+		politicalSource.politicalDisclosureSource = nil
+		candidate.politicalDisclosureSource = &politicalSource
 	}
 	return out
 }
@@ -176,19 +429,24 @@ func attachPoliticalFallback(fallback *SwingCandidate, source SwingCandidate) {
 	if fallback == nil {
 		return
 	}
-	copy := cloneSwingCandidate(*fallback)
-	copy.Sources = mergeSources(copy.Sources, source.Sources)
-	if copy.SourceScores == nil {
-		copy.SourceScores = make(map[string]float64)
-	}
-	copy.SourceScores["political_disclosure"] = source.PoliticalDisclosureScore
-	copy.PoliticalDisclosureClaimToken = source.PoliticalDisclosureClaimToken
-	copy.PoliticalDisclosureClaimReportIDs = append(
+	withoutPolitical := cloneSwingCandidate(*fallback)
+	withoutPolitical.politicalDisclosureFallback = nil
+	withPolitical := cloneSwingCandidate(withoutPolitical)
+	withPolitical.Sources = mergeSources(withPolitical.Sources, source.Sources)
+	withPolitical.PoliticalDisclosureClaimToken = source.PoliticalDisclosureClaimToken
+	withPolitical.PoliticalDisclosureClaimReportIDs = append(
 		[]string(nil), source.PoliticalDisclosureClaimReportIDs...,
 	)
-	copy.PoliticalDisclosureEvidence = source.PoliticalDisclosureEvidence
-	copy.PoliticalDisclosureScore = source.PoliticalDisclosureScore
-	fallback.politicalDisclosureFallback = &copy
+	withPolitical.PoliticalDisclosureEvidence = source.PoliticalDisclosureEvidence
+	withPolitical.PoliticalDisclosureFacts = append(
+		json.RawMessage(nil), source.PoliticalDisclosureFacts...,
+	)
+	withPolitical.politicalDisclosureFallback = &withoutPolitical
+	politicalSource := cloneSwingCandidate(source)
+	politicalSource.politicalDisclosureFallback = nil
+	politicalSource.politicalDisclosureSource = nil
+	withPolitical.politicalDisclosureSource = &politicalSource
+	*fallback = withPolitical
 }
 
 // hydratePoliticalDisclosureMarketData prevents a filing-derived symbol from

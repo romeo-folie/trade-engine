@@ -163,6 +163,9 @@ func cloneSwingCandidate(candidate SwingCandidate) SwingCandidate {
 	clone.PoliticalDisclosureClaimReportIDs = append(
 		[]string(nil), candidate.PoliticalDisclosureClaimReportIDs...,
 	)
+	clone.PoliticalDisclosureFacts = append(
+		json.RawMessage(nil), candidate.PoliticalDisclosureFacts...,
+	)
 	clone.TaxonomyEvidence = append(json.RawMessage(nil), candidate.TaxonomyEvidence...)
 	if candidate.SourceScores != nil {
 		clone.SourceScores = make(map[string]float64, len(candidate.SourceScores))

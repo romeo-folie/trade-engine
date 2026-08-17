@@ -112,7 +112,7 @@ func (c *HouseClient) get(ctx context.Context, endpoint string) ([]byte, error) 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GET %s: HTTP %s", endpoint, resp.Status)
+		return nil, disclosureHTTPStatusError("House", resp.StatusCode, resp.Status)
 	}
 	if resp.ContentLength > maxHouseResponseSize {
 		return nil, fmt.Errorf("GET %s: response exceeds %d-byte limit", endpoint, maxHouseResponseSize)

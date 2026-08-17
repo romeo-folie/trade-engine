@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
@@ -13,6 +14,7 @@ import (
 type fixtureSenateTransport struct {
 	searchBody []byte
 	fetchBody  []byte
+	fetchErr   error
 	closed     bool
 }
 
@@ -23,7 +25,7 @@ func (t *fixtureSenateTransport) SearchPTRs(
 }
 
 func (t *fixtureSenateTransport) FetchPTR(context.Context, string) ([]byte, error) {
-	return t.fetchBody, nil
+	return t.fetchBody, t.fetchErr
 }
 
 func (t *fixtureSenateTransport) Close() error {
@@ -224,6 +226,50 @@ func TestSenateClientUsesBrowserTransport(t *testing.T) {
 	}
 	if err := client.Close(); err != nil || !transport.closed {
 		t.Fatalf("closed=%v err=%v", transport.closed, err)
+	}
+}
+
+func TestSenateFetchPTRRejectsCrossOriginAndRedirectingDocumentURLs(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/search/view/ptr/redirect/":
+			http.Redirect(w, r, "https://untrusted.example/search/view/ptr/abc/", http.StatusFound)
+		case "/search/view/ptr/ok/":
+			_, _ = w.Write([]byte(`<table><tr><th>Transaction Date</th><th>Asset Name</th><th>Transaction Type</th><th>Amount</th></tr><tr><td>07/01/2026</td><td>Microsoft (MSFT)</td><td>Purchase</td><td>$1,001 - $15,000</td></tr></table>`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client, err := NewSenateClient(server.URL, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, documentURL := range []string{
+		"https://untrusted.example/search/view/ptr/abc/",
+		server.URL + "/search/view/ptr/redirect/",
+	} {
+		_, err := client.FetchPTR(context.Background(), SenateFiling{
+			ExternalID: "fixture", FilerName: "Fixture", FilingDate: time.Now(), DocumentURL: documentURL,
+		})
+		if err == nil || !strings.Contains(err.Error(), "cross-origin") {
+			t.Fatalf("FetchPTR(%q) error = %v, want cross-origin rejection", documentURL, err)
+		}
+	}
+	if _, err := client.FetchPTR(context.Background(), SenateFiling{
+		ExternalID: "ok", FilerName: "Fixture", FilingDate: time.Now(), DocumentURL: server.URL + "/search/view/ptr/ok/",
+	}); err != nil {
+		t.Fatalf("FetchPTR trusted document: %v", err)
+	}
+}
+
+func TestParseSenateSearchRowRejectsCrossOriginDocumentURL(t *testing.T) {
+	filing, ok := parseSenateSearchRow("https://efdsearch.senate.gov", []string{
+		"Jane", "Senator", "Office",
+		`<a href="https://evil.example/search/view/ptr/abc/">PTR</a>`, "07/05/2026",
+	})
+	if ok || filing.DocumentURL != "" {
+		t.Fatalf("cross-origin filing accepted: %+v", filing)
 	}
 }
 

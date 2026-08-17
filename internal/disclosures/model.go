@@ -18,6 +18,7 @@ type Report struct {
 	ContentHash      string
 	ExtractionStatus string
 	ExtractionError  string
+	RetryableFailure bool
 	RawMetadata      []byte
 	Transactions     []Transaction
 }

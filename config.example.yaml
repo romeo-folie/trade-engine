@@ -1026,7 +1026,7 @@ scanner:
     promote_candidates: false              # Observation-only until explicitly enabled
     max_candidates_per_run: 20             # Bound filing-driven LLM reviews per scan
     claim_lease_minutes: 60                 # Reclaim a scanner cycle that crashed mid-review
-    ttl_days: 7                             # Freshness window and watchlist TTL for disclosure evidence
+    ttl_days: 7                             # Filing freshness window for scanner eligibility; watchlist uses scanner.ttl_days
   graph_neighbors:
     enabled: false             # Source candidates from knowledge-graph neighbors of manually-watched tickers
     max_per_scan: 5            # Cap graph candidates per scan so they don't crowd out screener picks

@@ -156,7 +156,7 @@ var disclosureListCmd = &cobra.Command{
 			}
 			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\n",
 				item.FilingDate.Format("2006-01-02"), item.Source, item.FilerName,
-				optionalDisclosureText(item.Office), item.ExtractionStatus,
+				optionalDisclosureText(item.Office), disclosureStatusLabel(item),
 				item.TransactionCount, tickers, item.ExternalID,
 			)
 		}
@@ -196,6 +196,16 @@ var disclosureShowCmd = &cobra.Command{
 		fmt.Printf("Filed: %s · Status: %s · Transactions: %d\n",
 			report.FilingDate.Format("2006-01-02"), report.ExtractionStatus,
 			len(report.Transactions))
+		if report.ExtractionStatus == "failed" {
+			if report.RetryableFailure && report.NextRetryAt != nil {
+				fmt.Printf("Automatic retry: attempt %d/%d after %s\n", report.RetryAttemptCount,
+					store.MaxPoliticalDisclosureRetryAttempts,
+					report.NextRetryAt.UTC().Format(time.RFC3339))
+			} else {
+				fmt.Printf("Automatic retry: exhausted; run 'te disclosures retry %s %s' to re-queue it.\n",
+					report.Source, report.ExternalID)
+			}
+		}
 		fmt.Printf("Document: %s\n", report.DocumentURL)
 		if report.ExtractionError != "" {
 			fmt.Printf("Extraction note: %s\n", report.ExtractionError)
@@ -216,6 +226,46 @@ var disclosureShowCmd = &cobra.Command{
 		}
 		return w.Flush()
 	},
+}
+
+var disclosureRetryCmd = &cobra.Command{
+	Use:   "retry <house|senate|oge> <report-id>",
+	Short: "Re-queue a failed disclosure for the next sync",
+	Args:  cobra.ExactArgs(2),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		source := strings.ToLower(strings.TrimSpace(args[0]))
+		if source != "house" && source != "senate" && source != "oge" {
+			return fmt.Errorf("source must be house, senate, or oge")
+		}
+		if err := store.Connect(cmd.Context()); err != nil {
+			return fmt.Errorf("database: %w", err)
+		}
+		defer store.Close()
+		found, err := store.RetryPoliticalDisclosureReport(cmd.Context(), source, args[1])
+		if err != nil {
+			return err
+		}
+		if !found {
+			return fmt.Errorf("%s disclosure %q was not found", source, args[1])
+		}
+		fmt.Printf("Re-queued %s disclosure %s for the next sync.\n", source, args[1])
+		return nil
+	},
+}
+
+func disclosureStatusLabel(item store.PoliticalDisclosureReportSummary) string {
+	if item.ExtractionStatus != "failed" {
+		return item.ExtractionStatus
+	}
+	if item.RetryableFailure && item.NextRetryAt != nil {
+		return fmt.Sprintf("failed (retry %d/%d after %s)", item.RetryAttemptCount,
+			store.MaxPoliticalDisclosureRetryAttempts,
+			item.NextRetryAt.UTC().Format(time.RFC3339))
+	}
+	if item.RetryAttemptCount > 0 {
+		return fmt.Sprintf("failed (manual retry; %d attempts)", item.RetryAttemptCount)
+	}
+	return "failed (manual retry)"
 }
 
 func disclosureDateRange(now time.Time, fromValue, toValue string) (time.Time, time.Time, error) {
@@ -258,7 +308,7 @@ func optionalDisclosureText(value string) string {
 
 func init() {
 	disclosuresCmd.AddCommand(
-		disclosureSyncCmd, disclosureListCmd, disclosureShowCmd, disclosureSenateCmd,
+		disclosureSyncCmd, disclosureListCmd, disclosureShowCmd, disclosureRetryCmd, disclosureSenateCmd,
 	)
 	disclosureSyncCmd.Flags().StringVar(&disclosureSyncFrom, "from", "", "Start filing date (YYYY-MM-DD; defaults to 90 days ago)")
 	disclosureSyncCmd.Flags().StringVar(&disclosureSyncTo, "to", "", "End filing date (YYYY-MM-DD; defaults to today)")

@@ -168,26 +168,30 @@ func (c *SenateClient) FetchPTR(ctx context.Context, filing SenateFiling) (Repor
 	if err := c.pacer.Wait(ctx, c.RequestDelay); err != nil {
 		return Report{}, err
 	}
+	document, err := trustedDocumentURL(c.BaseURL, filing.DocumentURL, "/search/view/ptr/")
+	if err != nil {
+		return Report{}, err
+	}
 	if c.Transport != nil {
-		body, err := c.Transport.FetchPTR(ctx, filing.DocumentURL)
+		body, err := c.Transport.FetchPTR(ctx, document.String())
 		if err != nil {
 			return Report{}, err
 		}
 		return ParseSenatePTR(filing, body)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, filing.DocumentURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, document.String(), nil)
 	if err != nil {
 		return Report{}, err
 	}
 	req.Header.Set("Referer", c.BaseURL+"/search/")
 	req.Header.Set("User-Agent", c.userAgent())
-	resp, err := c.HTTP.Do(req)
+	resp, err := sameOriginDocumentClient(c.HTTP, c.BaseURL, "/search/view/ptr/").Do(req)
 	if err != nil {
 		return Report{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return Report{}, fmt.Errorf("GET Senate PTR: HTTP %s", resp.Status)
+		return Report{}, disclosureHTTPStatusError("Senate", resp.StatusCode, resp.Status)
 	}
 	if resp.Request != nil && resp.Request.URL != nil &&
 		resp.Request.URL.Path == "/search/home/" {
@@ -351,10 +355,13 @@ func parseSenateSearchRow(baseURL string, cells []string) (SenateFiling, bool) {
 			filing.ExternalID = match[2]
 			reference, err := url.Parse(match[1])
 			if err == nil {
-				if reference.IsAbs() {
-					filing.DocumentURL = reference.String()
-				} else {
-					filing.DocumentURL = strings.TrimRight(baseURL, "/") + "/" + strings.TrimLeft(reference.Path, "/")
+				if !reference.IsAbs() {
+					reference, err = url.Parse(strings.TrimRight(baseURL, "/") + "/" + strings.TrimLeft(reference.Path, "/"))
+				}
+				if err == nil {
+					if document, trustedErr := trustedDocumentURL(baseURL, reference.String(), "/search/view/ptr/"); trustedErr == nil {
+						filing.DocumentURL = document.String()
+					}
 				}
 			}
 		}

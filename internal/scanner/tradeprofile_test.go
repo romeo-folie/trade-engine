@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/romeo-folie/trade-engine/internal/store"
+	"github.com/romeo-folie/trade-engine/internal/tradeprofile"
 )
 
 func TestCompactScannerTextTruncatesAtUTF8RuneBoundary(t *testing.T) {
@@ -39,12 +40,11 @@ func TestBuildScannerTradeProfileUsesSourceOwnedMenus(t *testing.T) {
 		wantRecommend string
 	}{
 		{
-			name:       "political disclosure is daily trend momentum",
+			name:       "political disclosure does not select an execution workflow",
 			candidate:  SwingCandidate{Ticker: "GOV", Sources: []string{"political_disclosure"}},
 			score:      SwingScoreResult{Strategy: "weekly_leader"},
-			wantLenses: []string{"trend_following", "momentum"}, wantPrimary: "1D",
-			wantEntry:     "4H",
-			wantRecommend: "trend_following",
+			wantLenses: []string{"momentum", "news_sentiment"}, wantPrimary: "4H",
+			wantRecommend: "momentum",
 		},
 		{
 			name: "weekly leader permits qualified pullback and scorer reorders only within menu",
@@ -118,7 +118,7 @@ func TestScannerProfileDefaultsAssignTimeframeRolesBySource(t *testing.T) {
 		wantPrimary string
 		wantEntry   string
 	}{
-		{name: "political disclosure", source: "political_disclosure", wantPrimary: "1D", wantEntry: "4H"},
+		{name: "political disclosure uses ordinary workflow", source: "political_disclosure", wantPrimary: "4H"},
 		{name: "weekly leader", source: "weekly_leader", wantPrimary: "1D", wantEntry: "4H"},
 		{name: "potent industry", source: "potent_industry", wantPrimary: "1D", wantEntry: "4H"},
 		{name: "premarket episodic", source: "premarket_episodic", wantPrimary: "4H", wantEntry: "1H"},
@@ -135,6 +135,46 @@ func TestScannerProfileDefaultsAssignTimeframeRolesBySource(t *testing.T) {
 					tt.source, got.primary, got.entryTiming, tt.wantPrimary, tt.wantEntry)
 			}
 		})
+	}
+}
+
+func TestBuildScannerTradeProfileCarriesPoliticalDisclosureFacts(t *testing.T) {
+	facts := tradeprofile.PoliticalDisclosureEvidence{
+		Version: tradeprofile.PoliticalDisclosureEvidenceVersion, Ticker: "GOV",
+		DistinctFilerCount: 2, DistinctBuyerCount: 2, ReportCount: 3,
+		TransactionCount: 4, PurchaseCount: 3, SaleCount: 1,
+		IndependentBuyerActivity: true, ContradictoryActivity: true,
+		Filers: []tradeprofile.PoliticalDisclosureFilerEvidence{{
+			CanonicalFilerID: "house:house:alex-example", FilerName: "Alex Example",
+			Source: "house", Chamber: "house", ReportCount: 2, TransactionCount: 3,
+		}},
+		DataQuality: tradeprofile.PoliticalDisclosureDataQuality{
+			CanonicalIdentityBasis: "normalized source, chamber, and filer-name tokens",
+		},
+	}
+	raw, err := json.Marshal(facts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	discovery, profile, err := buildScannerTradeProfile(SwingCandidate{
+		Ticker: "GOV", Sources: []string{"political_disclosure"},
+		PoliticalDisclosureEvidence: "stale flattened evidence",
+		PoliticalDisclosureFacts:    raw,
+	}, SwingScoreResult{Strategy: "momentum"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored tradeprofile.PoliticalDisclosureEvidence
+	if err := json.Unmarshal(discovery.EvidenceBySource["political_disclosure"], &stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.DistinctFilerCount != 2 || stored.DistinctBuyerCount != 2 ||
+		!strings.Contains(discovery.Thesis, "3 report(s), 4 transaction(s), 2 canonical filer(s), 2 distinct buyer(s)") ||
+		strings.Contains(discovery.Thesis, "stale flattened evidence") {
+		t.Fatalf("discovery = %+v, facts = %+v", discovery, stored)
+	}
+	if profile.PrimaryTimeframe != "4H" || profile.RecommendedLens != "momentum" {
+		t.Fatalf("political provenance changed execution profile: %+v", profile)
 	}
 }
 

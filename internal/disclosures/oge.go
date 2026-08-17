@@ -168,17 +168,21 @@ func (c *OGEClient) FetchPDF(ctx context.Context, f OGEFiling) ([]byte, error) {
 	if err := c.pacer.Wait(ctx, c.RequestDelay); err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.DocumentURL, nil)
+	document, err := trustedDocumentURL(c.BaseURL, f.DocumentURL, ogeDocumentPathPrefix(c.BaseURL))
 	if err != nil {
 		return nil, err
 	}
-	resp, err := c.HTTP.Do(req)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, document.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := sameOriginDocumentClient(c.HTTP, c.BaseURL, ogeDocumentPathPrefix(c.BaseURL)).Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
-		return nil, fmt.Errorf("OGE PDF returned %s", resp.Status)
+		return nil, disclosureHTTPStatusError("OGE", resp.StatusCode, resp.Status)
 	}
 	if resp.ContentLength > maxOGEPDFSize {
 		return nil, fmt.Errorf("OGE PDF exceeds %d-byte limit", maxOGEPDFSize)

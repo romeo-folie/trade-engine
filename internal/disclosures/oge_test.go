@@ -89,6 +89,41 @@ func TestOGEListFilingsSkipsMalformedDateWithoutEndingPageRange(t *testing.T) {
 	}
 }
 
+func TestOGEFetchPDFRejectsCrossOriginAndRedirectingDocumentURLs(t *testing.T) {
+	var destinationHits int
+	destination := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		destinationHits++
+	}))
+	defer destination.Close()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/documents/redirect.pdf":
+			http.Redirect(w, r, destination.URL+"/document.pdf", http.StatusFound)
+		case "/documents/ok.pdf":
+			_, _ = w.Write([]byte("fixture pdf"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client := NewOGEClient(server.URL, time.Second)
+	for _, documentURL := range []string{
+		"https://untrusted.example/document.pdf",
+		server.URL + "/documents/redirect.pdf",
+	} {
+		_, err := client.FetchPDF(context.Background(), OGEFiling{DocumentURL: documentURL})
+		if err == nil || !strings.Contains(err.Error(), "cross-origin") {
+			t.Fatalf("FetchPDF(%q) error = %v, want cross-origin rejection", documentURL, err)
+		}
+	}
+	if _, err := client.FetchPDF(context.Background(), OGEFiling{DocumentURL: server.URL + "/documents/ok.pdf"}); err != nil {
+		t.Fatalf("FetchPDF trusted document: %v", err)
+	}
+	if destinationHits != 0 {
+		t.Fatalf("cross-origin redirect destination was requested %d times", destinationHits)
+	}
+}
+
 func TestParseOGEPDFReconstructsRows(t *testing.T) {
 	filing := OGEFiling{ExternalID: "oge-test", ReportType: "periodic_transaction", FilingDate: time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)}
 	report := ParseOGEPDF(filing, []byte("pdf"), []PageText{{Number: 2, Boxes: []TextBox{{Text: "07/01/2026", Left: 1, Top: 10}, {Text: "Purchase", Left: 80, Top: 10}, {Text: "Acme Corp (ACME)", Left: 140, Top: 10}, {Text: "$1,001 - $15,000", Left: 260, Top: 10}}}})
