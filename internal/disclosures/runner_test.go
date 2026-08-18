@@ -437,6 +437,56 @@ func TestRetryPersistenceErrorDoesNotBecomeExtractionFailure(t *testing.T) {
 	}
 }
 
+func TestSaveRetryConvertsCompleteTransactionEvidence(t *testing.T) {
+	filingDate := time.Date(2026, time.August, 10, 0, 0, 0, 0, time.UTC)
+	notificationDate := filingDate.AddDate(0, 0, 2)
+	minimum, maximum := int64(1_001), int64(15_000)
+	report := Report{
+		Source: "house", ExternalID: "retry-complete-evidence", Chamber: "house",
+		FilerName: "Jane Member", Office: "CA01", ReportType: "periodic_transaction",
+		IsAmendment: true, FilingDate: filingDate, DocumentURL: "https://example.test/retry.pdf",
+		ContentHash: "content-hash", ExtractionStatus: "failed", ExtractionError: "temporary failure",
+		RetryableFailure: true, RawMetadata: []byte(`{"report":true}`),
+		Transactions: []Transaction{{
+			Ordinal: 7, Owner: "Spouse", AssetName: "Example Corp", Ticker: "EXMP",
+			AssetType: "ST", TransactionType: "purchase", TransactionDate: filingDate,
+			NotificationDate: &notificationDate, AmountMin: &minimum, AmountMax: &maximum,
+			AmountText: "$1,001 - $15,000", Comment: "fixture", RawData: []byte(`{"row":7}`),
+		}},
+	}
+	var got store.PoliticalDisclosureReport
+	runner := &Runner{saveRetryResult: func(_ context.Context, saved store.PoliticalDisclosureReport, token string) error {
+		if token != "retry-token" {
+			t.Fatalf("token=%q", token)
+		}
+		got = saved
+		return nil
+	}}
+	if err := runner.saveRetry(context.Background(), report, "retry-token"); err != nil {
+		t.Fatal(err)
+	}
+	if got.Source != report.Source || got.ExternalID != report.ExternalID || got.Chamber != report.Chamber ||
+		got.FilerName != report.FilerName || got.Office != report.Office || got.ReportType != report.ReportType ||
+		got.IsAmendment != report.IsAmendment || !got.FilingDate.Equal(report.FilingDate) ||
+		got.DocumentURL != report.DocumentURL || got.ContentHash != report.ContentHash ||
+		got.ExtractionStatus != report.ExtractionStatus || got.ExtractionError != report.ExtractionError ||
+		got.RetryableFailure != report.RetryableFailure || string(got.RawMetadata) != string(report.RawMetadata) {
+		t.Fatalf("stored report lost scalar evidence: %+v", got)
+	}
+	if len(got.Transactions) != 1 {
+		t.Fatalf("transactions=%+v", got.Transactions)
+	}
+	transaction := got.Transactions[0]
+	if transaction.Ordinal != 7 || transaction.Owner != "Spouse" || transaction.AssetName != "Example Corp" ||
+		transaction.Ticker != "EXMP" || transaction.AssetType != "ST" || transaction.TransactionType != "purchase" ||
+		!transaction.TransactionDate.Equal(filingDate) || transaction.NotificationDate == nil ||
+		!transaction.NotificationDate.Equal(notificationDate) || transaction.AmountMin == nil || *transaction.AmountMin != minimum ||
+		transaction.AmountMax == nil || *transaction.AmountMax != maximum || transaction.AmountText != "$1,001 - $15,000" ||
+		transaction.Comment != "fixture" || string(transaction.RawData) != `{"row":7}` {
+		t.Fatalf("stored transaction lost evidence: %+v", transaction)
+	}
+}
+
 func TestRetryLoopPropagatesCancellationBetweenClaims(t *testing.T) {
 	client, err := NewSenateClient("https://efdsearch.senate.gov", time.Second)
 	if err != nil {

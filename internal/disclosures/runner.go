@@ -263,7 +263,7 @@ func randomRetryClaimToken() (string, error) {
 }
 
 func (r *Runner) saveRetry(ctx context.Context, report Report, token string) error {
-	stored := store.PoliticalDisclosureReport{Source: report.Source, ExternalID: report.ExternalID, Chamber: report.Chamber, FilerName: report.FilerName, Office: report.Office, ReportType: report.ReportType, IsAmendment: report.IsAmendment, FilingDate: report.FilingDate, DocumentURL: report.DocumentURL, ContentHash: report.ContentHash, ExtractionStatus: report.ExtractionStatus, ExtractionError: report.ExtractionError, RetryableFailure: report.RetryableFailure, RawMetadata: report.RawMetadata}
+	stored := politicalDisclosureStoreReport(report)
 	if r.saveRetryResult != nil {
 		return r.saveRetryResult(ctx, stored, token)
 	}
@@ -798,6 +798,13 @@ func (r *Runner) saveReport(ctx context.Context, report Report) error {
 	if r.persistReport != nil {
 		return r.persistReport(ctx, report)
 	}
+	return store.SavePoliticalDisclosureReport(ctx, politicalDisclosureStoreReport(report))
+}
+
+// politicalDisclosureStoreReport is the sole conversion boundary between
+// parsed-source reports and their durable representation. Retry completion
+// must persist exactly the same transaction evidence as first-pass ingestion.
+func politicalDisclosureStoreReport(report Report) store.PoliticalDisclosureReport {
 	stored := store.PoliticalDisclosureReport{
 		Source: report.Source, ExternalID: report.ExternalID,
 		Chamber: report.Chamber, FilerName: report.FilerName, Office: report.Office,
@@ -806,6 +813,7 @@ func (r *Runner) saveReport(ctx context.Context, report Report) error {
 		ExtractionStatus: report.ExtractionStatus,
 		ExtractionError:  report.ExtractionError,
 		RetryableFailure: report.RetryableFailure, RawMetadata: report.RawMetadata,
+		Transactions: make([]store.PoliticalDisclosureTransaction, 0, len(report.Transactions)),
 	}
 	for _, item := range report.Transactions {
 		stored.Transactions = append(stored.Transactions, store.PoliticalDisclosureTransaction{
@@ -818,7 +826,7 @@ func (r *Runner) saveReport(ctx context.Context, report Report) error {
 			AmountText: item.AmountText, Comment: item.Comment, RawData: item.RawData,
 		})
 	}
-	return store.SavePoliticalDisclosureReport(ctx, stored)
+	return stored
 }
 
 func (r *Runner) now() time.Time {

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/disclosures"
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
@@ -187,7 +188,7 @@ func TestClaimDuePoliticalDisclosureRetriesLeasesWithoutIncrementingAttempts(t *
 		Source: "senate", ExternalID: "test-due-disclosure-retry", Chamber: "senate",
 		FilerName: "Test Senator", ReportType: "periodic_transaction",
 		FilingDate: time.Now().UTC(), DocumentURL: "https://example.test/retry",
-		ExtractionStatus: "failed", ExtractionError: "temporary", RetryableFailure: true,
+		ContentHash: "retry-content-hash", ExtractionStatus: "failed", ExtractionError: "temporary", RetryableFailure: true,
 		RawMetadata: json.RawMessage(`{"fixture":true}`),
 	}
 	t.Cleanup(func() {
@@ -196,15 +197,23 @@ func TestClaimDuePoliticalDisclosureRetriesLeasesWithoutIncrementingAttempts(t *
 	if err := store.SavePoliticalDisclosureReport(ctx, report); err != nil {
 		t.Fatal(err)
 	}
+	stored, err := store.GetPoliticalDisclosureReport(ctx, report.Source, report.ExternalID)
+	if err != nil || stored == nil || stored.RetryClaimToken != "" || stored.RetryClaimedAt != nil || stored.RetryLeaseUntil != nil {
+		t.Fatalf("unclaimed retry=%+v err=%v", stored, err)
+	}
 	if _, err := store.GetDB().Exec(ctx, "UPDATE political_disclosure_reports SET next_retry_at=NOW()-INTERVAL '1 second' WHERE source=$1 AND external_id=$2", report.Source, report.ExternalID); err != nil {
 		t.Fatal(err)
 	}
+	if terminal, err := store.PoliticalDisclosureReportTerminal(ctx, report.Source, report.ExternalID); err != nil || terminal {
+		t.Fatalf("due unleased retry terminal=%v err=%v", terminal, err)
+	}
 	now := time.Now().UTC()
 	claimed, err := store.ClaimDuePoliticalDisclosureRetries(ctx, report.Source, now, 1, 2*time.Minute)
-	if err != nil || len(claimed) != 1 || claimed[0].ExternalID != report.ExternalID || claimed[0].RetryAttemptCount != 1 {
+	if err != nil || len(claimed) != 1 || claimed[0].ExternalID != report.ExternalID || claimed[0].RetryAttemptCount != 1 ||
+		claimed[0].ContentHash != report.ContentHash || claimed[0].ExtractionError != report.ExtractionError || claimed[0].RetryClaimToken == "" {
 		t.Fatalf("claimed=%+v err=%v", claimed, err)
 	}
-	stored, err := store.GetPoliticalDisclosureReport(ctx, report.Source, report.ExternalID)
+	stored, err = store.GetPoliticalDisclosureReport(ctx, report.Source, report.ExternalID)
 	if err != nil || stored == nil || stored.RetryAttemptCount != 1 || stored.NextRetryAt == nil || stored.NextRetryAt.After(now) {
 		t.Fatalf("leased retry=%+v err=%v", stored, err)
 	}
@@ -370,7 +379,7 @@ func TestPersistedTransientSenateFailureRetriesLaterWithoutStarvingOlderFiling(t
 	}
 	transport := &mutableSenateTransport{failNewest: true}
 	client.Transport = transport
-	runner := &disclosures.Runner{Senate: client}
+	runner := &disclosures.Runner{Cfg: config.DisclosuresConfig{LookbackDays: 1, MaxReportsPerSync: 1}, Senate: client, Now: time.Now}
 	from := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
 	until := time.Date(2026, 8, 12, 0, 0, 0, 0, time.UTC)
 
@@ -399,14 +408,25 @@ func TestPersistedTransientSenateFailureRetriesLaterWithoutStarvingOlderFiling(t
 		t.Fatal(err)
 	}
 	transport.failNewest = false
-	third, err := runner.SyncRange(ctx, from, until, 1)
-	if err != nil || third.SenateProcessed != 1 {
-		t.Fatalf("due retry result=%+v err=%v", third, err)
+	if err := runner.RunOnce(ctx); err != nil {
+		t.Fatalf("due retry run: %v", err)
 	}
 	newest, err = store.GetPoliticalDisclosureReport(ctx, source, newestID)
 	if err != nil || newest == nil || newest.ExtractionStatus != "completed" ||
-		newest.RetryableFailure || newest.RetryAttemptCount != 0 || newest.NextRetryAt != nil {
+		newest.RetryableFailure || newest.RetryAttemptCount != 0 || newest.NextRetryAt != nil ||
+		len(newest.Transactions) != 1 || newest.Transactions[0].Ticker != "MSFT" {
 		t.Fatalf("successful re-extraction did not clear retry state: report=%+v err=%v", newest, err)
+	}
+	var candidateCount int
+	var evidence []byte
+	if err := store.GetDB().QueryRow(ctx, `
+		SELECT transaction_count, evidence
+		FROM political_disclosure_candidates
+		WHERE report_id=(
+			SELECT id FROM political_disclosure_reports WHERE source=$1 AND external_id=$2
+		) AND ticker='MSFT'`, source, newestID,
+	).Scan(&candidateCount, &evidence); err != nil || candidateCount != 1 || len(evidence) == 0 {
+		t.Fatalf("recovered candidate count=%d evidence=%s err=%v", candidateCount, evidence, err)
 	}
 }
 

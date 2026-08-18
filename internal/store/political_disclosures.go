@@ -164,7 +164,7 @@ func GetPoliticalDisclosureReport(
 		SELECT source, external_id, chamber, filer_name, COALESCE(office,''),
 			report_type, is_amendment, filing_date, document_url, COALESCE(content_hash,''),
 			extraction_status, COALESCE(extraction_error,''), retryable_failure,
-			retry_attempt_count, next_retry_at, retry_claim_token, retry_claimed_at, retry_lease_until, raw_metadata
+			retry_attempt_count, next_retry_at, COALESCE(retry_claim_token,''), retry_claimed_at, retry_lease_until, raw_metadata
 		FROM political_disclosure_reports
 		WHERE source=$1 AND external_id=$2`,
 		strings.ToLower(strings.TrimSpace(source)), strings.TrimSpace(externalID),
@@ -239,7 +239,7 @@ func PoliticalDisclosureReportTerminal(
 	err := GetDB().QueryRow(ctx, `
 		SELECT extraction_status IN ('completed', 'no_text') OR
 			(extraction_status='failed' AND (
-				NOT retryable_failure OR next_retry_at IS NULL OR next_retry_at > NOW() OR retry_lease_until > NOW()
+				NOT retryable_failure OR next_retry_at IS NULL OR next_retry_at > NOW() OR COALESCE(retry_lease_until > NOW(), FALSE)
 			))
 		FROM political_disclosure_reports
 		WHERE source=$1 AND external_id=$2`, source, externalID,
@@ -308,8 +308,8 @@ func ClaimPoliticalDisclosureRetries(
 			FROM due WHERE r.id=due.id
 			RETURNING r.source, r.external_id, r.chamber, r.filer_name,
 				r.office, r.report_type, r.is_amendment, r.filing_date,
-				r.document_url, COALESCE(r.content_hash,''), r.extraction_status,
-				COALESCE(r.extraction_error,''), r.retryable_failure,
+				r.document_url, COALESCE(r.content_hash,'') AS content_hash, r.extraction_status,
+				COALESCE(r.extraction_error,'') AS extraction_error, r.retryable_failure,
 				r.retry_attempt_count, r.next_retry_at, r.retry_claim_token,
 				r.retry_claimed_at, r.retry_lease_until, r.raw_metadata
 		)
