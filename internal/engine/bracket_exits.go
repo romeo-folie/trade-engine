@@ -699,8 +699,8 @@ func (e *Engine) closeBracketTradeLocked(
 // excludes trailing/protective-stop mutations.
 //
 // We intentionally do not cancel an arbitrary user order sharing a ticker:
-// unprojected orders must carry the engine's client-order prefix. Projected
-// legs are also safe to cancel by broker ID regardless of their client ID.
+// unprojected orders must resolve to this exact trade through durable intent
+// ownership. Projected legs are also safe to cancel by broker ID.
 func (e *Engine) cancelResidualEngineExitOrders(
 	ctx context.Context,
 	t store.Trade,
@@ -732,8 +732,21 @@ func (e *Engine) cancelResidualEngineExitOrders(
 			continue
 		}
 		_, projected := known[order.OrderID]
-		if !projected && !strings.HasPrefix(order.TradeID, "te-stock-") {
-			continue
+		var residualIntent *store.StockOrderIntent
+		if !projected {
+			var ownershipErr error
+			residualIntent, ownershipErr = residualExitIntentForTrade(ctx, t.ID, order)
+			if ownershipErr != nil {
+				return ownershipErr
+			}
+			if residualIntent == nil {
+				// This may belong to another pyramided lot or to the user. Never
+				// infer ownership from ticker, side, or an engine-looking ID.
+				continue
+			}
+			if err := persistResidualExitOrder(ctx, t, order, residualIntent); err != nil {
+				return err
+			}
 		}
 		cancelErr := e.executor.CancelOrder(ctx, order.OrderID)
 		status, statusErr := e.executor.GetOrderStatus(ctx, order.OrderID)
@@ -746,12 +759,79 @@ func (e *Engine) cancelResidualEngineExitOrders(
 		}
 		if status.FilledQty > 1e-9 ||
 			!execution.IsTerminalOrderStatus(status.Status) {
-			return fmt.Errorf("residual exit %s remains %s after cancel: %w",
+			return fmt.Errorf("residual exit %s remains %s after cancel (cancel error: %v)",
 				order.OrderID, status.Status, cancelErr)
 		}
 		logger.Warn("bracket exits: cancelled residual engine exit after flatten",
 			"trade_id", t.ID, "ticker", t.Ticker,
 			"broker_order_id", order.OrderID)
+	}
+	return nil
+}
+
+// residualExitIntentForTrade proves a working order belongs to the trade being
+// closed. A broker-created bracket child is identified by its durable child
+// intent when projected, or by its parent client ID when projection failed.
+func residualExitIntentForTrade(ctx context.Context, tradeID string, order execution.WorkingOrder) (*store.StockOrderIntent, error) {
+	intent, err := store.GetStockOrderIntentByBrokerOrderID(ctx, order.OrderID)
+	if err != nil {
+		return nil, fmt.Errorf("find residual exit %s by broker ID: %w", order.OrderID, err)
+	}
+	if intent != nil && intent.TradeID == tradeID {
+		return intent, nil
+	}
+	if order.TradeID == "" {
+		return nil, nil
+	}
+	intent, err = store.GetStockOrderIntentByClientOrderID(ctx, order.TradeID)
+	if err != nil {
+		return nil, fmt.Errorf("find residual exit %s by client ID: %w", order.OrderID, err)
+	}
+	if intent != nil && intent.TradeID == tradeID {
+		return intent, nil
+	}
+	return nil, nil
+}
+
+// persistResidualExitOrder gives the ordinary claimed-exit reconciler durable
+// ownership of an unprojected order before cancellation. If cancellation is
+// asynchronous or the order filled meanwhile, the trade cannot be finalized
+// and forgotten; the pending row is polled until broker truth is terminal.
+func persistResidualExitOrder(ctx context.Context, t store.Trade, order execution.WorkingOrder, intent *store.StockOrderIntent) error {
+	if existing, err := store.GetOrderByBrokerOrderID(ctx, order.OrderID); err != nil {
+		return fmt.Errorf("look up residual exit %s projection: %w", order.OrderID, err)
+	} else if existing != nil {
+		if existing.TradeID != t.ID {
+			return fmt.Errorf("residual exit %s is already projected to trade %s", order.OrderID, existing.TradeID)
+		}
+		return nil
+	}
+	quantity := order.RemainingQty
+	if quantity <= 0 {
+		quantity = intent.RequestedQty
+	}
+	if quantity <= 0 {
+		quantity = t.Quantity
+	}
+	projection := store.Order{
+		TradeID: t.ID, BrokerOrderID: order.OrderID, Ticker: t.Ticker,
+		Side: order.Side, OrderType: intent.OrderType, Quantity: quantity,
+		Status: "pending",
+	}
+	if intent.BrokerOrderID == order.OrderID {
+		// The child/standalone intent is this exact broker order.
+		projection.StockIntentID = intent.ID
+	} else {
+		// This is a broker-created child identified through its bracket parent.
+		// The parent intent already projects the entry, so it cannot be reused as
+		// this child row's stock intent.
+		projection.ParentOrderID = intent.BrokerOrderID
+		if projection.OrderType == "market" || projection.OrderType == "" {
+			projection.OrderType = "stop"
+		}
+	}
+	if _, err := store.InsertOrderWithRetry(ctx, projection); err != nil {
+		return fmt.Errorf("persist residual exit %s: %w", order.OrderID, err)
 	}
 	return nil
 }

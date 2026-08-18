@@ -185,6 +185,28 @@ func GetStockOrderIntentByKey(ctx context.Context, key string) (*StockOrderInten
 	return &in, rows.Err()
 }
 
+// GetStockOrderIntentByClientOrderID resolves the durable request that owns a
+// broker-provided client order ID. Alpaca bracket children inherit their
+// parent's client ID, so this is also the safe ownership link when a child
+// escaped local projection before it received its own intent row.
+func GetStockOrderIntentByClientOrderID(ctx context.Context, clientOrderID string) (*StockOrderIntent, error) {
+	rows, err := GetDB().Query(ctx, `
+        SELECT id, idempotency_key, client_order_id, COALESCE(trade_id::text,''), COALESCE(parent_intent_id::text,''), purpose, ticker, side, order_type, requested_qty, request_payload, payload_hash, COALESCE(broker_order_id,''), status, COALESCE(filled_price,0), filled_qty, COALESCE(broker_error,''), COALESCE(broker_request_id,''), submitted_at, last_checked_at, created_at, updated_at
+        FROM stock_order_intents WHERE client_order_id=$1`, clientOrderID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return nil, nil
+	}
+	var in StockOrderIntent
+	if err := rows.Scan(&in.ID, &in.IdempotencyKey, &in.ClientOrderID, &in.TradeID, &in.ParentIntentID, &in.Purpose, &in.Ticker, &in.Side, &in.OrderType, &in.RequestedQty, &in.RequestPayload, &in.PayloadHash, &in.BrokerOrderID, &in.Status, &in.FilledPrice, &in.FilledQty, &in.BrokerError, &in.BrokerRequestID, &in.SubmittedAt, &in.LastCheckedAt, &in.CreatedAt, &in.UpdatedAt); err != nil {
+		return nil, err
+	}
+	return &in, rows.Err()
+}
+
 // StockEntryBrokerProtection returns whether the durable entry that owns a
 // trade requires broker-resident protection, plus its parent broker order ID.
 // Keeping the query here lets reconciliation enforce the immutable admission
