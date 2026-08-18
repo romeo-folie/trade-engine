@@ -671,6 +671,19 @@ func (e *Engine) closeBracketTradeLocked(
 			"trade_id", t.ID, "ticker", t.Ticker, "remaining_qty", remaining)
 		return true, fmt.Errorf("terminal broker fills left %.8f shares unreconciled", remaining)
 	}
+	// The fill that flattened this trade can race a previously unprojected
+	// broker stop. Local exit-leg rows are not a complete cancellation
+	// inventory after a projection/replacement failure, so inspect the broker's
+	// working orders before finalizing. Otherwise a leftover engine-owned SELL
+	// can fill into a flat account and open an unintended short (VOYG/TSM).
+	if err := e.cancelResidualEngineExitOrders(ctx, t, states); err != nil {
+		if claimed && !fillPersisted {
+			_ = store.ReleaseTradeExitClaim(ctx, t.ID)
+		}
+		logger.Warn("bracket exits: residual broker exit cleanup incomplete",
+			"trade_id", t.ID, "ticker", t.Ticker, "err", err)
+		return true, err
+	}
 	realized, err := store.FinalizeTradeExit(ctx, t.ID)
 	if err != nil {
 		logger.Warn("bracket exits: finalize broker-filled trade", "trade_id", t.ID, "err", err)
@@ -678,6 +691,69 @@ func (e *Engine) closeBracketTradeLocked(
 	}
 	e.recordBracketClose(t, realized, exitReason)
 	return true, nil
+}
+
+// cancelResidualEngineExitOrders retires working engine-owned exit orders that
+// escaped the local leg projection. It runs only after the winning exit has
+// durably reduced the tracked trade to zero, while the trade-order lock still
+// excludes trailing/protective-stop mutations.
+//
+// We intentionally do not cancel an arbitrary user order sharing a ticker:
+// unprojected orders must carry the engine's client-order prefix. Projected
+// legs are also safe to cancel by broker ID regardless of their client ID.
+func (e *Engine) cancelResidualEngineExitOrders(
+	ctx context.Context,
+	t store.Trade,
+	states []legState,
+) error {
+	lister, ok := e.executor.(execution.WorkingOrdersLister)
+	if !ok {
+		// Brokers without a working-order view cannot provide the final
+		// inventory check. Their existing per-leg reconciliation remains the
+		// best available protection (the production Alpaca executor implements
+		// this interface).
+		return nil
+	}
+	working, err := lister.GetWorkingOrders(ctx)
+	if err != nil {
+		return fmt.Errorf("list working broker exits: %w", err)
+	}
+	known := make(map[string]struct{}, len(states))
+	for _, state := range states {
+		known[state.leg.BrokerOrderID] = struct{}{}
+	}
+	wantSide := string(execution.OrderSideSell)
+	if t.Direction == "short" {
+		wantSide = string(execution.OrderSideBuy)
+	}
+	for _, order := range working {
+		if !strings.EqualFold(order.Ticker, t.Ticker) ||
+			!strings.EqualFold(order.Side, wantSide) || order.OrderID == "" {
+			continue
+		}
+		_, projected := known[order.OrderID]
+		if !projected && !strings.HasPrefix(order.TradeID, "te-stock-") {
+			continue
+		}
+		cancelErr := e.executor.CancelOrder(ctx, order.OrderID)
+		status, statusErr := e.executor.GetOrderStatus(ctx, order.OrderID)
+		if errors.Is(statusErr, execution.ErrOrderNotFound) {
+			continue
+		}
+		if statusErr != nil {
+			return fmt.Errorf("confirm residual exit %s cancellation: cancel=%v status=%w",
+				order.OrderID, cancelErr, statusErr)
+		}
+		if status.FilledQty > 1e-9 ||
+			!execution.IsTerminalOrderStatus(status.Status) {
+			return fmt.Errorf("residual exit %s remains %s after cancel: %w",
+				order.OrderID, status.Status, cancelErr)
+		}
+		logger.Warn("bracket exits: cancelled residual engine exit after flatten",
+			"trade_id", t.ID, "ticker", t.Ticker,
+			"broker_order_id", order.OrderID)
+	}
+	return nil
 }
 
 func bracketExitIntent(leg store.Order) store.ExitIntent {

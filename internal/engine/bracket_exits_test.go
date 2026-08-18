@@ -30,6 +30,8 @@ type fakeBracketExec struct {
 	onPlace     func(execution.OrderRequest)
 	positions   []execution.Position
 	positionErr error
+	working     []execution.WorkingOrder
+	workingErr  error
 }
 
 type recoverFailureBracketExec struct{ *fakeBracketExec }
@@ -72,6 +74,13 @@ func (f *fakeBracketExec) GetOrderStatus(_ context.Context, id string) (executio
 
 func (f *fakeBracketExec) GetPositions(_ context.Context) ([]execution.Position, error) {
 	return f.positions, f.positionErr
+}
+
+func (f *fakeBracketExec) GetWorkingOrders(context.Context) ([]execution.WorkingOrder, error) {
+	if f.workingErr != nil {
+		return nil, f.workingErr
+	}
+	return append([]execution.WorkingOrder(nil), f.working...), nil
 }
 
 func (f *fakeBracketExec) GetAccount(_ context.Context) (execution.AccountInfo, error) {
@@ -1556,6 +1565,79 @@ func TestReconcileBracket_StopLegFillClosesTrade(t *testing.T) {
 	}
 	if e.portfolio.CurrentState().LastLossAt.IsZero() {
 		t.Fatal("losing bracket stop-out must record the loss cooldown (RecordLoss)")
+	}
+}
+
+// A broker stop can survive if a prior projection/replacement race lost its
+// local row. Once the winning stop has flattened the long, that residual
+// engine-owned sell must be cancelled before the trade is finalized; otherwise
+// it can later open a short against the flat account (VOYG/TSM regression).
+func TestReconcileBracket_StopFillCancelsUnprojectedEngineResidual(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, tpID, slID := insertBracketFixture(t, "ORPHSL", 3)
+	exec := &fakeBracketExec{
+		statuses: map[string]execution.OrderResult{
+			tpID:          {Status: "cancelled"},
+			slID:          {Status: "filled", FilledPrice: 94.8, FilledQty: 3},
+			"orphan-stop": {Status: "cancelled"},
+		},
+		working: []execution.WorkingOrder{
+			{OrderID: "orphan-stop", TradeID: "te-stock-orphan", Ticker: "ORPHSL", Side: "sell", Status: "pending", RemainingQty: 3},
+			// A manually owned same-ticker order is intentionally out of scope.
+			{OrderID: "manual-sell", TradeID: "manual-order", Ticker: "ORPHSL", Side: "sell", Status: "pending", RemainingQty: 1},
+		},
+	}
+	e := newBracketTestEngine(exec)
+	if handled := e.reconcileBracketTrade(ctx, getTrade(t, tradeID)); !handled {
+		t.Fatal("filled stop must be handled")
+	}
+	if tr := getTrade(t, tradeID); tr.ID != "" {
+		t.Fatal("trade must finalize only after residual engine exit cleanup")
+	}
+	cancelled := func(id string) bool {
+		for _, got := range exec.cancelled {
+			if got == id {
+				return true
+			}
+		}
+		return false
+	}
+	if !cancelled("orphan-stop") {
+		t.Fatalf("residual engine stop was not cancelled: %v", exec.cancelled)
+	}
+	if cancelled("manual-sell") {
+		t.Fatalf("manual same-ticker sell must not be cancelled: %v", exec.cancelled)
+	}
+}
+
+func TestReconcileBracket_ResidualEngineExitBlocksFinalizationUntilTerminal(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, tpID, slID := insertBracketFixture(t, "ORPHBLK", 3)
+	exec := &fakeBracketExec{
+		statuses: map[string]execution.OrderResult{
+			tpID:          {Status: "cancelled"},
+			slID:          {Status: "filled", FilledPrice: 94.8, FilledQty: 3},
+			"orphan-stop": {Status: "accepted"},
+		},
+		working: []execution.WorkingOrder{{
+			OrderID: "orphan-stop", TradeID: "te-stock-orphan", Ticker: "ORPHBLK",
+			Side: "sell", Status: "pending", RemainingQty: 3,
+		}},
+	}
+	e := newBracketTestEngine(exec)
+	handled, err := e.reconcileBrokerExitTradeStatus(ctx, getTrade(t, tradeID), false)
+	if !handled || err == nil {
+		t.Fatalf("residual live exit = handled %v err %v, want handled error", handled, err)
+	}
+	trade, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || trade == nil || trade.Status == "closed" {
+		t.Fatalf("trade finalized despite residual live exit: %+v err=%v", trade, err)
 	}
 }
 
