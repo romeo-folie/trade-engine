@@ -420,11 +420,13 @@ func TestReconcileExitsNowWithoutDBDoesNotPanic(t *testing.T) {
 
 type recoveryExitExecutor struct {
 	*fakeExitExecutor
-	positions []execution.Position
-	working   []execution.WorkingOrder
+	positions     []execution.Position
+	working       []execution.WorkingOrder
+	positionCalls int
 }
 
 func (f *recoveryExitExecutor) GetPositions(context.Context) ([]execution.Position, error) {
+	f.positionCalls++
 	return f.positions, nil
 }
 
@@ -813,6 +815,7 @@ func TestExitReconcileRefusesFinalizationWhenBrokerPositionDriftsAfterClaimedFil
 	p.TradeStatus = "exiting"
 	p.Quantity = 5
 	p.OrderQuantity = 5
+	p.Ticker = " AAPL " // broker spelling must not hide a residual short.
 	db := &recoveryExitStore{fakeExitStore: newFakeExitStore(p)}
 	ex := &recoveryExitExecutor{
 		fakeExitExecutor: &fakeExitExecutor{results: map[string]execution.OrderResult{
@@ -821,7 +824,7 @@ func TestExitReconcileRefusesFinalizationWhenBrokerPositionDriftsAfterClaimedFil
 		// A stale sell filled after the owned lot was already flattened. The
 		// claimed reconciler must leave the trade exiting rather than making
 		// that residual short invisible by finalizing the durable record.
-		positions: []execution.Position{{Ticker: p.Ticker, Quantity: 5, Side: "short"}},
+		positions: []execution.Position{{Ticker: "aapl", Quantity: 5, Side: "short"}},
 	}
 
 	stats := ReconcileExitOrderFills(context.Background(), ex, db, 0)
@@ -830,6 +833,26 @@ func TestExitReconcileRefusesFinalizationWhenBrokerPositionDriftsAfterClaimedFil
 	}
 	if _, finalized := db.tradeExits[p.TradeID]; finalized {
 		t.Fatal("claimed exit finalized despite unmatched broker position")
+	}
+}
+
+func TestExitReconcileUsesOnePositionSnapshotForTerminalClaimedBatch(t *testing.T) {
+	p1 := lacExit()
+	p1.TradeStatus, p1.Quantity, p1.OrderQuantity = "exiting", 5, 5
+	p2 := p1
+	p2.TradeID, p2.OrderID, p2.BrokerOrderID, p2.Ticker = "t2", "o2", "b2", "MSFT"
+	db := &recoveryExitStore{fakeExitStore: newFakeExitStore(p1, p2)}
+	ex := &recoveryExitExecutor{fakeExitExecutor: &fakeExitExecutor{results: map[string]execution.OrderResult{
+		"b1": {Status: "filled", FilledPrice: 3.82, FilledQty: 5},
+		"b2": {Status: "filled", FilledPrice: 3.82, FilledQty: 5},
+	}}}
+
+	stats := ReconcileExitOrderFills(context.Background(), ex, db, 0)
+	if len(stats.Closed) != 2 || stats.Errors != 0 {
+		t.Fatalf("stats = %+v, want both claimed exits finalized", stats)
+	}
+	if ex.positionCalls != 1 {
+		t.Fatalf("GetPositions calls = %d, want one per sweep", ex.positionCalls)
 	}
 }
 

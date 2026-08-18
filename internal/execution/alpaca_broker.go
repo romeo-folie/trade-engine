@@ -283,8 +283,16 @@ func (b *AlpacaBroker) GetWorkingOrders(ctx context.Context) ([]WorkingOrder, er
 		LimitPx    string `json:"limit_price"`
 		ClientID   string `json:"client_order_id"`
 	}
+	const workingOrderPageLimit = 500
 	if err := b.do(ctx, http.MethodGet, "/v2/orders?status=open&nested=false&limit=500", nil, &resp); err != nil {
 		return nil, fmt.Errorf("alpaca GetWorkingOrders: %w", err)
+	}
+	// Alpaca's list endpoint has no cursor in this response shape. A full page
+	// therefore cannot prove that every live order was returned. Consumers use
+	// this inventory to retire dangerous residual exits, so fail closed instead
+	// of silently treating the first 500 as complete.
+	if len(resp) == workingOrderPageLimit {
+		return nil, fmt.Errorf("alpaca GetWorkingOrders: open-order inventory reached %d-item page limit", workingOrderPageLimit)
 	}
 	out := make([]WorkingOrder, 0, len(resp))
 	for _, o := range resp {

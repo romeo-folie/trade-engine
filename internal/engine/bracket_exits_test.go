@@ -32,6 +32,8 @@ type fakeBracketExec struct {
 	positionErr error
 	working     []execution.WorkingOrder
 	workingErr  error
+	clientOrder map[string]execution.OrderResult
+	clientErr   map[string]error
 }
 
 type recoverFailureBracketExec struct{ *fakeBracketExec }
@@ -67,6 +69,16 @@ func (f *fakeBracketExec) GetOrderStatus(_ context.Context, id string) (executio
 		return execution.OrderResult{}, err
 	}
 	if res, ok := f.statuses[id]; ok {
+		return res, nil
+	}
+	return execution.OrderResult{}, execution.ErrOrderNotFound
+}
+
+func (f *fakeBracketExec) GetOrderByClientID(_ context.Context, clientID string) (execution.OrderResult, error) {
+	if err, ok := f.clientErr[clientID]; ok {
+		return execution.OrderResult{}, err
+	}
+	if res, ok := f.clientOrder[clientID]; ok {
 		return res, nil
 	}
 	return execution.OrderResult{}, execution.ErrOrderNotFound
@@ -152,6 +164,33 @@ func persistExitIntent(t *testing.T, tradeID, brokerOrderID, clientOrderID strin
 	}
 	t.Cleanup(func() {
 		_, _ = store.GetDB().Exec(context.Background(), `DELETE FROM orders WHERE broker_order_id=$1`, brokerOrderID)
+		_, _ = store.GetDB().Exec(context.Background(), `DELETE FROM stock_order_intents WHERE id=$1::uuid`, tradeID)
+	})
+	return clientOrderID
+}
+
+func persistBracketParentIntent(t *testing.T, tradeID, brokerOrderID, clientOrderID string) string {
+	t.Helper()
+	ctx := context.Background()
+	intentKey := "entry:residual-parent:" + tradeID
+	payload, err := json.Marshal(execution.OrderRequest{
+		Ticker: "ORPHCHILD", Side: execution.OrderSideBuy, Type: execution.OrderTypeMarket,
+		Quantity: 3, TradeID: tradeID, IntentKey: intentKey, ClientOrderID: clientOrderID,
+	})
+	if err != nil {
+		t.Fatalf("marshal parent intent: %v", err)
+	}
+	if err := store.CreateStockOrderIntent(ctx, store.StockOrderIntent{
+		ID: tradeID, IdempotencyKey: intentKey, ClientOrderID: clientOrderID, TradeID: tradeID,
+		Ticker: "ORPHCHILD", Side: "buy", OrderType: "market", RequestedQty: 3,
+		RequestPayload: payload, PayloadHash: brokerOrderID, Status: "pending", Purpose: "submit",
+	}); err != nil {
+		t.Fatalf("CreateStockOrderIntent parent: %v", err)
+	}
+	if err := store.UpdateStockOrderIntentBroker(ctx, clientOrderID, brokerOrderID, "filled", 100, 3, "", "", true); err != nil {
+		t.Fatalf("UpdateStockOrderIntentBroker parent: %v", err)
+	}
+	t.Cleanup(func() {
 		_, _ = store.GetDB().Exec(context.Background(), `DELETE FROM stock_order_intents WHERE id=$1::uuid`, tradeID)
 	})
 	return clientOrderID
@@ -1744,16 +1783,17 @@ func TestReconcileBracket_PositionMismatchBlocksFinalizationWhenResidualAlreadyD
 	}
 }
 
-func TestReconcileBracket_StopFillCancelsUnprojectedBracketChildByParentClientID(t *testing.T) {
+func TestReconcileBracket_StopFillCancelsUnprojectedBracketChildByNestedParentLineage(t *testing.T) {
 	if !store.IsConnected() {
 		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
 	}
 	ctx := context.Background()
 	tradeID, tpID, slID := insertBracketFixture(t, "ORPHCHILD", 3)
-	// Alpaca-created bracket children inherit their parent's client ID. This
-	// simulates a crash before the child itself received a durable projection.
+	// Alpaca gives bracket children their own client IDs. This simulates a crash
+	// before a child received a durable projection, so ownership must come from
+	// the parent's nested broker snapshot rather than a client-ID assumption.
 	parentID := "bracket-parent-" + tradeID[:8]
-	parentClientID := persistExitIntent(t, tradeID, parentID, "te-stock-parent")
+	parentClientID := persistBracketParentIntent(t, tradeID, parentID, "te-stock-parent-"+tradeID[:8])
 	childID := "unprojected-child-" + tradeID[:8]
 	exec := &fakeBracketExec{
 		statuses: map[string]execution.OrderResult{
@@ -1761,7 +1801,10 @@ func TestReconcileBracket_StopFillCancelsUnprojectedBracketChildByParentClientID
 			childID: {Status: "cancelled"},
 		},
 		working: []execution.WorkingOrder{{
-			OrderID: childID, TradeID: parentClientID, Ticker: "ORPHCHILD", Side: "sell", Status: "pending", RemainingQty: 3,
+			OrderID: childID, TradeID: "broker-child-client-" + tradeID[:8], Ticker: "ORPHCHILD", Side: "sell", Status: "pending", RemainingQty: 3,
+		}},
+		clientOrder: map[string]execution.OrderResult{parentClientID: {
+			BrokerOrderID: parentID, ChildOrders: []execution.OrderLeg{{BrokerOrderID: childID, Type: "stop"}},
 		}},
 	}
 	e := newBracketTestEngine(exec)
@@ -1773,6 +1816,42 @@ func TestReconcileBracket_StopFillCancelsUnprojectedBracketChildByParentClientID
 	}
 	if len(exec.cancelled) != 1 || exec.cancelled[0] != childID {
 		t.Fatalf("cancelled=%v, want unprojected child only", exec.cancelled)
+	}
+	child, err := store.GetOrderByBrokerOrderID(ctx, childID)
+	if err != nil || child == nil || child.ParentOrderID != parentID || !child.IsStopLoss {
+		t.Fatalf("projected child = %+v err=%v, want GTC stop child with actual parent", child, err)
+	}
+}
+
+func TestReconcileBracket_UnprojectedGTCChildDoneForDayBlocksFinalization(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, tpID, slID := insertBracketFixture(t, "ORPHGTCCHILD", 3)
+	parentID := "bracket-parent-" + tradeID[:8]
+	parentClientID := persistBracketParentIntent(t, tradeID, parentID, "te-stock-parent-"+tradeID[:8])
+	childID := "unprojected-child-" + tradeID[:8]
+	exec := &fakeBracketExec{
+		statuses: map[string]execution.OrderResult{
+			tpID: {Status: "cancelled"}, slID: {Status: "filled", FilledPrice: 94.8, FilledQty: 3},
+			childID: {Status: "done_for_day"},
+		},
+		working: []execution.WorkingOrder{{OrderID: childID, TradeID: "broker-child-client", Ticker: "ORPHGTCCHILD", Side: "sell", Status: "pending", RemainingQty: 3}},
+		clientOrder: map[string]execution.OrderResult{parentClientID: {
+			BrokerOrderID: parentID, ChildOrders: []execution.OrderLeg{{BrokerOrderID: childID, Type: "stop"}},
+		}},
+	}
+	handled, err := newBracketTestEngine(exec).reconcileBrokerExitTradeStatus(ctx, getTrade(t, tradeID), false)
+	if !handled || err == nil {
+		t.Fatalf("GTC done_for_day = handled:%v err:%v, want unresolved cleanup", handled, err)
+	}
+	if trade, err := store.GetTradeByID(ctx, tradeID); err != nil || trade == nil || trade.Status == "closed" {
+		t.Fatalf("GTC child done_for_day finalized the trade: %+v err=%v", trade, err)
+	}
+	child, err := store.GetOrderByBrokerOrderID(ctx, childID)
+	if err != nil || child == nil || !child.IsStopLoss || child.ParentOrderID != parentID {
+		t.Fatalf("persisted GTC child = %+v err=%v", child, err)
 	}
 }
 

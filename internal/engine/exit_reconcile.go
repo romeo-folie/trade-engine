@@ -580,12 +580,19 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 		}
 	}
 
+	positionSnapshot := claimedExitPositionSnapshot{}
+	for _, state := range terminalTrades {
+		if state.canFinalize && state.remaining <= 1e-9 {
+			positionSnapshot = loadClaimedExitPositionSnapshot(ctx, executor, db)
+			break
+		}
+	}
 	for tradeID, state := range terminalTrades {
 		if !state.canFinalize {
 			continue
 		}
 		if state.remaining <= 1e-9 {
-			if matched, checked, verifyErr := claimedExitBrokerQuantityMatches(ctx, executor, db, state.ticker); checked {
+			if matched, checked, verifyErr := positionSnapshot.matches(state.ticker); checked {
 				if verifyErr != nil || !matched {
 					stats.Errors++
 					if verifyErr == nil {
@@ -644,53 +651,65 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 	return stats
 }
 
-// claimedExitBrokerQuantityMatches prevents an already-zero claimed trade
-// from being finalized while a residual broker fill has made the account drift
-// from its remaining durable lots. It is optional for lightweight executors,
-// but Alpaca supplies both views in production.
-func claimedExitBrokerQuantityMatches(
+// claimedExitPositionSnapshot is loaded once per claimed-exit sweep. Reusing
+// the same broker and durable snapshots both avoids rate-limit amplification
+// during a backlog and gives every terminal decision a consistent account view.
+type claimedExitPositionSnapshot struct {
+	brokerQty map[string]float64
+	ownedQty  map[string]float64
+	err       error
+	checked   bool
+}
+
+func loadClaimedExitPositionSnapshot(
 	ctx context.Context,
 	executor exitReconcileExecutor,
 	db exitReconcileStore,
-	ticker string,
-) (matched, checked bool, err error) {
+) claimedExitPositionSnapshot {
 	broker, brokerOK := executor.(orderlessExitBroker)
 	ownedStore, storeOK := db.(interface {
 		GetOwnedPositionTrades(context.Context) ([]store.Trade, error)
 	})
 	if !brokerOK || !storeOK {
-		return false, false, nil
+		return claimedExitPositionSnapshot{}
 	}
 	positions, err := broker.GetPositions(ctx)
 	if err != nil {
-		return false, true, err
+		return claimedExitPositionSnapshot{checked: true, err: err}
 	}
 	owned, err := ownedStore.GetOwnedPositionTrades(ctx)
 	if err != nil {
-		return false, true, err
+		return claimedExitPositionSnapshot{checked: true, err: err}
 	}
-	var brokerQty, ownedQty float64
+	snapshot := claimedExitPositionSnapshot{
+		brokerQty: make(map[string]float64), ownedQty: make(map[string]float64), checked: true,
+	}
 	for _, position := range positions {
-		if position.Ticker != ticker {
-			continue
-		}
 		qty := position.Quantity
 		if position.Side == "short" && qty > 0 {
 			qty = -qty
 		}
-		brokerQty += qty
+		snapshot.brokerQty[normalizedTicker(position.Ticker)] += qty
 	}
 	for _, trade := range owned {
-		if trade.Ticker != ticker {
-			continue
-		}
 		qty := trade.Quantity
 		if trade.Direction == "short" {
 			qty = -qty
 		}
-		ownedQty += qty
+		snapshot.ownedQty[normalizedTicker(trade.Ticker)] += qty
 	}
-	return math.Abs(brokerQty-ownedQty) <= 0.01, true, nil
+	return snapshot
+}
+
+func (s claimedExitPositionSnapshot) matches(ticker string) (matched, checked bool, err error) {
+	if !s.checked {
+		return false, false, nil
+	}
+	if s.err != nil {
+		return false, true, s.err
+	}
+	key := normalizedTicker(ticker)
+	return math.Abs(s.brokerQty[key]-s.ownedQty[key]) <= 0.01, true, nil
 }
 
 func recoverOrderlessExits(

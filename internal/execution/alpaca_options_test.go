@@ -3,6 +3,7 @@ package execution
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -184,6 +185,24 @@ func TestAlpacaGetWorkingOrders(t *testing.T) {
 	}
 	if opt == nil || opt.Ticker != "SPY260717C00551000" || opt.AssetClass != "us_option" || opt.Side != "sell" || opt.RemainingQty != 2 || opt.Status != "pending" {
 		t.Errorf("option working order = %+v", opt)
+	}
+}
+
+func TestAlpacaGetWorkingOrdersFailsClosedAtPageLimit(t *testing.T) {
+	page := make([]map[string]string, 500)
+	for i := range page {
+		page[i] = map[string]string{
+			"id": fmt.Sprintf("o-%d", i), "symbol": "AAPL", "side": "sell",
+			"status": "accepted", "qty": "1", "filled_qty": "0",
+		}
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(page)
+	}))
+	defer ts.Close()
+	b := &AlpacaBroker{baseURL: ts.URL, httpClient: ts.Client()}
+	if _, err := b.GetWorkingOrders(context.Background()); err == nil {
+		t.Fatal("full open-order page was accepted as a complete inventory")
 	}
 }
 
