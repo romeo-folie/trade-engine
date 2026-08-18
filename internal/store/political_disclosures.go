@@ -348,7 +348,7 @@ func RenewPoliticalDisclosureRetryLease(ctx context.Context, source, externalID,
 	if strings.TrimSpace(token) == "" {
 		return false, fmt.Errorf("political disclosure retry claim token is required")
 	}
-	result, err := GetDB().Exec(ctx, `UPDATE political_disclosure_reports SET retry_lease_until=$4 + ($5 * INTERVAL '1 microsecond'), updated_at=NOW() WHERE source=$1 AND external_id=$2 AND retry_claim_token=$3`, strings.ToLower(strings.TrimSpace(source)), strings.TrimSpace(externalID), token, now.UTC(), lease.Microseconds())
+	result, err := GetDB().Exec(ctx, `UPDATE political_disclosure_reports SET retry_lease_until=$4::timestamptz + ($5 * INTERVAL '1 microsecond'), updated_at=NOW() WHERE source=$1 AND external_id=$2 AND retry_claim_token=$3`, strings.ToLower(strings.TrimSpace(source)), strings.TrimSpace(externalID), token, now.UTC(), lease.Microseconds())
 	if err != nil {
 		return false, err
 	}
