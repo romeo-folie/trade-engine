@@ -808,6 +808,31 @@ func TestExitReconcileFilledStopFallsBackToRecordedPrice(t *testing.T) {
 	}
 }
 
+func TestExitReconcileRefusesFinalizationWhenBrokerPositionDriftsAfterClaimedFill(t *testing.T) {
+	p := lacExit()
+	p.TradeStatus = "exiting"
+	p.Quantity = 5
+	p.OrderQuantity = 5
+	db := &recoveryExitStore{fakeExitStore: newFakeExitStore(p)}
+	ex := &recoveryExitExecutor{
+		fakeExitExecutor: &fakeExitExecutor{results: map[string]execution.OrderResult{
+			"b1": {Status: "filled", FilledPrice: 3.82, FilledQty: 5},
+		}},
+		// A stale sell filled after the owned lot was already flattened. The
+		// claimed reconciler must leave the trade exiting rather than making
+		// that residual short invisible by finalizing the durable record.
+		positions: []execution.Position{{Ticker: p.Ticker, Quantity: 5, Side: "short"}},
+	}
+
+	stats := ReconcileExitOrderFills(context.Background(), ex, db, 0)
+	if stats.Errors != 1 || len(stats.Closed) != 0 {
+		t.Fatalf("stats = %+v, want one position-mismatch error and no close", stats)
+	}
+	if _, finalized := db.tradeExits[p.TradeID]; finalized {
+		t.Fatal("claimed exit finalized despite unmatched broker position")
+	}
+}
+
 func TestExitReconcileTerminalFillReplayUsesDurableAllocation(t *testing.T) {
 	p := lacExit()
 	p.TradeStatus = "exiting"

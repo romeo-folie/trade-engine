@@ -585,6 +585,17 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 			continue
 		}
 		if state.remaining <= 1e-9 {
+			if matched, checked, verifyErr := claimedExitBrokerQuantityMatches(ctx, executor, db, state.ticker); checked {
+				if verifyErr != nil || !matched {
+					stats.Errors++
+					if verifyErr == nil {
+						verifyErr = errors.New("broker position differs from durable owned quantity")
+					}
+					logger.Error("exit reconcile: refusing to finalize while broker position differs",
+						"trade_id", tradeID, "ticker", state.ticker, "err", verifyErr)
+					continue
+				}
+			}
 			if state.fillQty <= 0 || state.proceeds <= 0 {
 				stats.Errors++
 				logger.Error("exit reconcile: flattened trade lacks durable fill price",
@@ -631,6 +642,55 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 		ctx, executor, db, limit, &stats, recordLoss...,
 	)
 	return stats
+}
+
+// claimedExitBrokerQuantityMatches prevents an already-zero claimed trade
+// from being finalized while a residual broker fill has made the account drift
+// from its remaining durable lots. It is optional for lightweight executors,
+// but Alpaca supplies both views in production.
+func claimedExitBrokerQuantityMatches(
+	ctx context.Context,
+	executor exitReconcileExecutor,
+	db exitReconcileStore,
+	ticker string,
+) (matched, checked bool, err error) {
+	broker, brokerOK := executor.(orderlessExitBroker)
+	ownedStore, storeOK := db.(interface {
+		GetOwnedPositionTrades(context.Context) ([]store.Trade, error)
+	})
+	if !brokerOK || !storeOK {
+		return false, false, nil
+	}
+	positions, err := broker.GetPositions(ctx)
+	if err != nil {
+		return false, true, err
+	}
+	owned, err := ownedStore.GetOwnedPositionTrades(ctx)
+	if err != nil {
+		return false, true, err
+	}
+	var brokerQty, ownedQty float64
+	for _, position := range positions {
+		if position.Ticker != ticker {
+			continue
+		}
+		qty := position.Quantity
+		if position.Side == "short" && qty > 0 {
+			qty = -qty
+		}
+		brokerQty += qty
+	}
+	for _, trade := range owned {
+		if trade.Ticker != ticker {
+			continue
+		}
+		qty := trade.Quantity
+		if trade.Direction == "short" {
+			qty = -qty
+		}
+		ownedQty += qty
+	}
+	return math.Abs(brokerQty-ownedQty) <= 0.01, true, nil
 }
 
 func recoverOrderlessExits(

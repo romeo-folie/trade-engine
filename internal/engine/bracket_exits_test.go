@@ -1626,6 +1626,7 @@ func TestReconcileBracket_StopFillCancelsUnprojectedEngineResidual(t *testing.T)
 			// A manually owned same-ticker order is intentionally out of scope.
 			{OrderID: "manual-sell", TradeID: "manual-order", Ticker: "ORPHSL", Side: "sell", Status: "pending", RemainingQty: 1},
 		},
+		positions: []execution.Position{{Ticker: "ORPHSL", Quantity: 3, Side: "long"}},
 	}
 	e := newBracketTestEngine(exec)
 	if handled := e.reconcileBracketTrade(ctx, getTrade(t, tradeID)); !handled {
@@ -1645,11 +1646,44 @@ func TestReconcileBracket_StopFillCancelsUnprojectedEngineResidual(t *testing.T)
 	if !cancelled(orphanID) {
 		t.Fatalf("residual engine stop was not cancelled: %v", exec.cancelled)
 	}
+	if persisted, err := store.GetOrderByBrokerOrderID(ctx, orphanID); err != nil || persisted == nil || persisted.Status != "cancelled" {
+		t.Fatalf("residual cancellation was not persisted: %+v err=%v", persisted, err)
+	}
 	if cancelled("manual-sell") {
 		t.Fatalf("manual same-ticker sell must not be cancelled: %v", exec.cancelled)
 	}
 	if cancelled(otherID) {
 		t.Fatalf("another pyramided lot's stop must not be cancelled: %v", exec.cancelled)
+	}
+}
+
+func TestReconcileBracket_ResidualTerminalStatesNeverFinalizeWithoutCancellationProof(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	for name, result := range map[string]execution.OrderResult{
+		"filled without quantity": {Status: "filled"},
+		"gtc done for day":        {Status: "done_for_day"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			tradeID, tpID, slID := insertBracketFixture(t, "ORPHTERM", 3)
+			orphanID := "orphan-terminal-" + tradeID[:8]
+			orphanClientID := persistExitIntent(t, tradeID, orphanID, "te-stock-orphan-terminal")
+			exec := &fakeBracketExec{
+				statuses: map[string]execution.OrderResult{
+					tpID: {Status: "cancelled"}, slID: {Status: "filled", FilledPrice: 94.8, FilledQty: 3}, orphanID: result,
+				},
+				working: []execution.WorkingOrder{{OrderID: orphanID, TradeID: orphanClientID, Ticker: "ORPHTERM", Side: "sell", Status: "pending", RemainingQty: 3}},
+			}
+			handled, err := newBracketTestEngine(exec).reconcileBrokerExitTradeStatus(ctx, getTrade(t, tradeID), false)
+			if !handled || err == nil {
+				t.Fatalf("residual %s = handled %v err %v, want handled error", name, handled, err)
+			}
+			if trade, err := store.GetTradeByID(ctx, tradeID); err != nil || trade == nil || trade.Status == "closed" {
+				t.Fatalf("trade finalized despite residual %s: %+v err=%v", name, trade, err)
+			}
+		})
 	}
 }
 
@@ -1684,6 +1718,29 @@ func TestReconcileBracket_ResidualEngineExitBlocksFinalizationUntilTerminal(t *t
 	persisted, err := store.GetOrderByBrokerOrderID(ctx, orphanID)
 	if err != nil || persisted == nil || persisted.TradeID != tradeID || persisted.Status != "pending" {
 		t.Fatalf("residual must remain durably pending: %+v err=%v", persisted, err)
+	}
+}
+
+func TestReconcileBracket_PositionMismatchBlocksFinalizationWhenResidualAlreadyDisappeared(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, tpID, slID := insertBracketFixture(t, "ORPHGONE", 3)
+	exec := &fakeBracketExec{
+		statuses: map[string]execution.OrderResult{
+			tpID: {Status: "cancelled"}, slID: {Status: "filled", FilledPrice: 94.8, FilledQty: 3},
+		},
+		// The duplicate SELL filled after the stop did, so it is absent from the
+		// working-order snapshot and the account is now short three shares.
+		positions: []execution.Position{{Ticker: "ORPHGONE", Quantity: 3, Side: "short"}},
+	}
+	handled, err := newBracketTestEngine(exec).reconcileBrokerExitTradeStatus(ctx, getTrade(t, tradeID), false)
+	if !handled || err == nil {
+		t.Fatalf("broker mismatch = handled %v err %v, want handled error", handled, err)
+	}
+	if trade, err := store.GetTradeByID(ctx, tradeID); err != nil || trade == nil || trade.Status == "closed" {
+		t.Fatalf("trade finalized despite broker-only residual fill: %+v err=%v", trade, err)
 	}
 }
 

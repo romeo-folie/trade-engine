@@ -489,15 +489,31 @@ func workingBrokerStopCoversTrade(states []legState, heldQty float64) bool {
 }
 
 func (e *Engine) brokerStillHoldsOwnedTickerQuantity(ctx context.Context, ticker string) (bool, error) {
-	positions, err := e.executor.GetPositions(ctx)
+	brokerQty, dbQty, err := e.brokerAndOwnedTickerQuantities(ctx, ticker)
 	if err != nil {
 		return false, err
+	}
+	const tolerance = 0.01
+	return dbQty != 0 && brokerQty*dbQty > 0 && math.Abs(brokerQty-dbQty) <= tolerance, nil
+}
+
+func (e *Engine) brokerMatchesOwnedTickerQuantity(ctx context.Context, ticker string) (bool, error) {
+	brokerQty, dbQty, err := e.brokerAndOwnedTickerQuantities(ctx, ticker)
+	if err != nil {
+		return false, err
+	}
+	return math.Abs(brokerQty-dbQty) <= 0.01, nil
+}
+
+func (e *Engine) brokerAndOwnedTickerQuantities(ctx context.Context, ticker string) (brokerQty, dbQty float64, err error) {
+	positions, err := e.executor.GetPositions(ctx)
+	if err != nil {
+		return 0, 0, err
 	}
 	owned, err := store.GetOwnedPositionTrades(ctx)
 	if err != nil {
-		return false, err
+		return 0, 0, err
 	}
-	var brokerQty, dbQty float64
 	for _, p := range positions {
 		if p.Ticker != ticker {
 			continue
@@ -518,8 +534,7 @@ func (e *Engine) brokerStillHoldsOwnedTickerQuantity(ctx context.Context, ticker
 		}
 		dbQty += qty
 	}
-	const tolerance = 0.01
-	return dbQty != 0 && brokerQty*dbQty > 0 && math.Abs(brokerQty-dbQty) <= tolerance, nil
+	return brokerQty, dbQty, nil
 }
 
 // fillPriceOf resolves a leg's fill price, falling back to the leg's own
@@ -684,6 +699,22 @@ func (e *Engine) closeBracketTradeLocked(
 			"trade_id", t.ID, "ticker", t.Ticker, "err", err)
 		return true, err
 	}
+	// A residual can fill between the winning-leg lookup and the working-order
+	// snapshot, at which point Alpaca no longer lists it as open. Finalization
+	// is safe only when the broker position still matches every durable owned
+	// lot for this ticker (including any other pyramided lots).
+	matched, err := e.brokerMatchesOwnedTickerQuantity(ctx, t.Ticker)
+	if err != nil || !matched {
+		if claimed && !fillPersisted {
+			_ = store.ReleaseTradeExitClaim(ctx, t.ID)
+		}
+		if err == nil {
+			err = errors.New("broker position differs from durable owned quantity")
+		}
+		logger.Warn("bracket exits: residual position safety check incomplete",
+			"trade_id", t.ID, "ticker", t.Ticker, "err", err)
+		return true, fmt.Errorf("verify broker position after residual exit cleanup: %w", err)
+	}
 	realized, err := store.FinalizeTradeExit(ctx, t.ID)
 	if err != nil {
 		logger.Warn("bracket exits: finalize broker-filled trade", "trade_id", t.ID, "err", err)
@@ -748,19 +779,31 @@ func (e *Engine) cancelResidualEngineExitOrders(
 				return err
 			}
 		}
+		persisted, err := store.GetOrderByBrokerOrderID(ctx, order.OrderID)
+		if err != nil || persisted == nil {
+			if err == nil {
+				err = errors.New("missing durable order projection")
+			}
+			return fmt.Errorf("load residual exit %s after projection: %w", order.OrderID, err)
+		}
 		cancelErr := e.executor.CancelOrder(ctx, order.OrderID)
 		status, statusErr := e.executor.GetOrderStatus(ctx, order.OrderID)
 		if errors.Is(statusErr, execution.ErrOrderNotFound) {
-			continue
+			return fmt.Errorf("confirm residual exit %s cancellation: broker no longer has order", order.OrderID)
 		}
 		if statusErr != nil {
 			return fmt.Errorf("confirm residual exit %s cancellation: cancel=%v status=%w",
 				order.OrderID, cancelErr, statusErr)
 		}
-		if status.FilledQty > 1e-9 ||
-			!execution.IsTerminalOrderStatus(status.Status) {
+		normalized := normalizeBrokerExitStatus(*persisted, status.Status)
+		if normalized == "filled" || status.FilledQty > 1e-9 ||
+			(normalized != "cancelled" && normalized != "rejected") {
 			return fmt.Errorf("residual exit %s remains %s after cancel (cancel error: %v)",
 				order.OrderID, status.Status, cancelErr)
+		}
+		if err := store.UpdateOrderFillAtForBrokerOrder(ctx, persisted.ID, order.OrderID,
+			status.FilledPrice, 0, normalized, status.FilledAt); err != nil {
+			return fmt.Errorf("persist residual exit %s terminal cancellation: %w", order.OrderID, err)
 		}
 		logger.Warn("bracket exits: cancelled residual engine exit after flatten",
 			"trade_id", t.ID, "ticker", t.Ticker,
@@ -816,7 +859,7 @@ func persistResidualExitOrder(ctx context.Context, t store.Trade, order executio
 	projection := store.Order{
 		TradeID: t.ID, BrokerOrderID: order.OrderID, Ticker: t.Ticker,
 		Side: order.Side, OrderType: intent.OrderType, Quantity: quantity,
-		Status: "pending",
+		Status: "pending", IsStopLoss: intent.OrderType == string(execution.OrderTypeStop),
 	}
 	if intent.BrokerOrderID == order.OrderID {
 		// The child/standalone intent is this exact broker order.
