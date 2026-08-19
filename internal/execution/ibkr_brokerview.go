@@ -240,16 +240,22 @@ func (b *IBKRBroker) GetWorkingOrders(ctx context.Context) ([]WorkingOrder, erro
 		if resolved := b.reverseConid(conidStr); conidStr != "" && resolved != conidStr {
 			ticker = resolved
 		}
+		parentOrderID := ""
+		if o.ParentID != 0 {
+			parentOrderID = o.ParentID.String()
+		}
 		out = append(out, WorkingOrder{
-			OrderID:      o.OrderID.String(),
-			TradeID:      o.OrderRef,
-			Ticker:       ticker,
-			Conid:        conidStr,
-			Side:         side,
-			Status:       status,
-			RemainingQty: float64(o.RemainingQty),
-			Price:        float64(o.Price),
-			StopPrice:    float64(o.StopPrice),
+			OrderID:       o.OrderID.String(),
+			TradeID:       o.OrderRef,
+			ParentOrderID: parentOrderID,
+			OrderType:     o.OrderType,
+			Ticker:        ticker,
+			Conid:         conidStr,
+			Side:          side,
+			Status:        status,
+			RemainingQty:  float64(o.RemainingQty),
+			Price:         float64(o.Price),
+			StopPrice:     float64(o.StopPrice),
 		})
 	}
 	return out, nil
@@ -262,7 +268,9 @@ func (b *IBKRBroker) GetWorkingOrders(ctx context.Context) ([]WorkingOrder, erro
 // take-profit/stop-loss leg; both are 0 when the gateway omits them.
 type ibkrOrderRow struct {
 	OrderID      ibkrID    `json:"orderId"`
+	ParentID     ibkrID    `json:"parentId"`
 	OrderRef     string    `json:"order_ref"`
+	OrderType    string    `json:"orderType"`
 	Conid        int       `json:"conid"`
 	Ticker       string    `json:"ticker"`
 	Side         string    `json:"side"`   // "BUY" | "SELL" (sometimes "B" | "S")
