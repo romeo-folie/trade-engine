@@ -934,16 +934,19 @@ func residualExitIntentForTrade(ctx context.Context, executor execution.Executor
 		if err != nil {
 			return nil, fmt.Errorf("find legacy bracket parent for residual exit %s: %w", order.OrderID, err)
 		}
-		if parentOrder == nil || parentOrder.TradeID != tradeID {
+		if parentOrder == nil {
 			// A same-ticker working bracket child without durable lineage cannot
 			// be safely ignored: legacy trades predate intent backfill, and its
 			// child could otherwise sell the now-flat account later.
 			return nil, fmt.Errorf("resolve legacy bracket parent for residual exit %s", order.OrderID)
 		}
+		if parentOrder.TradeID != tradeID {
+			return nil, nil
+		}
 		if order.OrderType == "" {
 			return nil, fmt.Errorf("resolve legacy bracket child role for residual exit %s", order.OrderID)
 		}
-		return &residualExitOwnership{parentOrderID: order.ParentOrderID, childType: order.OrderType}, nil
+		return &residualExitOwnership{parentOrderID: order.ParentOrderID, childType: canonicalResidualOrderType(order.OrderType)}, nil
 	}
 	parent, err := store.GetStockEntryOrderIntent(ctx, tradeID)
 	if err != nil {
@@ -970,6 +973,19 @@ func residualExitIntentForTrade(ctx context.Context, executor execution.Executor
 		}
 	}
 	return nil, nil
+}
+
+func canonicalResidualOrderType(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "lmt", "limit":
+		return "limit"
+	case "stp", "stop":
+		return "stop"
+	case "stp lmt", "stp_lmt", "stop_limit", "stop limit":
+		return "stop_limit"
+	default:
+		return strings.ToLower(strings.TrimSpace(raw))
+	}
 }
 
 func residualOwnershipForIntent(ctx context.Context, brokerOrderID string, intent *store.StockOrderIntent) (*residualExitOwnership, error) {

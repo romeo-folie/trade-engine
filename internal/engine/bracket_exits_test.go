@@ -179,6 +179,14 @@ func TestResidualOwnershipStandaloneReplacementDoesNotInventBracketParent(t *tes
 	}
 }
 
+func TestCanonicalResidualOrderType(t *testing.T) {
+	for raw, want := range map[string]string{"LMT": "limit", "STP": "stop", "STP LMT": "stop_limit", "stop_limit": "stop_limit"} {
+		if got := canonicalResidualOrderType(raw); got != want {
+			t.Errorf("canonicalResidualOrderType(%q) = %q, want %q", raw, got, want)
+		}
+	}
+}
+
 func (f *fakeBracketExec) GetAccount(_ context.Context) (execution.AccountInfo, error) {
 	return execution.AccountInfo{}, nil
 }
