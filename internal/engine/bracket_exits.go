@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -764,6 +765,20 @@ func (e *Engine) cancelResidualEngineExitOrders(
 	if err != nil {
 		return fmt.Errorf("list working broker exits: %w", err)
 	}
+	return cancelResidualEngineExitOrdersFromInventory(ctx, e.executor, t, states, working)
+}
+
+// cancelResidualEngineExitOrdersFromInventory applies the residual cleanup to
+// one already-complete broker inventory. A claimed-exit batch shares that
+// inventory so it does not repeat the account-wide working-order request for
+// every trade before taking its shared position proof.
+func cancelResidualEngineExitOrdersFromInventory(
+	ctx context.Context,
+	executor execution.Executor,
+	t store.Trade,
+	states []legState,
+	working []execution.WorkingOrder,
+) error {
 	known := make(map[string]struct{}, len(states))
 	for _, state := range states {
 		known[state.leg.BrokerOrderID] = struct{}{}
@@ -782,7 +797,7 @@ func (e *Engine) cancelResidualEngineExitOrders(
 		var ownership *residualExitOwnership
 		if !projected {
 			var ownershipErr error
-			ownership, ownershipErr = residualExitIntentForTrade(ctx, e.executor, t.ID, order)
+			ownership, ownershipErr = residualExitIntentForTrade(ctx, executor, t.ID, order)
 			if ownershipErr != nil {
 				cleanupErrs = append(cleanupErrs, ownershipErr)
 				continue
@@ -805,8 +820,8 @@ func (e *Engine) cancelResidualEngineExitOrders(
 			cleanupErrs = append(cleanupErrs, fmt.Errorf("load residual exit %s after projection: %w", order.OrderID, err))
 			continue
 		}
-		cancelErr := e.executor.CancelOrder(ctx, order.OrderID)
-		status, statusErr := e.executor.GetOrderStatus(ctx, order.OrderID)
+		cancelErr := executor.CancelOrder(ctx, order.OrderID)
+		status, statusErr := executor.GetOrderStatus(ctx, order.OrderID)
 		if errors.Is(statusErr, execution.ErrOrderNotFound) {
 			cleanupErrs = append(cleanupErrs, fmt.Errorf("confirm residual exit %s cancellation: broker no longer has order", order.OrderID))
 			continue
@@ -835,6 +850,38 @@ func (e *Engine) cancelResidualEngineExitOrders(
 	return errors.Join(cleanupErrs...)
 }
 
+// newClaimedResidualExitGuard loads one complete working-order inventory for a
+// claimed reconciliation batch, then checks each terminal trade against that
+// same snapshot. It is shared by the engine ticker and the one-shot reconciler
+// so neither can finalize a market exit around an unprojected protective leg.
+func newClaimedResidualExitGuard(executor execution.Executor) claimedExitFinalizationGuard {
+	lister, ok := executor.(execution.WorkingOrdersLister)
+	if !ok {
+		return nil
+	}
+	var (
+		once    sync.Once
+		working []execution.WorkingOrder
+		loadErr error
+	)
+	return func(ctx context.Context, tradeID string) error {
+		once.Do(func() {
+			working, loadErr = lister.GetWorkingOrders(ctx)
+		})
+		if loadErr != nil {
+			return fmt.Errorf("list working broker exits: %w", loadErr)
+		}
+		trade, err := store.GetTradeByID(ctx, tradeID)
+		if err != nil {
+			return fmt.Errorf("load claimed trade: %w", err)
+		}
+		if trade == nil {
+			return errors.New("claimed trade missing")
+		}
+		return cancelResidualEngineExitOrdersFromInventory(ctx, executor, *trade, nil, working)
+	}
+}
+
 type residualExitOwnership struct {
 	intent        *store.StockOrderIntent
 	parentOrderID string
@@ -853,6 +900,11 @@ func residualExitIntentForTrade(ctx context.Context, executor execution.Executor
 	if intent != nil && intent.TradeID == tradeID {
 		return residualOwnershipForIntent(ctx, order.OrderID, intent)
 	}
+	if intent != nil {
+		// An exact durable broker ID is conclusive ownership. Do not fall
+		// through to the parent lineage of another pyramided lot.
+		return nil, nil
+	}
 	if order.TradeID != "" {
 		intent, err = store.GetStockOrderIntentByClientOrderID(ctx, order.TradeID)
 		if err != nil {
@@ -860,6 +912,11 @@ func residualExitIntentForTrade(ctx context.Context, executor execution.Executor
 		}
 		if intent != nil && intent.TradeID == tradeID {
 			return residualOwnershipForIntent(ctx, order.OrderID, intent)
+		}
+		if intent != nil {
+			// As above, another trade's exact client intent must be ignored,
+			// not treated as an ambiguous same-ticker residual.
+			return nil, nil
 		}
 	}
 	if order.ParentOrderID != "" {
@@ -907,7 +964,11 @@ func residualExitIntentForTrade(ctx context.Context, executor execution.Executor
 
 func residualOwnershipForIntent(ctx context.Context, brokerOrderID string, intent *store.StockOrderIntent) (*residualExitOwnership, error) {
 	ownership := &residualExitOwnership{intent: intent}
-	if intent.ParentIntentID == "" {
+	// Only broker-projected bracket children use their durable parent as the
+	// broker bracket parent. A standalone stop replacement also has a
+	// ParentIntentID (its predecessor), but it remains a DAY/whole-share stop
+	// according to its own submission policy.
+	if intent.ParentIntentID == "" || intent.Purpose != "broker_projection" {
 		return ownership, nil
 	}
 	parent, err := store.GetStockOrderIntentByID(ctx, intent.ParentIntentID)

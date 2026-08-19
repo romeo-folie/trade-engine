@@ -923,6 +923,48 @@ func TestExitReconcileTakesSharedSnapshotAfterAllResidualGuards(t *testing.T) {
 	}
 }
 
+func TestExitReconcileWithStoreCancelsResidualBeforeFinalizingClaim(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "RESIDUAL", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 3,
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	t.Cleanup(func() { _, _ = store.GetDB().Exec(context.Background(), `DELETE FROM trades WHERE id=$1`, tradeID) })
+	if claimed, err := store.ClaimTradeExitWithIntent(ctx, tradeID, store.ExitIntent{Reason: store.ExitReasonStopLoss}); err != nil || !claimed {
+		t.Fatalf("ClaimTradeExitWithIntent = %v, %v", claimed, err)
+	}
+	marketID := "one-shot-market-" + tradeID[:8]
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: marketID, Ticker: "RESIDUAL", Side: "sell", OrderType: "market", Quantity: 3, Status: "pending",
+	}); err != nil {
+		t.Fatalf("InsertOrder market exit: %v", err)
+	}
+	residualID := "one-shot-residual-" + tradeID[:8]
+	persistExitIntent(t, tradeID, residualID, "one-shot-residual-client")
+	exec := &fakeBracketExec{
+		statuses: map[string]execution.OrderResult{
+			marketID:   {Status: "filled", FilledPrice: 99, FilledQty: 3},
+			residualID: {Status: "pending"},
+		},
+		working: []execution.WorkingOrder{{
+			OrderID: residualID, Ticker: "RESIDUAL", Side: "sell", Status: "pending", RemainingQty: 3,
+		}},
+	}
+	stats := ReconcileExitOrderFillsWithStore(ctx, exec, 100)
+	if stats.Errors == 0 || len(stats.Closed) != 0 || exec.workingCalls != 1 {
+		t.Fatalf("stats=%+v working calls=%d; want guarded, unfinalized one-shot reconcile", stats, exec.workingCalls)
+	}
+	trade, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || trade == nil || trade.Status != "exiting" {
+		t.Fatalf("trade after guarded one-shot reconcile = %+v, %v", trade, err)
+	}
+}
+
 func TestClaimedExitPositionSnapshotRejectsSubCentResidual(t *testing.T) {
 	snapshot := claimedExitPositionSnapshot{
 		brokerQty: map[string]float64{"AAPL": -0.005},

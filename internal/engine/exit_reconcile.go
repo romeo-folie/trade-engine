@@ -3,7 +3,6 @@ package engine
 import (
 	"context"
 	"errors"
-	"fmt"
 	"math"
 	"strings"
 	"time"
@@ -952,7 +951,11 @@ func recoverOrderlessExits(
 // package-level store functions. Called from the engine's monitor loop and
 // the one-shot cmd/reconcile-exits tool.
 func ReconcileExitOrderFillsWithStore(ctx context.Context, executor exitReconcileExecutor, limit int) ExitReconcileStats {
-	return ReconcileExitOrderFills(ctx, executor, exitStoreAdapter{}, limit)
+	var guard claimedExitFinalizationGuard
+	if fullExecutor, ok := executor.(execution.Executor); ok {
+		guard = newClaimedResidualExitGuard(fullExecutor)
+	}
+	return reconcileExitOrderFills(ctx, executor, exitStoreAdapter{}, limit, guard)
 }
 
 func ReconcileExitOrderFillsWithStoreAndLoss(
@@ -961,7 +964,11 @@ func ReconcileExitOrderFillsWithStoreAndLoss(
 	limit int,
 	recordLoss func(),
 ) ExitReconcileStats {
-	return ReconcileExitOrderFills(ctx, executor, exitStoreAdapter{}, limit, recordLoss)
+	var guard claimedExitFinalizationGuard
+	if fullExecutor, ok := executor.(execution.Executor); ok {
+		guard = newClaimedResidualExitGuard(fullExecutor)
+	}
+	return reconcileExitOrderFills(ctx, executor, exitStoreAdapter{}, limit, guard, recordLoss)
 }
 
 func (e *Engine) runExitReconcileSweep(ctx context.Context) ExitReconcileStats {
@@ -1002,22 +1009,11 @@ func runExitReconcilePhases(
 }
 
 func (e *Engine) runClaimedExitReconcileSweepLimit(ctx context.Context, limit int) ExitReconcileStats {
-	stats := reconcileExitOrderFills(ctx, e.executor, exitStoreAdapter{}, limit, e.cleanupClaimedResidualExits, e.portfolio.RecordLoss)
+	stats := reconcileExitOrderFills(ctx, e.executor, exitStoreAdapter{}, limit, newClaimedResidualExitGuard(e.executor), e.portfolio.RecordLoss)
 	for _, realized := range stats.Closed {
 		e.publishTradeClosed(realized)
 	}
 	return stats
-}
-
-func (e *Engine) cleanupClaimedResidualExits(ctx context.Context, tradeID string) error {
-	trade, err := store.GetTradeByID(ctx, tradeID)
-	if err != nil {
-		return fmt.Errorf("load claimed trade: %w", err)
-	}
-	if trade == nil {
-		return errors.New("claimed trade missing")
-	}
-	return e.cancelResidualEngineExitOrders(ctx, *trade, nil)
 }
 
 func (e *Engine) reconcileBrokerManagedExitFills(ctx context.Context) int {

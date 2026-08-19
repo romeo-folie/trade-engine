@@ -19,21 +19,22 @@ import (
 
 // fakeBracketExec serves canned order statuses and records cancels/orders.
 type fakeBracketExec struct {
-	statuses    map[string]execution.OrderResult
-	statusErr   map[string]error
-	cancelErr   map[string]error
-	cancelled   []string
-	placed      []execution.OrderRequest
-	placeRes    execution.OrderResult
-	placeErr    error
-	onStatus    func(string)
-	onPlace     func(execution.OrderRequest)
-	positions   []execution.Position
-	positionErr error
-	working     []execution.WorkingOrder
-	workingErr  error
-	clientOrder map[string]execution.OrderResult
-	clientErr   map[string]error
+	statuses     map[string]execution.OrderResult
+	statusErr    map[string]error
+	cancelErr    map[string]error
+	cancelled    []string
+	placed       []execution.OrderRequest
+	placeRes     execution.OrderResult
+	placeErr     error
+	onStatus     func(string)
+	onPlace      func(execution.OrderRequest)
+	positions    []execution.Position
+	positionErr  error
+	working      []execution.WorkingOrder
+	workingErr   error
+	workingCalls int
+	clientOrder  map[string]execution.OrderResult
+	clientErr    map[string]error
 }
 
 type recoverFailureBracketExec struct{ *fakeBracketExec }
@@ -89,10 +90,45 @@ func (f *fakeBracketExec) GetPositions(_ context.Context) ([]execution.Position,
 }
 
 func (f *fakeBracketExec) GetWorkingOrders(context.Context) ([]execution.WorkingOrder, error) {
+	f.workingCalls++
 	if f.workingErr != nil {
 		return nil, f.workingErr
 	}
 	return append([]execution.WorkingOrder(nil), f.working...), nil
+}
+
+func TestResidualExitIntentSkipsDurablyOwnedPyramidedLot(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{Ticker: "RESIDUAL", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 3})
+	if err != nil {
+		t.Fatalf("InsertTrade target: %v", err)
+	}
+	otherTradeID, err := store.InsertTrade(ctx, store.Trade{Ticker: "RESIDUAL", Direction: "long", Strategy: "test", EntryPrice: 101, Quantity: 3})
+	if err != nil {
+		t.Fatalf("InsertTrade other: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), `DELETE FROM trades WHERE id = ANY($1::uuid[])`, []string{tradeID, otherTradeID})
+	})
+	brokerID := "other-lot-exit-" + otherTradeID[:8]
+	persistExitIntent(t, otherTradeID, brokerID, "other-lot-client")
+
+	ownership, err := residualExitIntentForTrade(ctx, &fakeBracketExec{}, tradeID, execution.WorkingOrder{OrderID: brokerID})
+	if err != nil || ownership != nil {
+		t.Fatalf("other lot ownership = %+v, %v; want no ownership without an error", ownership, err)
+	}
+}
+
+func TestResidualOwnershipStandaloneReplacementDoesNotInventBracketParent(t *testing.T) {
+	ownership, err := residualOwnershipForIntent(context.Background(), "replacement-stop", &store.StockOrderIntent{
+		ParentIntentID: "predecessor-intent", Purpose: "submit", OrderType: "stop",
+	})
+	if err != nil || ownership == nil || ownership.parentOrderID != "" {
+		t.Fatalf("standalone replacement ownership = %+v, %v; want no bracket parent", ownership, err)
+	}
 }
 
 func (f *fakeBracketExec) GetAccount(_ context.Context) (execution.AccountInfo, error) {
