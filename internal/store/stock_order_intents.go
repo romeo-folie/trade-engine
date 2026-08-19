@@ -188,6 +188,24 @@ func GetStockOrderIntentByKey(ctx context.Context, key string) (*StockOrderInten
 	return &in, rows.Err()
 }
 
+// GetStockOrderIntentByID resolves a durable intent lineage node. It is used
+// when a broker child is known directly but its local order projection was
+// lost: the parent provides the bracket's actual broker parent identity.
+func GetStockOrderIntentByID(ctx context.Context, id string) (*StockOrderIntent, error) {
+	var in StockOrderIntent
+	err := GetDB().QueryRow(ctx, `
+        SELECT id, idempotency_key, client_order_id, COALESCE(trade_id::text,''), COALESCE(parent_intent_id::text,''), purpose, ticker, side, order_type, requested_qty, request_payload, payload_hash, COALESCE(broker_order_id,''), status, COALESCE(filled_price,0), filled_qty, COALESCE(broker_error,''), COALESCE(broker_request_id,''), submitted_at, last_checked_at, created_at, updated_at
+        FROM stock_order_intents WHERE id=$1::uuid`, id,
+	).Scan(&in.ID, &in.IdempotencyKey, &in.ClientOrderID, &in.TradeID, &in.ParentIntentID, &in.Purpose, &in.Ticker, &in.Side, &in.OrderType, &in.RequestedQty, &in.RequestPayload, &in.PayloadHash, &in.BrokerOrderID, &in.Status, &in.FilledPrice, &in.FilledQty, &in.BrokerError, &in.BrokerRequestID, &in.SubmittedAt, &in.LastCheckedAt, &in.CreatedAt, &in.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &in, nil
+}
+
 // GetStockOrderIntentByClientOrderID resolves the durable request that owns a
 // broker-provided client order ID. Alpaca bracket children inherit their
 // parent's client ID, so this is also the safe ownership link when a child
@@ -220,7 +238,7 @@ func GetStockEntryOrderIntent(ctx context.Context, tradeID string) (*StockOrderI
         SELECT i.id, i.idempotency_key, i.client_order_id, COALESCE(i.trade_id::text,''), COALESCE(i.parent_intent_id::text,''), i.purpose, i.ticker, i.side, i.order_type, i.requested_qty, i.request_payload, i.payload_hash, COALESCE(i.broker_order_id,''), i.status, COALESCE(i.filled_price,0), i.filled_qty, COALESCE(i.broker_error,''), COALESCE(i.broker_request_id,''), i.submitted_at, i.last_checked_at, i.created_at, i.updated_at
         FROM stock_order_intents i
         JOIN trades t ON t.id=i.trade_id
-        WHERE i.trade_id=$1::uuid AND i.purpose='submit'
+        WHERE i.trade_id=$1::uuid AND i.purpose IN ('submit','broker_projection')
           AND ((t.direction='long' AND i.side='buy') OR (t.direction='short' AND i.side='sell'))
         ORDER BY i.created_at DESC LIMIT 1`, tradeID,
 	).Scan(&in.ID, &in.IdempotencyKey, &in.ClientOrderID, &in.TradeID, &in.ParentIntentID, &in.Purpose, &in.Ticker, &in.Side, &in.OrderType, &in.RequestedQty, &in.RequestPayload, &in.PayloadHash, &in.BrokerOrderID, &in.Status, &in.FilledPrice, &in.FilledQty, &in.BrokerError, &in.BrokerRequestID, &in.SubmittedAt, &in.LastCheckedAt, &in.CreatedAt, &in.UpdatedAt)

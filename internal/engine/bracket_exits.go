@@ -762,8 +762,9 @@ func (e *Engine) cancelResidualEngineExitOrders(
 	if t.Direction == "short" {
 		wantSide = string(execution.OrderSideBuy)
 	}
+	var cleanupErrs []error
 	for _, order := range working {
-		if !strings.EqualFold(order.Ticker, t.Ticker) ||
+		if normalizedTicker(order.Ticker) != normalizedTicker(t.Ticker) ||
 			!strings.EqualFold(order.Side, wantSide) || order.OrderID == "" {
 			continue
 		}
@@ -773,7 +774,8 @@ func (e *Engine) cancelResidualEngineExitOrders(
 			var ownershipErr error
 			ownership, ownershipErr = residualExitIntentForTrade(ctx, e.executor, t.ID, order)
 			if ownershipErr != nil {
-				return ownershipErr
+				cleanupErrs = append(cleanupErrs, ownershipErr)
+				continue
 			}
 			if ownership == nil {
 				// This may belong to another pyramided lot or to the user. Never
@@ -781,7 +783,8 @@ func (e *Engine) cancelResidualEngineExitOrders(
 				continue
 			}
 			if err := persistResidualExitOrder(ctx, t, order, ownership); err != nil {
-				return err
+				cleanupErrs = append(cleanupErrs, err)
+				continue
 			}
 		}
 		persisted, err := store.GetOrderByBrokerOrderID(ctx, order.OrderID)
@@ -789,32 +792,37 @@ func (e *Engine) cancelResidualEngineExitOrders(
 			if err == nil {
 				err = errors.New("missing durable order projection")
 			}
-			return fmt.Errorf("load residual exit %s after projection: %w", order.OrderID, err)
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("load residual exit %s after projection: %w", order.OrderID, err))
+			continue
 		}
 		cancelErr := e.executor.CancelOrder(ctx, order.OrderID)
 		status, statusErr := e.executor.GetOrderStatus(ctx, order.OrderID)
 		if errors.Is(statusErr, execution.ErrOrderNotFound) {
-			return fmt.Errorf("confirm residual exit %s cancellation: broker no longer has order", order.OrderID)
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("confirm residual exit %s cancellation: broker no longer has order", order.OrderID))
+			continue
 		}
 		if statusErr != nil {
-			return fmt.Errorf("confirm residual exit %s cancellation: cancel=%v status=%w",
-				order.OrderID, cancelErr, statusErr)
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("confirm residual exit %s cancellation: cancel=%v status=%w",
+				order.OrderID, cancelErr, statusErr))
+			continue
 		}
 		normalized := normalizeBrokerExitStatus(*persisted, status.Status)
 		if normalized == "filled" || status.FilledQty > 1e-9 ||
 			(normalized != "cancelled" && normalized != "rejected") {
-			return fmt.Errorf("residual exit %s remains %s after cancel (cancel error: %v)",
-				order.OrderID, status.Status, cancelErr)
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("residual exit %s remains %s after cancel (cancel error: %v)",
+				order.OrderID, status.Status, cancelErr))
+			continue
 		}
 		if err := store.UpdateOrderFillAtForBrokerOrder(ctx, persisted.ID, order.OrderID,
 			status.FilledPrice, 0, normalized, status.FilledAt); err != nil {
-			return fmt.Errorf("persist residual exit %s terminal cancellation: %w", order.OrderID, err)
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("persist residual exit %s terminal cancellation: %w", order.OrderID, err))
+			continue
 		}
 		logger.Warn("bracket exits: cancelled residual engine exit after flatten",
 			"trade_id", t.ID, "ticker", t.Ticker,
 			"broker_order_id", order.OrderID)
 	}
-	return nil
+	return errors.Join(cleanupErrs...)
 }
 
 type residualExitOwnership struct {
@@ -833,7 +841,7 @@ func residualExitIntentForTrade(ctx context.Context, executor execution.Executor
 		return nil, fmt.Errorf("find residual exit %s by broker ID: %w", order.OrderID, err)
 	}
 	if intent != nil && intent.TradeID == tradeID {
-		return &residualExitOwnership{intent: intent}, nil
+		return residualOwnershipForIntent(ctx, order.OrderID, intent)
 	}
 	if order.TradeID != "" {
 		intent, err = store.GetStockOrderIntentByClientOrderID(ctx, order.TradeID)
@@ -841,7 +849,7 @@ func residualExitIntentForTrade(ctx context.Context, executor execution.Executor
 			return nil, fmt.Errorf("find residual exit %s by client ID: %w", order.OrderID, err)
 		}
 		if intent != nil && intent.TradeID == tradeID {
-			return &residualExitOwnership{intent: intent}, nil
+			return residualOwnershipForIntent(ctx, order.OrderID, intent)
 		}
 	}
 	parent, err := store.GetStockEntryOrderIntent(ctx, tradeID)
@@ -871,6 +879,26 @@ func residualExitIntentForTrade(ctx context.Context, executor execution.Executor
 	return nil, nil
 }
 
+func residualOwnershipForIntent(ctx context.Context, brokerOrderID string, intent *store.StockOrderIntent) (*residualExitOwnership, error) {
+	ownership := &residualExitOwnership{intent: intent}
+	if intent.ParentIntentID == "" {
+		return ownership, nil
+	}
+	parent, err := store.GetStockOrderIntentByID(ctx, intent.ParentIntentID)
+	if err != nil {
+		return nil, fmt.Errorf("find durable parent for residual exit %s: %w", brokerOrderID, err)
+	}
+	if parent == nil || parent.BrokerOrderID == "" {
+		return nil, fmt.Errorf("find durable parent for residual exit %s: missing broker parent ID", brokerOrderID)
+	}
+	ownership.parentOrderID = parent.BrokerOrderID
+	ownership.childType = intent.OrderType
+	if ownership.childType == "" {
+		return nil, fmt.Errorf("find durable parent for residual exit %s: child has no type", brokerOrderID)
+	}
+	return ownership, nil
+}
+
 // persistResidualExitOrder gives the ordinary claimed-exit reconciler durable
 // ownership of an unprojected order before cancellation. If cancellation is
 // asynchronous or the order filled meanwhile, the trade cannot be finalized
@@ -897,7 +925,15 @@ func persistResidualExitOrder(ctx context.Context, t store.Trade, order executio
 		Side: order.Side, OrderType: intent.OrderType, Quantity: quantity,
 		Status: "pending", IsStopLoss: intent.OrderType == string(execution.OrderTypeStop),
 	}
-	if intent.BrokerOrderID == order.OrderID {
+	if ownership.parentOrderID != "" {
+		// This durable child already has its own intent, but its order row was
+		// lost. Keep both the child intent and its real bracket metadata.
+		projection.StockIntentID = intent.ID
+		projection.ParentOrderID = ownership.parentOrderID
+		projection.OrderType = ownership.childType
+		projection.IsStopLoss = strings.EqualFold(ownership.childType, string(execution.OrderTypeStop))
+		projection.IsTakeProfit = strings.EqualFold(ownership.childType, string(execution.OrderTypeLimit))
+	} else if intent.BrokerOrderID == order.OrderID {
 		// The child/standalone intent is this exact broker order.
 		projection.StockIntentID = intent.ID
 	} else {
