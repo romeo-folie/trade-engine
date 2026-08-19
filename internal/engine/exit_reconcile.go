@@ -589,19 +589,28 @@ func reconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 
 	positionSnapshot := claimedExitPositionSnapshot{}
 	positionSnapshotLoaded := false
+	// Residual cleanup can itself change broker truth (for example a child can
+	// fill while cancellation is being confirmed). Complete it for the whole
+	// claimed batch before taking the one shared position snapshot; otherwise a
+	// later cleanup could make that proof stale before its trade finalizes.
+	if guard != nil {
+		for tradeID, state := range terminalTrades {
+			if !state.canFinalize || state.remaining > 1e-9 {
+				continue
+			}
+			if err := guard(ctx, tradeID); err != nil {
+				stats.Errors++
+				state.canFinalize = false
+				logger.Error("exit reconcile: residual exit cleanup blocks finalization",
+					"trade_id", tradeID, "ticker", state.ticker, "err", err)
+			}
+		}
+	}
 	for tradeID, state := range terminalTrades {
 		if !state.canFinalize {
 			continue
 		}
 		if state.remaining <= 1e-9 {
-			if guard != nil {
-				if err := guard(ctx, tradeID); err != nil {
-					stats.Errors++
-					logger.Error("exit reconcile: residual exit cleanup blocks finalization",
-						"trade_id", tradeID, "ticker", state.ticker, "err", err)
-					continue
-				}
-			}
 			if !positionSnapshotLoaded {
 				positionSnapshot = loadClaimedExitPositionSnapshot(ctx, executor, db)
 				positionSnapshotLoaded = true

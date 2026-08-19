@@ -461,10 +461,14 @@ type recoveryExitExecutor struct {
 	positions     []execution.Position
 	working       []execution.WorkingOrder
 	positionCalls int
+	onPositions   func()
 }
 
 func (f *recoveryExitExecutor) GetPositions(context.Context) ([]execution.Position, error) {
 	f.positionCalls++
+	if f.onPositions != nil {
+		f.onPositions()
+	}
 	return f.positions, nil
 }
 
@@ -891,6 +895,31 @@ func TestExitReconcileUsesOnePositionSnapshotForTerminalClaimedBatch(t *testing.
 	}
 	if ex.positionCalls != 1 {
 		t.Fatalf("GetPositions calls = %d, want one per sweep", ex.positionCalls)
+	}
+}
+
+func TestExitReconcileTakesSharedSnapshotAfterAllResidualGuards(t *testing.T) {
+	p1 := lacExit()
+	p1.TradeStatus, p1.Quantity, p1.OrderQuantity = "exiting", 5, 5
+	p2 := p1
+	p2.TradeID, p2.OrderID, p2.BrokerOrderID, p2.Ticker = "t2", "o2", "b2", "MSFT"
+	db := &recoveryExitStore{fakeExitStore: newFakeExitStore(p1, p2)}
+	guarded := map[string]bool{}
+	ex := &recoveryExitExecutor{fakeExitExecutor: &fakeExitExecutor{results: map[string]execution.OrderResult{
+		"b1": {Status: "filled", FilledPrice: 3.82, FilledQty: 5},
+		"b2": {Status: "filled", FilledPrice: 3.82, FilledQty: 5},
+	}}}
+	ex.onPositions = func() {
+		if !guarded[p1.TradeID] || !guarded[p2.TradeID] {
+			t.Fatal("shared position snapshot was loaded before all residual guards")
+		}
+	}
+	stats := reconcileExitOrderFills(context.Background(), ex, db, 0, func(_ context.Context, tradeID string) error {
+		guarded[tradeID] = true
+		return nil
+	})
+	if len(stats.Closed) != 2 || stats.Errors != 0 || ex.positionCalls != 1 {
+		t.Fatalf("stats=%+v position calls=%d", stats, ex.positionCalls)
 	}
 }
 
