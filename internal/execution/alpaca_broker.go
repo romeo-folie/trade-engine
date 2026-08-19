@@ -313,6 +313,8 @@ func (b *AlpacaBroker) GetWorkingOrders(ctx context.Context) ([]WorkingOrder, er
 			Side:          o.Side,
 			Status:        NormalizeOrderStatus(o.Status),
 			RemainingQty:  qty - filled,
+			Quantity:      qty,
+			FilledQty:     filled,
 			Price:         px,
 			StopPrice:     stopPx,
 		})

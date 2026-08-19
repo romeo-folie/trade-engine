@@ -232,6 +232,8 @@ type WorkingOrder struct {
 	Side          string  // "buy" | "sell"
 	Status        string  // normalized: pending | partial (only working orders are returned)
 	RemainingQty  float64 // quantity still working
+	Quantity      float64 // original requested quantity when exposed
+	FilledQty     float64 // cumulative quantity already filled
 	Price         float64 // limit price (0 if none / not exposed)
 	StopPrice     float64 // stop trigger price (0 if none / not exposed)
 }

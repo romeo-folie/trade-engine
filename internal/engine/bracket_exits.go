@@ -816,6 +816,9 @@ func cancelResidualEngineExitOrdersFromInventory(
 			}
 		}
 		persisted, err := store.GetOrderByBrokerOrderID(ctx, order.OrderID)
+		if ownership != nil && ownership.allocation != nil {
+			persisted, err = ownership.allocation, nil
+		}
 		if err != nil || persisted == nil {
 			if err == nil {
 				err = errors.New("missing durable order projection")
@@ -887,6 +890,7 @@ func newClaimedResidualExitGuard(executor execution.Executor) claimedExitFinaliz
 
 type residualExitOwnership struct {
 	intent        *store.StockOrderIntent
+	allocation    *store.Order
 	parentOrderID string
 	childType     string
 }
@@ -933,7 +937,7 @@ func residualExitIntentForTrade(ctx context.Context, executor execution.Executor
 			return nil, fmt.Errorf("find aggregate residual allocation %s: %w", order.OrderID, err)
 		}
 		if allocation != nil {
-			return &residualExitOwnership{}, nil
+			return &residualExitOwnership{allocation: allocation}, nil
 		}
 		return nil, fmt.Errorf("resolve aggregate residual exit %s: missing closing-trade allocation", order.OrderID)
 	}
@@ -1044,7 +1048,10 @@ func persistResidualExitOrder(ctx context.Context, t store.Trade, order executio
 		}
 		return nil
 	}
-	quantity := order.RemainingQty
+	quantity := order.Quantity
+	if quantity <= 0 {
+		quantity = order.RemainingQty + order.FilledQty
+	}
 	if quantity <= 0 && intent != nil {
 		quantity = intent.RequestedQty
 	}
