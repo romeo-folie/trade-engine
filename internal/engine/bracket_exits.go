@@ -523,6 +523,9 @@ func (e *Engine) brokerAndOwnedTickerQuantities(ctx context.Context, ticker stri
 	}
 	ticker = normalizedTicker(ticker)
 	for _, p := range positions {
+		if isNumericBrokerTicker(p.Ticker) {
+			return 0, 0, fmt.Errorf("broker position %q has unresolved contract identity", p.Ticker)
+		}
 		if normalizedTicker(p.Ticker) != ticker {
 			continue
 		}
@@ -922,6 +925,16 @@ func residualExitIntentForTrade(ctx context.Context, executor execution.Executor
 			return nil, nil
 		}
 	}
+	if tradeLessIntent {
+		allocation, err := store.GetOrderByStockIntentAndTrade(ctx, intent.ID, tradeID)
+		if err != nil {
+			return nil, fmt.Errorf("find aggregate residual allocation %s: %w", order.OrderID, err)
+		}
+		if allocation != nil {
+			return &residualExitOwnership{}, nil
+		}
+		return nil, fmt.Errorf("resolve aggregate residual exit %s: missing closing-trade allocation", order.OrderID)
+	}
 	if existing, err := store.GetOrderByBrokerOrderID(ctx, order.OrderID); err != nil {
 		return nil, fmt.Errorf("find residual exit %s durable order: %w", order.OrderID, err)
 	} else if existing != nil {
@@ -931,9 +944,6 @@ func residualExitIntentForTrade(ctx context.Context, executor execution.Executor
 			return nil, nil
 		}
 		return &residualExitOwnership{}, nil
-	}
-	if tradeLessIntent {
-		return nil, fmt.Errorf("resolve aggregate residual exit %s: missing durable trade allocation", order.OrderID)
 	}
 	if order.ParentOrderID != "" {
 		parentOrder, err := store.GetOrderByBrokerOrderID(ctx, order.ParentOrderID)
