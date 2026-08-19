@@ -893,6 +893,7 @@ type residualExitOwnership struct {
 // child that escaped projection is resolved from the nested durable parent
 // snapshot, never by guessing that its client ID equals the parent's.
 func residualExitIntentForTrade(ctx context.Context, executor execution.Executor, tradeID string, order execution.WorkingOrder) (*residualExitOwnership, error) {
+	tradeLessIntent := false
 	intent, err := store.GetStockOrderIntentByBrokerOrderID(ctx, order.OrderID)
 	if err != nil {
 		return nil, fmt.Errorf("find residual exit %s by broker ID: %w", order.OrderID, err)
@@ -900,7 +901,9 @@ func residualExitIntentForTrade(ctx context.Context, executor execution.Executor
 	if intent != nil && intent.TradeID == tradeID {
 		return residualOwnershipForIntent(ctx, order.OrderID, intent)
 	}
-	if intent != nil {
+	if intent != nil && intent.TradeID == "" {
+		tradeLessIntent = true
+	} else if intent != nil {
 		// An exact durable broker ID is conclusive ownership. Do not fall
 		// through to the parent lineage of another pyramided lot.
 		return nil, nil
@@ -928,6 +931,9 @@ func residualExitIntentForTrade(ctx context.Context, executor execution.Executor
 			return nil, nil
 		}
 		return &residualExitOwnership{}, nil
+	}
+	if tradeLessIntent {
+		return nil, fmt.Errorf("resolve aggregate residual exit %s: missing durable trade allocation", order.OrderID)
 	}
 	if order.ParentOrderID != "" {
 		parentOrder, err := store.GetOrderByBrokerOrderID(ctx, order.ParentOrderID)

@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"strings"
 	"time"
@@ -707,6 +708,9 @@ func loadClaimedExitPositionSnapshot(
 		brokerQty: make(map[string]float64), ownedQty: make(map[string]float64), checked: true,
 	}
 	for _, position := range positions {
+		if isNumericBrokerTicker(position.Ticker) {
+			return claimedExitPositionSnapshot{checked: true, err: fmt.Errorf("broker position %q has unresolved contract identity", position.Ticker)}
+		}
 		qty := position.Quantity
 		if position.Side == "short" && qty > 0 {
 			qty = -qty
@@ -721,6 +725,19 @@ func loadClaimedExitPositionSnapshot(
 		snapshot.ownedQty[normalizedTicker(trade.Ticker)] += qty
 	}
 	return snapshot
+}
+
+func isNumericBrokerTicker(ticker string) bool {
+	ticker = strings.TrimSpace(ticker)
+	if ticker == "" {
+		return false
+	}
+	for _, r := range ticker {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func (s claimedExitPositionSnapshot) matches(ticker string) (matched, checked bool, err error) {
