@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -19,6 +20,12 @@ import (
 // exercise a transient durable-policy read failure without taking down the
 // shared database pool.
 var stockEntryBrokerProtection = store.StockEntryBrokerProtection
+
+// positionSafetyQuantityEpsilon only absorbs floating-point transport noise.
+// It is deliberately far below the broker's fractional-share precision: a
+// nonzero residual position must block exit finalization rather than being
+// treated like ordinary drift-alert rounding.
+const positionSafetyQuantityEpsilon = 1e-9
 
 // Broker-resident bracket exits (#435). The execution study measured the
 // stock path's hourly candle-close stop checks costing ~1.5%/trade: 49 of 53
@@ -489,17 +496,37 @@ func workingBrokerStopCoversTrade(states []legState, heldQty float64) bool {
 }
 
 func (e *Engine) brokerStillHoldsOwnedTickerQuantity(ctx context.Context, ticker string) (bool, error) {
-	positions, err := e.executor.GetPositions(ctx)
+	brokerQty, dbQty, err := e.brokerAndOwnedTickerQuantities(ctx, ticker)
 	if err != nil {
 		return false, err
+	}
+	const tolerance = 0.01
+	return dbQty != 0 && brokerQty*dbQty > 0 && math.Abs(brokerQty-dbQty) <= tolerance, nil
+}
+
+func (e *Engine) brokerMatchesOwnedTickerQuantity(ctx context.Context, ticker string) (bool, error) {
+	brokerQty, dbQty, err := e.brokerAndOwnedTickerQuantities(ctx, ticker)
+	if err != nil {
+		return false, err
+	}
+	return math.Abs(brokerQty-dbQty) <= positionSafetyQuantityEpsilon, nil
+}
+
+func (e *Engine) brokerAndOwnedTickerQuantities(ctx context.Context, ticker string) (brokerQty, dbQty float64, err error) {
+	positions, err := e.executor.GetPositions(ctx)
+	if err != nil {
+		return 0, 0, err
 	}
 	owned, err := store.GetOwnedPositionTrades(ctx)
 	if err != nil {
-		return false, err
+		return 0, 0, err
 	}
-	var brokerQty, dbQty float64
+	ticker = normalizedTicker(ticker)
 	for _, p := range positions {
-		if p.Ticker != ticker {
+		if isNumericBrokerTicker(p.Ticker) {
+			return 0, 0, fmt.Errorf("broker position %q has unresolved contract identity", p.Ticker)
+		}
+		if normalizedTicker(p.Ticker) != ticker {
 			continue
 		}
 		qty := p.Quantity
@@ -509,7 +536,7 @@ func (e *Engine) brokerStillHoldsOwnedTickerQuantity(ctx context.Context, ticker
 		brokerQty += qty
 	}
 	for _, trade := range owned {
-		if trade.Ticker != ticker {
+		if normalizedTicker(trade.Ticker) != ticker {
 			continue
 		}
 		qty := trade.Quantity
@@ -518,8 +545,15 @@ func (e *Engine) brokerStillHoldsOwnedTickerQuantity(ctx context.Context, ticker
 		}
 		dbQty += qty
 	}
-	const tolerance = 0.01
-	return dbQty != 0 && brokerQty*dbQty > 0 && math.Abs(brokerQty-dbQty) <= tolerance, nil
+	return brokerQty, dbQty, nil
+}
+
+func normalizedTicker(ticker string) string {
+	return strings.ToUpper(strings.TrimSpace(ticker))
+}
+
+func isStopLossOrderType(orderType string) bool {
+	return strings.EqualFold(orderType, string(execution.OrderTypeStop)) || strings.EqualFold(orderType, "stop_limit")
 }
 
 // fillPriceOf resolves a leg's fill price, falling back to the leg's own
@@ -671,6 +705,35 @@ func (e *Engine) closeBracketTradeLocked(
 			"trade_id", t.ID, "ticker", t.Ticker, "remaining_qty", remaining)
 		return true, fmt.Errorf("terminal broker fills left %.8f shares unreconciled", remaining)
 	}
+	// The fill that flattened this trade can race a previously unprojected
+	// broker stop. Local exit-leg rows are not a complete cancellation
+	// inventory after a projection/replacement failure, so inspect the broker's
+	// working orders before finalizing. Otherwise a leftover engine-owned SELL
+	// can fill into a flat account and open an unintended short (VOYG/TSM).
+	if err := e.cancelResidualEngineExitOrders(ctx, t, states); err != nil {
+		if claimed && !fillPersisted {
+			_ = store.ReleaseTradeExitClaim(ctx, t.ID)
+		}
+		logger.Warn("bracket exits: residual broker exit cleanup incomplete",
+			"trade_id", t.ID, "ticker", t.Ticker, "err", err)
+		return true, err
+	}
+	// A residual can fill between the winning-leg lookup and the working-order
+	// snapshot, at which point Alpaca no longer lists it as open. Finalization
+	// is safe only when the broker position still matches every durable owned
+	// lot for this ticker (including any other pyramided lots).
+	matched, err := e.brokerMatchesOwnedTickerQuantity(ctx, t.Ticker)
+	if err != nil || !matched {
+		if claimed && !fillPersisted {
+			_ = store.ReleaseTradeExitClaim(ctx, t.ID)
+		}
+		if err == nil {
+			err = errors.New("broker position differs from durable owned quantity")
+		}
+		logger.Warn("bracket exits: residual position safety check incomplete",
+			"trade_id", t.ID, "ticker", t.Ticker, "err", err)
+		return true, fmt.Errorf("verify broker position after residual exit cleanup: %w", err)
+	}
 	realized, err := store.FinalizeTradeExit(ctx, t.ID)
 	if err != nil {
 		logger.Warn("bracket exits: finalize broker-filled trade", "trade_id", t.ID, "err", err)
@@ -678,6 +741,359 @@ func (e *Engine) closeBracketTradeLocked(
 	}
 	e.recordBracketClose(t, realized, exitReason)
 	return true, nil
+}
+
+// cancelResidualEngineExitOrders retires working engine-owned exit orders that
+// escaped the local leg projection. It runs only after the winning exit has
+// durably reduced the tracked trade to zero, while the trade-order lock still
+// excludes trailing/protective-stop mutations.
+//
+// We intentionally do not cancel an arbitrary user order sharing a ticker:
+// unprojected orders must resolve to this exact trade through durable intent
+// ownership. Projected legs are also safe to cancel by broker ID.
+func (e *Engine) cancelResidualEngineExitOrders(
+	ctx context.Context,
+	t store.Trade,
+	states []legState,
+) error {
+	lister, ok := e.executor.(execution.WorkingOrdersLister)
+	if !ok {
+		// Brokers without a working-order view cannot provide the final
+		// inventory check. Their existing per-leg reconciliation remains the
+		// best available protection (the production Alpaca executor implements
+		// this interface).
+		return nil
+	}
+	working, err := lister.GetWorkingOrders(ctx)
+	if err != nil {
+		return fmt.Errorf("list working broker exits: %w", err)
+	}
+	return cancelResidualEngineExitOrdersFromInventory(ctx, e.executor, t, states, working)
+}
+
+// cancelResidualEngineExitOrdersFromInventory applies the residual cleanup to
+// one already-complete broker inventory. A claimed-exit batch shares that
+// inventory so it does not repeat the account-wide working-order request for
+// every trade before taking its shared position proof.
+func cancelResidualEngineExitOrdersFromInventory(
+	ctx context.Context,
+	executor execution.Executor,
+	t store.Trade,
+	states []legState,
+	working []execution.WorkingOrder,
+) error {
+	known := make(map[string]struct{}, len(states))
+	for _, state := range states {
+		known[state.leg.BrokerOrderID] = struct{}{}
+	}
+	wantSide := string(execution.OrderSideSell)
+	if t.Direction == "short" {
+		wantSide = string(execution.OrderSideBuy)
+	}
+	var cleanupErrs []error
+	for _, order := range working {
+		if normalizedTicker(order.Ticker) != normalizedTicker(t.Ticker) ||
+			!strings.EqualFold(order.Side, wantSide) || order.OrderID == "" {
+			continue
+		}
+		_, projected := known[order.OrderID]
+		var ownership *residualExitOwnership
+		if !projected {
+			var ownershipErr error
+			ownership, ownershipErr = residualExitIntentForTrade(ctx, executor, t.ID, order)
+			if ownershipErr != nil {
+				cleanupErrs = append(cleanupErrs, ownershipErr)
+				continue
+			}
+			if ownership == nil {
+				// This may belong to another pyramided lot or to the user. Never
+				// infer ownership from ticker, side, or an engine-looking ID.
+				continue
+			}
+			if err := persistResidualExitOrder(ctx, t, order, ownership); err != nil {
+				cleanupErrs = append(cleanupErrs, err)
+				continue
+			}
+		}
+		persisted, err := store.GetOrderByBrokerOrderID(ctx, order.OrderID)
+		if ownership != nil && ownership.allocation != nil {
+			persisted, err = ownership.allocation, nil
+		}
+		if err != nil || persisted == nil {
+			if err == nil {
+				err = errors.New("missing durable order projection")
+			}
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("load residual exit %s after projection: %w", order.OrderID, err))
+			continue
+		}
+		cancelErr := executor.CancelOrder(ctx, order.OrderID)
+		status, statusErr := executor.GetOrderStatus(ctx, order.OrderID)
+		if errors.Is(statusErr, execution.ErrOrderNotFound) {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("confirm residual exit %s cancellation: broker no longer has order", order.OrderID))
+			continue
+		}
+		if statusErr != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("confirm residual exit %s cancellation: cancel=%v status=%w",
+				order.OrderID, cancelErr, statusErr))
+			continue
+		}
+		normalized := normalizeBrokerExitStatus(*persisted, status.Status)
+		if normalized == "filled" || status.FilledQty > 1e-9 ||
+			(normalized != "cancelled" && normalized != "rejected") {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("residual exit %s remains %s after cancel (cancel error: %v)",
+				order.OrderID, status.Status, cancelErr))
+			continue
+		}
+		if err := store.UpdateOrderFillAtForBrokerOrder(ctx, persisted.ID, order.OrderID,
+			status.FilledPrice, 0, normalized, status.FilledAt); err != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("persist residual exit %s terminal cancellation: %w", order.OrderID, err))
+			continue
+		}
+		logger.Warn("bracket exits: cancelled residual engine exit after flatten",
+			"trade_id", t.ID, "ticker", t.Ticker,
+			"broker_order_id", order.OrderID)
+	}
+	return errors.Join(cleanupErrs...)
+}
+
+// newClaimedResidualExitGuard loads one complete working-order inventory for a
+// claimed reconciliation batch, then checks each terminal trade against that
+// same snapshot. It is shared by the engine ticker and the one-shot reconciler
+// so neither can finalize a market exit around an unprojected protective leg.
+func newClaimedResidualExitGuard(executor execution.Executor) claimedExitFinalizationGuard {
+	lister, ok := executor.(execution.WorkingOrdersLister)
+	if !ok {
+		return nil
+	}
+	var (
+		once    sync.Once
+		working []execution.WorkingOrder
+		loadErr error
+	)
+	return func(ctx context.Context, tradeID string) error {
+		once.Do(func() {
+			working, loadErr = lister.GetWorkingOrders(ctx)
+		})
+		if loadErr != nil {
+			return fmt.Errorf("list working broker exits: %w", loadErr)
+		}
+		trade, err := store.GetTradeByID(ctx, tradeID)
+		if err != nil {
+			return fmt.Errorf("load claimed trade: %w", err)
+		}
+		if trade == nil {
+			return errors.New("claimed trade missing")
+		}
+		return cancelResidualEngineExitOrdersFromInventory(ctx, executor, *trade, nil, working)
+	}
+}
+
+type residualExitOwnership struct {
+	intent        *store.StockOrderIntent
+	allocation    *store.Order
+	parentOrderID string
+	childType     string
+}
+
+// residualExitIntentForTrade proves a working order belongs to the trade being
+// closed. Bracket children receive their own broker-generated client IDs, so a
+// child that escaped projection is resolved from the nested durable parent
+// snapshot, never by guessing that its client ID equals the parent's.
+func residualExitIntentForTrade(ctx context.Context, executor execution.Executor, tradeID string, order execution.WorkingOrder) (*residualExitOwnership, error) {
+	tradeLessIntent := false
+	intent, err := store.GetStockOrderIntentByBrokerOrderID(ctx, order.OrderID)
+	if err != nil {
+		return nil, fmt.Errorf("find residual exit %s by broker ID: %w", order.OrderID, err)
+	}
+	if intent != nil && intent.TradeID == tradeID {
+		return residualOwnershipForIntent(ctx, order.OrderID, intent)
+	}
+	if intent != nil && intent.TradeID == "" {
+		tradeLessIntent = true
+	} else if intent != nil {
+		// An exact durable broker ID is conclusive ownership. Do not fall
+		// through to the parent lineage of another pyramided lot.
+		return nil, nil
+	}
+	if order.TradeID != "" {
+		intent, err = store.GetStockOrderIntentByClientOrderID(ctx, order.TradeID)
+		if err != nil {
+			return nil, fmt.Errorf("find residual exit %s by client ID: %w", order.OrderID, err)
+		}
+		if intent != nil && intent.TradeID == tradeID {
+			return residualOwnershipForIntent(ctx, order.OrderID, intent)
+		}
+		if intent != nil && intent.TradeID == "" {
+			tradeLessIntent = true
+		} else if intent != nil {
+			// As above, another trade's exact client intent must be ignored,
+			// not treated as an ambiguous same-ticker residual.
+			return nil, nil
+		}
+	}
+	if tradeLessIntent {
+		allocation, err := store.GetOrderByStockIntentAndTrade(ctx, intent.ID, tradeID)
+		if err != nil {
+			return nil, fmt.Errorf("find aggregate residual allocation %s: %w", order.OrderID, err)
+		}
+		if allocation != nil {
+			return &residualExitOwnership{allocation: allocation}, nil
+		}
+		return nil, fmt.Errorf("resolve aggregate residual exit %s: missing closing-trade allocation", order.OrderID)
+	}
+	if existing, err := store.GetOrderByBrokerOrderID(ctx, order.OrderID); err != nil {
+		return nil, fmt.Errorf("find residual exit %s durable order: %w", order.OrderID, err)
+	} else if existing != nil {
+		// Legacy bracket rows may predate stock-order intents. Their exact
+		// durable order ownership is equally conclusive for pyramided lots.
+		if existing.TradeID != tradeID {
+			return nil, nil
+		}
+		return &residualExitOwnership{}, nil
+	}
+	if order.ParentOrderID != "" {
+		parentOrder, err := store.GetOrderByBrokerOrderID(ctx, order.ParentOrderID)
+		if err != nil {
+			return nil, fmt.Errorf("find legacy bracket parent for residual exit %s: %w", order.OrderID, err)
+		}
+		if parentOrder == nil {
+			// A same-ticker working bracket child without durable lineage cannot
+			// be safely ignored: legacy trades predate intent backfill, and its
+			// child could otherwise sell the now-flat account later.
+			return nil, fmt.Errorf("resolve legacy bracket parent for residual exit %s", order.OrderID)
+		}
+		if parentOrder.TradeID != tradeID {
+			return nil, nil
+		}
+		if order.OrderType == "" {
+			return nil, fmt.Errorf("resolve legacy bracket child role for residual exit %s", order.OrderID)
+		}
+		return &residualExitOwnership{parentOrderID: order.ParentOrderID, childType: canonicalResidualOrderType(order.OrderType)}, nil
+	}
+	parent, err := store.GetStockEntryOrderIntent(ctx, tradeID)
+	if err != nil {
+		return nil, fmt.Errorf("find bracket parent for residual exit %s: %w", order.OrderID, err)
+	}
+	lookup, ok := executor.(execution.ClientOrderLookup)
+	if parent == nil || parent.ClientOrderID == "" || !ok {
+		return nil, nil
+	}
+	parentSnapshot, err := lookup.GetOrderByClientID(ctx, parent.ClientOrderID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve bracket parent for residual exit %s: %w", order.OrderID, err)
+	}
+	for _, child := range parentSnapshot.ChildOrders {
+		if child.BrokerOrderID == order.OrderID {
+			parentOrderID := parentSnapshot.BrokerOrderID
+			if parentOrderID == "" {
+				parentOrderID = parent.BrokerOrderID
+			}
+			if parentOrderID == "" {
+				return nil, fmt.Errorf("resolve bracket parent for residual exit %s: missing broker parent ID", order.OrderID)
+			}
+			return &residualExitOwnership{intent: parent, parentOrderID: parentOrderID, childType: child.Type}, nil
+		}
+	}
+	return nil, nil
+}
+
+func canonicalResidualOrderType(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "lmt", "limit":
+		return "limit"
+	case "stp", "stop":
+		return "stop"
+	case "stp lmt", "stp_lmt", "stop_limit", "stop limit":
+		return "stop_limit"
+	default:
+		return strings.ToLower(strings.TrimSpace(raw))
+	}
+}
+
+func residualOwnershipForIntent(ctx context.Context, brokerOrderID string, intent *store.StockOrderIntent) (*residualExitOwnership, error) {
+	ownership := &residualExitOwnership{intent: intent}
+	// Only broker-projected bracket children use their durable parent as the
+	// broker bracket parent. A standalone stop replacement also has a
+	// ParentIntentID (its predecessor), but it remains a DAY/whole-share stop
+	// according to its own submission policy.
+	if intent.ParentIntentID == "" || intent.Purpose != "broker_projection" {
+		return ownership, nil
+	}
+	parent, err := store.GetStockOrderIntentByID(ctx, intent.ParentIntentID)
+	if err != nil {
+		return nil, fmt.Errorf("find durable parent for residual exit %s: %w", brokerOrderID, err)
+	}
+	if parent == nil || parent.BrokerOrderID == "" {
+		return nil, fmt.Errorf("find durable parent for residual exit %s: missing broker parent ID", brokerOrderID)
+	}
+	ownership.parentOrderID = parent.BrokerOrderID
+	ownership.childType = intent.OrderType
+	if ownership.childType == "" {
+		return nil, fmt.Errorf("find durable parent for residual exit %s: child has no type", brokerOrderID)
+	}
+	return ownership, nil
+}
+
+// persistResidualExitOrder gives the ordinary claimed-exit reconciler durable
+// ownership of an unprojected order before cancellation. If cancellation is
+// asynchronous or the order filled meanwhile, the trade cannot be finalized
+// and forgotten; the pending row is polled until broker truth is terminal.
+func persistResidualExitOrder(ctx context.Context, t store.Trade, order execution.WorkingOrder, ownership *residualExitOwnership) error {
+	intent := ownership.intent
+	if existing, err := store.GetOrderByBrokerOrderID(ctx, order.OrderID); err != nil {
+		return fmt.Errorf("look up residual exit %s projection: %w", order.OrderID, err)
+	} else if existing != nil {
+		if existing.TradeID != t.ID {
+			return fmt.Errorf("residual exit %s is already projected to trade %s", order.OrderID, existing.TradeID)
+		}
+		return nil
+	}
+	quantity := order.Quantity
+	if quantity <= 0 {
+		quantity = order.RemainingQty + order.FilledQty
+	}
+	if quantity <= 0 && intent != nil {
+		quantity = intent.RequestedQty
+	}
+	if quantity <= 0 {
+		quantity = t.Quantity
+	}
+	projection := store.Order{
+		TradeID: t.ID, BrokerOrderID: order.OrderID, Ticker: t.Ticker,
+		Side: order.Side, Quantity: quantity, LimitPrice: order.Price,
+		StopPrice: order.StopPrice, Status: "pending",
+	}
+	if ownership.parentOrderID != "" {
+		// This durable child already has its own intent, but its order row was
+		// lost. Keep both the child intent and its real bracket metadata.
+		if intent != nil {
+			projection.StockIntentID = intent.ID
+		}
+		projection.ParentOrderID = ownership.parentOrderID
+		projection.OrderType = ownership.childType
+		projection.IsStopLoss = isStopLossOrderType(ownership.childType)
+		projection.IsTakeProfit = strings.EqualFold(ownership.childType, string(execution.OrderTypeLimit))
+	} else if intent != nil && intent.BrokerOrderID == order.OrderID {
+		// The child/standalone intent is this exact broker order.
+		projection.StockIntentID = intent.ID
+		projection.OrderType = intent.OrderType
+		projection.IsStopLoss = isStopLossOrderType(intent.OrderType)
+	} else {
+		// This is a broker-created child identified through its bracket parent.
+		// The parent intent already projects the entry, so it cannot be reused as
+		// this child row's stock intent.
+		projection.ParentOrderID = ownership.parentOrderID
+		projection.OrderType = ownership.childType
+		projection.IsStopLoss = isStopLossOrderType(ownership.childType)
+		projection.IsTakeProfit = strings.EqualFold(ownership.childType, string(execution.OrderTypeLimit))
+		if projection.OrderType == "" {
+			return fmt.Errorf("persist residual exit %s: bracket child has no type", order.OrderID)
+		}
+	}
+	if _, err := store.InsertOrderWithRetry(ctx, projection); err != nil {
+		return fmt.Errorf("persist residual exit %s: %w", order.OrderID, err)
+	}
+	return nil
 }
 
 func bracketExitIntent(leg store.Order) store.ExitIntent {

@@ -408,29 +408,26 @@ func (b *IBKRBroker) primePortfolio(ctx context.Context) {
 // unprotected shorts the DB recorded as "cancelled".
 func (b *IBKRBroker) GetPositions(ctx context.Context) ([]Position, error) {
 	b.primePortfolio(ctx)
-	var resp []struct {
-		Conid        int     `json:"conid"`
-		Position     float64 `json:"position"`
-		AvgCost      float64 `json:"avgCost"`
-		MktValue     float64 `json:"mktValue"`
-		UnrealizedPL float64 `json:"unrealizedPnl"`
-	}
-	if err := b.do(ctx, http.MethodGet, "/v1/api/portfolio/"+b.accountID+"/positions/0", nil, &resp); err != nil {
-		return nil, fmt.Errorf("ibkr GetPositions: %w", err)
-	}
-
-	out := make([]Position, 0, len(resp))
-	for _, p := range resp {
-		conidStr := fmt.Sprintf("%d", p.Conid)
-		ticker := b.reverseConid(conidStr)
-		out = append(out, Position{
-			Ticker:       ticker,
-			ConID:        conidStr,
-			Quantity:     p.Position,
-			AvgCostBasis: p.AvgCost,
-			CurrentValue: p.MktValue,
-			UnrealizedPL: p.UnrealizedPL,
-		})
+	var out []Position
+	for page := 0; ; page++ {
+		var resp []struct {
+			Conid        int     `json:"conid"`
+			Position     float64 `json:"position"`
+			AvgCost      float64 `json:"avgCost"`
+			MktValue     float64 `json:"mktValue"`
+			UnrealizedPL float64 `json:"unrealizedPnl"`
+		}
+		path := fmt.Sprintf("/v1/api/portfolio/%s/positions/%d", b.accountID, page)
+		if err := b.do(ctx, http.MethodGet, path, nil, &resp); err != nil {
+			return nil, fmt.Errorf("ibkr GetPositions: %w", err)
+		}
+		if len(resp) == 0 {
+			break
+		}
+		for _, p := range resp {
+			conidStr := fmt.Sprintf("%d", p.Conid)
+			out = append(out, Position{Ticker: b.reverseConid(conidStr), ConID: conidStr, Quantity: p.Position, AvgCostBasis: p.AvgCost, CurrentValue: p.MktValue, UnrealizedPL: p.UnrealizedPL})
+		}
 	}
 	return out, nil
 }

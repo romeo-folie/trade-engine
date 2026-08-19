@@ -281,25 +281,42 @@ func (b *AlpacaBroker) GetWorkingOrders(ctx context.Context) ([]WorkingOrder, er
 		Qty        string `json:"qty"`
 		FilledQty  string `json:"filled_qty"`
 		LimitPx    string `json:"limit_price"`
+		StopPx     string `json:"stop_price"`
 		ClientID   string `json:"client_order_id"`
+		ParentID   string `json:"parent_order_id"`
+		OrderType  string `json:"type"`
 	}
+	const workingOrderPageLimit = 500
 	if err := b.do(ctx, http.MethodGet, "/v2/orders?status=open&nested=false&limit=500", nil, &resp); err != nil {
 		return nil, fmt.Errorf("alpaca GetWorkingOrders: %w", err)
+	}
+	// Alpaca's list endpoint has no cursor in this response shape. A full page
+	// therefore cannot prove that every live order was returned. Consumers use
+	// this inventory to retire dangerous residual exits, so fail closed instead
+	// of silently treating the first 500 as complete.
+	if len(resp) == workingOrderPageLimit {
+		return nil, fmt.Errorf("alpaca GetWorkingOrders: open-order inventory reached %d-item page limit", workingOrderPageLimit)
 	}
 	out := make([]WorkingOrder, 0, len(resp))
 	for _, o := range resp {
 		qty, _ := parseFloat(o.Qty)
 		filled, _ := parseFloat(o.FilledQty)
 		px, _ := parseFloat(o.LimitPx)
+		stopPx, _ := parseFloat(o.StopPx)
 		out = append(out, WorkingOrder{
-			OrderID:      o.ID,
-			TradeID:      o.ClientID,
-			Ticker:       o.Symbol,
-			AssetClass:   o.AssetClass,
-			Side:         o.Side,
-			Status:       NormalizeOrderStatus(o.Status),
-			RemainingQty: qty - filled,
-			Price:        px,
+			OrderID:       o.ID,
+			TradeID:       o.ClientID,
+			ParentOrderID: o.ParentID,
+			OrderType:     o.OrderType,
+			Ticker:        o.Symbol,
+			AssetClass:    o.AssetClass,
+			Side:          o.Side,
+			Status:        NormalizeOrderStatus(o.Status),
+			RemainingQty:  qty - filled,
+			Quantity:      qty,
+			FilledQty:     filled,
+			Price:         px,
+			StopPrice:     stopPx,
 		})
 	}
 	return out, nil

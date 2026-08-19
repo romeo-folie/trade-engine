@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"strings"
 	"time"
@@ -207,7 +208,13 @@ func tradePnL(direction string, entryPrice, quantity, exitPrice float64) (pnl, p
 // async). With stale candle data that trigger price can be wildly wrong — a
 // LAC trade was recorded as +$787 at 5.50 when the broker filled at 3.82 for
 // −$19 (2026-07-02).
+type claimedExitFinalizationGuard func(ctx context.Context, tradeID string) error
+
 func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor, db exitReconcileStore, limit int, recordLoss ...func()) ExitReconcileStats {
+	return reconcileExitOrderFills(ctx, executor, db, limit, nil, recordLoss...)
+}
+
+func reconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor, db exitReconcileStore, limit int, guard claimedExitFinalizationGuard, recordLoss ...func()) ExitReconcileStats {
 	var stats ExitReconcileStats
 	if executor == nil {
 		return stats
@@ -580,11 +587,45 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 		}
 	}
 
+	positionSnapshot := claimedExitPositionSnapshot{}
+	positionSnapshotLoaded := false
+	// Residual cleanup can itself change broker truth (for example a child can
+	// fill while cancellation is being confirmed). Complete it for the whole
+	// claimed batch before taking the one shared position snapshot; otherwise a
+	// later cleanup could make that proof stale before its trade finalizes.
+	if guard != nil {
+		for tradeID, state := range terminalTrades {
+			if !state.canFinalize || state.remaining > 1e-9 {
+				continue
+			}
+			if err := guard(ctx, tradeID); err != nil {
+				stats.Errors++
+				state.canFinalize = false
+				logger.Error("exit reconcile: residual exit cleanup blocks finalization",
+					"trade_id", tradeID, "ticker", state.ticker, "err", err)
+			}
+		}
+	}
 	for tradeID, state := range terminalTrades {
 		if !state.canFinalize {
 			continue
 		}
 		if state.remaining <= 1e-9 {
+			if !positionSnapshotLoaded {
+				positionSnapshot = loadClaimedExitPositionSnapshot(ctx, executor, db)
+				positionSnapshotLoaded = true
+			}
+			if matched, checked, verifyErr := positionSnapshot.matches(state.ticker); checked {
+				if verifyErr != nil || !matched {
+					stats.Errors++
+					if verifyErr == nil {
+						verifyErr = errors.New("broker position differs from durable owned quantity")
+					}
+					logger.Error("exit reconcile: refusing to finalize while broker position differs",
+						"trade_id", tradeID, "ticker", state.ticker, "err", verifyErr)
+					continue
+				}
+			}
 			if state.fillQty <= 0 || state.proceeds <= 0 {
 				stats.Errors++
 				logger.Error("exit reconcile: flattened trade lacks durable fill price",
@@ -631,6 +672,83 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 		ctx, executor, db, limit, &stats, recordLoss...,
 	)
 	return stats
+}
+
+// claimedExitPositionSnapshot is loaded once per claimed-exit sweep. Reusing
+// the same broker and durable snapshots both avoids rate-limit amplification
+// during a backlog and gives every terminal decision a consistent account view.
+type claimedExitPositionSnapshot struct {
+	brokerQty map[string]float64
+	ownedQty  map[string]float64
+	err       error
+	checked   bool
+}
+
+func loadClaimedExitPositionSnapshot(
+	ctx context.Context,
+	executor exitReconcileExecutor,
+	db exitReconcileStore,
+) claimedExitPositionSnapshot {
+	broker, brokerOK := executor.(orderlessExitBroker)
+	ownedStore, storeOK := db.(interface {
+		GetOwnedPositionTrades(context.Context) ([]store.Trade, error)
+	})
+	if !brokerOK || !storeOK {
+		return claimedExitPositionSnapshot{}
+	}
+	positions, err := broker.GetPositions(ctx)
+	if err != nil {
+		return claimedExitPositionSnapshot{checked: true, err: err}
+	}
+	owned, err := ownedStore.GetOwnedPositionTrades(ctx)
+	if err != nil {
+		return claimedExitPositionSnapshot{checked: true, err: err}
+	}
+	snapshot := claimedExitPositionSnapshot{
+		brokerQty: make(map[string]float64), ownedQty: make(map[string]float64), checked: true,
+	}
+	for _, position := range positions {
+		if isNumericBrokerTicker(position.Ticker) {
+			return claimedExitPositionSnapshot{checked: true, err: fmt.Errorf("broker position %q has unresolved contract identity", position.Ticker)}
+		}
+		qty := position.Quantity
+		if position.Side == "short" && qty > 0 {
+			qty = -qty
+		}
+		snapshot.brokerQty[normalizedTicker(position.Ticker)] += qty
+	}
+	for _, trade := range owned {
+		qty := trade.Quantity
+		if trade.Direction == "short" {
+			qty = -qty
+		}
+		snapshot.ownedQty[normalizedTicker(trade.Ticker)] += qty
+	}
+	return snapshot
+}
+
+func isNumericBrokerTicker(ticker string) bool {
+	ticker = strings.TrimSpace(ticker)
+	if ticker == "" {
+		return false
+	}
+	for _, r := range ticker {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func (s claimedExitPositionSnapshot) matches(ticker string) (matched, checked bool, err error) {
+	if !s.checked {
+		return false, false, nil
+	}
+	if s.err != nil {
+		return false, true, s.err
+	}
+	key := normalizedTicker(ticker)
+	return math.Abs(s.brokerQty[key]-s.ownedQty[key]) <= positionSafetyQuantityEpsilon, true, nil
 }
 
 func recoverOrderlessExits(
@@ -850,7 +968,11 @@ func recoverOrderlessExits(
 // package-level store functions. Called from the engine's monitor loop and
 // the one-shot cmd/reconcile-exits tool.
 func ReconcileExitOrderFillsWithStore(ctx context.Context, executor exitReconcileExecutor, limit int) ExitReconcileStats {
-	return ReconcileExitOrderFills(ctx, executor, exitStoreAdapter{}, limit)
+	var guard claimedExitFinalizationGuard
+	if fullExecutor, ok := executor.(execution.Executor); ok {
+		guard = newClaimedResidualExitGuard(fullExecutor)
+	}
+	return reconcileExitOrderFills(ctx, executor, exitStoreAdapter{}, limit, guard)
 }
 
 func ReconcileExitOrderFillsWithStoreAndLoss(
@@ -859,7 +981,11 @@ func ReconcileExitOrderFillsWithStoreAndLoss(
 	limit int,
 	recordLoss func(),
 ) ExitReconcileStats {
-	return ReconcileExitOrderFills(ctx, executor, exitStoreAdapter{}, limit, recordLoss)
+	var guard claimedExitFinalizationGuard
+	if fullExecutor, ok := executor.(execution.Executor); ok {
+		guard = newClaimedResidualExitGuard(fullExecutor)
+	}
+	return reconcileExitOrderFills(ctx, executor, exitStoreAdapter{}, limit, guard, recordLoss)
 }
 
 func (e *Engine) runExitReconcileSweep(ctx context.Context) ExitReconcileStats {
@@ -900,9 +1026,7 @@ func runExitReconcilePhases(
 }
 
 func (e *Engine) runClaimedExitReconcileSweepLimit(ctx context.Context, limit int) ExitReconcileStats {
-	stats := ReconcileExitOrderFillsWithStoreAndLoss(
-		ctx, e.executor, limit, e.portfolio.RecordLoss,
-	)
+	stats := reconcileExitOrderFills(ctx, e.executor, exitStoreAdapter{}, limit, newClaimedResidualExitGuard(e.executor), e.portfolio.RecordLoss)
 	for _, realized := range stats.Closed {
 		e.publishTradeClosed(realized)
 	}

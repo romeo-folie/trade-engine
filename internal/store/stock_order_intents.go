@@ -3,8 +3,11 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // StockOrderIntent is the immutable pre-submit record for a standard stock
@@ -169,7 +172,7 @@ func CreateStockOrderIntent(ctx context.Context, in StockOrderIntent) error {
 
 func GetStockOrderIntentByKey(ctx context.Context, key string) (*StockOrderIntent, error) {
 	rows, err := GetDB().Query(ctx, `
-        SELECT id, idempotency_key, client_order_id, COALESCE(trade_id::text,''), COALESCE(parent_intent_id::text,''), purpose, ticker, side, order_type, requested_qty, request_payload, payload_hash, COALESCE(broker_order_id,''), status, COALESCE(filled_price,0), filled_qty, COALESCE(broker_error,''), COALESCE(broker_request_id,''), submitted_at, last_checked_at, created_at, updated_at
+		SELECT id, idempotency_key, client_order_id, COALESCE(trade_id::text,''), COALESCE(parent_intent_id::text,''), purpose, ticker, side, order_type, requested_qty, request_payload, payload_hash, COALESCE(broker_order_id,''), status, COALESCE(filled_price,0), filled_qty, COALESCE(broker_error,''), COALESCE(broker_request_id,''), submitted_at, last_checked_at, created_at, updated_at
         FROM stock_order_intents WHERE idempotency_key=$1`, key)
 	if err != nil {
 		return nil, err
@@ -183,6 +186,69 @@ func GetStockOrderIntentByKey(ctx context.Context, key string) (*StockOrderInten
 		return nil, err
 	}
 	return &in, rows.Err()
+}
+
+// GetStockOrderIntentByID resolves a durable intent lineage node. It is used
+// when a broker child is known directly but its local order projection was
+// lost: the parent provides the bracket's actual broker parent identity.
+func GetStockOrderIntentByID(ctx context.Context, id string) (*StockOrderIntent, error) {
+	var in StockOrderIntent
+	err := GetDB().QueryRow(ctx, `
+        SELECT id, idempotency_key, client_order_id, COALESCE(trade_id::text,''), COALESCE(parent_intent_id::text,''), purpose, ticker, side, order_type, requested_qty, request_payload, payload_hash, COALESCE(broker_order_id,''), status, COALESCE(filled_price,0), filled_qty, COALESCE(broker_error,''), COALESCE(broker_request_id,''), submitted_at, last_checked_at, created_at, updated_at
+        FROM stock_order_intents WHERE id=$1::uuid`, id,
+	).Scan(&in.ID, &in.IdempotencyKey, &in.ClientOrderID, &in.TradeID, &in.ParentIntentID, &in.Purpose, &in.Ticker, &in.Side, &in.OrderType, &in.RequestedQty, &in.RequestPayload, &in.PayloadHash, &in.BrokerOrderID, &in.Status, &in.FilledPrice, &in.FilledQty, &in.BrokerError, &in.BrokerRequestID, &in.SubmittedAt, &in.LastCheckedAt, &in.CreatedAt, &in.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &in, nil
+}
+
+// GetStockOrderIntentByClientOrderID resolves the durable request that owns a
+// broker-provided client order ID. Alpaca bracket children inherit their
+// parent's client ID, so this is also the safe ownership link when a child
+// escaped local projection before it received its own intent row.
+func GetStockOrderIntentByClientOrderID(ctx context.Context, clientOrderID string) (*StockOrderIntent, error) {
+	rows, err := GetDB().Query(ctx, `
+        SELECT id, idempotency_key, client_order_id, COALESCE(trade_id::text,''), COALESCE(parent_intent_id::text,''), purpose, ticker, side, order_type, requested_qty, request_payload, payload_hash, COALESCE(broker_order_id,''), status, COALESCE(filled_price,0), filled_qty, COALESCE(broker_error,''), COALESCE(broker_request_id,''), submitted_at, last_checked_at, created_at, updated_at
+        FROM stock_order_intents WHERE client_order_id=$1`, clientOrderID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return nil, nil
+	}
+	var in StockOrderIntent
+	if err := rows.Scan(&in.ID, &in.IdempotencyKey, &in.ClientOrderID, &in.TradeID, &in.ParentIntentID, &in.Purpose, &in.Ticker, &in.Side, &in.OrderType, &in.RequestedQty, &in.RequestPayload, &in.PayloadHash, &in.BrokerOrderID, &in.Status, &in.FilledPrice, &in.FilledQty, &in.BrokerError, &in.BrokerRequestID, &in.SubmittedAt, &in.LastCheckedAt, &in.CreatedAt, &in.UpdatedAt); err != nil {
+		return nil, err
+	}
+	return &in, rows.Err()
+}
+
+// GetStockEntryOrderIntent returns the durable broker parent for a trade. A
+// bracket's children have broker-generated client IDs, so callers that need to
+// prove a child belongs to a trade must resolve it through this submitted
+// parent rather than assuming the child inherited the parent's client ID.
+func GetStockEntryOrderIntent(ctx context.Context, tradeID string) (*StockOrderIntent, error) {
+	var in StockOrderIntent
+	err := GetDB().QueryRow(ctx, `
+        SELECT i.id, i.idempotency_key, i.client_order_id, COALESCE(i.trade_id::text,''), COALESCE(i.parent_intent_id::text,''), i.purpose, i.ticker, i.side, i.order_type, i.requested_qty, i.request_payload, i.payload_hash, COALESCE(i.broker_order_id,''), i.status, COALESCE(i.filled_price,0), i.filled_qty, COALESCE(i.broker_error,''), COALESCE(i.broker_request_id,''), i.submitted_at, i.last_checked_at, i.created_at, i.updated_at
+        FROM stock_order_intents i
+        JOIN trades t ON t.id=i.trade_id
+        WHERE i.trade_id=$1::uuid AND i.purpose IN ('submit','broker_projection')
+          AND ((t.direction='long' AND i.side='buy') OR (t.direction='short' AND i.side='sell'))
+        ORDER BY i.created_at DESC LIMIT 1`, tradeID,
+	).Scan(&in.ID, &in.IdempotencyKey, &in.ClientOrderID, &in.TradeID, &in.ParentIntentID, &in.Purpose, &in.Ticker, &in.Side, &in.OrderType, &in.RequestedQty, &in.RequestPayload, &in.PayloadHash, &in.BrokerOrderID, &in.Status, &in.FilledPrice, &in.FilledQty, &in.BrokerError, &in.BrokerRequestID, &in.SubmittedAt, &in.LastCheckedAt, &in.CreatedAt, &in.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &in, nil
 }
 
 // StockEntryBrokerProtection returns whether the durable entry that owns a

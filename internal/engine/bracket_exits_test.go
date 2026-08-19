@@ -19,17 +19,22 @@ import (
 
 // fakeBracketExec serves canned order statuses and records cancels/orders.
 type fakeBracketExec struct {
-	statuses    map[string]execution.OrderResult
-	statusErr   map[string]error
-	cancelErr   map[string]error
-	cancelled   []string
-	placed      []execution.OrderRequest
-	placeRes    execution.OrderResult
-	placeErr    error
-	onStatus    func(string)
-	onPlace     func(execution.OrderRequest)
-	positions   []execution.Position
-	positionErr error
+	statuses     map[string]execution.OrderResult
+	statusErr    map[string]error
+	cancelErr    map[string]error
+	cancelled    []string
+	placed       []execution.OrderRequest
+	placeRes     execution.OrderResult
+	placeErr     error
+	onStatus     func(string)
+	onPlace      func(execution.OrderRequest)
+	positions    []execution.Position
+	positionErr  error
+	working      []execution.WorkingOrder
+	workingErr   error
+	workingCalls int
+	clientOrder  map[string]execution.OrderResult
+	clientErr    map[string]error
 }
 
 type recoverFailureBracketExec struct{ *fakeBracketExec }
@@ -70,8 +75,116 @@ func (f *fakeBracketExec) GetOrderStatus(_ context.Context, id string) (executio
 	return execution.OrderResult{}, execution.ErrOrderNotFound
 }
 
+func (f *fakeBracketExec) GetOrderByClientID(_ context.Context, clientID string) (execution.OrderResult, error) {
+	if err, ok := f.clientErr[clientID]; ok {
+		return execution.OrderResult{}, err
+	}
+	if res, ok := f.clientOrder[clientID]; ok {
+		return res, nil
+	}
+	return execution.OrderResult{}, execution.ErrOrderNotFound
+}
+
 func (f *fakeBracketExec) GetPositions(_ context.Context) ([]execution.Position, error) {
 	return f.positions, f.positionErr
+}
+
+func (f *fakeBracketExec) GetWorkingOrders(context.Context) ([]execution.WorkingOrder, error) {
+	f.workingCalls++
+	if f.workingErr != nil {
+		return nil, f.workingErr
+	}
+	return append([]execution.WorkingOrder(nil), f.working...), nil
+}
+
+func TestResidualExitIntentSkipsDurablyOwnedPyramidedLot(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{Ticker: "RESIDUAL", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 3})
+	if err != nil {
+		t.Fatalf("InsertTrade target: %v", err)
+	}
+	otherTradeID, err := store.InsertTrade(ctx, store.Trade{Ticker: "RESIDUAL", Direction: "long", Strategy: "test", EntryPrice: 101, Quantity: 3})
+	if err != nil {
+		t.Fatalf("InsertTrade other: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), `DELETE FROM trades WHERE id = ANY($1::uuid[])`, []string{tradeID, otherTradeID})
+	})
+	brokerID := "other-lot-exit-" + otherTradeID[:8]
+	persistExitIntent(t, otherTradeID, brokerID, "other-lot-client")
+
+	ownership, err := residualExitIntentForTrade(ctx, &fakeBracketExec{}, tradeID, execution.WorkingOrder{OrderID: brokerID})
+	if err != nil || ownership != nil {
+		t.Fatalf("other lot ownership = %+v, %v; want no ownership without an error", ownership, err)
+	}
+}
+
+func TestResidualExitIntentSkipsLegacyOrderOwnedByAnotherPyramidedLot(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{Ticker: "LEGACYLOT", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 3})
+	if err != nil {
+		t.Fatalf("InsertTrade target: %v", err)
+	}
+	otherTradeID, err := store.InsertTrade(ctx, store.Trade{Ticker: "LEGACYLOT", Direction: "long", Strategy: "test", EntryPrice: 101, Quantity: 3})
+	if err != nil {
+		t.Fatalf("InsertTrade other: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), `DELETE FROM trades WHERE id = ANY($1::uuid[])`, []string{tradeID, otherTradeID})
+	})
+	brokerID := "legacy-other-lot-" + otherTradeID[:8]
+	if _, err := store.InsertOrder(ctx, store.Order{TradeID: otherTradeID, BrokerOrderID: brokerID, Ticker: "LEGACYLOT", Side: "sell", OrderType: "stop", Quantity: 3, Status: "pending"}); err != nil {
+		t.Fatalf("InsertOrder legacy other lot: %v", err)
+	}
+	ownership, err := residualExitIntentForTrade(ctx, &fakeBracketExec{}, tradeID, execution.WorkingOrder{OrderID: brokerID})
+	if err != nil || ownership != nil {
+		t.Fatalf("legacy other lot ownership = %+v, %v; want no ownership without an error", ownership, err)
+	}
+}
+
+func TestPersistResidualExitOrderPreservesWorkingPrices(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{Ticker: "RESIDUALPX", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 3})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	t.Cleanup(func() { _, _ = store.GetDB().Exec(context.Background(), `DELETE FROM trades WHERE id=$1`, tradeID) })
+	brokerID := "residual-price-" + tradeID[:8]
+	if err := persistResidualExitOrder(ctx, store.Trade{ID: tradeID, Ticker: "RESIDUALPX", Quantity: 3}, execution.WorkingOrder{
+		OrderID: brokerID, Ticker: "RESIDUALPX", Side: "sell", RemainingQty: 3, Price: 105.5, StopPrice: 98.25,
+	}, &residualExitOwnership{intent: &store.StockOrderIntent{BrokerOrderID: brokerID, OrderType: "stop"}}); err != nil {
+		t.Fatalf("persistResidualExitOrder: %v", err)
+	}
+	persisted, err := store.GetOrderByBrokerOrderID(ctx, brokerID)
+	if err != nil || persisted == nil || persisted.LimitPrice != 105.5 || persisted.StopPrice != 98.25 {
+		t.Fatalf("persisted residual = %+v, %v; want working limit and stop prices", persisted, err)
+	}
+}
+
+func TestResidualOwnershipStandaloneReplacementDoesNotInventBracketParent(t *testing.T) {
+	ownership, err := residualOwnershipForIntent(context.Background(), "replacement-stop", &store.StockOrderIntent{
+		ParentIntentID: "predecessor-intent", Purpose: "submit", OrderType: "stop",
+	})
+	if err != nil || ownership == nil || ownership.parentOrderID != "" {
+		t.Fatalf("standalone replacement ownership = %+v, %v; want no bracket parent", ownership, err)
+	}
+}
+
+func TestCanonicalResidualOrderType(t *testing.T) {
+	for raw, want := range map[string]string{"LMT": "limit", "STP": "stop", "STP LMT": "stop_limit", "stop_limit": "stop_limit"} {
+		if got := canonicalResidualOrderType(raw); got != want {
+			t.Errorf("canonicalResidualOrderType(%q) = %q, want %q", raw, got, want)
+		}
+	}
 }
 
 func (f *fakeBracketExec) GetAccount(_ context.Context) (execution.AccountInfo, error) {
@@ -116,6 +229,72 @@ func insertBracketFixture(t *testing.T, ticker string, qty float64) (string, str
 		}
 	}
 	return tradeID, tpID, slID
+}
+
+func persistExitIntent(t *testing.T, tradeID, brokerOrderID, clientOrderID string) string {
+	return persistExitIntentWithType(t, tradeID, brokerOrderID, clientOrderID, execution.OrderTypeStop)
+}
+
+func persistExitIntentWithType(t *testing.T, tradeID, brokerOrderID, clientOrderID string, orderType execution.OrderType) string {
+	t.Helper()
+	ctx := context.Background()
+	var intentID string
+	if err := store.GetDB().QueryRow(ctx, `SELECT uuid_generate_v4()::text`).Scan(&intentID); err != nil {
+		t.Fatalf("create residual intent UUID: %v", err)
+	}
+	clientOrderID += "-" + tradeID[:8]
+	intentKey := "residual:" + brokerOrderID + ":" + tradeID
+	payload, err := json.Marshal(execution.OrderRequest{
+		Ticker: "RESIDUAL", Side: execution.OrderSideSell, Type: orderType,
+		Quantity: 3, TradeID: tradeID, IntentKey: intentKey, ClientOrderID: clientOrderID,
+	})
+	if err != nil {
+		t.Fatalf("marshal residual intent: %v", err)
+	}
+	if err := store.CreateStockOrderIntent(ctx, store.StockOrderIntent{
+		ID: intentID, IdempotencyKey: intentKey,
+		ClientOrderID: clientOrderID, TradeID: tradeID, Ticker: "RESIDUAL",
+		Side: "sell", OrderType: string(orderType), RequestedQty: 3,
+		RequestPayload: payload, PayloadHash: brokerOrderID, Status: "pending", Purpose: "superseded",
+	}); err != nil {
+		t.Fatalf("CreateStockOrderIntent: %v", err)
+	}
+	if err := store.UpdateStockOrderIntentBroker(ctx, clientOrderID, brokerOrderID, "pending", 0, 0, "", "", true); err != nil {
+		t.Fatalf("UpdateStockOrderIntentBroker: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), `DELETE FROM orders WHERE broker_order_id=$1`, brokerOrderID)
+		_, _ = store.GetDB().Exec(context.Background(), `DELETE FROM stock_order_intents WHERE id=$1::uuid`, intentID)
+	})
+	return clientOrderID
+}
+
+func persistBracketParentIntent(t *testing.T, tradeID, brokerOrderID, clientOrderID string) string {
+	t.Helper()
+	ctx := context.Background()
+	intentKey := "residual-parent:" + tradeID
+	payload, err := json.Marshal(execution.OrderRequest{
+		Ticker: "ORPHCHILD", Side: execution.OrderSideBuy, Type: execution.OrderTypeMarket,
+		Quantity: 3, TradeID: tradeID, IntentKey: intentKey, ClientOrderID: clientOrderID,
+	})
+	if err != nil {
+		t.Fatalf("marshal parent intent: %v", err)
+	}
+	if err := store.CreateStockOrderIntent(ctx, store.StockOrderIntent{
+		ID: tradeID, IdempotencyKey: intentKey, ClientOrderID: clientOrderID, TradeID: tradeID,
+		Ticker: "ORPHCHILD", Side: "buy", OrderType: "market", RequestedQty: 3,
+		RequestPayload: payload, PayloadHash: brokerOrderID, BrokerOrderID: brokerOrderID, Status: "cancelled", Purpose: "broker_projection",
+	}); err != nil {
+		t.Fatalf("CreateStockOrderIntent parent: %v", err)
+	}
+	if err := store.UpdateStockOrderIntentBroker(ctx, clientOrderID, brokerOrderID, "cancelled", 0, 0, "", "", true); err != nil {
+		t.Fatalf("UpdateStockOrderIntentBroker parent: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), `DELETE FROM stock_order_intents WHERE parent_intent_id=$1::uuid`, tradeID)
+		_, _ = store.GetDB().Exec(context.Background(), `DELETE FROM stock_order_intents WHERE id=$1::uuid`, tradeID)
+	})
+	return clientOrderID
 }
 
 func getTrade(t *testing.T, id string) store.Trade {
@@ -1556,6 +1735,352 @@ func TestReconcileBracket_StopLegFillClosesTrade(t *testing.T) {
 	}
 	if e.portfolio.CurrentState().LastLossAt.IsZero() {
 		t.Fatal("losing bracket stop-out must record the loss cooldown (RecordLoss)")
+	}
+}
+
+// A broker stop can survive if a prior projection/replacement race lost its
+// local row. Once the winning stop has flattened the long, that residual
+// engine-owned sell must be cancelled before the trade is finalized; otherwise
+// it can later open a short against the flat account (VOYG/TSM regression).
+func TestReconcileBracket_StopFillCancelsUnprojectedEngineResidual(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, tpID, slID := insertBracketFixture(t, "ORPHSL", 3)
+	orphanID := "orphan-stop-" + tradeID[:8]
+	orphanClientID := persistExitIntent(t, tradeID, orphanID, "te-stock-orphan")
+	otherTradeID, _, _ := insertBracketFixture(t, "ORPHSL", 3)
+	otherID := "other-lot-stop-" + otherTradeID[:8]
+	otherClientID := persistExitIntent(t, otherTradeID, otherID, "te-stock-other-lot")
+	exec := &fakeBracketExec{
+		statuses: map[string]execution.OrderResult{
+			tpID:     {Status: "cancelled"},
+			slID:     {Status: "filled", FilledPrice: 94.8, FilledQty: 3},
+			orphanID: {Status: "cancelled"},
+		},
+		working: []execution.WorkingOrder{
+			{OrderID: orphanID, TradeID: orphanClientID, Ticker: "ORPHSL", Side: "sell", Status: "pending", RemainingQty: 3},
+			// Pyramided lots can have another engine-owned stop for the same ticker.
+			{OrderID: otherID, TradeID: otherClientID, Ticker: "ORPHSL", Side: "sell", Status: "pending", RemainingQty: 3},
+			// A manually owned same-ticker order is intentionally out of scope.
+			{OrderID: "manual-sell", TradeID: "manual-order", Ticker: "ORPHSL", Side: "sell", Status: "pending", RemainingQty: 1},
+		},
+		positions: []execution.Position{{Ticker: "ORPHSL", Quantity: 3, Side: "long"}},
+	}
+	e := newBracketTestEngine(exec)
+	if handled := e.reconcileBracketTrade(ctx, getTrade(t, tradeID)); !handled {
+		t.Fatal("filled stop must be handled")
+	}
+	if tr := getTrade(t, tradeID); tr.ID != "" {
+		t.Fatal("trade must finalize only after residual engine exit cleanup")
+	}
+	cancelled := func(id string) bool {
+		for _, got := range exec.cancelled {
+			if got == id {
+				return true
+			}
+		}
+		return false
+	}
+	if !cancelled(orphanID) {
+		t.Fatalf("residual engine stop was not cancelled: %v", exec.cancelled)
+	}
+	if persisted, err := store.GetOrderByBrokerOrderID(ctx, orphanID); err != nil || persisted == nil || persisted.Status != "cancelled" {
+		t.Fatalf("residual cancellation was not persisted: %+v err=%v", persisted, err)
+	}
+	if cancelled("manual-sell") {
+		t.Fatalf("manual same-ticker sell must not be cancelled: %v", exec.cancelled)
+	}
+	if cancelled(otherID) {
+		t.Fatalf("another pyramided lot's stop must not be cancelled: %v", exec.cancelled)
+	}
+}
+
+func TestReconcileBracket_ProjectsEveryResidualBeforeReportingCleanupFailure(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, tpID, slID := insertBracketFixture(t, "ORPHBATCH", 3)
+	firstID := "orphan-first-" + tradeID[:8]
+	secondID := "orphan-second-" + tradeID[:8]
+	firstClientID := persistExitIntent(t, tradeID, firstID, "te-stock-first")
+	secondClientID := persistExitIntentWithType(t, tradeID, secondID, "te-stock-second", execution.OrderTypeLimit)
+	exec := &fakeBracketExec{
+		statuses: map[string]execution.OrderResult{
+			tpID: {Status: "cancelled"}, slID: {Status: "filled", FilledPrice: 94.8, FilledQty: 3},
+			firstID: {Status: "accepted"}, secondID: {Status: "cancelled"},
+		},
+		working: []execution.WorkingOrder{
+			{OrderID: firstID, TradeID: firstClientID, Ticker: "ORPHBATCH", Side: "sell", Status: "pending", RemainingQty: 3},
+			{OrderID: secondID, TradeID: secondClientID, Ticker: "ORPHBATCH", Side: "sell", Status: "pending", RemainingQty: 3},
+		},
+	}
+	handled, err := newBracketTestEngine(exec).reconcileBrokerExitTradeStatus(ctx, getTrade(t, tradeID), false)
+	if !handled || err == nil {
+		t.Fatalf("residual cleanup = handled:%v err:%v, want unresolved first residual", handled, err)
+	}
+	if persisted, err := store.GetOrderByBrokerOrderID(ctx, secondID); err != nil || persisted == nil || persisted.Status != "cancelled" {
+		t.Fatalf("second residual was not durably retired: %+v err=%v", persisted, err)
+	}
+	if trade, err := store.GetTradeByID(ctx, tradeID); err != nil || trade == nil || trade.Status == "closed" {
+		t.Fatalf("trade finalized despite unresolved residual: %+v err=%v", trade, err)
+	}
+}
+
+func TestReconcileBracket_ResidualInventoryNormalizesTicker(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, tpID, slID := insertBracketFixture(t, " AAPL ", 3)
+	orphanID := "orphan-normalized-" + tradeID[:8]
+	clientID := persistExitIntent(t, tradeID, orphanID, "te-stock-normalized")
+	exec := &fakeBracketExec{
+		statuses: map[string]execution.OrderResult{
+			tpID: {Status: "cancelled"}, slID: {Status: "filled", FilledPrice: 94.8, FilledQty: 3},
+			orphanID: {Status: "cancelled"},
+		},
+		working: []execution.WorkingOrder{{OrderID: orphanID, TradeID: clientID, Ticker: "aapl", Side: "sell", Status: "pending", RemainingQty: 3}},
+	}
+	if !newBracketTestEngine(exec).reconcileBracketTrade(ctx, getTrade(t, tradeID)) {
+		t.Fatal("filled stop must be handled")
+	}
+	if len(exec.cancelled) != 1 || exec.cancelled[0] != orphanID {
+		t.Fatalf("cancelled=%v, want normalized residual cancellation", exec.cancelled)
+	}
+}
+
+func TestReconcileBracket_LegacyBracketChildUsesDurableParentOrder(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, tpID, slID := insertBracketFixture(t, "LEGACYRESIDUAL", 3)
+	parentID := "legacy-parent-" + tradeID[:8]
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: parentID, Ticker: "LEGACYRESIDUAL", Side: "buy",
+		OrderType: "market", Quantity: 3, Status: "filled",
+	}); err != nil {
+		t.Fatalf("insert legacy parent: %v", err)
+	}
+	childID := "legacy-child-" + tradeID[:8]
+	exec := &fakeBracketExec{
+		statuses: map[string]execution.OrderResult{
+			tpID: {Status: "cancelled"}, slID: {Status: "filled", FilledPrice: 94.8, FilledQty: 3},
+			childID: {Status: "cancelled"},
+		},
+		working: []execution.WorkingOrder{{
+			OrderID: childID, ParentOrderID: parentID, OrderType: "stop",
+			Ticker: "LEGACYRESIDUAL", Side: "sell", Status: "pending", RemainingQty: 3,
+		}},
+	}
+	if !newBracketTestEngine(exec).reconcileBracketTrade(ctx, getTrade(t, tradeID)) {
+		t.Fatal("filled stop must be handled")
+	}
+	child, err := store.GetOrderByBrokerOrderID(ctx, childID)
+	if err != nil || child == nil || child.ParentOrderID != parentID || !child.IsStopLoss || child.Status != "cancelled" {
+		t.Fatalf("legacy child projection = %+v err=%v", child, err)
+	}
+}
+
+func TestBrokerPositionSafetyRejectsSubCentResidual(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	e := newBracketTestEngine(&fakeBracketExec{positions: []execution.Position{{Ticker: "FRACTION", Quantity: 0.005, Side: "short"}}})
+	matched, err := e.brokerMatchesOwnedTickerQuantity(context.Background(), "FRACTION")
+	if err != nil || matched {
+		t.Fatalf("fractional broker residual = matched:%v err:%v, want mismatch", matched, err)
+	}
+}
+
+func TestReconcileBracket_ResidualTerminalStatesNeverFinalizeWithoutCancellationProof(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	for name, result := range map[string]execution.OrderResult{
+		"filled without quantity": {Status: "filled"},
+		"gtc done for day":        {Status: "done_for_day"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			tradeID, tpID, slID := insertBracketFixture(t, "ORPHTERM", 3)
+			orphanID := "orphan-terminal-" + tradeID[:8]
+			orphanClientID := persistExitIntent(t, tradeID, orphanID, "te-stock-orphan-terminal")
+			exec := &fakeBracketExec{
+				statuses: map[string]execution.OrderResult{
+					tpID: {Status: "cancelled"}, slID: {Status: "filled", FilledPrice: 94.8, FilledQty: 3}, orphanID: result,
+				},
+				working: []execution.WorkingOrder{{OrderID: orphanID, TradeID: orphanClientID, Ticker: "ORPHTERM", Side: "sell", Status: "pending", RemainingQty: 3}},
+			}
+			handled, err := newBracketTestEngine(exec).reconcileBrokerExitTradeStatus(ctx, getTrade(t, tradeID), false)
+			if !handled || err == nil {
+				t.Fatalf("residual %s = handled %v err %v, want handled error", name, handled, err)
+			}
+			if trade, err := store.GetTradeByID(ctx, tradeID); err != nil || trade == nil || trade.Status == "closed" {
+				t.Fatalf("trade finalized despite residual %s: %+v err=%v", name, trade, err)
+			}
+		})
+	}
+}
+
+func TestReconcileBracket_ResidualEngineExitBlocksFinalizationUntilTerminal(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, tpID, slID := insertBracketFixture(t, "ORPHBLK", 3)
+	orphanID := "orphan-stop-" + tradeID[:8]
+	orphanClientID := persistExitIntent(t, tradeID, orphanID, "te-stock-orphan")
+	exec := &fakeBracketExec{
+		statuses: map[string]execution.OrderResult{
+			tpID:     {Status: "cancelled"},
+			slID:     {Status: "filled", FilledPrice: 94.8, FilledQty: 3},
+			orphanID: {Status: "accepted"},
+		},
+		working: []execution.WorkingOrder{{
+			OrderID: orphanID, TradeID: orphanClientID, Ticker: "ORPHBLK",
+			Side: "sell", Status: "pending", RemainingQty: 3,
+		}},
+	}
+	e := newBracketTestEngine(exec)
+	handled, err := e.reconcileBrokerExitTradeStatus(ctx, getTrade(t, tradeID), false)
+	if !handled || err == nil {
+		t.Fatalf("residual live exit = handled %v err %v, want handled error", handled, err)
+	}
+	trade, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || trade == nil || trade.Status == "closed" {
+		t.Fatalf("trade finalized despite residual live exit: %+v err=%v", trade, err)
+	}
+	persisted, err := store.GetOrderByBrokerOrderID(ctx, orphanID)
+	if err != nil || persisted == nil || persisted.TradeID != tradeID || persisted.Status != "pending" {
+		t.Fatalf("residual must remain durably pending: %+v err=%v", persisted, err)
+	}
+}
+
+func TestReconcileBracket_PositionMismatchBlocksFinalizationWhenResidualAlreadyDisappeared(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, tpID, slID := insertBracketFixture(t, "ORPHGONE", 3)
+	exec := &fakeBracketExec{
+		statuses: map[string]execution.OrderResult{
+			tpID: {Status: "cancelled"}, slID: {Status: "filled", FilledPrice: 94.8, FilledQty: 3},
+		},
+		// The duplicate SELL filled after the stop did, so it is absent from the
+		// working-order snapshot and the account is now short three shares.
+		positions: []execution.Position{{Ticker: "ORPHGONE", Quantity: 3, Side: "short"}},
+	}
+	handled, err := newBracketTestEngine(exec).reconcileBrokerExitTradeStatus(ctx, getTrade(t, tradeID), false)
+	if !handled || err == nil {
+		t.Fatalf("broker mismatch = handled %v err %v, want handled error", handled, err)
+	}
+	if trade, err := store.GetTradeByID(ctx, tradeID); err != nil || trade == nil || trade.Status == "closed" {
+		t.Fatalf("trade finalized despite broker-only residual fill: %+v err=%v", trade, err)
+	}
+}
+
+func TestReconcileBracket_StopFillCancelsUnprojectedBracketChildByNestedParentLineage(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, tpID, slID := insertBracketFixture(t, "ORPHCHILD", 3)
+	// Alpaca gives bracket children their own client IDs. This simulates a crash
+	// before a child received a durable projection, so ownership must come from
+	// the parent's nested broker snapshot rather than a client-ID assumption.
+	parentID := "bracket-parent-" + tradeID[:8]
+	parentClientID := persistBracketParentIntent(t, tradeID, parentID, "te-stock-parent-"+tradeID[:8])
+	childID := "unprojected-child-" + tradeID[:8]
+	exec := &fakeBracketExec{
+		statuses: map[string]execution.OrderResult{
+			tpID: {Status: "cancelled"}, slID: {Status: "filled", FilledPrice: 94.8, FilledQty: 3},
+			childID: {Status: "cancelled"},
+		},
+		working: []execution.WorkingOrder{{
+			OrderID: childID, TradeID: "broker-child-client-" + tradeID[:8], Ticker: "ORPHCHILD", Side: "sell", Status: "pending", RemainingQty: 3,
+		}},
+		clientOrder: map[string]execution.OrderResult{parentClientID: {
+			BrokerOrderID: parentID, ChildOrders: []execution.OrderLeg{{BrokerOrderID: childID, Type: "stop_limit"}},
+		}},
+	}
+	e := newBracketTestEngine(exec)
+	if !e.reconcileBracketTrade(ctx, getTrade(t, tradeID)) {
+		t.Fatal("filled stop must be handled")
+	}
+	if got := getTrade(t, tradeID); got.ID != "" {
+		t.Fatal("trade must finalize after child cancellation")
+	}
+	if len(exec.cancelled) != 1 || exec.cancelled[0] != childID {
+		t.Fatalf("cancelled=%v, want unprojected child only", exec.cancelled)
+	}
+	child, err := store.GetOrderByBrokerOrderID(ctx, childID)
+	if err != nil || child == nil || child.ParentOrderID != parentID || !child.IsStopLoss {
+		t.Fatalf("projected child = %+v err=%v, want GTC stop child with actual parent", child, err)
+	}
+}
+
+func TestReconcileBracket_UnprojectedGTCChildDoneForDayBlocksFinalization(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, tpID, slID := insertBracketFixture(t, "ORPHGTCCHILD", 3)
+	parentID := "bracket-parent-" + tradeID[:8]
+	parentClientID := persistBracketParentIntent(t, tradeID, parentID, "te-stock-parent-"+tradeID[:8])
+	childID := "unprojected-child-" + tradeID[:8]
+	exec := &fakeBracketExec{
+		statuses: map[string]execution.OrderResult{
+			tpID: {Status: "cancelled"}, slID: {Status: "filled", FilledPrice: 94.8, FilledQty: 3},
+			childID: {Status: "done_for_day"},
+		},
+		working: []execution.WorkingOrder{{OrderID: childID, TradeID: "broker-child-client", Ticker: "ORPHGTCCHILD", Side: "sell", Status: "pending", RemainingQty: 3}},
+		clientOrder: map[string]execution.OrderResult{parentClientID: {
+			BrokerOrderID: parentID, ChildOrders: []execution.OrderLeg{{BrokerOrderID: childID, Type: "stop_limit"}},
+		}},
+	}
+	handled, err := newBracketTestEngine(exec).reconcileBrokerExitTradeStatus(ctx, getTrade(t, tradeID), false)
+	if !handled || err == nil {
+		t.Fatalf("GTC done_for_day = handled:%v err:%v, want unresolved cleanup", handled, err)
+	}
+	if trade, err := store.GetTradeByID(ctx, tradeID); err != nil || trade == nil || trade.Status == "closed" {
+		t.Fatalf("GTC child done_for_day finalized the trade: %+v err=%v", trade, err)
+	}
+	child, err := store.GetOrderByBrokerOrderID(ctx, childID)
+	if err != nil || child == nil || !child.IsStopLoss || child.ParentOrderID != parentID {
+		t.Fatalf("persisted GTC child = %+v err=%v", child, err)
+	}
+}
+
+func TestReconcileBracket_DurableUnprojectedGTCChildRetainsBracketMetadata(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, tpID, slID := insertBracketFixture(t, "ORPHDURABLE", 3)
+	parentID := "bracket-parent-" + tradeID[:8]
+	persistBracketParentIntent(t, tradeID, parentID, "te-stock-parent-"+tradeID[:8])
+	childID := "durable-child-" + tradeID[:8]
+	if _, err := store.UpsertBracketChildIntent(ctx, tradeID, tradeID, "ORPHDURABLE", "take-profit", childID, "limit", 3, 110); err != nil {
+		t.Fatalf("UpsertBracketChildIntent: %v", err)
+	}
+	exec := &fakeBracketExec{
+		statuses: map[string]execution.OrderResult{
+			tpID: {Status: "cancelled"}, slID: {Status: "filled", FilledPrice: 94.8, FilledQty: 3},
+			childID: {Status: "done_for_day"},
+		},
+		working: []execution.WorkingOrder{{OrderID: childID, TradeID: "broker-child-client", Ticker: "ORPHDURABLE", Side: "sell", Status: "pending", RemainingQty: 3}},
+	}
+	handled, err := newBracketTestEngine(exec).reconcileBrokerExitTradeStatus(ctx, getTrade(t, tradeID), false)
+	if !handled || err == nil {
+		t.Fatalf("durable GTC child = handled:%v err:%v, want unresolved cleanup", handled, err)
+	}
+	child, err := store.GetOrderByBrokerOrderID(ctx, childID)
+	if err != nil || child == nil || child.ParentOrderID != parentID || !child.IsTakeProfit {
+		t.Fatalf("durable child projection = %+v err=%v, want GTC take-profit metadata", child, err)
 	}
 }
 

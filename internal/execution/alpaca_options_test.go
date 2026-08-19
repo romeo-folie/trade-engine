@@ -3,6 +3,7 @@ package execution
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -161,7 +162,7 @@ func TestAlpacaGetWorkingOrders(t *testing.T) {
 			t.Errorf("unexpected request %s?%s", r.URL.Path, r.URL.RawQuery)
 		}
 		io.WriteString(w, `[
-			{"id":"o1","symbol":"SPY260717C00551000","asset_class":"us_option","side":"sell","status":"accepted","qty":"2","filled_qty":"0","limit_price":"0"},
+			{"id":"o1","parent_order_id":"parent-1","type":"stop","symbol":"SPY260717C00551000","asset_class":"us_option","side":"sell","status":"accepted","qty":"2","filled_qty":"0","limit_price":"0","stop_price":"551.25"},
 			{"id":"o2","symbol":"AAPL","asset_class":"us_equity","side":"buy","status":"new","qty":"10","filled_qty":"3","limit_price":"200"}
 		]`)
 	}))
@@ -182,8 +183,26 @@ func TestAlpacaGetWorkingOrders(t *testing.T) {
 			opt = &orders[i]
 		}
 	}
-	if opt == nil || opt.Ticker != "SPY260717C00551000" || opt.AssetClass != "us_option" || opt.Side != "sell" || opt.RemainingQty != 2 || opt.Status != "pending" {
+	if opt == nil || opt.Ticker != "SPY260717C00551000" || opt.AssetClass != "us_option" || opt.Side != "sell" || opt.ParentOrderID != "parent-1" || opt.OrderType != "stop" || opt.RemainingQty != 2 || opt.StopPrice != 551.25 || opt.Status != "pending" {
 		t.Errorf("option working order = %+v", opt)
+	}
+}
+
+func TestAlpacaGetWorkingOrdersFailsClosedAtPageLimit(t *testing.T) {
+	page := make([]map[string]string, 500)
+	for i := range page {
+		page[i] = map[string]string{
+			"id": fmt.Sprintf("o-%d", i), "symbol": "AAPL", "side": "sell",
+			"status": "accepted", "qty": "1", "filled_qty": "0",
+		}
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(page)
+	}))
+	defer ts.Close()
+	b := &AlpacaBroker{baseURL: ts.URL, httpClient: ts.Client()}
+	if _, err := b.GetWorkingOrders(context.Background()); err == nil {
+		t.Fatal("full open-order page was accepted as a complete inventory")
 	}
 }
 

@@ -222,16 +222,20 @@ type ClientOrderLookup interface {
 // when the child order IDs were never captured at placement time (the IBKR
 // bracket confirmation flow does not reliably return them).
 type WorkingOrder struct {
-	OrderID      string
-	TradeID      string  // client/order reference supplied when the order was placed
-	Ticker       string  // resolved symbol when the broker provides one (else raw conid)
-	AssetClass   string  // Alpaca: "us_equity" | "us_option"; empty when unavailable
-	Conid        string  // IBKR contract id (empty for non-IBKR brokers)
-	Side         string  // "buy" | "sell"
-	Status       string  // normalized: pending | partial (only working orders are returned)
-	RemainingQty float64 // quantity still working
-	Price        float64 // limit price (0 if none / not exposed)
-	StopPrice    float64 // stop trigger price (0 if none / not exposed)
+	OrderID       string
+	TradeID       string  // client/order reference supplied when the order was placed
+	ParentOrderID string  // broker bracket parent, when the broker exposes it
+	OrderType     string  // broker order type (e.g. limit or stop)
+	Ticker        string  // resolved symbol when the broker provides one (else raw conid)
+	AssetClass    string  // Alpaca: "us_equity" | "us_option"; empty when unavailable
+	Conid         string  // IBKR contract id (empty for non-IBKR brokers)
+	Side          string  // "buy" | "sell"
+	Status        string  // normalized: pending | partial (only working orders are returned)
+	RemainingQty  float64 // quantity still working
+	Quantity      float64 // original requested quantity when exposed
+	FilledQty     float64 // cumulative quantity already filled
+	Price         float64 // limit price (0 if none / not exposed)
+	StopPrice     float64 // stop trigger price (0 if none / not exposed)
 }
 
 // WorkingOrdersLister is an optional Executor capability: it lists the broker's

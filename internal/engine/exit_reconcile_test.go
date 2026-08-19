@@ -290,6 +290,44 @@ func TestStartupExitReconcileFinalizesFullyAppliedProtectiveFill(t *testing.T) {
 	}
 }
 
+func TestClaimedExitReconcileCancelsUnprojectedResidualBeforeFinalization(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "CLAIMED_RESIDUAL", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 3, Status: "open",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed, err := store.ClaimTradeExitWithIntent(ctx, tradeID, store.ExitIntent{Reason: store.ExitReasonEMA9Close}); err != nil || !claimed {
+		t.Fatalf("claim exit = %v, %v", claimed, err)
+	}
+	const marketID = "claimed-market-exit"
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: marketID, Ticker: "CLAIMED_RESIDUAL", Side: "sell", OrderType: "market", Quantity: 3, Status: "pending",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	residualID := "claimed-residual-" + tradeID[:8]
+	clientID := persistExitIntent(t, tradeID, residualID, "te-stock-claimed-residual")
+	exec := &fakeBracketExec{
+		statuses: map[string]execution.OrderResult{
+			marketID:   {Status: "filled", FilledPrice: 99, FilledQty: 3},
+			residualID: {Status: "cancelled"},
+		},
+		working: []execution.WorkingOrder{{OrderID: residualID, TradeID: clientID, Ticker: "CLAIMED_RESIDUAL", Side: "sell", Status: "pending", RemainingQty: 3}},
+	}
+	newBracketTestEngine(exec).runClaimedExitReconcileSweepLimit(ctx, StartupExitReconcileBatch)
+	if len(exec.cancelled) != 1 || exec.cancelled[0] != residualID {
+		t.Fatalf("cancelled=%v, want unprojected residual", exec.cancelled)
+	}
+	if trade, err := store.GetTradeByID(ctx, tradeID); err != nil || trade == nil || trade.Status != "closed" {
+		t.Fatalf("claimed trade after residual cleanup = %+v err=%v, want closed", trade, err)
+	}
+}
+
 func TestStartupClaimedExitTimeoutRemainsRetryable(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -420,11 +458,17 @@ func TestReconcileExitsNowWithoutDBDoesNotPanic(t *testing.T) {
 
 type recoveryExitExecutor struct {
 	*fakeExitExecutor
-	positions []execution.Position
-	working   []execution.WorkingOrder
+	positions     []execution.Position
+	working       []execution.WorkingOrder
+	positionCalls int
+	onPositions   func()
 }
 
 func (f *recoveryExitExecutor) GetPositions(context.Context) ([]execution.Position, error) {
+	f.positionCalls++
+	if f.onPositions != nil {
+		f.onPositions()
+	}
 	return f.positions, nil
 }
 
@@ -805,6 +849,131 @@ func TestExitReconcileFilledStopFallsBackToRecordedPrice(t *testing.T) {
 	}
 	if got := db.tradeQty[p.TradeID]; got != 0 {
 		t.Fatalf("remaining quantity = %v, want 0", got)
+	}
+}
+
+func TestExitReconcileRefusesFinalizationWhenBrokerPositionDriftsAfterClaimedFill(t *testing.T) {
+	p := lacExit()
+	p.TradeStatus = "exiting"
+	p.Quantity = 5
+	p.OrderQuantity = 5
+	p.Ticker = " AAPL " // broker spelling must not hide a residual short.
+	db := &recoveryExitStore{fakeExitStore: newFakeExitStore(p)}
+	ex := &recoveryExitExecutor{
+		fakeExitExecutor: &fakeExitExecutor{results: map[string]execution.OrderResult{
+			"b1": {Status: "filled", FilledPrice: 3.82, FilledQty: 5},
+		}},
+		// A stale sell filled after the owned lot was already flattened. The
+		// claimed reconciler must leave the trade exiting rather than making
+		// that residual short invisible by finalizing the durable record.
+		positions: []execution.Position{{Ticker: "aapl", Quantity: 5, Side: "short"}},
+	}
+
+	stats := ReconcileExitOrderFills(context.Background(), ex, db, 0)
+	if stats.Errors != 1 || len(stats.Closed) != 0 {
+		t.Fatalf("stats = %+v, want one position-mismatch error and no close", stats)
+	}
+	if _, finalized := db.tradeExits[p.TradeID]; finalized {
+		t.Fatal("claimed exit finalized despite unmatched broker position")
+	}
+}
+
+func TestExitReconcileUsesOnePositionSnapshotForTerminalClaimedBatch(t *testing.T) {
+	p1 := lacExit()
+	p1.TradeStatus, p1.Quantity, p1.OrderQuantity = "exiting", 5, 5
+	p2 := p1
+	p2.TradeID, p2.OrderID, p2.BrokerOrderID, p2.Ticker = "t2", "o2", "b2", "MSFT"
+	db := &recoveryExitStore{fakeExitStore: newFakeExitStore(p1, p2)}
+	ex := &recoveryExitExecutor{fakeExitExecutor: &fakeExitExecutor{results: map[string]execution.OrderResult{
+		"b1": {Status: "filled", FilledPrice: 3.82, FilledQty: 5},
+		"b2": {Status: "filled", FilledPrice: 3.82, FilledQty: 5},
+	}}}
+
+	stats := ReconcileExitOrderFills(context.Background(), ex, db, 0)
+	if len(stats.Closed) != 2 || stats.Errors != 0 {
+		t.Fatalf("stats = %+v, want both claimed exits finalized", stats)
+	}
+	if ex.positionCalls != 1 {
+		t.Fatalf("GetPositions calls = %d, want one per sweep", ex.positionCalls)
+	}
+}
+
+func TestExitReconcileTakesSharedSnapshotAfterAllResidualGuards(t *testing.T) {
+	p1 := lacExit()
+	p1.TradeStatus, p1.Quantity, p1.OrderQuantity = "exiting", 5, 5
+	p2 := p1
+	p2.TradeID, p2.OrderID, p2.BrokerOrderID, p2.Ticker = "t2", "o2", "b2", "MSFT"
+	db := &recoveryExitStore{fakeExitStore: newFakeExitStore(p1, p2)}
+	guarded := map[string]bool{}
+	ex := &recoveryExitExecutor{fakeExitExecutor: &fakeExitExecutor{results: map[string]execution.OrderResult{
+		"b1": {Status: "filled", FilledPrice: 3.82, FilledQty: 5},
+		"b2": {Status: "filled", FilledPrice: 3.82, FilledQty: 5},
+	}}}
+	ex.onPositions = func() {
+		if !guarded[p1.TradeID] || !guarded[p2.TradeID] {
+			t.Fatal("shared position snapshot was loaded before all residual guards")
+		}
+	}
+	stats := reconcileExitOrderFills(context.Background(), ex, db, 0, func(_ context.Context, tradeID string) error {
+		guarded[tradeID] = true
+		return nil
+	})
+	if len(stats.Closed) != 2 || stats.Errors != 0 || ex.positionCalls != 1 {
+		t.Fatalf("stats=%+v position calls=%d", stats, ex.positionCalls)
+	}
+}
+
+func TestExitReconcileWithStoreCancelsResidualBeforeFinalizingClaim(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "RESIDUAL", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 3,
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	t.Cleanup(func() { _, _ = store.GetDB().Exec(context.Background(), `DELETE FROM trades WHERE id=$1`, tradeID) })
+	if claimed, err := store.ClaimTradeExitWithIntent(ctx, tradeID, store.ExitIntent{Reason: store.ExitReasonStopLoss}); err != nil || !claimed {
+		t.Fatalf("ClaimTradeExitWithIntent = %v, %v", claimed, err)
+	}
+	marketID := "one-shot-market-" + tradeID[:8]
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: marketID, Ticker: "RESIDUAL", Side: "sell", OrderType: "market", Quantity: 3, Status: "pending",
+	}); err != nil {
+		t.Fatalf("InsertOrder market exit: %v", err)
+	}
+	residualID := "one-shot-residual-" + tradeID[:8]
+	persistExitIntent(t, tradeID, residualID, "one-shot-residual-client")
+	exec := &fakeBracketExec{
+		statuses: map[string]execution.OrderResult{
+			marketID:   {Status: "filled", FilledPrice: 99, FilledQty: 3},
+			residualID: {Status: "pending"},
+		},
+		working: []execution.WorkingOrder{{
+			OrderID: residualID, Ticker: "RESIDUAL", Side: "sell", Status: "pending", RemainingQty: 3,
+		}},
+	}
+	stats := ReconcileExitOrderFillsWithStore(ctx, exec, 100)
+	if stats.Errors == 0 || len(stats.Closed) != 0 || exec.workingCalls != 1 {
+		t.Fatalf("stats=%+v working calls=%d; want guarded, unfinalized one-shot reconcile", stats, exec.workingCalls)
+	}
+	trade, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || trade == nil || trade.Status != "exiting" {
+		t.Fatalf("trade after guarded one-shot reconcile = %+v, %v", trade, err)
+	}
+}
+
+func TestClaimedExitPositionSnapshotRejectsSubCentResidual(t *testing.T) {
+	snapshot := claimedExitPositionSnapshot{
+		brokerQty: map[string]float64{"AAPL": -0.005},
+		ownedQty:  map[string]float64{},
+		checked:   true,
+	}
+	matched, checked, err := snapshot.matches(" aapl ")
+	if err != nil || !checked || matched {
+		t.Fatalf("fractional snapshot match = matched:%v checked:%v err:%v, want mismatch", matched, checked, err)
 	}
 }
 

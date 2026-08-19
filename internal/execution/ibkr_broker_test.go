@@ -882,6 +882,8 @@ func TestIBKRGetPositions_PortfolioRoute(t *testing.T) {
 				t.Error("positions requested before /portfolio/accounts priming call")
 			}
 			w.Write([]byte(`[{"conid":77124483,"position":-700,"avgCost":58.2525,"mktValue":-41391.0,"unrealizedPnl":-616.69}]`))
+		case "/v1/api/portfolio/U123456/positions/1":
+			w.Write([]byte(`[]`))
 		case "/v1/api/iserver/account/U123456/positions/0":
 			t.Error("legacy /iserver/account positions route must not be called (it 404s at the real gateway)")
 			http.NotFound(w, r)
@@ -911,6 +913,8 @@ func TestIBKRPositionsSnapshot_PortfolioRoute(t *testing.T) {
 			w.Write([]byte(`[]`))
 		case "/v1/api/portfolio/U123456/positions/0":
 			w.Write([]byte(`[{"conid":69067925,"position":-57,"avgCost":4090.18,"mktPrice":4108.06,"mktValue":-234159.4,"unrealizedPnl":-1019.31}]`))
+		case "/v1/api/portfolio/U123456/positions/1":
+			w.Write([]byte(`[]`))
 		default:
 			t.Errorf("unexpected request to %s", r.URL.Path)
 			http.NotFound(w, r)

@@ -207,8 +207,8 @@ func TestGetWorkingOrders(t *testing.T) {
 		// Four rows: a working TP (number id, number price), a working SL (string id,
 		// string stop_price), a filled order and a cancelled order (both dropped).
 		w.Write([]byte(`{"orders":[
-			{"orderId": 111, "order_ref": "currency-strength-exit-2026-07-27-EURUSD", "conid": 12087792, "ticker": "EUR", "side": "SELL", "status": "PreSubmitted", "remainingQuantity": 5000, "price": 1.12},
-			{"orderId": "222", "conid": 12087792, "ticker": "EUR", "side": "SELL", "status": "Submitted", "remainingQuantity": "5000", "stop_price": "1.09"},
+			{"orderId": 111, "parentId": 100, "orderType":"LMT", "order_ref": "currency-strength-exit-2026-07-27-EURUSD", "conid": 12087792, "ticker": "EUR", "side": "SELL", "status": "PreSubmitted", "remainingQuantity": 5000, "price": 1.12},
+			{"orderId": "222", "parentId":"100", "orderType":"STP", "conid": 12087792, "ticker": "EUR", "side": "SELL", "status": "Submitted", "remainingQuantity": "5000", "stop_price": "1.09"},
 			{"orderId": 333, "conid": 12087792, "ticker": "EUR", "side": "SELL", "status": "Filled", "remainingQuantity": 0},
 			{"orderId": 444, "conid": 12087797, "ticker": "GBP", "side": "BUY", "status": "Cancelled", "remainingQuantity": 5000}
 		]}`))
@@ -243,6 +243,9 @@ func TestGetWorkingOrders(t *testing.T) {
 	}
 	if orders[1].OrderID != "222" {
 		t.Errorf("orders[1].OrderID = %q; want 222 (string id)", orders[1].OrderID)
+	}
+	if orders[0].ParentOrderID != "100" || orders[0].OrderType != "LMT" || orders[1].ParentOrderID != "100" || orders[1].OrderType != "STP" {
+		t.Errorf("bracket lineage = %+v / %+v", orders[0], orders[1])
 	}
 	// Leg prices decode from both number (price) and string (stop_price) encodings.
 	if orders[0].Price != 1.12 {
