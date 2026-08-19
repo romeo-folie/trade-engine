@@ -20,6 +20,12 @@ import (
 // shared database pool.
 var stockEntryBrokerProtection = store.StockEntryBrokerProtection
 
+// positionSafetyQuantityEpsilon only absorbs floating-point transport noise.
+// It is deliberately far below the broker's fractional-share precision: a
+// nonzero residual position must block exit finalization rather than being
+// treated like ordinary drift-alert rounding.
+const positionSafetyQuantityEpsilon = 1e-9
+
 // Broker-resident bracket exits (#435). The execution study measured the
 // stock path's hourly candle-close stop checks costing ~1.5%/trade: 49 of 53
 // stop breaches happened intraday where a broker-resident stop would have
@@ -502,7 +508,7 @@ func (e *Engine) brokerMatchesOwnedTickerQuantity(ctx context.Context, ticker st
 	if err != nil {
 		return false, err
 	}
-	return math.Abs(brokerQty-dbQty) <= 0.01, nil
+	return math.Abs(brokerQty-dbQty) <= positionSafetyQuantityEpsilon, nil
 }
 
 func (e *Engine) brokerAndOwnedTickerQuantities(ctx context.Context, ticker string) (brokerQty, dbQty float64, err error) {
@@ -852,6 +858,22 @@ func residualExitIntentForTrade(ctx context.Context, executor execution.Executor
 			return residualOwnershipForIntent(ctx, order.OrderID, intent)
 		}
 	}
+	if order.ParentOrderID != "" {
+		parentOrder, err := store.GetOrderByBrokerOrderID(ctx, order.ParentOrderID)
+		if err != nil {
+			return nil, fmt.Errorf("find legacy bracket parent for residual exit %s: %w", order.OrderID, err)
+		}
+		if parentOrder == nil || parentOrder.TradeID != tradeID {
+			// A same-ticker working bracket child without durable lineage cannot
+			// be safely ignored: legacy trades predate intent backfill, and its
+			// child could otherwise sell the now-flat account later.
+			return nil, fmt.Errorf("resolve legacy bracket parent for residual exit %s", order.OrderID)
+		}
+		if order.OrderType == "" {
+			return nil, fmt.Errorf("resolve legacy bracket child role for residual exit %s", order.OrderID)
+		}
+		return &residualExitOwnership{parentOrderID: order.ParentOrderID, childType: order.OrderType}, nil
+	}
 	parent, err := store.GetStockEntryOrderIntent(ctx, tradeID)
 	if err != nil {
 		return nil, fmt.Errorf("find bracket parent for residual exit %s: %w", order.OrderID, err)
@@ -914,7 +936,7 @@ func persistResidualExitOrder(ctx context.Context, t store.Trade, order executio
 		return nil
 	}
 	quantity := order.RemainingQty
-	if quantity <= 0 {
+	if quantity <= 0 && intent != nil {
 		quantity = intent.RequestedQty
 	}
 	if quantity <= 0 {
@@ -922,20 +944,23 @@ func persistResidualExitOrder(ctx context.Context, t store.Trade, order executio
 	}
 	projection := store.Order{
 		TradeID: t.ID, BrokerOrderID: order.OrderID, Ticker: t.Ticker,
-		Side: order.Side, OrderType: intent.OrderType, Quantity: quantity,
-		Status: "pending", IsStopLoss: intent.OrderType == string(execution.OrderTypeStop),
+		Side: order.Side, Quantity: quantity, Status: "pending",
 	}
 	if ownership.parentOrderID != "" {
 		// This durable child already has its own intent, but its order row was
 		// lost. Keep both the child intent and its real bracket metadata.
-		projection.StockIntentID = intent.ID
+		if intent != nil {
+			projection.StockIntentID = intent.ID
+		}
 		projection.ParentOrderID = ownership.parentOrderID
 		projection.OrderType = ownership.childType
 		projection.IsStopLoss = strings.EqualFold(ownership.childType, string(execution.OrderTypeStop))
 		projection.IsTakeProfit = strings.EqualFold(ownership.childType, string(execution.OrderTypeLimit))
-	} else if intent.BrokerOrderID == order.OrderID {
+	} else if intent != nil && intent.BrokerOrderID == order.OrderID {
 		// The child/standalone intent is this exact broker order.
 		projection.StockIntentID = intent.ID
+		projection.OrderType = intent.OrderType
+		projection.IsStopLoss = intent.OrderType == string(execution.OrderTypeStop)
 	} else {
 		// This is a broker-created child identified through its bracket parent.
 		// The parent intent already projects the entry, so it cannot be reused as

@@ -856,6 +856,18 @@ func TestExitReconcileUsesOnePositionSnapshotForTerminalClaimedBatch(t *testing.
 	}
 }
 
+func TestClaimedExitPositionSnapshotRejectsSubCentResidual(t *testing.T) {
+	snapshot := claimedExitPositionSnapshot{
+		brokerQty: map[string]float64{"AAPL": -0.005},
+		ownedQty:  map[string]float64{},
+		checked:   true,
+	}
+	matched, checked, err := snapshot.matches(" aapl ")
+	if err != nil || !checked || matched {
+		t.Fatalf("fractional snapshot match = matched:%v checked:%v err:%v, want mismatch", matched, checked, err)
+	}
+}
+
 func TestExitReconcileTerminalFillReplayUsesDurableAllocation(t *testing.T) {
 	p := lacExit()
 	p.TradeStatus = "exiting"

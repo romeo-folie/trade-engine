@@ -709,7 +709,7 @@ func (s claimedExitPositionSnapshot) matches(ticker string) (matched, checked bo
 		return false, true, s.err
 	}
 	key := normalizedTicker(ticker)
-	return math.Abs(s.brokerQty[key]-s.ownedQty[key]) <= 0.01, true, nil
+	return math.Abs(s.brokerQty[key]-s.ownedQty[key]) <= positionSafetyQuantityEpsilon, true, nil
 }
 
 func recoverOrderlessExits(

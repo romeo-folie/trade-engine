@@ -1760,6 +1760,50 @@ func TestReconcileBracket_ResidualInventoryNormalizesTicker(t *testing.T) {
 	}
 }
 
+func TestReconcileBracket_LegacyBracketChildUsesDurableParentOrder(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, tpID, slID := insertBracketFixture(t, "LEGACYRESIDUAL", 3)
+	parentID := "legacy-parent-" + tradeID[:8]
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: parentID, Ticker: "LEGACYRESIDUAL", Side: "buy",
+		OrderType: "market", Quantity: 3, Status: "filled",
+	}); err != nil {
+		t.Fatalf("insert legacy parent: %v", err)
+	}
+	childID := "legacy-child-" + tradeID[:8]
+	exec := &fakeBracketExec{
+		statuses: map[string]execution.OrderResult{
+			tpID: {Status: "cancelled"}, slID: {Status: "filled", FilledPrice: 94.8, FilledQty: 3},
+			childID: {Status: "cancelled"},
+		},
+		working: []execution.WorkingOrder{{
+			OrderID: childID, ParentOrderID: parentID, OrderType: "stop",
+			Ticker: "LEGACYRESIDUAL", Side: "sell", Status: "pending", RemainingQty: 3,
+		}},
+	}
+	if !newBracketTestEngine(exec).reconcileBracketTrade(ctx, getTrade(t, tradeID)) {
+		t.Fatal("filled stop must be handled")
+	}
+	child, err := store.GetOrderByBrokerOrderID(ctx, childID)
+	if err != nil || child == nil || child.ParentOrderID != parentID || !child.IsStopLoss || child.Status != "cancelled" {
+		t.Fatalf("legacy child projection = %+v err=%v", child, err)
+	}
+}
+
+func TestBrokerPositionSafetyRejectsSubCentResidual(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	e := newBracketTestEngine(&fakeBracketExec{positions: []execution.Position{{Ticker: "FRACTION", Quantity: 0.005, Side: "short"}}})
+	matched, err := e.brokerMatchesOwnedTickerQuantity(context.Background(), "FRACTION")
+	if err != nil || matched {
+		t.Fatalf("fractional broker residual = matched:%v err:%v, want mismatch", matched, err)
+	}
+}
+
 func TestReconcileBracket_ResidualTerminalStatesNeverFinalizeWithoutCancellationProof(t *testing.T) {
 	if !store.IsConnected() {
 		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")

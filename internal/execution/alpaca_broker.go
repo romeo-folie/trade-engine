@@ -282,6 +282,8 @@ func (b *AlpacaBroker) GetWorkingOrders(ctx context.Context) ([]WorkingOrder, er
 		FilledQty  string `json:"filled_qty"`
 		LimitPx    string `json:"limit_price"`
 		ClientID   string `json:"client_order_id"`
+		ParentID   string `json:"parent_order_id"`
+		OrderType  string `json:"type"`
 	}
 	const workingOrderPageLimit = 500
 	if err := b.do(ctx, http.MethodGet, "/v2/orders?status=open&nested=false&limit=500", nil, &resp); err != nil {
@@ -300,14 +302,16 @@ func (b *AlpacaBroker) GetWorkingOrders(ctx context.Context) ([]WorkingOrder, er
 		filled, _ := parseFloat(o.FilledQty)
 		px, _ := parseFloat(o.LimitPx)
 		out = append(out, WorkingOrder{
-			OrderID:      o.ID,
-			TradeID:      o.ClientID,
-			Ticker:       o.Symbol,
-			AssetClass:   o.AssetClass,
-			Side:         o.Side,
-			Status:       NormalizeOrderStatus(o.Status),
-			RemainingQty: qty - filled,
-			Price:        px,
+			OrderID:       o.ID,
+			TradeID:       o.ClientID,
+			ParentOrderID: o.ParentID,
+			OrderType:     o.OrderType,
+			Ticker:        o.Symbol,
+			AssetClass:    o.AssetClass,
+			Side:          o.Side,
+			Status:        NormalizeOrderStatus(o.Status),
+			RemainingQty:  qty - filled,
+			Price:         px,
 		})
 	}
 	return out, nil
