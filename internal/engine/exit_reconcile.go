@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"strings"
 	"time"
@@ -207,7 +208,13 @@ func tradePnL(direction string, entryPrice, quantity, exitPrice float64) (pnl, p
 // async). With stale candle data that trigger price can be wildly wrong — a
 // LAC trade was recorded as +$787 at 5.50 when the broker filled at 3.82 for
 // −$19 (2026-07-02).
+type claimedExitFinalizationGuard func(ctx context.Context, tradeID string) error
+
 func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor, db exitReconcileStore, limit int, recordLoss ...func()) ExitReconcileStats {
+	return reconcileExitOrderFills(ctx, executor, db, limit, nil, recordLoss...)
+}
+
+func reconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor, db exitReconcileStore, limit int, guard claimedExitFinalizationGuard, recordLoss ...func()) ExitReconcileStats {
 	var stats ExitReconcileStats
 	if executor == nil {
 		return stats
@@ -581,17 +588,24 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 	}
 
 	positionSnapshot := claimedExitPositionSnapshot{}
-	for _, state := range terminalTrades {
-		if state.canFinalize && state.remaining <= 1e-9 {
-			positionSnapshot = loadClaimedExitPositionSnapshot(ctx, executor, db)
-			break
-		}
-	}
+	positionSnapshotLoaded := false
 	for tradeID, state := range terminalTrades {
 		if !state.canFinalize {
 			continue
 		}
 		if state.remaining <= 1e-9 {
+			if guard != nil {
+				if err := guard(ctx, tradeID); err != nil {
+					stats.Errors++
+					logger.Error("exit reconcile: residual exit cleanup blocks finalization",
+						"trade_id", tradeID, "ticker", state.ticker, "err", err)
+					continue
+				}
+			}
+			if !positionSnapshotLoaded {
+				positionSnapshot = loadClaimedExitPositionSnapshot(ctx, executor, db)
+				positionSnapshotLoaded = true
+			}
 			if matched, checked, verifyErr := positionSnapshot.matches(state.ticker); checked {
 				if verifyErr != nil || !matched {
 					stats.Errors++
@@ -979,13 +993,22 @@ func runExitReconcilePhases(
 }
 
 func (e *Engine) runClaimedExitReconcileSweepLimit(ctx context.Context, limit int) ExitReconcileStats {
-	stats := ReconcileExitOrderFillsWithStoreAndLoss(
-		ctx, e.executor, limit, e.portfolio.RecordLoss,
-	)
+	stats := reconcileExitOrderFills(ctx, e.executor, exitStoreAdapter{}, limit, e.cleanupClaimedResidualExits, e.portfolio.RecordLoss)
 	for _, realized := range stats.Closed {
 		e.publishTradeClosed(realized)
 	}
 	return stats
+}
+
+func (e *Engine) cleanupClaimedResidualExits(ctx context.Context, tradeID string) error {
+	trade, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil {
+		return fmt.Errorf("load claimed trade: %w", err)
+	}
+	if trade == nil {
+		return errors.New("claimed trade missing")
+	}
+	return e.cancelResidualEngineExitOrders(ctx, *trade, nil)
 }
 
 func (e *Engine) reconcileBrokerManagedExitFills(ctx context.Context) int {

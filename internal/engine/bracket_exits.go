@@ -548,6 +548,10 @@ func normalizedTicker(ticker string) string {
 	return strings.ToUpper(strings.TrimSpace(ticker))
 }
 
+func isStopLossOrderType(orderType string) bool {
+	return strings.EqualFold(orderType, string(execution.OrderTypeStop)) || strings.EqualFold(orderType, "stop_limit")
+}
+
 // fillPriceOf resolves a leg's fill price, falling back to the leg's own
 // level when the broker reported a fill without a price yet (the 10-min
 // exit-fill reconciler heals rows to broker truth afterwards).
@@ -954,20 +958,20 @@ func persistResidualExitOrder(ctx context.Context, t store.Trade, order executio
 		}
 		projection.ParentOrderID = ownership.parentOrderID
 		projection.OrderType = ownership.childType
-		projection.IsStopLoss = strings.EqualFold(ownership.childType, string(execution.OrderTypeStop))
+		projection.IsStopLoss = isStopLossOrderType(ownership.childType)
 		projection.IsTakeProfit = strings.EqualFold(ownership.childType, string(execution.OrderTypeLimit))
 	} else if intent != nil && intent.BrokerOrderID == order.OrderID {
 		// The child/standalone intent is this exact broker order.
 		projection.StockIntentID = intent.ID
 		projection.OrderType = intent.OrderType
-		projection.IsStopLoss = intent.OrderType == string(execution.OrderTypeStop)
+		projection.IsStopLoss = isStopLossOrderType(intent.OrderType)
 	} else {
 		// This is a broker-created child identified through its bracket parent.
 		// The parent intent already projects the entry, so it cannot be reused as
 		// this child row's stock intent.
 		projection.ParentOrderID = ownership.parentOrderID
 		projection.OrderType = ownership.childType
-		projection.IsStopLoss = strings.EqualFold(ownership.childType, string(execution.OrderTypeStop))
+		projection.IsStopLoss = isStopLossOrderType(ownership.childType)
 		projection.IsTakeProfit = strings.EqualFold(ownership.childType, string(execution.OrderTypeLimit))
 		if projection.OrderType == "" {
 			return fmt.Errorf("persist residual exit %s: bracket child has no type", order.OrderID)

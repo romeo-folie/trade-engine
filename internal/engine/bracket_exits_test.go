@@ -1912,7 +1912,7 @@ func TestReconcileBracket_StopFillCancelsUnprojectedBracketChildByNestedParentLi
 			OrderID: childID, TradeID: "broker-child-client-" + tradeID[:8], Ticker: "ORPHCHILD", Side: "sell", Status: "pending", RemainingQty: 3,
 		}},
 		clientOrder: map[string]execution.OrderResult{parentClientID: {
-			BrokerOrderID: parentID, ChildOrders: []execution.OrderLeg{{BrokerOrderID: childID, Type: "stop"}},
+			BrokerOrderID: parentID, ChildOrders: []execution.OrderLeg{{BrokerOrderID: childID, Type: "stop_limit"}},
 		}},
 	}
 	e := newBracketTestEngine(exec)
@@ -1947,7 +1947,7 @@ func TestReconcileBracket_UnprojectedGTCChildDoneForDayBlocksFinalization(t *tes
 		},
 		working: []execution.WorkingOrder{{OrderID: childID, TradeID: "broker-child-client", Ticker: "ORPHGTCCHILD", Side: "sell", Status: "pending", RemainingQty: 3}},
 		clientOrder: map[string]execution.OrderResult{parentClientID: {
-			BrokerOrderID: parentID, ChildOrders: []execution.OrderLeg{{BrokerOrderID: childID, Type: "stop"}},
+			BrokerOrderID: parentID, ChildOrders: []execution.OrderLeg{{BrokerOrderID: childID, Type: "stop_limit"}},
 		}},
 	}
 	handled, err := newBracketTestEngine(exec).reconcileBrokerExitTradeStatus(ctx, getTrade(t, tradeID), false)

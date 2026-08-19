@@ -290,6 +290,44 @@ func TestStartupExitReconcileFinalizesFullyAppliedProtectiveFill(t *testing.T) {
 	}
 }
 
+func TestClaimedExitReconcileCancelsUnprojectedResidualBeforeFinalization(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "CLAIMED_RESIDUAL", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 3, Status: "open",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed, err := store.ClaimTradeExitWithIntent(ctx, tradeID, store.ExitIntent{Reason: store.ExitReasonEMA9Close}); err != nil || !claimed {
+		t.Fatalf("claim exit = %v, %v", claimed, err)
+	}
+	const marketID = "claimed-market-exit"
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: marketID, Ticker: "CLAIMED_RESIDUAL", Side: "sell", OrderType: "market", Quantity: 3, Status: "pending",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	residualID := "claimed-residual-" + tradeID[:8]
+	clientID := persistExitIntent(t, tradeID, residualID, "te-stock-claimed-residual")
+	exec := &fakeBracketExec{
+		statuses: map[string]execution.OrderResult{
+			marketID:   {Status: "filled", FilledPrice: 99, FilledQty: 3},
+			residualID: {Status: "cancelled"},
+		},
+		working: []execution.WorkingOrder{{OrderID: residualID, TradeID: clientID, Ticker: "CLAIMED_RESIDUAL", Side: "sell", Status: "pending", RemainingQty: 3}},
+	}
+	newBracketTestEngine(exec).runClaimedExitReconcileSweepLimit(ctx, StartupExitReconcileBatch)
+	if len(exec.cancelled) != 1 || exec.cancelled[0] != residualID {
+		t.Fatalf("cancelled=%v, want unprojected residual", exec.cancelled)
+	}
+	if trade, err := store.GetTradeByID(ctx, tradeID); err != nil || trade == nil || trade.Status != "closed" {
+		t.Fatalf("claimed trade after residual cleanup = %+v err=%v, want closed", trade, err)
+	}
+}
+
 func TestStartupClaimedExitTimeoutRemainsRetryable(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
