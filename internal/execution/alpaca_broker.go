@@ -281,6 +281,7 @@ func (b *AlpacaBroker) GetWorkingOrders(ctx context.Context) ([]WorkingOrder, er
 		Qty        string `json:"qty"`
 		FilledQty  string `json:"filled_qty"`
 		LimitPx    string `json:"limit_price"`
+		StopPx     string `json:"stop_price"`
 		ClientID   string `json:"client_order_id"`
 		ParentID   string `json:"parent_order_id"`
 		OrderType  string `json:"type"`
@@ -301,6 +302,7 @@ func (b *AlpacaBroker) GetWorkingOrders(ctx context.Context) ([]WorkingOrder, er
 		qty, _ := parseFloat(o.Qty)
 		filled, _ := parseFloat(o.FilledQty)
 		px, _ := parseFloat(o.LimitPx)
+		stopPx, _ := parseFloat(o.StopPx)
 		out = append(out, WorkingOrder{
 			OrderID:       o.ID,
 			TradeID:       o.ClientID,
@@ -312,6 +314,7 @@ func (b *AlpacaBroker) GetWorkingOrders(ctx context.Context) ([]WorkingOrder, er
 			Status:        NormalizeOrderStatus(o.Status),
 			RemainingQty:  qty - filled,
 			Price:         px,
+			StopPrice:     stopPx,
 		})
 	}
 	return out, nil

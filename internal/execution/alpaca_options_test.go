@@ -162,7 +162,7 @@ func TestAlpacaGetWorkingOrders(t *testing.T) {
 			t.Errorf("unexpected request %s?%s", r.URL.Path, r.URL.RawQuery)
 		}
 		io.WriteString(w, `[
-			{"id":"o1","parent_order_id":"parent-1","type":"stop","symbol":"SPY260717C00551000","asset_class":"us_option","side":"sell","status":"accepted","qty":"2","filled_qty":"0","limit_price":"0"},
+			{"id":"o1","parent_order_id":"parent-1","type":"stop","symbol":"SPY260717C00551000","asset_class":"us_option","side":"sell","status":"accepted","qty":"2","filled_qty":"0","limit_price":"0","stop_price":"551.25"},
 			{"id":"o2","symbol":"AAPL","asset_class":"us_equity","side":"buy","status":"new","qty":"10","filled_qty":"3","limit_price":"200"}
 		]`)
 	}))
@@ -183,7 +183,7 @@ func TestAlpacaGetWorkingOrders(t *testing.T) {
 			opt = &orders[i]
 		}
 	}
-	if opt == nil || opt.Ticker != "SPY260717C00551000" || opt.AssetClass != "us_option" || opt.Side != "sell" || opt.ParentOrderID != "parent-1" || opt.OrderType != "stop" || opt.RemainingQty != 2 || opt.Status != "pending" {
+	if opt == nil || opt.Ticker != "SPY260717C00551000" || opt.AssetClass != "us_option" || opt.Side != "sell" || opt.ParentOrderID != "parent-1" || opt.OrderType != "stop" || opt.RemainingQty != 2 || opt.StopPrice != 551.25 || opt.Status != "pending" {
 		t.Errorf("option working order = %+v", opt)
 	}
 }

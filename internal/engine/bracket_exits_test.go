@@ -122,6 +122,54 @@ func TestResidualExitIntentSkipsDurablyOwnedPyramidedLot(t *testing.T) {
 	}
 }
 
+func TestResidualExitIntentSkipsLegacyOrderOwnedByAnotherPyramidedLot(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{Ticker: "LEGACYLOT", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 3})
+	if err != nil {
+		t.Fatalf("InsertTrade target: %v", err)
+	}
+	otherTradeID, err := store.InsertTrade(ctx, store.Trade{Ticker: "LEGACYLOT", Direction: "long", Strategy: "test", EntryPrice: 101, Quantity: 3})
+	if err != nil {
+		t.Fatalf("InsertTrade other: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), `DELETE FROM trades WHERE id = ANY($1::uuid[])`, []string{tradeID, otherTradeID})
+	})
+	brokerID := "legacy-other-lot-" + otherTradeID[:8]
+	if _, err := store.InsertOrder(ctx, store.Order{TradeID: otherTradeID, BrokerOrderID: brokerID, Ticker: "LEGACYLOT", Side: "sell", OrderType: "stop", Quantity: 3, Status: "pending"}); err != nil {
+		t.Fatalf("InsertOrder legacy other lot: %v", err)
+	}
+	ownership, err := residualExitIntentForTrade(ctx, &fakeBracketExec{}, tradeID, execution.WorkingOrder{OrderID: brokerID})
+	if err != nil || ownership != nil {
+		t.Fatalf("legacy other lot ownership = %+v, %v; want no ownership without an error", ownership, err)
+	}
+}
+
+func TestPersistResidualExitOrderPreservesWorkingPrices(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{Ticker: "RESIDUALPX", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 3})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	t.Cleanup(func() { _, _ = store.GetDB().Exec(context.Background(), `DELETE FROM trades WHERE id=$1`, tradeID) })
+	brokerID := "residual-price-" + tradeID[:8]
+	if err := persistResidualExitOrder(ctx, store.Trade{ID: tradeID, Ticker: "RESIDUALPX", Quantity: 3}, execution.WorkingOrder{
+		OrderID: brokerID, Ticker: "RESIDUALPX", Side: "sell", RemainingQty: 3, Price: 105.5, StopPrice: 98.25,
+	}, &residualExitOwnership{intent: &store.StockOrderIntent{BrokerOrderID: brokerID, OrderType: "stop"}}); err != nil {
+		t.Fatalf("persistResidualExitOrder: %v", err)
+	}
+	persisted, err := store.GetOrderByBrokerOrderID(ctx, brokerID)
+	if err != nil || persisted == nil || persisted.LimitPrice != 105.5 || persisted.StopPrice != 98.25 {
+		t.Fatalf("persisted residual = %+v, %v; want working limit and stop prices", persisted, err)
+	}
+}
+
 func TestResidualOwnershipStandaloneReplacementDoesNotInventBracketParent(t *testing.T) {
 	ownership, err := residualOwnershipForIntent(context.Background(), "replacement-stop", &store.StockOrderIntent{
 		ParentIntentID: "predecessor-intent", Purpose: "submit", OrderType: "stop",

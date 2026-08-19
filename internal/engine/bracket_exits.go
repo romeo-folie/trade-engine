@@ -919,6 +919,16 @@ func residualExitIntentForTrade(ctx context.Context, executor execution.Executor
 			return nil, nil
 		}
 	}
+	if existing, err := store.GetOrderByBrokerOrderID(ctx, order.OrderID); err != nil {
+		return nil, fmt.Errorf("find residual exit %s durable order: %w", order.OrderID, err)
+	} else if existing != nil {
+		// Legacy bracket rows may predate stock-order intents. Their exact
+		// durable order ownership is equally conclusive for pyramided lots.
+		if existing.TradeID != tradeID {
+			return nil, nil
+		}
+		return &residualExitOwnership{}, nil
+	}
 	if order.ParentOrderID != "" {
 		parentOrder, err := store.GetOrderByBrokerOrderID(ctx, order.ParentOrderID)
 		if err != nil {
@@ -1009,7 +1019,8 @@ func persistResidualExitOrder(ctx context.Context, t store.Trade, order executio
 	}
 	projection := store.Order{
 		TradeID: t.ID, BrokerOrderID: order.OrderID, Ticker: t.Ticker,
-		Side: order.Side, Quantity: quantity, Status: "pending",
+		Side: order.Side, Quantity: quantity, LimitPrice: order.Price,
+		StopPrice: order.StopPrice, Status: "pending",
 	}
 	if ownership.parentOrderID != "" {
 		// This durable child already has its own intent, but its order row was
