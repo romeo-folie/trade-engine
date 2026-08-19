@@ -919,7 +919,9 @@ func residualExitIntentForTrade(ctx context.Context, executor execution.Executor
 		if intent != nil && intent.TradeID == tradeID {
 			return residualOwnershipForIntent(ctx, order.OrderID, intent)
 		}
-		if intent != nil {
+		if intent != nil && intent.TradeID == "" {
+			tradeLessIntent = true
+		} else if intent != nil {
 			// As above, another trade's exact client intent must be ignored,
 			// not treated as an ambiguous same-ticker residual.
 			return nil, nil
