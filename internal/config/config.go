@@ -2230,7 +2230,7 @@ func Validate(cfg *Config) []string {
 				cfg.Scanner.Universe.HistoricalFeed))
 		}
 	}
-	if cfg.Scanner.Universe.Enabled || cfg.Scanner.PromotionCorrelationEnabled {
+	if cfg.Scanner.Universe.Enabled || cfg.Scanner.PromotionCorrelationEnabled || cfg.Scanner.EarningsWatchlist.Enabled {
 		delay := cfg.Scanner.Universe.SIPRecentDataDelayMinutes
 		if delay < 0 {
 			errs = append(errs,
@@ -2705,6 +2705,11 @@ func Validate(cfg *Config) []string {
 	}
 	if earnings := cfg.Scanner.EarningsWatchlist; earnings.Enabled {
 		const prefix = "scanner.earnings_watchlist"
+		if cfg.Scanner.Universe.HistoricalFeed != "" && !validUniverseHistoricalFeed(cfg.Scanner.Universe.HistoricalFeed) {
+			errs = append(errs, fmt.Sprintf(
+				"scanner.universe.historical_feed must be one of iex|sip when earnings watchlist is enabled, got %q",
+				cfg.Scanner.Universe.HistoricalFeed))
+		}
 		if earnings.AfterCloseDelayMinutes < 0 {
 			errs = append(errs, prefix+".after_close_delay_minutes must be >= 0")
 		}
