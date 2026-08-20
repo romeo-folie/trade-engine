@@ -51,7 +51,7 @@ type PageText struct {
 }
 
 type PDFExtractor interface {
-	Extract(pdf []byte) ([]PageText, error)
+	Extract(ctx context.Context, pdf []byte) ([]PageText, error)
 	Close() error
 }
 

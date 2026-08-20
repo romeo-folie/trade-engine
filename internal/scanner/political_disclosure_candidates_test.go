@@ -136,11 +136,12 @@ func TestPoliticalMarketProviderFailureDoesNotReturnUnhydratedCandidate(t *testi
 	}
 }
 
-func TestPoliticalDisclosureScoringFailureRequeuesClaim(t *testing.T) {
-	if !politicalDisclosureScoringFailureRequeues("failed") ||
-		politicalDisclosureScoringFailureRequeues("rejected") ||
-		politicalDisclosureScoringFailureRequeues("pending") {
-		t.Fatal("scoring-failure requeue must apply only to transient failed status")
+func TestPoliticalDisclosurePromotionRequeuesTransientOutcomes(t *testing.T) {
+	if !politicalDisclosurePromotionRequeues("failed") ||
+		politicalDisclosurePromotionRequeues("rejected") ||
+		politicalDisclosurePromotionRequeues("pending") ||
+		!politicalDisclosurePromotionRequeues("cap_suppressed") {
+		t.Fatal("transient failure and capacity suppression must requeue disclosure claims")
 	}
 }
 
@@ -163,6 +164,28 @@ func TestPoliticalDisclosureCountsDistinctPurchasersByReportedOwner(t *testing.T
 	}
 	if facts.IndependentBuyerActivity {
 		t.Fatalf("one filer with multiple owners must not count as independent buyer activity: %+v", facts)
+	}
+}
+
+func TestPoliticalDisclosureIndependentBuyerActivityRequiresPurchasingFilers(t *testing.T) {
+	filing := time.Date(2026, 8, 15, 0, 0, 0, 0, time.UTC)
+	transaction := filing.AddDate(0, 0, -5)
+	items := []store.PoliticalDisclosureCandidate{
+		politicalCandidateFixture(t, "buyers", "buyers", "house", "house", "Alex Buyer", "CA12", filing, []store.PoliticalDisclosureTransaction{
+			{Owner: "Self", TransactionType: "purchase", TransactionDate: transaction},
+			{Owner: "Spouse", TransactionType: "purchase", TransactionDate: transaction},
+		}),
+		politicalCandidateFixture(t, "seller", "seller", "senate", "senate", "Sam Seller", "OH", filing, []store.PoliticalDisclosureTransaction{
+			{Owner: "Self", TransactionType: "sale", TransactionDate: transaction},
+		}),
+	}
+	candidate := buildPoliticalDisclosureCandidate("TEST", "claim", items)
+	var facts tradeprofile.PoliticalDisclosureEvidence
+	if err := json.Unmarshal(candidate.PoliticalDisclosureFacts, &facts); err != nil {
+		t.Fatal(err)
+	}
+	if facts.DistinctBuyerCount != 2 || facts.DistinctFilerCount != 2 || facts.IndependentBuyerActivity {
+		t.Fatalf("buyer activity must require purchases from multiple filers: %+v", facts)
 	}
 }
 

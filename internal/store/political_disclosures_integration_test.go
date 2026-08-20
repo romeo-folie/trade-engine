@@ -546,6 +546,67 @@ func TestMarkPoliticalDisclosurePromotionRequiresAllClaimedReportIDs(t *testing.
 	}
 }
 
+func TestMarkPoliticalDisclosurePromotionRequeuesOnlyCapSuppressedTicker(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2300, time.April, 11, 12, 0, 0, 0, time.UTC)
+	suppressed := politicalDisclosureClaimFixture("test-disclosure-cap-suppressed", "PDCAPONE", now)
+	sibling := politicalDisclosureClaimFixture("test-disclosure-cap-sibling", "PDCAPTWO", now.AddDate(0, 0, -1))
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), `
+			DELETE FROM political_disclosure_reports
+			WHERE source='house' AND external_id = ANY($1::text[])`,
+			[]string{suppressed.ExternalID, sibling.ExternalID})
+	})
+	for _, report := range []store.PoliticalDisclosureReport{suppressed, sibling} {
+		if err := store.SavePoliticalDisclosureReport(ctx, report); err != nil {
+			t.Fatal(err)
+		}
+	}
+	claimed, err := store.ClaimPoliticalDisclosureCandidates(
+		ctx, now.AddDate(0, 0, -7), now, time.Hour, 2, "cap-batch-token",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byTicker := make(map[string]store.PoliticalDisclosureCandidate, len(claimed))
+	for _, item := range claimed {
+		if item.Claimed {
+			byTicker[item.Ticker] = item
+		}
+	}
+	suppressedClaim, foundSuppressed := byTicker["PDCAPONE"]
+	siblingClaim, foundSibling := byTicker["PDCAPTWO"]
+	if !foundSuppressed || !foundSibling {
+		t.Fatalf("claimed=%+v, want both tickers", claimed)
+	}
+	if err := store.MarkPoliticalDisclosurePromotion(
+		ctx, suppressedClaim.Ticker, "cap-batch-token", []string{suppressedClaim.ReportID},
+		"pending", "", "candidate ranked beyond available scanner slots", now,
+	); err != nil {
+		t.Fatal(err)
+	}
+	var siblingStatus, siblingToken string
+	if err := store.GetDB().QueryRow(ctx, `
+		SELECT promotion_status, COALESCE(promotion_claim_token,'')
+		FROM political_disclosure_candidates WHERE report_id=$1`, siblingClaim.ReportID,
+	).Scan(&siblingStatus, &siblingToken); err != nil {
+		t.Fatal(err)
+	}
+	if siblingStatus != "processing" || siblingToken != "cap-batch-token" {
+		t.Fatalf("sibling claim was disturbed: status=%q token=%q", siblingStatus, siblingToken)
+	}
+	reclaimed, err := store.ClaimPoliticalDisclosureCandidates(
+		ctx, now.AddDate(0, 0, -7), now.Add(time.Minute), time.Hour, 2, "cap-reclaim-token",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reclaimed) != 1 || reclaimed[0].Ticker != "PDCAPONE" ||
+		!reclaimed[0].Claimed || reclaimed[0].PromotionClaimToken != "cap-reclaim-token" {
+		t.Fatalf("reclaimed=%+v, want only cap-suppressed ticker", reclaimed)
+	}
+}
+
 func TestClaimPoliticalDisclosureCandidatesReturnsHistoryButClaimsOnlyPendingRows(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2300, time.March, 15, 12, 0, 0, 0, time.UTC)

@@ -179,6 +179,8 @@ func scannerEvidenceBySource(
 			}
 			if candidate.PoliticalDisclosureEvidence != "" {
 				evidence["summary"] = candidate.PoliticalDisclosureEvidence
+			}
+			if !politicalDisclosureEvidenceObject(candidate.PoliticalDisclosureFacts) {
 				evidence["data_quality"] = map[string]any{
 					"limitations": []string{"structured disclosure evidence was unavailable"},
 				}

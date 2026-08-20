@@ -16,11 +16,27 @@ import (
 
 type runnerTestExtractor struct{}
 
-func (runnerTestExtractor) Extract([]byte) ([]PageText, error) {
+func (runnerTestExtractor) Extract(context.Context, []byte) ([]PageText, error) {
 	return []PageText{{Number: 1}}, nil
 }
 
 func (runnerTestExtractor) Close() error { return nil }
+
+type blockingContextExtractor struct {
+	started chan context.Context
+}
+
+func (e blockingContextExtractor) Extract(ctx context.Context, _ []byte) ([]PageText, error) {
+	select {
+	case e.started <- ctx:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (blockingContextExtractor) Close() error { return nil }
 
 type countingSenateTransport struct {
 	searchBody  []byte
@@ -81,6 +97,175 @@ func TestScheduledDisclosureRangeUsesCalendarDayBoundaries(t *testing.T) {
 	if !since.Equal(wantSince) || !until.Equal(wantUntil) {
 		t.Fatalf("range = %s through %s, want %s through %s",
 			since, until, wantSince, wantUntil)
+	}
+}
+
+func TestHouseSyncCancelsInFlightPDFExtraction(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/financial-pdfs/2026FD.txt":
+			_, _ = w.Write([]byte("Prefix\tLast\tFirst\tSuffix\tFilingType\tStateDst\tYear\tFilingDate\tDocID\nHon.\tExample\tJane\t\tP\tCA01\t2026\t08/10/2026\tdoc"))
+		case "/ptr-pdfs/2026/doc.pdf":
+			_, _ = w.Write([]byte("pdf"))
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+	extractor := blockingContextExtractor{started: make(chan context.Context, 1)}
+	runner := &Runner{
+		House: &HouseClient{BaseURL: server.URL, HTTP: server.Client()}, Extractor: extractor,
+		reportTerminal: func(context.Context, string, string) (bool, error) { return false, nil },
+		persistReport:  func(context.Context, Report) error { t.Fatal("canceled extraction was persisted"); return nil },
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := runner.syncHouse(ctx, time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 8, 12, 0, 0, 0, 0, time.UTC), 1)
+		done <- err
+	}()
+	select {
+	case extractCtx := <-extractor.started:
+		if extractCtx != ctx {
+			t.Fatal("runner did not pass its sync context to PDF extraction")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("PDF extraction did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("sync error = %v, want context cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("sync did not return after extraction cancellation")
+	}
+}
+
+func TestOGESyncCancelsInFlightPDFExtraction(t *testing.T) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/":
+			_, _ = w.Write([]byte(`{"recordsTotal":1,"data":[{"type":"<a href='` + server.URL + `/oge.pdf'>PDF</a>","name":"Jane Official","agency":"Office","title":"Role","docDate":"2026-08-10"}]}`))
+		case "/oge.pdf":
+			_, _ = w.Write([]byte("pdf"))
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+	extractor := blockingContextExtractor{started: make(chan context.Context, 1)}
+	runner := &Runner{
+		OGE:       NewOGEClient(server.URL, time.Second),
+		Extractor: extractor,
+		reportTerminal: func(context.Context, string, string) (bool, error) {
+			return false, nil
+		},
+		persistReport: func(context.Context, Report) error {
+			t.Fatal("canceled extraction was persisted")
+			return nil
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := runner.syncOGE(ctx, time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 8, 12, 0, 0, 0, 0, time.UTC), 1)
+		done <- err
+	}()
+	select {
+	case extractCtx := <-extractor.started:
+		if extractCtx != ctx {
+			t.Fatal("runner did not pass its sync context to OGE PDF extraction")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("OGE PDF extraction did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("sync error = %v, want context cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("OGE sync did not return after extraction cancellation")
+	}
+}
+
+func TestPDFiumExtractorRejectsCanceledContextBeforeClaimingWorker(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := (&PDFiumExtractor{}).Extract(ctx, []byte("pdf"))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Extract error = %v, want context cancellation", err)
+	}
+}
+
+func TestRetryPDFExtractionReceivesCancellationContext(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("pdf"))
+	}))
+	defer server.Close()
+	filingDate := time.Date(2026, 8, 10, 0, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name string
+		run  func(*Runner, context.Context) (int, error)
+		make func(PDFExtractor) *Runner
+	}{
+		{
+			name: "house retry",
+			run:  func(r *Runner, ctx context.Context) (int, error) { return r.retryHouse(ctx, 1) },
+			make: func(extractor PDFExtractor) *Runner {
+				return &Runner{House: &HouseClient{BaseURL: server.URL, HTTP: server.Client()}, Extractor: extractor,
+					claimDueRetries: func(context.Context, string, time.Time, int, time.Duration) ([]store.PoliticalDisclosureReport, error) {
+						return []store.PoliticalDisclosureReport{{Source: "house", ExternalID: "retry-house", Chamber: "house", FilerName: "Jane Member", Office: "CA01", ReportType: "periodic_transaction", FilingDate: filingDate, RetryClaimToken: "token", RawMetadata: []byte(`{"First":"Jane","Last":"Member","FilingType":"P","StateDistrict":"CA01","Year":2026,"FilingDate":"2026-08-10T00:00:00Z","DocumentID":"retry-house"}`)}}, nil
+					},
+				}
+			},
+		},
+		{
+			name: "oge retry",
+			run:  func(r *Runner, ctx context.Context) (int, error) { return r.retryOGE(ctx, 1) },
+			make: func(extractor PDFExtractor) *Runner {
+				return &Runner{OGE: NewOGEClient(server.URL, time.Second), Extractor: extractor,
+					claimDueRetries: func(context.Context, string, time.Time, int, time.Duration) ([]store.PoliticalDisclosureReport, error) {
+						return []store.PoliticalDisclosureReport{{Source: "oge", ExternalID: "retry-oge", Chamber: "executive", FilerName: "Jane Official", Office: "Office", ReportType: "periodic_transaction", FilingDate: filingDate, DocumentURL: server.URL + "/retry-oge.pdf", RetryClaimToken: "token"}}, nil
+					},
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			extractor := blockingContextExtractor{started: make(chan context.Context, 1)}
+			runner := test.make(extractor)
+			runner.saveRetryResult = func(context.Context, store.PoliticalDisclosureReport, string) error { return nil }
+			runner.releaseRetryClaims = func(context.Context, string) error { return nil }
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { _, err := test.run(runner, ctx); done <- err }()
+			select {
+			case extractCtx := <-extractor.started:
+				if extractCtx != ctx {
+					t.Fatal("retry did not pass its context to PDF extraction")
+				}
+			case <-time.After(time.Second):
+				t.Fatal("retry extraction did not start")
+			}
+			cancel()
+			select {
+			case err := <-done:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("retry error = %v, want context cancellation", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("retry did not return after extraction cancellation")
+			}
+		})
 	}
 }
 

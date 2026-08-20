@@ -334,7 +334,7 @@ func (r *Runner) retryHouse(ctx context.Context, limit int) (int, error) {
 			if r.Extractor == nil {
 				fetchErr = permanentDisclosureError(errors.New("house retry has no PDF extractor"))
 			} else {
-				pages, extractErr := r.Extractor.Extract(pdf)
+				pages, extractErr := r.Extractor.Extract(ctx, pdf)
 				if extractErr == nil {
 					if saveErr := r.saveRetry(ctx, ParseHousePTR(filing, documentURL, pdf, pages), claim.RetryClaimToken); saveErr != nil {
 						return processed, fmt.Errorf("persist House retry %s: %w", claim.ExternalID, saveErr)
@@ -431,7 +431,7 @@ func (r *Runner) retryOGE(ctx context.Context, limit int) (int, error) {
 			if r.Extractor == nil {
 				fetchErr = permanentDisclosureError(errors.New("OGE retry has no PDF extractor"))
 			} else {
-				pages, extractErr := r.Extractor.Extract(pdf)
+				pages, extractErr := r.Extractor.Extract(ctx, pdf)
 				if extractErr == nil {
 					if saveErr := r.saveRetry(ctx, ParseOGEPDF(filing, pdf, pages), claim.RetryClaimToken); saveErr != nil {
 						return processed, fmt.Errorf("persist OGE retry %s: %w", claim.ExternalID, saveErr)
@@ -612,7 +612,7 @@ func (r *Runner) syncHouse(
 			}
 			continue
 		}
-		pages, err := r.Extractor.Extract(pdfData)
+		pages, err := r.Extractor.Extract(ctx, pdfData)
 		if err != nil {
 			if ctx.Err() != nil {
 				return processed, ctx.Err()
@@ -770,7 +770,7 @@ func (r *Runner) syncOGE(ctx context.Context, since, until time.Time, limit int)
 				}
 				continue
 			}
-			pages, err := r.Extractor.Extract(pdf)
+			pages, err := r.Extractor.Extract(ctx, pdf)
 			if err != nil {
 				if ctx.Err() != nil {
 					return processed, ctx.Err()

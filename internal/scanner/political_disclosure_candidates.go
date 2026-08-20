@@ -290,12 +290,16 @@ func (a *politicalDisclosureAggregate) finish() {
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
+	purchasingFilerCount := 0
 	for _, id := range ids {
 		filer := a.filers[id]
 		filer.evidence.ReportedOwners = sortedSet(filer.owners)
 		filer.evidence.RepeatedActivity = filer.evidence.IndependentReportCount > 1 || filer.independentTransactionCount > 1
 		filer.evidence.ContradictoryActivity = filer.evidence.PurchaseCount > 0 && filer.evidence.SaleCount > 0
 		a.evidence.DistinctBuyerCount += len(filer.purchasers)
+		if filer.evidence.PurchaseCount > 0 {
+			purchasingFilerCount++
+		}
 		if filer.evidence.RepeatedActivity {
 			a.evidence.RepeatedFilerActivity = true
 		}
@@ -306,8 +310,7 @@ func (a *politicalDisclosureAggregate) finish() {
 		}
 	}
 	a.evidence.DistinctFilerCount = len(ids)
-	a.evidence.IndependentBuyerActivity = a.evidence.DistinctBuyerCount > 1 &&
-		a.evidence.DistinctFilerCount > 1
+	a.evidence.IndependentBuyerActivity = purchasingFilerCount > 1
 	a.evidence.ContradictoryActivity = a.evidence.PurchaseCount > 0 && a.evidence.SaleCount > 0
 	if a.evidence.AmendmentReportCount > 0 {
 		a.addLimitation("amendment rows remain in report detail and raw transaction counts, but are excluded from independent semantic action, amount, owner, timing, repetition, and contradiction aggregates because no authoritative supersession relationship is available")
@@ -649,11 +652,17 @@ func (s *MarketScanner) markPoliticalDisclosureCandidate(
 	if candidate.PoliticalDisclosureClaimToken == "" || !store.IsConnected() {
 		return
 	}
-	// A scoring failure is transient by definition: the provider failed, not the
-	// evidence. Requeue disclosure claims instead of terminalizing them so the
-	// next scanner cycle can evaluate the same filing evidence after recovery.
-	if politicalDisclosureScoringFailureRequeues(status) {
-		s.releasePoliticalDisclosureClaims(ctx, []SwingCandidate{candidate})
+	// Scanner failures and capacity/diversification suppression are transient:
+	// they do not invalidate the disclosure evidence. Requeue only this
+	// candidate so another cycle can evaluate it after capacity recovers.
+	if politicalDisclosurePromotionRequeues(status) {
+		if err := store.MarkPoliticalDisclosurePromotion(
+			ctx, candidate.Ticker, candidate.PoliticalDisclosureClaimToken,
+			candidate.PoliticalDisclosureClaimReportIDs, "pending", "", reason, s.now(),
+		); err != nil {
+			slog.Warn("scanner: requeue political disclosure promotion",
+				"ticker", candidate.Ticker, "status", status, "err", err)
+		}
 		return
 	}
 	if err := store.MarkPoliticalDisclosurePromotion(
@@ -665,8 +674,8 @@ func (s *MarketScanner) markPoliticalDisclosureCandidate(
 	}
 }
 
-func politicalDisclosureScoringFailureRequeues(status string) bool {
-	return status == "failed"
+func politicalDisclosurePromotionRequeues(status string) bool {
+	return status == "failed" || status == "cap_suppressed"
 }
 
 func (s *MarketScanner) releasePoliticalDisclosureClaims(

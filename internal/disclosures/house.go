@@ -45,9 +45,11 @@ func ParseHouseIndex(data []byte) ([]HouseFiling, error) {
 		return nil, nil
 	}
 	var out []HouseFiling
-	for rowIndex, row := range records[1:] {
+	for _, row := range records[1:] {
 		if len(row) < 9 {
-			return nil, fmt.Errorf("house filing index row %d has %d fields", rowIndex+2, len(row))
+			// One malformed official row must not discard the remaining annual
+			// index. The row cannot form a valid filing identity anyway.
+			continue
 		}
 		if strings.TrimSpace(row[4]) != "P" {
 			continue
@@ -60,11 +62,17 @@ func ParseHouseIndex(data []byte) ([]HouseFiling, error) {
 		if err != nil {
 			continue
 		}
+		documentID := strings.TrimSpace(row[8])
+		filerName := strings.Join(strings.Fields(strings.Join(
+			[]string{row[0], row[2], row[1], row[3]}, " ")), " ")
+		if documentID == "" || filerName == "" {
+			continue
+		}
 		out = append(out, HouseFiling{
 			Prefix: strings.TrimSpace(row[0]), Last: strings.TrimSpace(row[1]),
 			First: strings.TrimSpace(row[2]), Suffix: strings.TrimSpace(row[3]),
 			FilingType: "P", StateDistrict: strings.TrimSpace(row[5]), Year: year,
-			FilingDate: filedAt, DocumentID: strings.TrimSpace(row[8]),
+			FilingDate: filedAt, DocumentID: documentID,
 		})
 	}
 	return out, nil

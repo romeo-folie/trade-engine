@@ -39,7 +39,7 @@ func TestPDFiumHousePTRFixture(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer extractor.Close() //nolint:errcheck
-	pages, err := extractor.Extract(data)
+	pages, err := extractor.Extract(context.Background(), data)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,6 +118,24 @@ func TestParseHouseIndexSkipsMalformedRowsWithoutDiscardingYear(t *testing.T) {
 	}
 	if len(filings) != 1 || filings[0].DocumentID != "good" {
 		t.Fatalf("filings = %+v, want only valid PTR row", filings)
+	}
+}
+
+func TestParseHouseIndexSkipsIncompleteIdentityRows(t *testing.T) {
+	data := strings.Join([]string{
+		"Prefix\tLast\tFirst\tSuffix\tFilingType\tStateDst\tYear\tFilingDate\tDocID",
+		"Hon.\tValid\tJane\t\tP\tCA01\t2026\t08/10/2026\tvalid",
+		"Hon.\tMissingID\tJane\t\tP\tCA01\t2026\t08/10/2026\t",
+		"\t\t\t\tP\tCA01\t2026\t08/10/2026\tmissing-name",
+		"too\tshort",
+		"Hon.\tLater\tPat\t\tP\tCA01\t2026\t08/10/2026\tlater-valid",
+	}, "\n")
+	filings, err := ParseHouseIndex([]byte(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(filings) != 2 || filings[0].DocumentID != "valid" || filings[1].DocumentID != "later-valid" {
+		t.Fatalf("filings = %+v, want both complete identities", filings)
 	}
 }
 

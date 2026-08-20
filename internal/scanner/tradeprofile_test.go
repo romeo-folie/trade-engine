@@ -151,6 +151,7 @@ func TestBuildScannerTradeProfileCarriesPoliticalDisclosureFacts(t *testing.T) {
 		}},
 		DataQuality: tradeprofile.PoliticalDisclosureDataQuality{
 			CanonicalIdentityBasis: "normalized source, chamber, and filer-name tokens",
+			Limitations:            []string{"report detail was bounded"},
 		},
 	}
 	raw, err := json.Marshal(facts)
@@ -186,6 +187,26 @@ func TestBuildScannerTradeProfileCarriesPoliticalDisclosureFacts(t *testing.T) {
 	}
 	if _, ok := common["market_observation"]; !ok {
 		t.Fatalf("disclosure-only discovery lost market observation: %v", common)
+	}
+	dataQuality, ok := common["data_quality"].(map[string]any)
+	if !ok || dataQuality["canonical_identity_basis"] != facts.DataQuality.CanonicalIdentityBasis {
+		t.Fatalf("structured data quality was overwritten: %v", common["data_quality"])
+	}
+	qualityJSON, err := json.Marshal(dataQuality)
+	if err != nil || !strings.Contains(string(qualityJSON), "report detail was bounded") ||
+		strings.Contains(string(qualityJSON), "structured disclosure evidence was unavailable") {
+		t.Fatalf("structured limitations were not preserved: %s", qualityJSON)
+	}
+
+	fallbackDiscovery, _, err := buildScannerTradeProfile(SwingCandidate{
+		Ticker: "NOFACTS", Sources: []string{"political_disclosure"},
+		PoliticalDisclosureEvidence: "flattened evidence only",
+	}, SwingScoreResult{Strategy: "momentum"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(fallbackDiscovery.EvidenceBySource["political_disclosure"]), "structured disclosure evidence was unavailable") {
+		t.Fatal("fallback data-quality limitation was not emitted for absent facts")
 	}
 }
 
