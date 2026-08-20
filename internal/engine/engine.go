@@ -588,7 +588,7 @@ func (e *Engine) tick(ctx context.Context) error {
 			e.processStockWithProfile(
 				ctx, item.Ticker, item.Timeframes, item.Strategies, item.Source,
 				item.MinConfidence, item.GraphContext, item.ScannerRunID,
-				item.DiscoveryContext, item.ExecutionProfile,
+				item.EffectiveDiscoveryContext(), item.ExecutionProfile,
 			)
 		}(item)
 	}

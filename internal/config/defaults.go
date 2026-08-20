@@ -511,6 +511,10 @@ func Defaults() *Config {
 				BatchSize:           200,
 				RunLeaseMinutes:     15,
 			},
+			EarningsWatchlist: EarningsWatchlistConfig{
+				Enabled: true, AfterCloseDelayMinutes: 20, CandidateCap: 5,
+				WatchlistSessions: 5, BarBatchSize: 100,
+			},
 			GraphNeighbors: GraphNeighborsConfig{
 				Enabled:          false,
 				MaxPerScan:       5,

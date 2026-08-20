@@ -1231,6 +1231,10 @@ type ScannerConfig struct {
 	// path; this source never places orders or grants trade permission.
 	PremarketEpisodic PremarketEpisodicConfig `yaml:"premarket_episodic"`
 
+	// EarningsWatchlist adds a small, calendar-driven cohort to the ordinary
+	// analyst funnel before the next regular session.
+	EarningsWatchlist EarningsWatchlistConfig `yaml:"earnings_watchlist"`
+
 	// GraphNeighbors configures sourcing scanner candidates from the knowledge
 	// graph — tradeable companies one hop from a manually-watched ticker.
 	GraphNeighbors GraphNeighborsConfig `yaml:"graph_neighbors"`
@@ -1326,6 +1330,16 @@ type PremarketEpisodicConfig struct {
 	MinMarketCapMM      float64 `yaml:"min_market_cap_mm"`
 	BatchSize           int     `yaml:"batch_size"`
 	RunLeaseMinutes     int     `yaml:"run_lease_minutes"`
+}
+
+// EarningsWatchlistConfig controls the scheduled-earnings watchlist feeder.
+// It intentionally has no result-confirmation or scanner-promotion settings.
+type EarningsWatchlistConfig struct {
+	Enabled                bool `yaml:"enabled"`
+	AfterCloseDelayMinutes int  `yaml:"after_close_delay_minutes"`
+	CandidateCap           int  `yaml:"candidate_cap"`
+	WatchlistSessions      int  `yaml:"watchlist_sessions"`
+	BarBatchSize           int  `yaml:"bar_batch_size"`
 }
 
 // UniverseConfig controls construction and caching of the point-in-time stock
@@ -2216,7 +2230,7 @@ func Validate(cfg *Config) []string {
 				cfg.Scanner.Universe.HistoricalFeed))
 		}
 	}
-	if cfg.Scanner.Universe.Enabled || cfg.Scanner.PromotionCorrelationEnabled {
+	if cfg.Scanner.Universe.Enabled || cfg.Scanner.PromotionCorrelationEnabled || cfg.Scanner.EarningsWatchlist.Enabled {
 		delay := cfg.Scanner.Universe.SIPRecentDataDelayMinutes
 		if delay < 0 {
 			errs = append(errs,
@@ -2687,6 +2701,32 @@ func Validate(cfg *Config) []string {
 		if premarket.MinBarCoverage <= 0 || premarket.MinBarCoverage > 1 ||
 			math.IsNaN(premarket.MinBarCoverage) {
 			errs = append(errs, prefix+".min_bar_coverage must be in (0,1]")
+		}
+	}
+	if earnings := cfg.Scanner.EarningsWatchlist; earnings.Enabled {
+		const prefix = "scanner.earnings_watchlist"
+		if !validUniverseHistoricalFeed(cfg.Scanner.Universe.HistoricalFeed) {
+			errs = append(errs, fmt.Sprintf(
+				"scanner.universe.historical_feed must be one of iex|sip when earnings watchlist is enabled, got %q",
+				cfg.Scanner.Universe.HistoricalFeed))
+		}
+		if earnings.AfterCloseDelayMinutes < 0 {
+			errs = append(errs, prefix+".after_close_delay_minutes must be >= 0")
+		} else if !durationConfigFits(earnings.AfterCloseDelayMinutes, time.Minute) {
+			errs = append(errs, prefix+".after_close_delay_minutes overflows time.Duration")
+		}
+		if cfg.Scanner.Universe.HistoricalFeed == "sip" &&
+			earnings.AfterCloseDelayMinutes < cfg.Scanner.Universe.SIPRecentDataDelayMinutes {
+			errs = append(errs, prefix+".after_close_delay_minutes must be >= scanner.universe.sip_recent_data_delay_minutes when historical_feed=sip")
+		}
+		for field, value := range map[string]int{
+			"candidate_cap":      earnings.CandidateCap,
+			"watchlist_sessions": earnings.WatchlistSessions,
+			"bar_batch_size":     earnings.BarBatchSize,
+		} {
+			if value <= 0 {
+				errs = append(errs, prefix+"."+field+" must be > 0")
+			}
 		}
 	}
 
