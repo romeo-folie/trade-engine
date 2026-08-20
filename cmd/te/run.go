@@ -1020,8 +1020,12 @@ Modes:
 			} else {
 				feeder := &earnings.WatchlistFeeder{
 					Calendar: finnhub,
-					Bars:     data.NewAlpacaUniverseClient(alpaca, cfg.Markets.Stocks.BaseURL),
-					Cfg:      cfg.Scanner.EarningsWatchlist,
+					Bars: data.NewAlpacaUniverseClient(alpaca, cfg.Markets.Stocks.BaseURL, data.AlpacaUniverseFeeds{
+						Snapshots:          cfg.Scanner.Universe.SnapshotFeed,
+						Historical:         cfg.Scanner.Universe.HistoricalFeed,
+						SIPRecentDataDelay: time.Duration(cfg.Scanner.Universe.SIPRecentDataDelayMinutes) * time.Minute,
+					}),
+					Cfg: cfg.Scanner.EarningsWatchlist,
 				}
 				scheduler := &earnings.WatchlistScheduler{Cfg: cfg.Scanner.EarningsWatchlist, Job: feeder}
 				go func() {
