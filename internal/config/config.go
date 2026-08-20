@@ -2712,6 +2712,8 @@ func Validate(cfg *Config) []string {
 		}
 		if earnings.AfterCloseDelayMinutes < 0 {
 			errs = append(errs, prefix+".after_close_delay_minutes must be >= 0")
+		} else if !durationConfigFits(earnings.AfterCloseDelayMinutes, time.Minute) {
+			errs = append(errs, prefix+".after_close_delay_minutes overflows time.Duration")
 		}
 		for field, value := range map[string]int{
 			"candidate_cap":      earnings.CandidateCap,

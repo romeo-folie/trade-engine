@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -118,7 +119,7 @@ func publishEarningsCandidate(ctx context.Context, tx pgx.Tx, candidate Earnings
 			Ticker: ticker, Platform: "stock", Source: "earnings_watchlist",
 			Strategies: []string{"trend_following", "momentum", "news_sentiment"},
 			Timeframes: []string{"1D", "4H", "1H"}, GraphContext: "Scheduled earnings watchlist candidate.",
-		}, false); err != nil {
+		}, true); err != nil && !errors.Is(err, ErrWatchlistActiveItemExists) {
 			return err
 		}
 	}

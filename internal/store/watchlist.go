@@ -390,7 +390,21 @@ func GetWatchlistItems(ctx context.Context, activeOnly bool) ([]WatchlistItem, e
 	for i := range items {
 		clearExpiredWatchlistContract(&items[i])
 	}
+	if activeOnly {
+		items = filterExpiredContextlessScannerItems(items)
+	}
 	return items, nil
+}
+
+func filterExpiredContextlessScannerItems(items []WatchlistItem) []WatchlistItem {
+	filtered := items[:0]
+	for _, item := range items {
+		if item.Source == "scanner" && item.ExpiresAt != nil && !item.ExpiresAt.After(time.Now()) && len(item.DiscoveryContexts) == 0 {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	return filtered
 }
 
 // GetWatchlistItem returns a single watchlist entry by ticker and platform.
