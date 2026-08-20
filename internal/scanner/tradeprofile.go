@@ -166,10 +166,16 @@ func scannerEvidenceBySource(
 			}
 		case "political_disclosure":
 			if politicalDisclosureEvidenceObject(candidate.PoliticalDisclosureFacts) {
-				evidenceBySource[source] = append(
-					json.RawMessage(nil), candidate.PoliticalDisclosureFacts...,
-				)
-				continue
+				// Preserve the common market/news observations for the first
+				// source and attach the structured disclosure facts alongside
+				// them. Replacing the whole object would drop the exact
+				// point-in-time evidence the scanner and later audits need.
+				var facts map[string]any
+				if err := json.Unmarshal(candidate.PoliticalDisclosureFacts, &facts); err == nil {
+					for key, value := range facts {
+						evidence[key] = value
+					}
+				}
 			}
 			if candidate.PoliticalDisclosureEvidence != "" {
 				evidence["summary"] = candidate.PoliticalDisclosureEvidence

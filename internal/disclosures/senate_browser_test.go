@@ -1,12 +1,14 @@
 package disclosures
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestSenatePageAuthorized(t *testing.T) {
@@ -167,6 +169,28 @@ func TestSenateBrowserProfileLifecycle(t *testing.T) {
 	}
 	if _, err := os.Stat(profile); !os.IsNotExist(err) {
 		t.Fatalf("profile still exists: %v", err)
+	}
+}
+
+func TestSenateBrowserStartupIsBoundedByRequestContext(t *testing.T) {
+	profile := filepath.Join(t.TempDir(), "senate-profile")
+	browser, err := NewSenateChromeTransport(SenateBrowserOptions{
+		BaseURL: "https://efdsearch.senate.gov", ProfileDir: profile,
+		Timeout: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A startLockedWithContext call is not practical without a browser, but the
+	// context wiring must cancel the startup context when the request cancels.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = browser.startLockedWithContext(ctx)
+	if err == nil {
+		t.Fatal("startup with canceled request context succeeded")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("startup error = %v, want context.Canceled", err)
 	}
 }
 

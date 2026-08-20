@@ -105,6 +105,22 @@ func TestParseHouseIndexAllowsOfficialBareQuotesInNames(t *testing.T) {
 	}
 }
 
+func TestParseHouseIndexSkipsMalformedRowsWithoutDiscardingYear(t *testing.T) {
+	data := strings.Join([]string{
+		"Prefix\tLast\tFirst\tSuffix\tFilingType\tStateDst\tYear\tFilingDate\tDocID",
+		"Hon.\tGood\tJane\t\tP\tCA01\t2026\t08/10/2026\tgood",
+		"Hon.\tBadYear\tBob\t\tP\tCA01\tnot-a-year\t08/10/2026\tbad-year",
+		"Hon.\tBadDate\tSue\t\tP\tCA01\t2026\tnot-a-date\tbad-date",
+	}, "\n")
+	filings, err := ParseHouseIndex([]byte(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(filings) != 1 || filings[0].DocumentID != "good" {
+		t.Fatalf("filings = %+v, want only valid PTR row", filings)
+	}
+}
+
 func TestParseHouseIndexAllowsUnpaddedOfficialDates(t *testing.T) {
 	data := strings.Join([]string{
 		"Prefix\tLast\tFirst\tSuffix\tFilingType\tStateDst\tYear\tFilingDate\tDocID",

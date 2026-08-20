@@ -54,11 +54,11 @@ func ParseHouseIndex(data []byte) ([]HouseFiling, error) {
 		}
 		year, err := strconv.Atoi(strings.TrimSpace(row[6]))
 		if err != nil {
-			return nil, fmt.Errorf("house filing index row %d year: %w", rowIndex+2, err)
+			continue
 		}
 		filedAt, err := parseDate(row[7])
 		if err != nil {
-			return nil, fmt.Errorf("house filing index row %d date: %w", rowIndex+2, err)
+			continue
 		}
 		out = append(out, HouseFiling{
 			Prefix: strings.TrimSpace(row[0]), Last: strings.TrimSpace(row[1]),

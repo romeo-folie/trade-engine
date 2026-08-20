@@ -144,6 +144,28 @@ func TestPoliticalDisclosureScoringFailureRequeuesClaim(t *testing.T) {
 	}
 }
 
+func TestPoliticalDisclosureCountsDistinctPurchasersByReportedOwner(t *testing.T) {
+	filing := time.Date(2026, 8, 15, 0, 0, 0, 0, time.UTC)
+	transaction := filing.AddDate(0, 0, -5)
+	items := []store.PoliticalDisclosureCandidate{
+		politicalCandidateFixture(t, "self", "self", "house", "house", "Alex Example", "CA12", filing, []store.PoliticalDisclosureTransaction{{Owner: "Self", TransactionType: "purchase", TransactionDate: transaction}}),
+		politicalCandidateFixture(t, "spouse", "spouse", "house", "house", "Alex Example", "CA12", filing, []store.PoliticalDisclosureTransaction{{Owner: "Spouse", TransactionType: "purchase", TransactionDate: transaction}}),
+		politicalCandidateFixture(t, "joint", "joint", "house", "house", "Alex Example", "CA12", filing, []store.PoliticalDisclosureTransaction{{Owner: "JT", TransactionType: "purchase", TransactionDate: transaction}}),
+		politicalCandidateFixture(t, "missing", "missing", "house", "house", "Alex Example", "CA12", filing, []store.PoliticalDisclosureTransaction{{TransactionType: "purchase", TransactionDate: transaction}}),
+	}
+	candidate := buildPoliticalDisclosureCandidate("TEST", "claim", items)
+	var facts tradeprofile.PoliticalDisclosureEvidence
+	if err := json.Unmarshal(candidate.PoliticalDisclosureFacts, &facts); err != nil {
+		t.Fatal(err)
+	}
+	if facts.DistinctFilerCount != 1 || facts.DistinctBuyerCount != 3 {
+		t.Fatalf("buyer count = %d (filers %d), want three reported purchasers", facts.DistinctBuyerCount, facts.DistinctFilerCount)
+	}
+	if facts.IndependentBuyerActivity {
+		t.Fatalf("one filer with multiple owners must not count as independent buyer activity: %+v", facts)
+	}
+}
+
 func TestPoliticalDisclosureFactsDistinguishRepeatedAndIndependentFilers(t *testing.T) {
 	filing := time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC)
 	firstTransaction := filing.AddDate(0, 0, -10)
@@ -251,7 +273,7 @@ func TestPoliticalDisclosureAmendmentDoesNotInflateIndependentBreadthOrRepeatedA
 	if err := json.Unmarshal(candidate.PoliticalDisclosureFacts, &facts); err != nil {
 		t.Fatal(err)
 	}
-	if facts.ReportCount != 2 || facts.AmendmentReportCount != 1 || facts.IndependentReportCount != 1 || facts.RepeatedFilerActivity || facts.IndependentBuyerActivity || facts.DistinctBuyerCount != 1 {
+	if facts.ReportCount != 2 || facts.AmendmentReportCount != 1 || facts.IndependentReportCount != 1 || facts.RepeatedFilerActivity || facts.IndependentBuyerActivity || facts.DistinctBuyerCount != 0 {
 		t.Fatalf("amendment inflated independent evidence: %+v", facts)
 	}
 	if len(facts.Filers) != 1 || facts.Filers[0].IndependentReportCount != 1 || facts.Filers[0].RepeatedActivity {

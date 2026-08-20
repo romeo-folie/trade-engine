@@ -179,6 +179,14 @@ func TestBuildScannerTradeProfileCarriesPoliticalDisclosureFacts(t *testing.T) {
 	if profile.PrimaryTimeframe != "4H" || profile.RecommendedLens != "momentum" {
 		t.Fatalf("political provenance changed execution profile: %+v", profile)
 	}
+
+	var common map[string]any
+	if err := json.Unmarshal(discovery.EvidenceBySource["political_disclosure"], &common); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := common["market_observation"]; !ok {
+		t.Fatalf("disclosure-only discovery lost market observation: %v", common)
+	}
 }
 
 func TestBuildScannerTradeProfileCapturesStructuredEvidence(t *testing.T) {

@@ -130,7 +130,7 @@ func (t *SenateChromeTransport) SearchPTRs(
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if err := t.startLocked(); err != nil {
+	if err := t.startLockedWithContext(ctx); err != nil {
 		return nil, err
 	}
 	if _, err := t.ensureAuthorizedLocked(ctx); err != nil {
@@ -157,10 +157,32 @@ func (t *SenateChromeTransport) SearchPTRs(
 			},
 			body
 		});
-		const text = await response.text();
-		const bodyBytes = new TextEncoder().encode(text).byteLength;
-		const oversized = bodyBytes > %d;
-		return {status: response.status, url: response.url, body: oversized ? "" : text, bodyBytes, oversized};
+		const limit = %d;
+		const reader = response.body ? response.body.getReader() : null;
+		if (!reader) {
+			const text = await response.text();
+			const bodyBytes = new TextEncoder().encode(text).byteLength;
+			const oversized = bodyBytes > limit;
+			return {status: response.status, url: response.url, body: oversized ? "" : text, bodyBytes, oversized};
+		}
+		const chunks = [];
+		let bodyBytes = 0;
+		let oversized = false;
+		while (true) {
+			const {done, value} = await reader.read();
+			if (done) break;
+			bodyBytes += value.byteLength;
+			if (bodyBytes > limit) {
+				oversized = true;
+				await reader.cancel();
+				break;
+			}
+			chunks.push(value);
+		}
+		const body = oversized ? "" : new TextDecoder().decode(
+			chunks.length ? await new Blob(chunks).arrayBuffer() : new ArrayBuffer(0)
+		);
+		return {status: response.status, url: response.url, body, bodyBytes, oversized};
 	})()`, string(encodedForm), maxSenateSearchResponseSize)
 	var response senateBrowserResponse
 	if err := t.runLocked(ctx, chromedp.Evaluate(
@@ -190,7 +212,7 @@ func (t *SenateChromeTransport) FetchPTR(ctx context.Context, documentURL string
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if err := t.startLocked(); err != nil {
+	if err := t.startLockedWithContext(ctx); err != nil {
 		return nil, err
 	}
 	if _, err := t.ensureAuthorizedLocked(ctx); err != nil {
@@ -205,10 +227,32 @@ func (t *SenateChromeTransport) FetchPTR(ctx context.Context, documentURL string
 	}
 	expression := fmt.Sprintf(`(async () => {
 		const response = await fetch(%s, {credentials: "same-origin", redirect: "follow"});
-		const text = await response.text();
-		const bodyBytes = new TextEncoder().encode(text).byteLength;
-		const oversized = bodyBytes > %d;
-		return {status: response.status, url: response.url, body: oversized ? "" : text, bodyBytes, oversized};
+		const limit = %d;
+		const reader = response.body ? response.body.getReader() : null;
+		if (!reader) {
+			const text = await response.text();
+			const bodyBytes = new TextEncoder().encode(text).byteLength;
+			const oversized = bodyBytes > limit;
+			return {status: response.status, url: response.url, body: oversized ? "" : text, bodyBytes, oversized};
+		}
+		const chunks = [];
+		let bodyBytes = 0;
+		let oversized = false;
+		while (true) {
+			const {done, value} = await reader.read();
+			if (done) break;
+			bodyBytes += value.byteLength;
+			if (bodyBytes > limit) {
+				oversized = true;
+				await reader.cancel();
+				break;
+			}
+			chunks.push(value);
+		}
+		const body = oversized ? "" : new TextDecoder().decode(
+			chunks.length ? await new Blob(chunks).arrayBuffer() : new ArrayBuffer(0)
+		);
+		return {status: response.status, url: response.url, body, bodyBytes, oversized};
 	})()`, string(encodedURL), maxSenatePTRResponseSize)
 	var response senateBrowserResponse
 	if err := t.runLocked(ctx, chromedp.Evaluate(
@@ -236,7 +280,7 @@ func (t *SenateChromeTransport) AuthorizationStatus(ctx context.Context) (bool, 
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if err := t.startLocked(); err != nil {
+	if err := t.startLockedWithContext(ctx); err != nil {
 		return false, err
 	}
 	_, err := t.ensureAuthorizedLocked(ctx)
@@ -255,7 +299,7 @@ func (t *SenateChromeTransport) Authorize(ctx context.Context) error {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if err := t.startLocked(); err != nil {
+	if err := t.startLockedWithContext(ctx); err != nil {
 		return err
 	}
 	if err := t.runLocked(ctx, chromedp.Navigate(t.opts.BaseURL+"/search/home/")); err != nil {
@@ -299,6 +343,10 @@ func (t *SenateChromeTransport) stopLocked() error {
 }
 
 func (t *SenateChromeTransport) startLocked() error {
+	return t.startLockedWithContext(context.Background())
+}
+
+func (t *SenateChromeTransport) startLockedWithContext(ctx context.Context) error {
 	if t.browserContext != nil {
 		return nil
 	}
@@ -349,17 +397,22 @@ func (t *SenateChromeTransport) startLocked() error {
 		allocatorOptions = append(allocatorOptions, chromedp.ExecPath(t.opts.ExecutablePath))
 	}
 	t.allocatorContext, t.allocatorCancel = chromedp.NewExecAllocator(
-		context.Background(), allocatorOptions...,
+		ctx, allocatorOptions...,
 	)
 	t.browserContext, t.browserCancel = chromedp.NewContext(t.allocatorContext)
 	// The first Run allocates Chrome with this context. It must use the
 	// persistent browser context; a short-lived child would own and terminate
 	// the Chrome process when its request timeout is cancelled.
-	if err := chromedp.Run(t.browserContext); err != nil {
+	startCtx, cancelStart := context.WithTimeout(t.browserContext, t.opts.Timeout)
+	defer cancelStart()
+	if err := chromedp.Run(startCtx); err != nil {
 		t.browserCancel()
 		t.allocatorCancel()
 		t.allocatorContext, t.allocatorCancel = nil, nil
 		t.browserContext, t.browserCancel = nil, nil
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("start Senate Chrome profile: %w", ctxErr)
+		}
 		return fmt.Errorf("start Senate Chrome profile: %w", err)
 	}
 	if err := t.restoreSessionLocked(); err != nil {

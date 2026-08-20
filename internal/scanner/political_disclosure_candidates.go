@@ -68,11 +68,11 @@ type politicalDisclosureAggregate struct {
 type politicalDisclosureFilerAggregate struct {
 	evidence                    tradeprofile.PoliticalDisclosureFilerEvidence
 	owners                      map[string]struct{}
+	purchasers                  map[string]struct{}
 	latestTransactionDate       time.Time
 	latestTransactionFilingDate time.Time
 	lagKnown                    bool
 	independentTransactionCount int
-	independentPurchaseCount    int
 }
 
 func buildPoliticalDisclosureCandidate(
@@ -143,7 +143,8 @@ func (a *politicalDisclosureAggregate) addReport(item store.PoliticalDisclosureC
 				Office: strings.TrimSpace(item.Office), Chamber: strings.TrimSpace(item.Chamber),
 				Source: strings.ToLower(strings.TrimSpace(item.Source)),
 			},
-			owners: make(map[string]struct{}),
+			owners:     make(map[string]struct{}),
+			purchasers: make(map[string]struct{}),
 		}
 		a.filers[filerID] = filer
 	}
@@ -214,7 +215,9 @@ func (a *politicalDisclosureAggregate) addTransaction(
 		if independent {
 			a.evidence.PurchaseCount++
 			filer.evidence.PurchaseCount++
-			filer.independentPurchaseCount++
+			if purchaser := canonicalPoliticalPurchaser(transaction.Owner); purchaser != "" {
+				filer.purchasers[purchaser] = struct{}{}
+			}
 			addPoliticalAmount(&a.evidence.PurchaseAmounts, transaction)
 			addPoliticalAmount(&filer.evidence.PurchaseAmounts, transaction)
 		}
@@ -292,9 +295,7 @@ func (a *politicalDisclosureAggregate) finish() {
 		filer.evidence.ReportedOwners = sortedSet(filer.owners)
 		filer.evidence.RepeatedActivity = filer.evidence.IndependentReportCount > 1 || filer.independentTransactionCount > 1
 		filer.evidence.ContradictoryActivity = filer.evidence.PurchaseCount > 0 && filer.evidence.SaleCount > 0
-		if filer.independentPurchaseCount > 0 {
-			a.evidence.DistinctBuyerCount++
-		}
+		a.evidence.DistinctBuyerCount += len(filer.purchasers)
 		if filer.evidence.RepeatedActivity {
 			a.evidence.RepeatedFilerActivity = true
 		}
@@ -305,7 +306,8 @@ func (a *politicalDisclosureAggregate) finish() {
 		}
 	}
 	a.evidence.DistinctFilerCount = len(ids)
-	a.evidence.IndependentBuyerActivity = a.evidence.DistinctBuyerCount > 1
+	a.evidence.IndependentBuyerActivity = a.evidence.DistinctBuyerCount > 1 &&
+		a.evidence.DistinctFilerCount > 1
 	a.evidence.ContradictoryActivity = a.evidence.PurchaseCount > 0 && a.evidence.SaleCount > 0
 	if a.evidence.AmendmentReportCount > 0 {
 		a.addLimitation("amendment rows remain in report detail and raw transaction counts, but are excluded from independent semantic action, amount, owner, timing, repetition, and contradiction aggregates because no authoritative supersession relationship is available")
@@ -387,6 +389,24 @@ func evidenceDate(value time.Time) string {
 func parseEvidenceDate(value string) time.Time {
 	parsed, _ := time.Parse("2006-01-02", value)
 	return parsed
+}
+
+func canonicalPoliticalPurchaser(owner string) string {
+	owner = strings.ToLower(strings.Join(strings.Fields(owner), " "))
+	switch owner {
+	case "", "unknown":
+		return ""
+	case "self":
+		return "self"
+	case "sp", "spouse":
+		return "spouse"
+	case "dc", "dependent", "dependent child":
+		return "dependent child"
+	case "jt", "joint", "jointly":
+		return "joint"
+	default:
+		return owner
+	}
 }
 
 func filerOwnersForReport(transactions []store.PoliticalDisclosureTransaction) map[string]struct{} {
