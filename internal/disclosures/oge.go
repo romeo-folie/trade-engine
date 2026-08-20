@@ -242,8 +242,14 @@ func ogeAmendedFieldIsAmendment(value string) bool {
 	return true
 }
 
+type ogeAction struct {
+	position        int
+	transactionType string
+}
+
 type ogeLine struct {
-	text string
+	text    string
+	actions []ogeAction
 }
 
 func ParseOGEPDF(f OGEFiling, pdf []byte, pages []PageText) Report {
@@ -251,10 +257,6 @@ func ParseOGEPDF(f OGEFiling, pdf []byte, pages []PageText) Report {
 	for _, p := range pages {
 		lines := ogeLines(p)
 		for _, line := range lines {
-			low := strings.ToLower(line.text)
-			if !strings.Contains(low, "purchase") && !strings.Contains(low, "sale") && !strings.Contains(low, "exchange") {
-				continue
-			}
 			match := ogeDate.FindString(line.text)
 			if match == "" {
 				continue
@@ -283,33 +285,22 @@ func ParseOGEPDF(f OGEFiling, pdf []byte, pages []PageText) Report {
 	return r
 }
 
-// ogeTransactionType determines the reported action from the box nearest to
-// the transaction date. The legacy firstType keyword priority could reverse a
-// sale whose asset or comment also contained "purchase".
+// ogeTransactionType determines the reported action from the positioned action
+// box nearest to the transaction date. It accepts both expanded words and the
+// compact P/S/E codes, while ignoring action words inside asset descriptions.
 func ogeTransactionType(line ogeLine) string {
-	text := strings.ToLower(line.text)
 	datePosition := -1
-	dateText := ogeDate.FindString(line.text)
-	if dateText != "" {
+	if dateText := ogeDate.FindString(line.text); dateText != "" {
 		datePosition = strings.Index(strings.ToLower(line.text), strings.ToLower(dateText))
 	}
-	types := map[string]string{
-		"purchase": "purchase",
-		"sale":     "sale",
-		"exchange": "exchange",
-	}
 	best, bestDistance := "", int(^uint(0)>>1)
-	for keyword, transactionType := range types {
-		position := strings.Index(text, keyword)
-		if position < 0 {
-			continue
-		}
-		distance := absInt(position - datePosition)
+	for _, action := range line.actions {
+		distance := absInt(action.position - datePosition)
 		if distance < bestDistance {
-			best, bestDistance = transactionType, distance
+			best, bestDistance = action.transactionType, distance
 		}
 	}
-	return normalizeTransactionType(best)
+	return best
 }
 
 func absInt(v int) int {
@@ -330,12 +321,22 @@ func ogeLines(p PageText) []ogeLine {
 	var lines []ogeLine
 	for i := 0; i < len(boxes); {
 		top := boxes[i].Top
-		var parts []string
+		line := ogeLine{}
+		position := 0
 		for i < len(boxes) && boxes[i].Top-top <= 3 {
-			parts = append(parts, boxes[i].Text)
+			box := boxes[i]
+			if line.text != "" {
+				line.text += " "
+				position++
+			}
+			if typ := normalizeTransactionType(box.Text); typ == "purchase" || typ == "sale" || typ == "exchange" {
+				line.actions = append(line.actions, ogeAction{position: position, transactionType: typ})
+			}
+			line.text += box.Text
+			position += len(box.Text)
 			i++
 		}
-		lines = append(lines, ogeLine{text: strings.Join(parts, " ")})
+		lines = append(lines, line)
 	}
 	return lines
 }

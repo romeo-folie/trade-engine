@@ -266,3 +266,16 @@ func TestParseOGEPDFUsesTransactionColumnWhenAssetMentionsPurchase(t *testing.T)
 		t.Fatalf("unexpected report: %#v", report)
 	}
 }
+
+func TestParseOGEPDFReconstructsCompactActionCodes(t *testing.T) {
+	filing := OGEFiling{ExternalID: "oge-test-compact", ReportType: "periodic_transaction", FilingDate: time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)}
+	report := ParseOGEPDF(filing, []byte("pdf"), []PageText{{Number: 2, Boxes: []TextBox{
+		{Text: "07/01/2026", Left: 1, Top: 10},
+		{Text: "P", Left: 80, Top: 10},
+		{Text: "Compact Corp (CMPT)", Left: 140, Top: 10},
+		{Text: "$1,001 - $15,000", Left: 260, Top: 10},
+	}}})
+	if len(report.Transactions) != 1 || report.Transactions[0].TransactionType != "purchase" || report.Transactions[0].Ticker != "CMPT" {
+		t.Fatalf("unexpected compact report: %#v", report)
+	}
+}

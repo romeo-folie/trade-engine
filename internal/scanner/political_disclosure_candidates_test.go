@@ -136,6 +136,14 @@ func TestPoliticalMarketProviderFailureDoesNotReturnUnhydratedCandidate(t *testi
 	}
 }
 
+func TestPoliticalDisclosureScoringFailureRequeuesClaim(t *testing.T) {
+	if !politicalDisclosureScoringFailureRequeues("failed") ||
+		politicalDisclosureScoringFailureRequeues("rejected") ||
+		politicalDisclosureScoringFailureRequeues("pending") {
+		t.Fatal("scoring-failure requeue must apply only to transient failed status")
+	}
+}
+
 func TestPoliticalDisclosureFactsDistinguishRepeatedAndIndependentFilers(t *testing.T) {
 	filing := time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC)
 	firstTransaction := filing.AddDate(0, 0, -10)

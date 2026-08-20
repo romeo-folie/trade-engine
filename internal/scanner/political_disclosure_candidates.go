@@ -607,7 +607,9 @@ func hydratePoliticalSnapshot(candidate *SwingCandidate, snapshot data.StockSnap
 func (s *MarketScanner) rejectPoliticalDisclosureMarketData(
 	ctx context.Context, candidate SwingCandidate, reason string,
 ) {
-	s.markPoliticalDisclosureCandidate(ctx, candidate, "failed", "", reason)
+	// This is a definitive asset/snapshot failure, not a transient scoring
+	// failure. It must remain terminal instead of being requeued forever.
+	s.markPoliticalDisclosureCandidate(ctx, candidate, "rejected", "", reason)
 	slog.Warn("scanner: political disclosure candidate rejected",
 		"ticker", candidate.Ticker, "reason", reason)
 }
@@ -627,6 +629,13 @@ func (s *MarketScanner) markPoliticalDisclosureCandidate(
 	if candidate.PoliticalDisclosureClaimToken == "" || !store.IsConnected() {
 		return
 	}
+	// A scoring failure is transient by definition: the provider failed, not the
+	// evidence. Requeue disclosure claims instead of terminalizing them so the
+	// next scanner cycle can evaluate the same filing evidence after recovery.
+	if politicalDisclosureScoringFailureRequeues(status) {
+		s.releasePoliticalDisclosureClaims(ctx, []SwingCandidate{candidate})
+		return
+	}
 	if err := store.MarkPoliticalDisclosurePromotion(
 		ctx, candidate.Ticker, candidate.PoliticalDisclosureClaimToken,
 		status, scannerRunID, reason, s.now(),
@@ -634,6 +643,10 @@ func (s *MarketScanner) markPoliticalDisclosureCandidate(
 		slog.Warn("scanner: mark political disclosure promotion",
 			"ticker", candidate.Ticker, "status", status, "err", err)
 	}
+}
+
+func politicalDisclosureScoringFailureRequeues(status string) bool {
+	return status == "failed"
 }
 
 func (s *MarketScanner) releasePoliticalDisclosureClaims(
