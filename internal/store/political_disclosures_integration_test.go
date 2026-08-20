@@ -486,6 +486,66 @@ func TestClaimPoliticalDisclosureCandidatesExcludesFutureReportsFromClaimSet(t *
 	}
 }
 
+func TestMarkPoliticalDisclosurePromotionRequiresAllClaimedReportIDs(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2300, time.April, 10, 12, 0, 0, 0, time.UTC)
+	first := politicalDisclosureClaimFixture("test-disclosure-partial-claim-1", "PDPARTIAL", now.AddDate(0, 0, -1))
+	second := politicalDisclosureClaimFixture("test-disclosure-partial-claim-2", "PDPARTIAL", now)
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), `
+			DELETE FROM political_disclosure_reports
+			WHERE source='house' AND external_id = ANY($1::text[])`,
+			[]string{first.ExternalID, second.ExternalID})
+	})
+	for _, report := range []store.PoliticalDisclosureReport{first, second} {
+		if err := store.SavePoliticalDisclosureReport(ctx, report); err != nil {
+			t.Fatal(err)
+		}
+	}
+	claimed, err := store.ClaimPoliticalDisclosureCandidates(ctx, now.AddDate(0, 0, -7), now, time.Hour, 1, "partial-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reportIDs []string
+	for _, item := range claimed {
+		if item.Claimed {
+			reportIDs = append(reportIDs, item.ReportID)
+		}
+	}
+	if len(reportIDs) != 2 {
+		t.Fatalf("claim report IDs = %v", reportIDs)
+	}
+	// Invalidate one claimed row, simulating re-extraction during scoring.
+	if _, err := store.GetDB().Exec(ctx, `
+		UPDATE political_disclosure_candidates
+		SET promotion_status='pending', promotion_claim_token=NULL, promotion_claimed_at=NULL
+		WHERE report_id=$1 AND ticker=$2`, reportIDs[0], "PDPARTIAL"); err != nil {
+		t.Fatal(err)
+	}
+	var claimErr *store.ScannerSourcePromotionClaimError
+	err = store.MarkPoliticalDisclosurePromotion(ctx, "PDPARTIAL", "partial-token", reportIDs, "rejected", "", "fixture", now)
+	if !errors.As(err, &claimErr) || claimErr.Source != "political_disclosure" {
+		t.Fatalf("partial claim update error=%v, want political disclosure claim loss", err)
+	}
+	var status string
+	if err := store.GetDB().QueryRow(ctx, `
+		SELECT promotion_status FROM political_disclosure_candidates
+		WHERE report_id=$1 AND ticker=$2`, reportIDs[0], "PDPARTIAL").Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "pending" {
+		t.Fatalf("invalidated report status=%q, want pending", status)
+	}
+	if err := store.GetDB().QueryRow(ctx, `
+		SELECT promotion_status FROM political_disclosure_candidates
+		WHERE report_id=$1 AND ticker=$2`, reportIDs[1], "PDPARTIAL").Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "processing" {
+		t.Fatalf("other report status=%q, want still processing after partial claim rejection", status)
+	}
+}
+
 func TestClaimPoliticalDisclosureCandidatesReturnsHistoryButClaimsOnlyPendingRows(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2300, time.March, 15, 12, 0, 0, 0, time.UTC)
@@ -528,7 +588,7 @@ func TestClaimPoliticalDisclosureCandidatesReturnsHistoryButClaimsOnlyPendingRow
 	if !claimedPending.Claimed || claimedPending.PromotionClaimToken != "history-token" {
 		t.Fatalf("pending row claim=%+v", claimedPending)
 	}
-	if err := store.MarkPoliticalDisclosurePromotion(ctx, "PDHISTORY", "history-token", "rejected", "", "fixture", now); err != nil {
+	if err := store.MarkPoliticalDisclosurePromotion(ctx, "PDHISTORY", "history-token", []string{claimedPending.ReportID}, "rejected", "", "fixture", now); err != nil {
 		t.Fatal(err)
 	}
 	var historyStatus, pendingStatus string

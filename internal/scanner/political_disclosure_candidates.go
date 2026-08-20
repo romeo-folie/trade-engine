@@ -638,7 +638,7 @@ func (s *MarketScanner) markPoliticalDisclosureCandidate(
 	}
 	if err := store.MarkPoliticalDisclosurePromotion(
 		ctx, candidate.Ticker, candidate.PoliticalDisclosureClaimToken,
-		status, scannerRunID, reason, s.now(),
+		candidate.PoliticalDisclosureClaimReportIDs, status, scannerRunID, reason, s.now(),
 	); err != nil {
 		slog.Warn("scanner: mark political disclosure promotion",
 			"ticker", candidate.Ticker, "status", status, "err", err)

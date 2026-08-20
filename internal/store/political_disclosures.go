@@ -732,8 +732,8 @@ func ReleasePoliticalDisclosurePromotionClaims(
 }
 
 func MarkPoliticalDisclosurePromotion(
-	ctx context.Context, ticker, token, status, scannerRunID, reason string,
-	at time.Time,
+	ctx context.Context, ticker, token string, reportIDs []string,
+	status, scannerRunID, reason string, at time.Time,
 ) error {
 	result, err := GetDB().Exec(ctx, `
 		UPDATE political_disclosure_candidates
@@ -742,11 +742,22 @@ func MarkPoliticalDisclosurePromotion(
 			promotion_reason=$5, promotion_claim_token=NULL,
 			promotion_claimed_at=NULL
 		WHERE ticker=$1 AND promotion_status='processing'
-		  AND promotion_claim_token=$2`, ticker, token, status, scannerRunID, reason, at)
+		  AND promotion_claim_token=$2
+		  AND report_id IN (
+			SELECT report_id::uuid FROM unnest($7::text[]) expected(report_id)
+		  )
+		  AND (
+			SELECT COUNT(*) FROM political_disclosure_candidates
+			WHERE ticker=$1 AND promotion_status='processing'
+			  AND promotion_claim_token=$2
+			  AND report_id IN (
+				SELECT report_id::uuid FROM unnest($7::text[]) expected(report_id)
+			  )
+		  ) = $8`, ticker, token, status, scannerRunID, reason, at, reportIDs, len(reportIDs))
 	if err != nil {
 		return err
 	}
-	if result.RowsAffected() == 0 {
+	if result.RowsAffected() != int64(len(reportIDs)) {
 		return &ScannerSourcePromotionClaimError{Source: "political_disclosure"}
 	}
 	return nil

@@ -278,6 +278,43 @@ func TestHouseRetryRejectsMismatchedStoredDocumentIdentityPermanently(t *testing
 	}
 }
 
+func TestHouseSyncProcessesAvailableYearsDespiteIndexFailure(t *testing.T) {
+	const index = "Prefix\tLast\tFirst\tSuffix\tFilingType\tStateDst\tYear\tFilingDate\tDocID\n" +
+		"Hon.\tMember\tJane\t\tP\tCA01\t2025\t12/20/2025\tlate-2025\n"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "2026") {
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = w.Write([]byte(index))
+	}))
+	defer server.Close()
+	var saved []Report
+	runner := &Runner{
+		House:     &HouseClient{BaseURL: server.URL, HTTP: server.Client()},
+		Extractor: runnerTestExtractor{},
+		reportTerminal: func(context.Context, string, string) (bool, error) {
+			return false, nil
+		},
+		persistReport: func(_ context.Context, report Report) error {
+			saved = append(saved, report)
+			return nil
+		},
+	}
+	processed, err := runner.syncHouse(
+		context.Background(),
+		time.Date(2025, 12, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC),
+		2,
+	)
+	if processed != 1 || len(saved) != 1 || saved[0].ExternalID != "late-2025" {
+		t.Fatalf("processed=%d saved=%+v err=%v", processed, saved, err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "fetch House 2026 filing index") {
+		t.Fatalf("error=%v, want retained current-year index failure", err)
+	}
+}
+
 func TestRetryHeartbeatRenewsClaimedBatch(t *testing.T) {
 	called := make(chan struct{}, 1)
 	runner := &Runner{RetryLease: 9 * time.Millisecond, Now: time.Now,

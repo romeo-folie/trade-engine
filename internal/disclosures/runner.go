@@ -565,13 +565,15 @@ func (r *Runner) syncHouse(
 ) (int, error) {
 	firstYear, lastYear := since.Year(), now.Year()
 	var filings []HouseFiling
+	var indexFailures []error
 	for year := lastYear; year >= firstYear; year-- {
 		if err := ctx.Err(); err != nil {
 			return 0, err
 		}
 		rows, err := r.House.FetchIndex(ctx, year)
 		if err != nil {
-			return 0, fmt.Errorf("fetch House %d filing index: %w", year, err)
+			indexFailures = append(indexFailures, fmt.Errorf("fetch House %d filing index: %w", year, err))
+			continue
 		}
 		for _, filing := range rows {
 			if !filing.FilingDate.Before(since) && !filing.FilingDate.After(now) {
@@ -628,6 +630,9 @@ func (r *Runner) syncHouse(
 	}
 	if err := ctx.Err(); err != nil {
 		return processed, err
+	}
+	if len(indexFailures) > 0 {
+		failures = append(failures, indexFailures...)
 	}
 	if len(failures) > 0 {
 		return processed, fmt.Errorf("%d House filing(s) failed: %w", len(failures), errors.Join(failures...))
