@@ -202,8 +202,10 @@ func parseHousePage(page PageText) []Transaction {
 			assetType = match[1]
 		}
 		minimum, maximum := parseAmount(amount)
+		owner := canonicalHouseOwner(joinHouseBoxes(boxes, y, 2.5, 0, 95))
 		raw, _ := json.Marshal(map[string]any{"page": page.Number, "y": y})
 		out = append(out, Transaction{
+			Owner:     owner,
 			AssetName: strings.Join(strings.Fields(asset), " "),
 			Ticker:    tickerFromAsset(asset), AssetType: assetType,
 			TransactionType: transactionType, TransactionDate: transactionDate,
@@ -212,6 +214,22 @@ func parseHousePage(page PageText) []Transaction {
 		})
 	}
 	return out
+}
+
+func canonicalHouseOwner(value string) string {
+	value = strings.ToUpper(strings.Join(strings.Fields(value), " "))
+	switch value {
+	case "", "SELF":
+		return "Self"
+	case "SP", "SPOUSE":
+		return "Spouse"
+	case "DC", "DEPENDENT", "DEPENDENT CHILD":
+		return "Dependent Child"
+	case "JT", "JOINT", "JOINTLY":
+		return "Joint"
+	default:
+		return strings.TrimSpace(value)
+	}
 }
 
 func wrappedHouseAsset(boxes []TextBox, y float64) string {

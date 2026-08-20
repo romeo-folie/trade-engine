@@ -751,10 +751,105 @@ func TestFirstPassDisclosureFailureDoesNotDowngradeCompletedReport(t *testing.T)
 	}
 	stored, err := store.GetPoliticalDisclosureReport(ctx, report.Source, report.ExternalID)
 	if err != nil || stored == nil || stored.ExtractionStatus != "completed" ||
-		stored.RetryableFailure || stored.RetryAttemptCount != 0 || len(stored.Transactions) != 1 {
+		stored.ContentHash != "completed-hash" || stored.RetryableFailure || stored.RetryAttemptCount != 0 || len(stored.Transactions) != 1 {
 		t.Fatalf("late failure downgraded completed report: %+v err=%v", stored, err)
 	}
 	if stored.Transactions[0].Ticker != "CMF" {
 		t.Fatalf("completed transaction evidence lost: %+v", stored.Transactions)
+	}
+}
+
+func TestReplacingDisclosureEvidenceInvalidatesActiveCandidateClaim(t *testing.T) {
+	ctx := context.Background()
+	report := store.PoliticalDisclosureReport{
+		Source: "house", ExternalID: "test-disclosure-evidence-replacement", Chamber: "house",
+		FilerName: "Hon. Claim Evidence", Office: "TS05",
+		ReportType: "periodic_transaction", FilingDate: time.Now().UTC(),
+		DocumentURL: "https://example.test/evidence.pdf", ContentHash: "hash-1",
+		ExtractionStatus: "completed", RawMetadata: json.RawMessage(`{"fixture":true}`),
+		Transactions: []store.PoliticalDisclosureTransaction{{
+			Ordinal: 1, AssetName: "Original Corp (ORIG)",
+			Ticker: "ORIG", TransactionType: "purchase",
+			TransactionDate: time.Now().UTC().AddDate(0, 0, -1),
+			RawData:         json.RawMessage(`{"row":1}`),
+		}},
+	}
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(),
+			"DELETE FROM political_disclosure_reports WHERE source=$1 AND external_id=$2",
+			report.Source, report.ExternalID)
+	})
+	if err := store.SavePoliticalDisclosureReport(ctx, report); err != nil {
+		t.Fatal(err)
+	}
+	_, err := store.ClaimPoliticalDisclosureCandidates(
+		ctx, time.Now().UTC().AddDate(0, 0, -7), time.Now().UTC(), time.Hour, 1, "claim-token",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replaced := report
+	replaced.ContentHash = "hash-2"
+	replaced.Transactions = []store.PoliticalDisclosureTransaction{{
+		Ordinal: 2, AssetName: "Replacement Corp (RPLC)",
+		Ticker: "RPLC", TransactionType: "sale",
+		TransactionDate: time.Now().UTC(), RawData: json.RawMessage(`{"row":2}`),
+	}}
+	if err := store.SavePoliticalDisclosureReport(ctx, replaced); err != nil {
+		t.Fatal(err)
+	}
+	var oldStatus, oldToken string
+	if err := store.GetDB().QueryRow(ctx, `
+		SELECT promotion_status, COALESCE(promotion_claim_token,'')
+		FROM political_disclosure_candidates
+		WHERE report_id=(
+			SELECT id FROM political_disclosure_reports WHERE source=$1 AND external_id=$2
+		) AND ticker='ORIG'`, report.Source, report.ExternalID).Scan(&oldStatus, &oldToken); err != nil {
+		t.Fatal(err)
+	}
+	if oldStatus != "superseded" || oldToken != "" {
+		t.Fatalf("removed ticker retained an active claim: status=%q token=%q", oldStatus, oldToken)
+	}
+	var newStatus, newToken string
+	if err := store.GetDB().QueryRow(ctx, `
+		SELECT promotion_status, COALESCE(promotion_claim_token,'')
+		FROM political_disclosure_candidates
+		WHERE report_id=(
+			SELECT id FROM political_disclosure_reports WHERE source=$1 AND external_id=$2
+		) AND ticker='RPLC'`, report.Source, report.ExternalID).Scan(&newStatus, &newToken); err != nil {
+		t.Fatal(err)
+	}
+	if newStatus != "pending" || newToken != "" {
+		t.Fatalf("replacement ticker was not resettable: status=%q token=%q", newStatus, newToken)
+	}
+
+	// Reclaim the replacement ticker, then replace its evidence with a new row.
+	_, err = store.ClaimPoliticalDisclosureCandidates(
+		ctx, time.Now().UTC().AddDate(0, 0, -7), time.Now().UTC(), time.Hour, 1, "second-claim-token",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sameTickerReplacement := replaced
+	sameTickerReplacement.ContentHash = "hash-3"
+	sameTickerReplacement.Transactions = []store.PoliticalDisclosureTransaction{{
+		Ordinal: 3, AssetName: "Replacement Corp (RPLC)",
+		Ticker: "RPLC", TransactionType: "exchange",
+		TransactionDate: time.Now().UTC(), RawData: json.RawMessage(`{"row":3}`),
+	}}
+	if err := store.SavePoliticalDisclosureReport(ctx, sameTickerReplacement); err != nil {
+		t.Fatal(err)
+	}
+	var activeStatus, activeToken string
+	if err := store.GetDB().QueryRow(ctx, `
+		SELECT promotion_status, COALESCE(promotion_claim_token,'')
+		FROM political_disclosure_candidates
+		WHERE report_id=(
+			SELECT id FROM political_disclosure_reports WHERE source=$1 AND external_id=$2
+		) AND ticker='RPLC'`, report.Source, report.ExternalID).Scan(&activeStatus, &activeToken); err != nil {
+		t.Fatal(err)
+	}
+	if activeStatus != "pending" || activeToken != "" {
+		t.Fatalf("same-ticker evidence replacement preserved active claim: status=%q token=%q", activeStatus, activeToken)
 	}
 }

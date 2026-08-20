@@ -463,7 +463,10 @@ func savePoliticalDisclosureReportTx(
 			office=EXCLUDED.office, report_type=EXCLUDED.report_type,
 			is_amendment=EXCLUDED.is_amendment,
 			filing_date=EXCLUDED.filing_date, document_url=EXCLUDED.document_url,
-			content_hash=EXCLUDED.content_hash,
+			content_hash=CASE
+				WHEN NOT $18 AND political_disclosure_reports.extraction_status='completed' AND EXCLUDED.extraction_status <> 'completed'
+					THEN political_disclosure_reports.content_hash
+				ELSE EXCLUDED.content_hash END,
 			extraction_status=CASE
 				WHEN NOT $18 AND political_disclosure_reports.extraction_status='completed' AND EXCLUDED.extraction_status <> 'completed'
 					THEN political_disclosure_reports.extraction_status
@@ -591,7 +594,9 @@ func savePoliticalDisclosureReportTx(
 	sort.Strings(tickers)
 	if _, err := tx.Exec(ctx, `
 		UPDATE political_disclosure_candidates
-		SET promotion_status='superseded', promotion_reason='removed by filing re-extraction'
+		SET promotion_status='superseded', promotion_claim_token=NULL,
+			promotion_claimed_at=NULL, scanner_run_id=NULL, promoted_at=NULL,
+			promotion_reason='removed by filing re-extraction'
 		WHERE report_id=$1 AND NOT (ticker = ANY($2::text[]))`, reportID, tickers,
 	); err != nil {
 		return fmt.Errorf("supersede removed political disclosure candidates: %w", err)
@@ -612,12 +617,34 @@ func savePoliticalDisclosureReportTx(
 				evidence=EXCLUDED.evidence,
 				promotion_status=CASE
 					WHEN political_disclosure_candidates.promotion_status='superseded' THEN 'pending'
+					WHEN political_disclosure_candidates.promotion_status='processing' AND
+						(political_disclosure_candidates.promotion_claim_token IS NOT NULL OR
+						 political_disclosure_candidates.promotion_claimed_at IS NOT NULL)
+						THEN 'pending'
 					ELSE political_disclosure_candidates.promotion_status END,
-				promotion_claim_token=CASE WHEN political_disclosure_candidates.promotion_status='superseded' THEN NULL ELSE political_disclosure_candidates.promotion_claim_token END,
-				promotion_claimed_at=CASE WHEN political_disclosure_candidates.promotion_status='superseded' THEN NULL ELSE political_disclosure_candidates.promotion_claimed_at END,
+				promotion_claim_token=CASE
+					WHEN political_disclosure_candidates.promotion_status='processing' AND
+						(political_disclosure_candidates.promotion_claim_token IS NOT NULL OR
+						 political_disclosure_candidates.promotion_claimed_at IS NOT NULL)
+						THEN NULL
+					WHEN political_disclosure_candidates.promotion_status='superseded' THEN NULL
+					ELSE political_disclosure_candidates.promotion_claim_token END,
+				promotion_claimed_at=CASE
+					WHEN political_disclosure_candidates.promotion_status='processing' AND
+						(political_disclosure_candidates.promotion_claim_token IS NOT NULL OR
+						 political_disclosure_candidates.promotion_claimed_at IS NOT NULL)
+						THEN NULL
+					WHEN political_disclosure_candidates.promotion_status='superseded' THEN NULL
+					ELSE political_disclosure_candidates.promotion_claimed_at END,
 				scanner_run_id=CASE WHEN political_disclosure_candidates.promotion_status='superseded' THEN NULL ELSE political_disclosure_candidates.scanner_run_id END,
 				promoted_at=CASE WHEN political_disclosure_candidates.promotion_status='superseded' THEN NULL ELSE political_disclosure_candidates.promoted_at END,
-				promotion_reason=CASE WHEN political_disclosure_candidates.promotion_status='superseded' THEN NULL ELSE political_disclosure_candidates.promotion_reason END`,
+				promotion_reason=CASE
+					WHEN political_disclosure_candidates.promotion_status='processing' AND
+						(political_disclosure_candidates.promotion_claim_token IS NOT NULL OR
+						 political_disclosure_candidates.promotion_claimed_at IS NOT NULL)
+						THEN 'evidence replaced while claim active'
+					WHEN political_disclosure_candidates.promotion_status='superseded' THEN NULL
+					ELSE political_disclosure_candidates.promotion_reason END`,
 			reportID, ticker, len(group.transactions), group.latest, evidence,
 		)
 		if err != nil {

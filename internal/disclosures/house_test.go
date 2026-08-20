@@ -136,6 +136,7 @@ func TestParseHousePTRUsesPositionedColumnsAndWrappedLines(t *testing.T) {
 		DocumentID: "20034138", StateDistrict: "OH02",
 	}
 	pages := []PageText{{Number: 1, Boxes: []TextBox{
+		{Text: "SP", Left: 24, Top: 100},
 		{Text: "Stock (GOOGL) [ST]", Left: 104, Top: 90},
 		{Text: "Alphabet Inc. - Class A Common", Left: 104, Top: 100},
 		{Text: "P", Left: 262, Top: 100},
@@ -143,6 +144,7 @@ func TestParseHousePTRUsesPositionedColumnsAndWrappedLines(t *testing.T) {
 		{Text: "03/05/2026", Left: 382, Top: 100},
 		{Text: "$1,001 - $15,000", Left: 447, Top: 100},
 		{Text: "$50,000", Left: 447, Top: 140},
+		{Text: "DC", Left: 24, Top: 150},
 		{Text: "(IBM) [ST]", Left: 104, Top: 140},
 		{Text: "International Business Machines Common Stock", Left: 104, Top: 150},
 		{Text: "S (partial)", Left: 262, Top: 150},
@@ -155,13 +157,13 @@ func TestParseHousePTRUsesPositionedColumnsAndWrappedLines(t *testing.T) {
 		t.Fatalf("unexpected report: status=%s transactions=%+v", report.ExtractionStatus, report.Transactions)
 	}
 	first := report.Transactions[0]
-	if first.Ticker != "GOOGL" || first.TransactionType != "purchase" ||
+	if first.Ticker != "GOOGL" || first.TransactionType != "purchase" || first.Owner != "Spouse" ||
 		first.AmountMin == nil || *first.AmountMin != 1001 ||
 		first.AmountMax == nil || *first.AmountMax != 15000 {
 		t.Fatalf("unexpected first transaction: %+v", first)
 	}
 	second := report.Transactions[1]
-	if second.Ticker != "IBM" || second.TransactionType != "sale" ||
+	if second.Ticker != "IBM" || second.TransactionType != "sale" || second.Owner != "Dependent Child" ||
 		second.AmountMin == nil || *second.AmountMin != 15001 ||
 		second.AmountMax == nil || *second.AmountMax != 50000 {
 		t.Fatalf("unexpected second transaction: %+v", second)
