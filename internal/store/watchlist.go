@@ -41,6 +41,9 @@ type WatchlistItem struct {
 	// scanner promotion. It intentionally remains separate from Strategies,
 	// which is retained for legacy configuration and entry tags.
 	ExecutionProfile *tradeprofile.ExecutionProfile
+	// DiscoveryContexts are additive, independently expiring provenance records.
+	// They coexist with the legacy single scanner contract above.
+	DiscoveryContexts []WatchlistDiscoveryContext
 	// ScannerRunID links scanner-sourced rows to their prospective universe
 	// snapshot. Empty for manual/config watchlist items.
 	ScannerRunID string
@@ -55,6 +58,17 @@ type WatchlistItem struct {
 	PullbackRequalificationComplete bool
 	CreatedAt                       time.Time
 	UpdatedAt                       time.Time
+}
+
+// EffectiveDiscoveryContext merges the legacy scanner contract with additive
+// source contexts for the analyst prompt. It never changes execution routing.
+func (item WatchlistItem) EffectiveDiscoveryContext() *tradeprofile.DiscoveryContext {
+	contexts := make([]*tradeprofile.DiscoveryContext, 0, 1+len(item.DiscoveryContexts))
+	contexts = append(contexts, item.DiscoveryContext)
+	for _, value := range item.DiscoveryContexts {
+		contexts = append(contexts, value.Context)
+	}
+	return tradeprofile.MergeDiscoveryContexts(contexts...)
 }
 
 // AddWatchlistItem inserts or re-activates a watchlist entry.
@@ -332,7 +346,14 @@ func GetWatchlistItems(ctx context.Context, activeOnly bool) ([]WatchlistItem, e
 		FROM watchlist
 	`
 	if activeOnly {
-		q += " WHERE active = true AND (expires_at IS NULL OR expires_at > NOW())"
+		q += ` WHERE active AND (
+			(source = 'earnings_watchlist' AND EXISTS (
+				SELECT 1 FROM watchlist_discovery_contexts c WHERE c.watchlist_id=watchlist.id AND c.active=true AND (c.expires_at IS NULL OR c.expires_at > NOW())
+			)) OR
+			(source <> 'earnings_watchlist' AND ((expires_at IS NULL OR expires_at > NOW()) OR EXISTS (
+				SELECT 1 FROM watchlist_discovery_contexts c WHERE c.watchlist_id=watchlist.id AND c.active=true AND (c.expires_at IS NULL OR c.expires_at > NOW())
+			)))
+		)`
 	}
 	q += " ORDER BY created_at DESC"
 
@@ -360,7 +381,16 @@ func GetWatchlistItems(ctx context.Context, activeOnly bool) ([]WatchlistItem, e
 		}
 		items = append(items, w)
 	}
-	return items, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := loadActiveWatchlistDiscoveryContextsBatch(ctx, items); err != nil {
+		return nil, fmt.Errorf("load watchlist discovery contexts: %w", err)
+	}
+	for i := range items {
+		clearExpiredWatchlistContract(&items[i])
+	}
+	return items, nil
 }
 
 // GetWatchlistItem returns a single watchlist entry by ticker and platform.
@@ -395,7 +425,30 @@ func GetWatchlistItem(ctx context.Context, ticker, platform string) (*WatchlistI
 	if err := decodeWatchlistContracts(&w, discoveryContext, executionProfile); err != nil {
 		return nil, fmt.Errorf("decode watchlist %s/%s contracts: %w", w.Ticker, w.Platform, err)
 	}
+	if err := loadActiveWatchlistDiscoveryContexts(ctx, &w); err != nil {
+		return nil, fmt.Errorf("load watchlist %s/%s discovery contexts: %w", w.Ticker, w.Platform, err)
+	}
+	clearExpiredWatchlistContract(&w)
 	return &w, nil
+}
+
+// An independently active context may keep an expired scanner row visible.
+// Its old routing contract must not survive past its owning legacy TTL.
+func clearExpiredWatchlistContract(item *WatchlistItem) {
+	if item.ExpiresAt != nil && !item.ExpiresAt.After(time.Now()) && len(item.DiscoveryContexts) > 0 {
+		item.DiscoveryContext = nil
+		item.ExecutionProfile = nil
+		if item.Source == "scanner" {
+			// A live additive context (such as scheduled earnings) can extend
+			// eligibility, but never the scanner's old execution routing.
+			item.Source = "earnings_watchlist"
+			item.Strategies = []string{"trend_following", "momentum", "news_sentiment"}
+			item.Timeframes = []string{"1D", "4H", "1H"}
+			item.MinConfidence = 0
+			item.ScannerRunID = ""
+			item.GraphContext = "Scheduled earnings watchlist candidate."
+		}
+	}
 }
 
 func decodeWatchlistContracts(
@@ -438,6 +491,10 @@ func ExpireScannedItems(ctx context.Context) ([]string, error) {
 		UPDATE watchlist
 		SET active = false, updated_at = NOW()
 		WHERE source = 'scanner' AND active = true AND expires_at IS NOT NULL AND expires_at <= NOW()
+		  AND NOT EXISTS (
+			SELECT 1 FROM watchlist_discovery_contexts c
+			WHERE c.watchlist_id=watchlist.id AND c.active=true AND (c.expires_at IS NULL OR c.expires_at > NOW())
+		  )
 		RETURNING ticker
 	`)
 	if err != nil {

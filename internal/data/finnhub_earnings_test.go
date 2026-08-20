@@ -56,3 +56,21 @@ func TestFetchEarningsCalendar_EmptyIsNotAnError(t *testing.T) {
 		t.Errorf("expected 0 releases, got %d", len(got))
 	}
 }
+
+func TestFetchMarketEarningsCalendarOmitsSymbol(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("symbol"); got != "" {
+			t.Errorf("symbol = %q, want omitted", got)
+		}
+		if got := r.URL.Query().Get("from"); got != "2026-08-24" {
+			t.Errorf("from=%q", got)
+		}
+		fmt.Fprint(w, `{"earningsCalendar":[{"symbol":"NVDA","date":"2026-08-24","hour":"amc"}]}`)
+	}))
+	defer srv.Close()
+	c := newTestFinnhubClient(srv.URL)
+	got, err := c.FetchMarketEarningsCalendar(context.Background(), time.Date(2026, 8, 24, 0, 0, 0, 0, time.UTC), time.Date(2026, 8, 24, 0, 0, 0, 0, time.UTC))
+	if err != nil || len(got) != 1 || got[0].Symbol != "NVDA" {
+		t.Fatalf("got=%+v err=%v", got, err)
+	}
+}

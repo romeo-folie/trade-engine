@@ -17,6 +17,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/analysis"
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
+	"github.com/romeo-folie/trade-engine/internal/earnings"
 	"github.com/romeo-folie/trade-engine/internal/embeddings"
 	"github.com/romeo-folie/trade-engine/internal/engine"
 	"github.com/romeo-folie/trade-engine/internal/events"
@@ -1001,6 +1002,37 @@ Modes:
 					"interval_hours", cfg.Scanner.ScanIntervalHours,
 					"ttl_days", cfg.Scanner.TTLDays,
 					"candidate_cap", cfg.Scanner.CandidateCap,
+				)
+			}
+		}
+
+		// Scheduled earnings names feed the ordinary watchlist independently of
+		// the intraday scanner and its optional universe pipeline.
+		if cfg.Scanner.EarningsWatchlist.Enabled {
+			finnhub, fhOK := newsProvider.(*data.FinnhubClient)
+			alpaca, alpacaOK := marketProvider.(*data.AlpacaClient)
+			if !store.IsConnected() {
+				logger.Warn("earnings watchlist feeder requested but DB not connected; skipping startup")
+			} else if !fhOK || finnhub == nil {
+				logger.Warn("earnings watchlist feeder requires Finnhub news/calendar provider; skipping startup")
+			} else if !alpacaOK || alpaca == nil {
+				logger.Warn("earnings watchlist feeder requires Alpaca stock data provider; skipping startup")
+			} else {
+				feeder := &earnings.WatchlistFeeder{
+					Calendar: finnhub,
+					Bars:     data.NewAlpacaUniverseClient(alpaca, cfg.Markets.Stocks.BaseURL),
+					Cfg:      cfg.Scanner.EarningsWatchlist,
+				}
+				scheduler := &earnings.WatchlistScheduler{Cfg: cfg.Scanner.EarningsWatchlist, Job: feeder}
+				go func() {
+					if err := scheduler.Run(ctx); err != nil && err != context.Canceled {
+						logger.Warn("earnings watchlist feeder stopped", "err", err.Error())
+					}
+				}()
+				logger.Info("earnings watchlist feeder started",
+					"after_close_delay_minutes", cfg.Scanner.EarningsWatchlist.AfterCloseDelayMinutes,
+					"candidate_cap", cfg.Scanner.EarningsWatchlist.CandidateCap,
+					"watchlist_sessions", cfg.Scanner.EarningsWatchlist.WatchlistSessions,
 				)
 			}
 		}

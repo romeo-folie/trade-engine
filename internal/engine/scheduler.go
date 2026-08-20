@@ -93,6 +93,30 @@ func NextMarketCloseRun(now time.Time, delay time.Duration) (USMarketSession, ti
 	}
 }
 
+// NextMarketSession returns the first regular US equity session strictly after
+// t's Eastern calendar date. It keeps feeder scheduling correct across
+// weekends, holidays, and early closes.
+func NextMarketSession(t time.Time) USMarketSession {
+	for candidate := t.In(nyLoc).AddDate(0, 0, 1); ; candidate = candidate.AddDate(0, 0, 1) {
+		if session, ok := MarketSessionForDate(candidate); ok {
+			return session
+		}
+	}
+}
+
+// MarketSessionOffset returns the session offset regular sessions after the
+// session containing t. Offset zero returns that session.
+func MarketSessionOffset(t time.Time, offset int) USMarketSession {
+	session, ok := MarketSessionForDate(t)
+	if !ok {
+		session = NextMarketSession(t)
+	}
+	for ; offset > 0; offset-- {
+		session = NextMarketSession(session.Date)
+	}
+	return session
+}
+
 // NextTickTime returns the next scheduled tick time starting from 'now'.
 // If the market is currently open, it returns now + tickInterval.
 // If the market is closed, it returns the next market open (09:30 ET next trading day).

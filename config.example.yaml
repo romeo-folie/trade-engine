@@ -983,6 +983,12 @@ scanner:
     min_market_cap_mm: 100.0               # Market-cap risk floor in USD millions
     batch_size: 200                        # Maximum symbols per snapshot request
     run_lease_minutes: 15                  # Reclaim a crashed checkpoint worker
+  earnings_watchlist:
+    enabled: true                          # Add next-session earnings names to the ordinary analyst funnel
+    after_close_delay_minutes: 5           # Runs after each US regular-session close (early closes included)
+    candidate_cap: 5                       # Top names by prior-session dollar volume
+    watchlist_sessions: 5                  # Independent earnings context lifetime in trading sessions
+    bar_batch_size: 100                    # Maximum symbols per Alpaca daily-bars request
   graph_neighbors:
     enabled: false             # Source candidates from knowledge-graph neighbors of manually-watched tickers
     max_per_scan: 5            # Cap graph candidates per scan so they don't crowd out screener picks

@@ -181,12 +181,26 @@ type finnhubEarningsResp struct {
 // dates separately (they're public record). Live use only needs the next upcoming report,
 // which is always covered. Malformed date strings are skipped, not fatal.
 func (c *FinnhubClient) FetchEarningsCalendar(ctx context.Context, symbol string, from, to time.Time) ([]EarningsRelease, error) {
+	return c.fetchEarningsCalendar(ctx, symbol, from, to)
+}
+
+// FetchMarketEarningsCalendar returns all calendar entries in [from,to]. The
+// Finnhub endpoint treats an omitted symbol as a market-wide request; keeping a
+// separate method prevents callers from accidentally depending on an empty
+// per-symbol query.
+func (c *FinnhubClient) FetchMarketEarningsCalendar(ctx context.Context, from, to time.Time) ([]EarningsRelease, error) {
+	return c.fetchEarningsCalendar(ctx, "", from, to)
+}
+
+func (c *FinnhubClient) fetchEarningsCalendar(ctx context.Context, symbol string, from, to time.Time) ([]EarningsRelease, error) {
 	if err := c.throttle(ctx); err != nil {
 		return nil, err
 	}
 
 	params := url.Values{}
-	params.Set("symbol", symbol)
+	if symbol = strings.TrimSpace(symbol); symbol != "" {
+		params.Set("symbol", symbol)
+	}
 	params.Set("from", from.Format("2006-01-02"))
 	params.Set("to", to.Format("2006-01-02"))
 	params.Set("token", c.apiKey)
