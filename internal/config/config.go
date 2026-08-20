@@ -2705,7 +2705,7 @@ func Validate(cfg *Config) []string {
 	}
 	if earnings := cfg.Scanner.EarningsWatchlist; earnings.Enabled {
 		const prefix = "scanner.earnings_watchlist"
-		if cfg.Scanner.Universe.HistoricalFeed != "" && !validUniverseHistoricalFeed(cfg.Scanner.Universe.HistoricalFeed) {
+		if !validUniverseHistoricalFeed(cfg.Scanner.Universe.HistoricalFeed) {
 			errs = append(errs, fmt.Sprintf(
 				"scanner.universe.historical_feed must be one of iex|sip when earnings watchlist is enabled, got %q",
 				cfg.Scanner.Universe.HistoricalFeed))
@@ -2714,6 +2714,10 @@ func Validate(cfg *Config) []string {
 			errs = append(errs, prefix+".after_close_delay_minutes must be >= 0")
 		} else if !durationConfigFits(earnings.AfterCloseDelayMinutes, time.Minute) {
 			errs = append(errs, prefix+".after_close_delay_minutes overflows time.Duration")
+		}
+		if cfg.Scanner.Universe.HistoricalFeed == "sip" &&
+			earnings.AfterCloseDelayMinutes < cfg.Scanner.Universe.SIPRecentDataDelayMinutes {
+			errs = append(errs, prefix+".after_close_delay_minutes must be >= scanner.universe.sip_recent_data_delay_minutes when historical_feed=sip")
 		}
 		for field, value := range map[string]int{
 			"candidate_cap":      earnings.CandidateCap,

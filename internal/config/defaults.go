@@ -512,7 +512,7 @@ func Defaults() *Config {
 				RunLeaseMinutes:     15,
 			},
 			EarningsWatchlist: EarningsWatchlistConfig{
-				Enabled: true, AfterCloseDelayMinutes: 5, CandidateCap: 5,
+				Enabled: true, AfterCloseDelayMinutes: 20, CandidateCap: 5,
 				WatchlistSessions: 5, BarBatchSize: 100,
 			},
 			GraphNeighbors: GraphNeighborsConfig{

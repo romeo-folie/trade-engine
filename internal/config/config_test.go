@@ -280,6 +280,7 @@ func TestValidateScannerUniverseConfig(t *testing.T) {
 
 	disabled := Defaults()
 	disabled.Scanner.Universe = UniverseConfig{}
+	disabled.Scanner.EarningsWatchlist.Enabled = false
 	if errs := Validate(disabled); containsStr(errs, "scanner.universe") {
 		t.Fatalf("disabled zero-value universe must preserve existing configs: %v", errs)
 	}

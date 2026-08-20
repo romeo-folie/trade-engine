@@ -62,8 +62,14 @@ func EarningsWatchlistRunLeaseHeld(ctx context.Context, target, now time.Time) (
 }
 
 func CompleteEarningsWatchlistRun(ctx context.Context, target time.Time, attemptID string) error {
-	_, err := GetDB().Exec(ctx, `UPDATE earnings_watchlist_runs SET status='completed', completed_at=NOW(), updated_at=NOW() WHERE target_session_date=$1::date AND status='running' AND attempt_id=$2::uuid`, target, attemptID)
-	return err
+	tag, err := GetDB().Exec(ctx, `UPDATE earnings_watchlist_runs SET status='completed', completed_at=NOW(), updated_at=NOW() WHERE target_session_date=$1::date AND status='running' AND attempt_id=$2::uuid`, target, attemptID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("complete earnings watchlist run %s: claim is no longer running", target.Format("2006-01-02"))
+	}
+	return nil
 }
 
 func FailEarningsWatchlistRun(ctx context.Context, target time.Time, attemptID string, cause error) error {

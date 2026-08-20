@@ -985,7 +985,7 @@ scanner:
     run_lease_minutes: 15                  # Reclaim a crashed checkpoint worker
   earnings_watchlist:
     enabled: true                          # Add next-session earnings names to the ordinary analyst funnel
-    after_close_delay_minutes: 5           # Runs after each US regular-session close (early closes included)
+    after_close_delay_minutes: 20           # Runs after each US regular-session close; clears the default SIP delay
     candidate_cap: 5                       # Top names by prior-session dollar volume
     watchlist_sessions: 5                  # Independent earnings context lifetime in trading sessions
     bar_batch_size: 100                    # Maximum symbols per Alpaca daily-bars request
