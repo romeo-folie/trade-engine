@@ -298,6 +298,28 @@ func TestRetryHeartbeatRenewsClaimedBatch(t *testing.T) {
 	}
 }
 
+func TestRetryShutdownReleaseUsesBoundedDetachedContext(t *testing.T) {
+	released := 0
+	r := &Runner{
+		releaseRetryClaims: func(ctx context.Context, token string) error {
+			if ctx.Done() == nil {
+				t.Fatal("release context has no deadline")
+			}
+			select {
+			case <-ctx.Done():
+				t.Fatal("release context was already canceled")
+			default:
+			}
+			released++
+			return nil
+		},
+	}
+	r.releaseRetriesAfterShutdown("token")
+	if released != 1 {
+		t.Fatalf("released=%d", released)
+	}
+}
+
 func TestSenateBlockedRetryReleasesClaimsWithoutPersistingAttempt(t *testing.T) {
 	client, _ := NewSenateClient("https://efdsearch.senate.gov", time.Second)
 	client.Transport = &fixtureSenateTransport{fetchErr: ErrSenateAuthorizationRequired}

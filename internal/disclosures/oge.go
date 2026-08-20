@@ -242,16 +242,20 @@ func ogeAmendedFieldIsAmendment(value string) bool {
 	return true
 }
 
+type ogeLine struct {
+	text string
+}
+
 func ParseOGEPDF(f OGEFiling, pdf []byte, pages []PageText) Report {
 	r := Report{Source: "oge", ExternalID: f.ExternalID, Chamber: "executive", FilerName: f.FilerName, Office: f.Office, ReportType: f.ReportType, IsAmendment: f.IsAmendment, FilingDate: f.FilingDate, DocumentURL: f.DocumentURL, RawMetadata: f.RawMetadata, ContentHash: hashBytes(pdf), ExtractionStatus: "no_text"}
 	for _, p := range pages {
 		lines := ogeLines(p)
-		for _, text := range lines {
-			low := strings.ToLower(text)
+		for _, line := range lines {
+			low := strings.ToLower(line.text)
 			if !strings.Contains(low, "purchase") && !strings.Contains(low, "sale") && !strings.Contains(low, "exchange") {
 				continue
 			}
-			match := ogeDate.FindString(text)
+			match := ogeDate.FindString(line.text)
 			if match == "" {
 				continue
 			}
@@ -259,13 +263,16 @@ func ParseOGEPDF(f OGEFiling, pdf []byte, pages []PageText) Report {
 			if err != nil {
 				continue
 			}
-			typ := normalizeTransactionType(firstType(low))
-			amountMin, amountMax := parseAmount(text)
-			asset := strings.TrimSpace(ogeDate.ReplaceAllString(text, ""))
+			typ := ogeTransactionType(line)
+			if typ != "purchase" && typ != "sale" && typ != "exchange" {
+				continue
+			}
+			amountMin, amountMax := parseAmount(line.text)
+			asset := strings.TrimSpace(ogeDate.ReplaceAllString(line.text, ""))
 			asset = strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(asset, "Purchase", ""), "Sale", ""))
 			asset = strings.TrimSpace(strings.ReplaceAll(asset, "Exchange", ""))
-			raw, _ := json.Marshal(map[string]any{"page": p.Number, "line": text})
-			r.Transactions = append(r.Transactions, Transaction{Ordinal: len(r.Transactions) + 1, AssetName: asset, Ticker: tickerFromAsset(asset), TransactionType: typ, TransactionDate: date, AmountMin: amountMin, AmountMax: amountMax, AmountText: strings.TrimSpace(text), RawData: raw})
+			raw, _ := json.Marshal(map[string]any{"page": p.Number, "line": line.text})
+			r.Transactions = append(r.Transactions, Transaction{Ordinal: len(r.Transactions) + 1, AssetName: asset, Ticker: tickerFromAsset(asset), TransactionType: typ, TransactionDate: date, AmountMin: amountMin, AmountMax: amountMax, AmountText: strings.TrimSpace(line.text), RawData: raw})
 		}
 	}
 	if len(r.Transactions) > 0 {
@@ -276,7 +283,43 @@ func ParseOGEPDF(f OGEFiling, pdf []byte, pages []PageText) Report {
 	return r
 }
 
-func ogeLines(p PageText) []string {
+// ogeTransactionType determines the reported action from the box nearest to
+// the transaction date. The legacy firstType keyword priority could reverse a
+// sale whose asset or comment also contained "purchase".
+func ogeTransactionType(line ogeLine) string {
+	text := strings.ToLower(line.text)
+	datePosition := -1
+	dateText := ogeDate.FindString(line.text)
+	if dateText != "" {
+		datePosition = strings.Index(strings.ToLower(line.text), strings.ToLower(dateText))
+	}
+	types := map[string]string{
+		"purchase": "purchase",
+		"sale":     "sale",
+		"exchange": "exchange",
+	}
+	best, bestDistance := "", int(^uint(0)>>1)
+	for keyword, transactionType := range types {
+		position := strings.Index(text, keyword)
+		if position < 0 {
+			continue
+		}
+		distance := absInt(position - datePosition)
+		if distance < bestDistance {
+			best, bestDistance = transactionType, distance
+		}
+	}
+	return normalizeTransactionType(best)
+}
+
+func absInt(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+func ogeLines(p PageText) []ogeLine {
 	boxes := append([]TextBox(nil), p.Boxes...)
 	sort.SliceStable(boxes, func(i, j int) bool {
 		if boxes[i].Top != boxes[j].Top {
@@ -284,7 +327,7 @@ func ogeLines(p PageText) []string {
 		}
 		return boxes[i].Left < boxes[j].Left
 	})
-	var lines []string
+	var lines []ogeLine
 	for i := 0; i < len(boxes); {
 		top := boxes[i].Top
 		var parts []string
@@ -292,16 +335,9 @@ func ogeLines(p PageText) []string {
 			parts = append(parts, boxes[i].Text)
 			i++
 		}
-		lines = append(lines, strings.Join(parts, " "))
+		lines = append(lines, ogeLine{text: strings.Join(parts, " ")})
 	}
 	return lines
 }
-func firstType(s string) string {
-	for _, v := range []string{"purchase", "sale", "exchange"} {
-		if strings.Contains(s, v) {
-			return v
-		}
-	}
-	return ""
-}
+
 func hashBytes(b []byte) string { sum := sha256.Sum256(b); return hex.EncodeToString(sum[:]) }

@@ -253,3 +253,16 @@ func TestParseOGEPDFReconstructsRows(t *testing.T) {
 		t.Fatalf("row fields were not reconstructed: %#v", report.Transactions[0])
 	}
 }
+
+func TestParseOGEPDFUsesTransactionColumnWhenAssetMentionsPurchase(t *testing.T) {
+	filing := OGEFiling{ExternalID: "oge-test-sale", ReportType: "periodic_transaction", FilingDate: time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)}
+	report := ParseOGEPDF(filing, []byte("pdf"), []PageText{{Number: 2, Boxes: []TextBox{
+		{Text: "07/01/2026", Left: 1, Top: 10},
+		{Text: "Sale", Left: 80, Top: 10},
+		{Text: "Purchase Corp (ACME)", Left: 140, Top: 10},
+		{Text: "$15,001 - $50,000", Left: 260, Top: 10},
+	}}})
+	if len(report.Transactions) != 1 || report.Transactions[0].TransactionType != "sale" || report.Transactions[0].Ticker != "ACME" {
+		t.Fatalf("unexpected report: %#v", report)
+	}
+}

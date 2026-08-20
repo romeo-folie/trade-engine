@@ -716,3 +716,45 @@ func TestNonCompletedDisclosureReExtractionClearsChildEvidence(t *testing.T) {
 		})
 	}
 }
+
+func TestFirstPassDisclosureFailureDoesNotDowngradeCompletedReport(t *testing.T) {
+	ctx := context.Background()
+	report := store.PoliticalDisclosureReport{
+		Source: "house", ExternalID: "test-disclosure-downgrade-fence", Chamber: "house",
+		FilerName: "Hon. Completed Evidence", Office: "TS04",
+		ReportType: "periodic_transaction", FilingDate: time.Now().UTC(),
+		DocumentURL: "https://example.test/completed.pdf", ContentHash: "completed-hash",
+		ExtractionStatus: "completed", RawMetadata: json.RawMessage(`{"fixture":true}`),
+		Transactions: []store.PoliticalDisclosureTransaction{{
+			Ordinal: 1, AssetName: "Completed Corp (CMF)",
+			Ticker: "CMF", TransactionType: "purchase",
+			TransactionDate: time.Now().UTC().AddDate(0, 0, -1),
+			RawData:         json.RawMessage(`{"row":1}`),
+		}},
+	}
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(),
+			"DELETE FROM political_disclosure_reports WHERE source=$1 AND external_id=$2",
+			report.Source, report.ExternalID)
+	})
+	if err := store.SavePoliticalDisclosureReport(ctx, report); err != nil {
+		t.Fatal(err)
+	}
+	late := report
+	late.ExtractionStatus = "failed"
+	late.ExtractionError = "temporary loser"
+	late.RetryableFailure = true
+	late.ContentHash = ""
+	late.Transactions = nil
+	if err := store.SavePoliticalDisclosureFirstPass(ctx, late); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := store.GetPoliticalDisclosureReport(ctx, report.Source, report.ExternalID)
+	if err != nil || stored == nil || stored.ExtractionStatus != "completed" ||
+		stored.RetryableFailure || stored.RetryAttemptCount != 0 || len(stored.Transactions) != 1 {
+		t.Fatalf("late failure downgraded completed report: %+v err=%v", stored, err)
+	}
+	if stored.Transactions[0].Ticker != "CMF" {
+		t.Fatalf("completed transaction evidence lost: %+v", stored.Transactions)
+	}
+}

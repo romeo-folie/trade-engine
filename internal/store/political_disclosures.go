@@ -390,15 +390,34 @@ func SavePoliticalDisclosureRetryResult(ctx context.Context, report PoliticalDis
 	if currentToken == nil || *currentToken != token {
 		return ErrPoliticalDisclosureRetryLeaseLost
 	}
-	if err := savePoliticalDisclosureReportTx(ctx, tx, report); err != nil {
+	if err := savePoliticalDisclosureReportTx(ctx, tx, report, false); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// SavePoliticalDisclosureFirstPass stores a freshly discovered report and
+// fences completed rows against a concurrent loser. A later sync worker that
+// saw the filing before this worker committed must not downgrade it after a
+// transient fetch/parse failure.
+func SavePoliticalDisclosureFirstPass(
+	ctx context.Context, report PoliticalDisclosureReport,
+) error {
+	tx, err := GetDB().Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if err := savePoliticalDisclosureReportTx(ctx, tx, report, false); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
 }
 
 // SavePoliticalDisclosureReport replaces extracted child evidence atomically.
-// Existing terminal promotion outcomes are retained when an upstream filing is
-// re-extracted; removed tickers are marked superseded for auditability.
+// This is the explicit operator-facing upsert, so it intentionally allows a
+// completed row to be re-extracted as failed or no_text when an operator
+// re-runs a filing.
 func SavePoliticalDisclosureReport(
 	ctx context.Context, report PoliticalDisclosureReport,
 ) error {
@@ -407,13 +426,15 @@ func SavePoliticalDisclosureReport(
 		return err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
-	if err := savePoliticalDisclosureReportTx(ctx, tx, report); err != nil {
+	if err := savePoliticalDisclosureReportTx(ctx, tx, report, true); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
 }
 
-func savePoliticalDisclosureReportTx(ctx context.Context, tx pgx.Tx, report PoliticalDisclosureReport) error {
+func savePoliticalDisclosureReportTx(
+	ctx context.Context, tx pgx.Tx, report PoliticalDisclosureReport, allowCompletedDowngrade bool,
+) error {
 	if strings.TrimSpace(report.ExternalID) == "" ||
 		strings.TrimSpace(report.FilerName) == "" {
 		return fmt.Errorf("political disclosure report identity is incomplete")
@@ -430,7 +451,7 @@ func savePoliticalDisclosureReportTx(ctx context.Context, tx pgx.Tx, report Poli
 		nextRetryAt = &next
 	}
 
-	var reportID string
+	var reportID, storedStatus string
 	err := tx.QueryRow(ctx, `
 		INSERT INTO political_disclosure_reports (
 			source, external_id, chamber, filer_name, office, report_type,
@@ -443,43 +464,61 @@ func savePoliticalDisclosureReportTx(ctx context.Context, tx pgx.Tx, report Poli
 			is_amendment=EXCLUDED.is_amendment,
 			filing_date=EXCLUDED.filing_date, document_url=EXCLUDED.document_url,
 			content_hash=EXCLUDED.content_hash,
-			extraction_status=EXCLUDED.extraction_status,
-			extraction_error=EXCLUDED.extraction_error,
+			extraction_status=CASE
+				WHEN NOT $18 AND political_disclosure_reports.extraction_status='completed' AND EXCLUDED.extraction_status <> 'completed'
+					THEN political_disclosure_reports.extraction_status
+				ELSE EXCLUDED.extraction_status END,
+			extraction_error=CASE
+				WHEN NOT $18 AND political_disclosure_reports.extraction_status='completed' AND EXCLUDED.extraction_status <> 'completed'
+					THEN political_disclosure_reports.extraction_error
+				ELSE EXCLUDED.extraction_error END,
 			retry_attempt_count=CASE
-				WHEN EXCLUDED.extraction_status='failed' AND EXCLUDED.retryable_failure THEN
-					CASE WHEN political_disclosure_reports.extraction_status='failed'
-						THEN political_disclosure_reports.retry_attempt_count + 1 ELSE 1 END
-				ELSE 0 END,
+				WHEN NOT $18 AND political_disclosure_reports.extraction_status='completed' AND EXCLUDED.extraction_status <> 'completed'
+					THEN political_disclosure_reports.retry_attempt_count
+				ELSE CASE
+					WHEN EXCLUDED.extraction_status='failed' AND EXCLUDED.retryable_failure THEN
+						CASE WHEN political_disclosure_reports.extraction_status='failed'
+							THEN political_disclosure_reports.retry_attempt_count + 1 ELSE 1 END
+					ELSE 0 END
+			END,
 			retryable_failure=CASE
-				WHEN EXCLUDED.extraction_status='failed' AND EXCLUDED.retryable_failure THEN
-					(CASE WHEN political_disclosure_reports.extraction_status='failed'
-						THEN political_disclosure_reports.retry_attempt_count + 1 ELSE 1 END) < $17
-				ELSE FALSE END,
+				WHEN NOT $18 AND political_disclosure_reports.extraction_status='completed' AND EXCLUDED.extraction_status <> 'completed'
+					THEN political_disclosure_reports.retryable_failure
+				ELSE CASE
+					WHEN EXCLUDED.extraction_status='failed' AND EXCLUDED.retryable_failure THEN
+						(CASE WHEN political_disclosure_reports.extraction_status='failed'
+							THEN political_disclosure_reports.retry_attempt_count + 1 ELSE 1 END) < $17
+					ELSE FALSE END
+			END,
 			next_retry_at=CASE
-				WHEN EXCLUDED.extraction_status='failed' AND EXCLUDED.retryable_failure AND
-					(CASE WHEN political_disclosure_reports.extraction_status='failed'
-						THEN political_disclosure_reports.retry_attempt_count + 1 ELSE 1 END) < $17
-				THEN NOW() + CASE
-					WHEN (CASE WHEN political_disclosure_reports.extraction_status='failed'
-						THEN political_disclosure_reports.retry_attempt_count + 1 ELSE 1 END) = 1
-						THEN INTERVAL '1 hour'
-					WHEN (CASE WHEN political_disclosure_reports.extraction_status='failed'
-						THEN political_disclosure_reports.retry_attempt_count + 1 ELSE 1 END) = 2
-						THEN INTERVAL '6 hours'
-					ELSE INTERVAL '24 hours' END
-				ELSE NULL END,
+				WHEN NOT $18 AND political_disclosure_reports.extraction_status='completed' AND EXCLUDED.extraction_status <> 'completed'
+					THEN political_disclosure_reports.next_retry_at
+				ELSE CASE
+					WHEN EXCLUDED.extraction_status='failed' AND EXCLUDED.retryable_failure AND
+						(CASE WHEN political_disclosure_reports.extraction_status='failed'
+							THEN political_disclosure_reports.retry_attempt_count + 1 ELSE 1 END) < $17
+					THEN NOW() + CASE
+						WHEN (CASE WHEN political_disclosure_reports.extraction_status='failed'
+							THEN political_disclosure_reports.retry_attempt_count + 1 ELSE 1 END) = 1
+							THEN INTERVAL '1 hour'
+						WHEN (CASE WHEN political_disclosure_reports.extraction_status='failed'
+							THEN political_disclosure_reports.retry_attempt_count + 1 ELSE 1 END) = 2
+							THEN INTERVAL '6 hours'
+						ELSE INTERVAL '24 hours' END
+					ELSE NULL END
+			END,
 			raw_metadata=EXCLUDED.raw_metadata,
 			retry_claim_token=NULL, retry_claimed_at=NULL, retry_lease_until=NULL, updated_at=NOW()
-		RETURNING id`, report.Source, report.ExternalID, report.Chamber,
+		RETURNING id, extraction_status`, report.Source, report.ExternalID, report.Chamber,
 		report.FilerName, report.Office, report.ReportType, report.FilingDate,
 		report.DocumentURL, report.ContentHash, report.ExtractionStatus, report.IsAmendment,
 		report.ExtractionError, retryableFailure, retryAttempts, nextRetryAt,
-		report.RawMetadata, MaxPoliticalDisclosureRetryAttempts,
-	).Scan(&reportID)
+		report.RawMetadata, MaxPoliticalDisclosureRetryAttempts, allowCompletedDowngrade,
+	).Scan(&reportID, &storedStatus)
 	if err != nil {
 		return fmt.Errorf("upsert political disclosure report: %w", err)
 	}
-	if report.ExtractionStatus != "completed" {
+	if storedStatus != "completed" {
 		if _, err := tx.Exec(ctx,
 			`DELETE FROM political_disclosure_transactions WHERE report_id=$1`, reportID,
 		); err != nil {
@@ -492,10 +531,13 @@ func savePoliticalDisclosureReportTx(ctx context.Context, tx pgx.Tx, report Poli
 				promotion_claimed_at=NULL,
 				promotion_reason=$2
 			WHERE report_id=$1`, reportID,
-			"latest report extraction status is "+report.ExtractionStatus,
+			"latest report extraction status is "+storedStatus,
 		); err != nil {
 			return fmt.Errorf("supersede political disclosure candidates: %w", err)
 		}
+		return nil
+	}
+	if !allowCompletedDowngrade && storedStatus != report.ExtractionStatus {
 		return nil
 	}
 	if _, err := tx.Exec(ctx,

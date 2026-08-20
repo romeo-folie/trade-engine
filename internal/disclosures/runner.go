@@ -284,6 +284,15 @@ func (r *Runner) releaseRetries(ctx context.Context, token string) {
 	_ = store.ReleasePoliticalDisclosureRetryClaims(ctx, token)
 }
 
+// releaseRetriesAfterShutdown detaches from the canceled sync context and
+// bounds the database call so a dead connection pool cannot stall Runner.Run
+// during shutdown.
+func (r *Runner) releaseRetriesAfterShutdown(token string) {
+	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), 5*time.Second)
+	defer cancel()
+	r.releaseRetries(releaseCtx, token)
+}
+
 func retryFailure(report store.PoliticalDisclosureReport, cause error) Report {
 	return Report{Source: report.Source, ExternalID: report.ExternalID, Chamber: report.Chamber,
 		FilerName: report.FilerName, Office: report.Office, ReportType: report.ReportType,
@@ -298,7 +307,7 @@ func (r *Runner) retryHouse(ctx context.Context, limit int) (int, error) {
 		return 0, err
 	}
 	if len(claims) > 0 {
-		defer r.releaseRetries(context.Background(), claims[0].RetryClaimToken)
+		defer r.releaseRetriesAfterShutdown(claims[0].RetryClaimToken)
 	}
 	stopHeartbeat := r.heartbeatRetries(ctx, claims)
 	defer stopHeartbeat()
@@ -359,7 +368,7 @@ func (r *Runner) retrySenate(ctx context.Context, limit int) (int, error) {
 		return 0, err
 	}
 	if len(claims) > 0 {
-		defer r.releaseRetries(context.Background(), claims[0].RetryClaimToken)
+		defer r.releaseRetriesAfterShutdown(claims[0].RetryClaimToken)
 	}
 	stopHeartbeat := r.heartbeatRetries(ctx, claims)
 	defer stopHeartbeat()
@@ -405,7 +414,7 @@ func (r *Runner) retryOGE(ctx context.Context, limit int) (int, error) {
 		return 0, err
 	}
 	if len(claims) > 0 {
-		defer r.releaseRetries(context.Background(), claims[0].RetryClaimToken)
+		defer r.releaseRetriesAfterShutdown(claims[0].RetryClaimToken)
 	}
 	stopHeartbeat := r.heartbeatRetries(ctx, claims)
 	defer stopHeartbeat()
@@ -798,7 +807,7 @@ func (r *Runner) saveReport(ctx context.Context, report Report) error {
 	if r.persistReport != nil {
 		return r.persistReport(ctx, report)
 	}
-	return store.SavePoliticalDisclosureReport(ctx, politicalDisclosureStoreReport(report))
+	return store.SavePoliticalDisclosureFirstPass(ctx, politicalDisclosureStoreReport(report))
 }
 
 // politicalDisclosureStoreReport is the sole conversion boundary between
