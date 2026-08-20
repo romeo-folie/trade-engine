@@ -255,14 +255,23 @@ func PoliticalDisclosureReportTerminal(
 func RetryPoliticalDisclosureReport(
 	ctx context.Context, source, externalID string,
 ) (bool, error) {
+	return retryPoliticalDisclosureReportAt(ctx, source, externalID, time.Now().UTC())
+}
+
+// retryPoliticalDisclosureReportAt makes a failed report due according to the
+// caller's clock. Keeping the same clock for this reset and the subsequent
+// claim prevents a database/app clock skew from stranding a manual retry.
+func retryPoliticalDisclosureReportAt(
+	ctx context.Context, source, externalID string, now time.Time,
+) (bool, error) {
 	result, err := GetDB().Exec(ctx, `
 		UPDATE political_disclosure_reports
 		SET extraction_status='failed', extraction_error=NULL,
-			retryable_failure=TRUE, retry_attempt_count=0, next_retry_at=NOW(),
+			retryable_failure=TRUE, retry_attempt_count=0, next_retry_at=$3,
 			retry_claim_token=NULL, retry_claimed_at=NULL, retry_lease_until=NULL,
 			updated_at=NOW()
 		WHERE source=$1 AND external_id=$2 AND extraction_status='failed'`,
-		strings.ToLower(strings.TrimSpace(source)), strings.TrimSpace(externalID),
+		strings.ToLower(strings.TrimSpace(source)), strings.TrimSpace(externalID), now.UTC(),
 	)
 	if err != nil {
 		return false, err

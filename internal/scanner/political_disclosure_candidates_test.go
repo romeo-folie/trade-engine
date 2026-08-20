@@ -615,6 +615,39 @@ func TestClaimLossFallsBackToDisclosureOnlyCandidate(t *testing.T) {
 	}
 }
 
+func TestPoliticalOnlyFallbackRetainsPoliticalMarketEvidenceAndQualifiedMetrics(t *testing.T) {
+	qualified := SwingCandidate{
+		Ticker: "MSFT", Price: 999, ChangePct: 99, Volume: 999_999, TradeCount: 9_999,
+		DollarVolume: 999_000_000, PullbackQualified: true, PullbackQualificationKnown: true,
+		Return1M: 11, Return3M: 22, Return6M: 33, MarketCapMM: 44,
+		Sources: []string{"weekly_leader"}, WeeklyLeaderRunID: "weekly-run", WeeklyLeaderClaimToken: "weekly-claim",
+	}
+	political := SwingCandidate{
+		Ticker: "MSFT", Price: 425, ChangePct: 3.2, Volume: 100_000, TradeCount: 123,
+		DollarVolume: 42_500_000, Return1M: -1, Return3M: -2, Return6M: -3, MarketCapMM: 4,
+		Sources:                           []string{"political_disclosure"},
+		PoliticalDisclosureClaimToken:     "political-claim",
+		PoliticalDisclosureClaimReportIDs: []string{"report-1"},
+		PoliticalDisclosureEvidence:       "one purchase",
+	}
+
+	merged := mergePoliticalDisclosureCandidates([]SwingCandidate{qualified}, []SwingCandidate{political})
+	fallback, ok := candidateAfterPromotionClaimLoss(merged[0], "weekly_leader")
+	if !ok {
+		t.Fatal("weekly claim loss did not retain political fallback")
+	}
+	if fallback.Price != political.Price || fallback.ChangePct != political.ChangePct ||
+		fallback.Volume != political.Volume || fallback.TradeCount != political.TradeCount ||
+		fallback.DollarVolume != political.DollarVolume {
+		t.Fatalf("political market evidence was replaced: %+v", fallback)
+	}
+	if !fallback.PullbackQualified || !fallback.PullbackQualificationKnown ||
+		fallback.Return1M != qualified.Return1M || fallback.Return3M != qualified.Return3M ||
+		fallback.Return6M != qualified.Return6M || fallback.MarketCapMM != qualified.MarketCapMM {
+		t.Fatalf("qualified metrics were not retained: %+v", fallback)
+	}
+}
+
 func TestClaimLossAfterDisclosureHydrationRetainsLiquidityAndTaxonomy(t *testing.T) {
 	previous := data.Candle{Close: 20, Volume: 90_000}
 	scanner := &MarketScanner{

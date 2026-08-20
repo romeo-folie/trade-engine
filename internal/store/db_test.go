@@ -118,3 +118,37 @@ func TestConcurrentConnectAndBorrowedPoolUse(t *testing.T) {
 		t.Fatal("concurrent Connect() replaced the published pool")
 	}
 }
+
+func TestRetryPoliticalDisclosureReportAtUsesCallerClock(t *testing.T) {
+	if !IsConnected() {
+		t.Skip("DATABASE_URL not set; store integration tests skipped")
+	}
+
+	ctx := context.Background()
+	report := PoliticalDisclosureReport{
+		Source: "senate", ExternalID: "test-retry-caller-clock", Chamber: "senate",
+		FilerName: "Clock Senator", ReportType: "periodic_transaction",
+		FilingDate: time.Now().UTC(), DocumentURL: "https://example.test/caller-clock",
+		ExtractionStatus: "failed", ExtractionError: "temporary", RetryableFailure: true,
+	}
+	t.Cleanup(func() {
+		_, _ = GetDB().Exec(context.Background(),
+			"DELETE FROM political_disclosure_reports WHERE source=$1 AND external_id=$2",
+			report.Source, report.ExternalID)
+	})
+	if err := SavePoliticalDisclosureReport(ctx, report); err != nil {
+		t.Fatal(err)
+	}
+
+	// Deliberately put the app clock well behind PostgreSQL's clock. A reset
+	// based on NOW() would not be claimable by this caller immediately.
+	appNow := time.Now().UTC().Add(-24 * time.Hour)
+	found, err := retryPoliticalDisclosureReportAt(ctx, report.Source, report.ExternalID, appNow)
+	if err != nil || !found {
+		t.Fatalf("manual retry found=%v err=%v", found, err)
+	}
+	claimed, err := ClaimPoliticalDisclosureRetries(ctx, report.Source, appNow, 1, time.Minute, "caller-clock")
+	if err != nil || len(claimed) != 1 || claimed[0].ExternalID != report.ExternalID {
+		t.Fatalf("immediate claim under skew = %+v, err=%v", claimed, err)
+	}
+}

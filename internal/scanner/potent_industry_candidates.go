@@ -236,6 +236,12 @@ func politicalDisclosureOnlyFallback(candidate SwingCandidate) (SwingCandidate, 
 	// selected-universe taxonomy.
 	copyCandidatePresentationState(&fallback, candidate)
 	copyCandidateTaxonomyState(&fallback, candidate)
+	if candidate.PullbackQualified {
+		fallback.Return1M = candidate.Return1M
+		fallback.Return3M = candidate.Return3M
+		fallback.Return6M = candidate.Return6M
+		fallback.MarketCapMM = candidate.MarketCapMM
+	}
 	if !hasPoliticalMarketEvidence(fallback) && hasPoliticalMarketEvidence(candidate) {
 		snapshotCandidateEvidence(candidate).apply(&fallback)
 	}
