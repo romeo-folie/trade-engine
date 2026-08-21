@@ -64,6 +64,16 @@ func (s *MarketScanner) sourceLeaseTTLDays(source string) int {
 	return s.ttlDays()
 }
 
+func maxSourceLeaseExpiry(leases []store.WatchlistSourceLease, fallback time.Time) time.Time {
+	expiresAt := fallback
+	for _, lease := range leases {
+		if lease.ExpiresAt.After(expiresAt) {
+			expiresAt = lease.ExpiresAt
+		}
+	}
+	return expiresAt
+}
+
 func scannerSourceIdentity(candidate SwingCandidate, source string) map[string]any {
 	identity := map[string]any{"ticker": strings.ToUpper(strings.TrimSpace(candidate.Ticker))}
 	switch source {

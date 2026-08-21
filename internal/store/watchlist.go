@@ -183,6 +183,11 @@ func addWatchlistItemInTransaction(ctx context.Context, item WatchlistItem, pres
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 	if err := addWatchlistItem(ctx, tx, item, preserveActive); err != nil {
+		if errors.Is(err, ErrWatchlistActiveItemExists) {
+			if commitErr := tx.Commit(ctx); commitErr != nil {
+				return commitErr
+			}
+		}
 		return err
 	}
 	return tx.Commit(ctx)
@@ -211,6 +216,11 @@ func addWatchlistItemWithScannerLease(
 		return err
 	}
 	if err := addWatchlistItem(ctx, tx, item, preserveActive); err != nil {
+		if errors.Is(err, ErrWatchlistActiveItemExists) {
+			if commitErr := tx.Commit(ctx); commitErr != nil {
+				return commitErr
+			}
+		}
 		return err
 	}
 	return tx.Commit(ctx)
@@ -672,6 +682,9 @@ func GetWatchlistItems(ctx context.Context, activeOnly bool) ([]WatchlistItem, e
 	if err := loadActiveWatchlistDiscoveryContextsBatch(ctx, items); err != nil {
 		return nil, fmt.Errorf("load watchlist discovery contexts: %w", err)
 	}
+	if err := pruneExpiredSourceLeaseEvidenceBatch(ctx, items); err != nil {
+		return nil, fmt.Errorf("prune expired watchlist source evidence: %w", err)
+	}
 	for i := range items {
 		clearExpiredWatchlistContract(&items[i])
 	}
@@ -728,6 +741,11 @@ func GetWatchlistItem(ctx context.Context, ticker, platform string) (*WatchlistI
 	if err := loadActiveWatchlistDiscoveryContexts(ctx, &w); err != nil {
 		return nil, fmt.Errorf("load watchlist %s/%s discovery contexts: %w", w.Ticker, w.Platform, err)
 	}
+	items := []WatchlistItem{w}
+	if err := pruneExpiredSourceLeaseEvidenceBatch(ctx, items); err != nil {
+		return nil, fmt.Errorf("prune expired watchlist source evidence: %w", err)
+	}
+	w = items[0]
 	clearExpiredWatchlistContract(&w)
 	return &w, nil
 }

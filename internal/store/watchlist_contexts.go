@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -130,6 +131,92 @@ func loadActiveWatchlistDiscoveryContextsBatch(ctx context.Context, items []Watc
 		}
 	}
 	return rows.Err()
+}
+
+// pruneExpiredSourceLeaseEvidenceBatch keeps persisted provenance as history
+// but prevents expired source evidence from entering analyst-facing contexts.
+// Lease-less legacy scanner rows retain their scalar-TTL compatibility path.
+func pruneExpiredSourceLeaseEvidenceBatch(ctx context.Context, items []WatchlistItem) error {
+	if len(items) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(items))
+	byID := make(map[string]int, len(items))
+	for i := range items {
+		if !items[i].ScannerOrigin {
+			continue
+		}
+		ids = append(ids, items[i].ID)
+		byID[items[i].ID] = i
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	rows, err := GetDB().Query(ctx, `
+		SELECT watchlist_id::text, source, expires_at > NOW()
+		FROM watchlist_source_leases WHERE watchlist_id = ANY($1::uuid[])`, ids)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	leaseBacked := make(map[string]bool)
+	live := make(map[string]map[string]bool)
+	for rows.Next() {
+		var id, source string
+		var active bool
+		if err := rows.Scan(&id, &source, &active); err != nil {
+			return err
+		}
+		leaseBacked[id] = true
+		if active {
+			if live[id] == nil {
+				live[id] = make(map[string]bool)
+			}
+			live[id][source] = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for id, index := range byID {
+		if leaseBacked[id] {
+			filtered, pruned := filterDiscoveryContextSources(items[index].DiscoveryContext, live[id])
+			items[index].DiscoveryContext = filtered
+			if pruned {
+				// The original thesis/graph wording may describe an expired source.
+				// Preserve only source-scoped facts that remain live.
+				items[index].GraphContext = ""
+			}
+		}
+	}
+	return nil
+}
+
+func filterDiscoveryContextSources(value *tradeprofile.DiscoveryContext, live map[string]bool) (*tradeprofile.DiscoveryContext, bool) {
+	if value == nil {
+		return nil, false
+	}
+	filtered := *value
+	filtered.Sources = make([]string, 0, len(value.Sources))
+	filtered.EvidenceBySource = make(map[string]json.RawMessage, len(value.EvidenceBySource))
+	pruned := false
+	for _, source := range value.Sources {
+		if !live[source] {
+			pruned = true
+			continue
+		}
+		filtered.Sources = append(filtered.Sources, source)
+		if evidence, ok := value.EvidenceBySource[source]; ok {
+			filtered.EvidenceBySource[source] = append(json.RawMessage(nil), evidence...)
+		}
+	}
+	if pruned {
+		if len(filtered.Sources) == 0 {
+			return nil, true
+		}
+		filtered.Thesis = "Active source evidence: " + strings.Join(filtered.Sources, ", ")
+	}
+	return &filtered, pruned
 }
 
 // ExpireWatchlistDiscoveryContexts ends due contexts. Earnings-only rows are

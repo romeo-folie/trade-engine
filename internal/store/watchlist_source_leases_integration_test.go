@@ -152,6 +152,16 @@ func TestRefreshDropsEvidenceWhoseSourceLeaseExpired(t *testing.T) {
 	if err := store.AddWatchlistItem(ctx, item); err != nil {
 		t.Fatalf("add item: %v", err)
 	}
+	beforeRefresh, err := store.GetWatchlistItem(ctx, ticker, "stock")
+	if err != nil || beforeRefresh == nil || beforeRefresh.EffectiveDiscoveryContext() == nil {
+		t.Fatalf("read lease-backed item before refresh: %+v, %v", beforeRefresh, err)
+	}
+	if _, found := beforeRefresh.EffectiveDiscoveryContext().EvidenceBySource["political_disclosure"]; found {
+		t.Fatalf("expired political evidence reached effective context without a refresh: %+v", beforeRefresh.EffectiveDiscoveryContext())
+	}
+	if beforeRefresh.EffectiveDiscoveryContext().Thesis == "" {
+		t.Fatalf("live source context lost its usable thesis: %+v", beforeRefresh.EffectiveDiscoveryContext())
+	}
 	refresh := item
 	refresh.DiscoveryContext = &tradeprofile.DiscoveryContext{
 		Version: tradeprofile.DiscoveryContextVersion, Sources: []string{"mover"}, Thesis: "Fresh mover provenance",
@@ -172,6 +182,29 @@ func TestRefreshDropsEvidenceWhoseSourceLeaseExpired(t *testing.T) {
 	}
 	if _, found := stored.DiscoveryContext.EvidenceBySource["mover"]; !found {
 		t.Fatalf("fresh mover evidence missing: %+v", stored.DiscoveryContext)
+	}
+}
+
+func TestActiveScannerRaceCommitsRefreshedLease(t *testing.T) {
+	ctx := context.Background()
+	const ticker = "LEASE_RACE_COMMIT_RT"
+	t.Cleanup(func() { _, _ = store.GetDB().Exec(ctx, "DELETE FROM watchlist WHERE ticker=$1", ticker) })
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	expiresAt := now.Add(24 * time.Hour)
+	initial := store.WatchlistItem{Ticker: ticker, Platform: "stock", Source: "scanner", Strategies: []string{"momentum"}, Timeframes: []string{"1D"}, ExpiresAt: &expiresAt,
+		SourceLeases: []store.WatchlistSourceLease{{Source: "mover", EvidenceFingerprint: "mover", QualifiedAt: now, ObservedAt: now, EffectiveAt: now, ExpiresAt: expiresAt, Evidence: json.RawMessage(`{"price":10}`)}},
+	}
+	if err := store.AddWatchlistItem(ctx, initial); err != nil {
+		t.Fatalf("add initial: %v", err)
+	}
+	race := initial
+	race.SourceLeases = []store.WatchlistSourceLease{{Source: "graph_neighbor", EvidenceFingerprint: "graph", QualifiedAt: now, ObservedAt: now, EffectiveAt: now, ExpiresAt: expiresAt, Evidence: json.RawMessage(`{"relationship":"supplies"}`)}}
+	if err := store.AddWatchlistItemUnlessActive(ctx, race); !errors.Is(err, store.ErrWatchlistActiveItemExists) {
+		t.Fatalf("race error = %v, want ErrWatchlistActiveItemExists", err)
+	}
+	var count int
+	if err := store.GetDB().QueryRow(ctx, `SELECT count(*) FROM watchlist_source_leases l JOIN watchlist w ON w.id=l.watchlist_id WHERE w.ticker=$1 AND l.source='graph_neighbor'`, ticker).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("committed graph lease = %d, %v; want 1", count, err)
 	}
 }
 

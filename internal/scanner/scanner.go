@@ -369,8 +369,18 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 	// active-watchlist exclusion and before cap accounting. This keeps a full
 	// watchlist renewable without allowing renewals to consume a promotion slot
 	// or replace its admission-time conviction/execution profile.
-	if err := s.refreshActiveSourceLeases(ctx, candidates, recorder.run.ID, cycleLease); err != nil {
+	deferredClaims, err := s.refreshActiveSourceLeases(ctx, candidates, recorder.run.ID, cycleLease)
+	if err != nil {
 		return fmt.Errorf("refresh active watchlist source leases: %w", err)
+	}
+	if len(deferredClaims) > 0 {
+		filtered := candidates[:0]
+		for _, candidate := range candidates {
+			if !deferredClaims[normalizePromotionKey(candidate.Ticker)] {
+				filtered = append(filtered, candidate)
+			}
+		}
+		candidates = filtered
 	}
 
 	// 3.5 Dedup against active watchlist/position exposure only after universe
@@ -530,7 +540,8 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			return err
 		}
 		sc := scored[index]
-		expiresAt := s.now().AddDate(0, 0, s.candidateTTLDays(sc.candidate))
+		now := s.now()
+		expiresAt := now.AddDate(0, 0, s.candidateTTLDays(sc.candidate))
 		// A claim-loss fallback may change the candidate's effective taxonomy.
 		// Re-check later candidates against peers that were actually admitted,
 		// without allowing unattempted lower-ranked candidates to consume the cap.
@@ -561,6 +572,8 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 		); err != nil {
 			return fmt.Errorf("record scanner trade profile for %s: %w", sc.candidate.Ticker, err)
 		}
+		leases := s.scannerSourceLeases(sc.candidate, discoveryContext, now)
+		expiresAt = maxSourceLeaseExpiry(leases, expiresAt)
 		item := store.WatchlistItem{
 			Ticker:     sc.candidate.Ticker,
 			Platform:   "stock",
@@ -579,7 +592,7 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			ExecutionProfile:                executionProfile,
 			ScannerRunID:                    recorder.run.ID,
 			ExpiresAt:                       &expiresAt,
-			SourceLeases:                    s.scannerSourceLeases(sc.candidate, discoveryContext, s.now()),
+			SourceLeases:                    leases,
 			PullbackRequalificationComplete: sc.candidate.PullbackQualificationKnown,
 		}
 		if err := s.renewScannerCycleBeforePromotion(ctx, cycleKey, cycleOwner, interval); err != nil {
@@ -654,7 +667,8 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			item.GraphContext = fallback.GraphContext
 			item.DiscoveryContext = fallbackDiscovery
 			item.ExecutionProfile = fallbackProfile
-			item.SourceLeases = s.scannerSourceLeases(fallback, fallbackDiscovery, s.now())
+			now = s.now()
+			item.SourceLeases = s.scannerSourceLeases(fallback, fallbackDiscovery, now)
 			item.PullbackRequalificationComplete =
 				fallback.PullbackQualificationKnown
 			sc = scoredCandidate{candidate: fallback, score: fallbackScore}
@@ -671,7 +685,7 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			}
 			promotionState[index] = sc
 			scored[index] = sc
-			expiresAt = s.now().AddDate(0, 0, s.candidateTTLDays(sc.candidate))
+			expiresAt = maxSourceLeaseExpiry(item.SourceLeases, now.AddDate(0, 0, s.candidateTTLDays(sc.candidate)))
 			item.ExpiresAt = &expiresAt
 			if err := s.renewScannerCycleBeforePromotion(ctx, cycleKey, cycleOwner, interval); err != nil {
 				return err
@@ -766,12 +780,13 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 
 func (s *MarketScanner) refreshActiveSourceLeases(
 	ctx context.Context, candidates []SwingCandidate, scannerRunID string, cycleLease *store.ScannerCycleLease,
-) error {
+) (map[string]bool, error) {
 	items, err := store.GetWatchlistItems(ctx, true)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	active := make(map[string]struct{}, len(items))
+	deferredClaims := make(map[string]bool)
 	for _, item := range items {
 		if item.Source == "scanner" {
 			active[normalizePromotionKey(item.Ticker)] = struct{}{}
@@ -781,41 +796,60 @@ func (s *MarketScanner) refreshActiveSourceLeases(
 		if _, ok := active[normalizePromotionKey(candidate.Ticker)]; !ok {
 			continue
 		}
-		// The profile is validation scaffolding only. The store preserves the
-		// original one on an active-row refresh; it is never re-scored here.
-		discovery, profile, err := buildScannerTradeProfile(candidate, SwingScoreResult{})
-		if err != nil {
-			return fmt.Errorf("build refresh profile for %s: %w", candidate.Ticker, err)
-		}
-		now := s.now()
-		expiresAt := now.AddDate(0, 0, s.candidateTTLDays(candidate))
-		item := store.WatchlistItem{
-			Ticker: candidate.Ticker, Platform: "stock", Source: "scanner",
-			Strategies: scannerCandidateStrategies(candidate, SwingScoreResult{}),
-			Timeframes: []string{"1H", "4H"}, DiscoveryContext: discovery,
-			ExecutionProfile: profile, ScannerRunID: scannerRunID, ExpiresAt: &expiresAt,
-			SourceLeases:                    s.scannerSourceLeases(candidate, discovery, now),
-			PullbackRequalificationComplete: candidate.PullbackQualificationKnown,
-		}
-		claims := scannerSourcePromotionClaims(candidate)
-		if claims.WeeklyLeader != nil || claims.PotentIndustry != nil ||
-			claims.PremarketEpisodic != nil || claims.PoliticalDisclosure != nil {
-			err = store.RefreshScannerSourcesOnActiveWatchlist(
-				ctx, item, claims, "meaningful scanner evidence refreshed an active watchlist lease", now, cycleLease,
-			)
-		} else {
-			_, err = store.RefreshActiveScannerWatchlistItem(ctx, item, cycleLease)
-		}
-		if errors.Is(err, store.ErrWatchlistRefreshNotActive) {
-			// It will be handled by normal scoring if it is not active by the
-			// later exposure filter; do not turn this refresh into re-admission.
-			continue
-		}
-		if err != nil {
-			return fmt.Errorf("refresh %s: %w", candidate.Ticker, err)
+		refreshCandidate := candidate
+		for {
+			// The profile is validation scaffolding only. The store preserves the
+			// original one on an active-row refresh; it is never re-scored here.
+			discovery, profile, err := buildScannerTradeProfile(refreshCandidate, SwingScoreResult{})
+			if err != nil {
+				return nil, fmt.Errorf("build refresh profile for %s: %w", refreshCandidate.Ticker, err)
+			}
+			now := s.now()
+			leases := s.scannerSourceLeases(refreshCandidate, discovery, now)
+			expiresAt := maxSourceLeaseExpiry(leases, now.AddDate(0, 0, s.candidateTTLDays(refreshCandidate)))
+			item := store.WatchlistItem{
+				Ticker: refreshCandidate.Ticker, Platform: "stock", Source: "scanner",
+				Strategies: scannerCandidateStrategies(refreshCandidate, SwingScoreResult{}),
+				Timeframes: []string{"1H", "4H"}, DiscoveryContext: discovery,
+				ExecutionProfile: profile, ScannerRunID: scannerRunID, ExpiresAt: &expiresAt,
+				SourceLeases:                    leases,
+				PullbackRequalificationComplete: refreshCandidate.PullbackQualificationKnown,
+			}
+			claims := scannerSourcePromotionClaims(refreshCandidate)
+			if claims.WeeklyLeader != nil || claims.PotentIndustry != nil ||
+				claims.PremarketEpisodic != nil || claims.PoliticalDisclosure != nil {
+				err = store.RefreshScannerSourcesOnActiveWatchlist(
+					ctx, item, claims, "meaningful scanner evidence refreshed an active watchlist lease", now, cycleLease,
+				)
+			} else {
+				_, err = store.RefreshActiveScannerWatchlistItem(ctx, item, cycleLease)
+			}
+			if errors.Is(err, store.ErrWatchlistRefreshNotActive) {
+				// It will be handled by normal scoring if it is not active by the
+				// later exposure filter; do not turn this refresh into re-admission.
+				break
+			}
+			if errors.Is(err, store.ErrScannerSourcePromotionClaimLost) {
+				var claimErr *store.ScannerSourcePromotionClaimError
+				if errors.As(err, &claimErr) {
+					if fallback, ok := candidateAfterPromotionClaimLoss(refreshCandidate, claimErr.Source); ok {
+						refreshCandidate = fallback
+						continue
+					}
+				}
+				// No safe reduced provenance exists (for example, premarket data
+				// cannot be reconstructed). Keep the remaining claims retryable.
+				deferredClaims[normalizePromotionKey(candidate.Ticker)] = true
+				slog.Info("scanner: active source refresh lost stale claim", "ticker", refreshCandidate.Ticker)
+				break
+			}
+			if err != nil {
+				return nil, fmt.Errorf("refresh %s: %w", refreshCandidate.Ticker, err)
+			}
+			break
 		}
 	}
-	return nil
+	return deferredClaims, nil
 }
 
 type pullbackQualification struct {

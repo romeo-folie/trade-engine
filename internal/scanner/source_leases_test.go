@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/config"
+	"github.com/romeo-folie/trade-engine/internal/store"
 	"github.com/romeo-folie/trade-engine/internal/tradeprofile"
 )
 
@@ -100,5 +101,14 @@ func TestScannerSourceLeaseFingerprintIgnoresNewsOrdering(t *testing.T) {
 	second := scanner.scannerSourceLeases(candidate, secondDiscovery, now.Add(time.Hour))
 	if first[0].EvidenceFingerprint != second[0].EvidenceFingerprint {
 		t.Fatalf("news ordering changed fingerprint: %q != %q", first[0].EvidenceFingerprint, second[0].EvidenceFingerprint)
+	}
+}
+
+func TestMaxSourceLeaseExpiryUsesLongestGeneratedLease(t *testing.T) {
+	now := time.Date(2026, time.August, 21, 14, 0, 0, 0, time.UTC)
+	short := now.AddDate(0, 0, 3)
+	political := now.AddDate(0, 0, 7)
+	if got := maxSourceLeaseExpiry([]store.WatchlistSourceLease{{ExpiresAt: short}, {ExpiresAt: political}}, short); !got.Equal(political) {
+		t.Fatalf("max source lease expiry = %s, want %s", got, political)
 	}
 }
