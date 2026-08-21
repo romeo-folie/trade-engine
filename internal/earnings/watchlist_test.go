@@ -14,6 +14,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/engine"
 	"github.com/romeo-folie/trade-engine/internal/logger"
+	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
 func TestNextSessionReleasesUsesFinnhubCalendarDateWithoutTimezoneShift(t *testing.T) {
@@ -96,5 +97,160 @@ func TestWatchlistSchedulerRetriesTransientFailure(t *testing.T) {
 		if !strings.Contains(logs.String(), want) {
 			t.Errorf("scheduler logs missing %q:\n%s", want, logs.String())
 		}
+	}
+}
+
+type watchlistCalendarStub struct {
+	calls int
+	fetch func(context.Context) ([]data.EarningsRelease, error)
+}
+
+func (f *watchlistCalendarStub) FetchMarketEarningsCalendar(ctx context.Context, _, _ time.Time) ([]data.EarningsRelease, error) {
+	f.calls++
+	return f.fetch(ctx)
+}
+
+type watchlistBarsStub struct {
+	calls int
+}
+
+func (f *watchlistBarsStub) FetchDailyBars(context.Context, []string, time.Time, time.Time, int) (data.DailyBarsBatchResult, error) {
+	f.calls++
+	return data.DailyBarsBatchResult{}, nil
+}
+
+func TestWatchlistFeederSkipsClaimWhenExpiryCrossesTargetOpen(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("store unavailable; skipping DB-backed earnings watchlist test")
+	}
+	ctx := context.Background()
+	completed, ok := engine.MarketSessionForDate(time.Date(2031, time.January, 2, 12, 0, 0, 0, time.UTC))
+	if !ok {
+		t.Fatal("expected completed session")
+	}
+	target := engine.NextMarketSession(completed.Date)
+	if _, err := store.GetDB().Exec(ctx, `DELETE FROM earnings_watchlist_runs WHERE target_session_date=$1::date`, target.Date); err != nil {
+		t.Fatalf("clear run fixture: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), `DELETE FROM earnings_watchlist_runs WHERE target_session_date=$1::date`, target.Date)
+	})
+
+	calendar := &watchlistCalendarStub{fetch: func(context.Context) ([]data.EarningsRelease, error) {
+		return nil, nil
+	}}
+	bars := &watchlistBarsStub{}
+	nowCalls := 0
+	feeder := WatchlistFeeder{
+		Calendar: calendar,
+		Bars:     bars,
+		Now: func() time.Time {
+			nowCalls++
+			if nowCalls == 1 {
+				return target.Open.Add(-time.Nanosecond)
+			}
+			return target.Open
+		},
+	}
+	if err := feeder.RunSession(ctx, completed, completed.Close); err != nil {
+		t.Fatalf("RunSession: %v", err)
+	}
+	if calendar.calls != 0 || bars.calls != 0 {
+		t.Fatalf("providers called after target opened: calendar=%d bars=%d", calendar.calls, bars.calls)
+	}
+	var claimed int
+	if err := store.GetDB().QueryRow(ctx, `SELECT COUNT(*) FROM earnings_watchlist_runs WHERE target_session_date=$1::date`, target.Date).Scan(&claimed); err != nil {
+		t.Fatalf("query claimed run: %v", err)
+	}
+	if claimed != 0 {
+		t.Fatalf("claimed runs=%d, want 0", claimed)
+	}
+}
+
+func TestWatchlistFeederCancellationAfterClaimLeavesRunRunning(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("store unavailable; skipping DB-backed earnings watchlist test")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	completed, ok := engine.MarketSessionForDate(time.Date(2031, time.January, 3, 12, 0, 0, 0, time.UTC))
+	if !ok {
+		t.Fatal("expected completed session")
+	}
+	target := engine.NextMarketSession(completed.Date)
+	if _, err := store.GetDB().Exec(context.Background(), `DELETE FROM earnings_watchlist_runs WHERE target_session_date=$1::date`, target.Date); err != nil {
+		t.Fatalf("clear run fixture: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), `DELETE FROM earnings_watchlist_runs WHERE target_session_date=$1::date`, target.Date)
+	})
+	var logs bytes.Buffer
+	restore := logger.SetForTesting(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer restore()
+	calendar := &watchlistCalendarStub{fetch: func(context.Context) ([]data.EarningsRelease, error) {
+		cancel()
+		return nil, context.Canceled
+	}}
+	feeder := WatchlistFeeder{
+		Calendar: calendar,
+		Bars:     &watchlistBarsStub{},
+		Now:      func() time.Time { return target.Open.Add(-time.Minute) },
+	}
+	err := feeder.RunSession(ctx, completed, completed.Close)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("RunSession error = %v, want context canceled", err)
+	}
+	if strings.Contains(logs.String(), "earnings watchlist run failed") {
+		t.Fatalf("canceled run logged failure:\n%s", logs.String())
+	}
+	var status string
+	var lastError *string
+	if err := store.GetDB().QueryRow(context.Background(), `SELECT status, last_error FROM earnings_watchlist_runs WHERE target_session_date=$1::date`, target.Date).Scan(&status, &lastError); err != nil {
+		t.Fatalf("query claimed run: %v", err)
+	}
+	if status != "running" || lastError != nil {
+		t.Fatalf("run status=%q last_error=%v, want running with no error", status, lastError)
+	}
+}
+
+func TestWatchlistFeederProviderCancellationFailsHealthyRun(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("store unavailable; skipping DB-backed earnings watchlist test")
+	}
+	ctx := context.Background()
+	completed, ok := engine.MarketSessionForDate(time.Date(2031, time.January, 6, 12, 0, 0, 0, time.UTC))
+	if !ok {
+		t.Fatal("expected completed session")
+	}
+	target := engine.NextMarketSession(completed.Date)
+	if _, err := store.GetDB().Exec(ctx, `DELETE FROM earnings_watchlist_runs WHERE target_session_date=$1::date`, target.Date); err != nil {
+		t.Fatalf("clear run fixture: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), `DELETE FROM earnings_watchlist_runs WHERE target_session_date=$1::date`, target.Date)
+	})
+	var logs bytes.Buffer
+	restore := logger.SetForTesting(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer restore()
+	feeder := WatchlistFeeder{
+		Calendar: &watchlistCalendarStub{fetch: func(context.Context) ([]data.EarningsRelease, error) {
+			return nil, context.Canceled
+		}},
+		Bars: &watchlistBarsStub{},
+		Now:  func() time.Time { return target.Open.Add(-time.Minute) },
+	}
+	err := feeder.RunSession(ctx, completed, completed.Close)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("RunSession error = %v, want context canceled", err)
+	}
+	if !strings.Contains(logs.String(), "earnings watchlist run failed") {
+		t.Fatalf("healthy-context provider cancellation did not log failure:\n%s", logs.String())
+	}
+	var status string
+	if err := store.GetDB().QueryRow(ctx, `SELECT status FROM earnings_watchlist_runs WHERE target_session_date=$1::date`, target.Date).Scan(&status); err != nil {
+		t.Fatalf("query failed run: %v", err)
+	}
+	if status != "failed" {
+		t.Fatalf("run status=%q, want failed", status)
 	}
 }
