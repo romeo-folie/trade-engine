@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -267,7 +268,7 @@ func ParseOGEPDF(f OGEFiling, pdf []byte, pages []PageText) Report {
 	r := Report{Source: "oge", ExternalID: f.ExternalID, Chamber: "executive", FilerName: f.FilerName, Office: f.Office, ReportType: f.ReportType, IsAmendment: f.IsAmendment, FilingDate: f.FilingDate, DocumentURL: f.DocumentURL, RawMetadata: f.RawMetadata, ContentHash: hashBytes(pdf), ExtractionStatus: "no_text"}
 	for _, p := range pages {
 		bands := ogeHeaderBands(p)
-		for _, row := range ogeRows(p) {
+		for _, row := range ogeRows(p, bands) {
 			dateText := ogeDate.FindString(row.date.Text)
 			date, err := parseDate(dateText)
 			if err != nil {
@@ -341,7 +342,10 @@ func ogeStandaloneAction(text string) string {
 	return ""
 }
 
-func ogeRows(p PageText) []ogeTransactionRow {
+// ogeRows only treats dates in the transaction-date column as row anchors.
+// Asset descriptions often include their own dates; using those as anchors
+// would split a single transaction into multiple, malformed rows.
+func ogeRows(p PageText, bands ogeColumnBands) []ogeTransactionRow {
 	boxes := append([]TextBox(nil), p.Boxes...)
 	sort.SliceStable(boxes, func(i, j int) bool {
 		if boxes[i].Top != boxes[j].Top {
@@ -353,10 +357,14 @@ func ogeRows(p PageText) []ogeTransactionRow {
 	for i, box := range boxes {
 		positioned = append(positioned, ogePositionedBox{TextBox: box, index: i})
 	}
+	dateBand, ok := ogeDateAnchorBand(positioned, bands)
+	if !ok {
+		return nil
+	}
 	anchors := make([]ogePositionedBox, 0)
 	for _, box := range positioned {
 		if dateText := ogeDate.FindString(box.Text); dateText != "" {
-			if _, err := parseDate(dateText); err == nil {
+			if _, err := parseDate(dateText); err == nil && dateBand.contains(box.Left) {
 				anchors = append(anchors, box)
 			}
 		}
@@ -382,6 +390,109 @@ func ogeRows(p PageText) []ogeTransactionRow {
 		rows = append(rows, row)
 	}
 	return rows
+}
+
+type ogeDateBand struct{ min, max float64 }
+
+func (b ogeDateBand) contains(left float64) bool {
+	return left >= b.min && left <= b.max
+}
+
+// ogeDateAnchorBand prefers the explicit date header. For headerless PDFs it
+// infers the date column from repeated date/action/currency row geometry.
+func ogeDateAnchorBand(boxes []ogePositionedBox, headers ogeColumnBands) (ogeDateBand, bool) {
+	if headers.hasDate {
+		// The next known column is the natural right edge of the date column.
+		right := math.Inf(1)
+		for _, column := range []struct {
+			left float64
+			has  bool
+		}{
+			{headers.action, headers.hasAction},
+			{headers.asset, headers.hasAsset},
+			{headers.amount, headers.hasAmount},
+		} {
+			if column.has && column.left > headers.date && column.left < right {
+				right = column.left
+			}
+		}
+		if math.IsInf(right, 1) {
+			// A lone Date header still supplies a useful narrow column band.
+			right = headers.date + 30
+		} else {
+			right = headers.date + (right-headers.date)/2
+		}
+		return ogeDateBand{min: headers.date - 12, max: right}, true
+	}
+
+	// Headerless documents need at least one row-shaped date candidate. Group
+	// candidates by horizontal position so a date embedded in every asset name
+	// cannot outvote the actual left-most date column.
+	type candidate struct {
+		left        float64
+		occurrences int
+		evidence    int
+	}
+	candidates := make([]candidate, 0)
+	for _, box := range boxes {
+		dateText := ogeDate.FindString(box.Text)
+		if dateText == "" {
+			continue
+		}
+		if _, err := parseDate(dateText); err != nil {
+			continue
+		}
+		index := -1
+		for i := range candidates {
+			if math.Abs(candidates[i].left-box.Left) <= 12 {
+				index = i
+				break
+			}
+		}
+		if index == -1 {
+			candidates = append(candidates, candidate{left: box.Left})
+			index = len(candidates) - 1
+		}
+		candidates[index].occurrences++
+		if ogeDateRowEvidence(box, boxes) {
+			candidates[index].evidence++
+		}
+	}
+	best := -1
+	for i := range candidates {
+		if candidates[i].evidence == 0 || (best >= 0 &&
+			(candidates[i].evidence < candidates[best].evidence ||
+				(candidates[i].evidence == candidates[best].evidence && candidates[i].occurrences < candidates[best].occurrences) ||
+				(candidates[i].evidence == candidates[best].evidence && candidates[i].occurrences == candidates[best].occurrences && candidates[i].left >= candidates[best].left))) {
+			continue
+		}
+		best = i
+	}
+	if best < 0 {
+		return ogeDateBand{}, false
+	}
+	return ogeDateBand{min: candidates[best].left - 12, max: candidates[best].left + 12}, true
+}
+
+func ogeDateRowEvidence(date ogePositionedBox, boxes []ogePositionedBox) bool {
+	actionLeft := math.Inf(1)
+	for _, box := range boxes {
+		if math.Abs(box.Top-date.Top) > 4 || box.Left <= date.Left || ogeStandaloneAction(box.Text) == "" {
+			continue
+		}
+		if box.Left < actionLeft {
+			actionLeft = box.Left
+		}
+	}
+	if math.IsInf(actionLeft, 1) {
+		return false
+	}
+	for _, box := range boxes {
+		if math.Abs(box.Top-date.Top) <= 4 && box.Left > actionLeft && strings.Contains(box.Text, "$") {
+			return true
+		}
+	}
+	return false
 }
 
 func ogeHeaderBands(p PageText) ogeColumnBands {

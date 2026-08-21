@@ -85,6 +85,9 @@ func (c *SenateClient) ListPTRs(
 	ctx context.Context, since, until time.Time, maxReports int,
 ) ([]SenateFiling, error) {
 	if c.Transport != nil {
+		if err := c.pacer.Wait(ctx, c.RequestDelay); err != nil {
+			return nil, err
+		}
 		body, err := c.Transport.SearchPTRs(ctx, since, until, 0, maxReports)
 		if err != nil {
 			return nil, err
@@ -140,6 +143,9 @@ func (c *SenateClient) ListPTRPage(ctx context.Context, since, until time.Time, 
 	var body []byte
 	var err error
 	if c.Transport != nil {
+		if err := c.pacer.Wait(ctx, c.RequestDelay); err != nil {
+			return SenateFilingPage{}, err
+		}
 		body, err = c.Transport.SearchPTRs(ctx, since, until, start, length)
 	} else {
 		body, err = c.searchPTRsHTTP(ctx, since, until, start, length)

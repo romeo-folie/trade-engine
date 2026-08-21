@@ -6,6 +6,7 @@ import (
 	"errors"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -846,7 +847,7 @@ func TestMarkPoliticalDisclosurePromotionRequeuesOnlyCapSuppressedTicker(t *test
 	}
 }
 
-func TestClaimPoliticalDisclosureCandidatesReturnsHistoryButClaimsOnlyPendingRows(t *testing.T) {
+func TestClaimPoliticalDisclosureCandidatesFencesEntireAggregateLineage(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2300, time.March, 15, 12, 0, 0, 0, time.UTC)
 	history := politicalDisclosureClaimFixture("test-claim-history-terminal", "PDHISTORY", now.AddDate(0, 0, -1))
@@ -881,14 +882,13 @@ func TestClaimPoliticalDisclosureCandidatesReturnsHistoryButClaimsOnlyPendingRow
 		byExternalID[item.ExternalID] = item
 	}
 	claimedHistory := byExternalID[history.ExternalID]
-	if claimedHistory.Claimed || claimedHistory.PromotionClaimToken != "" {
-		t.Fatalf("terminal history row was claimed: %+v", claimedHistory)
-	}
 	claimedPending := byExternalID[pending.ExternalID]
-	if !claimedPending.Claimed || claimedPending.PromotionClaimToken != "history-token" {
-		t.Fatalf("pending row claim=%+v", claimedPending)
+	for _, item := range []store.PoliticalDisclosureCandidate{claimedHistory, claimedPending} {
+		if !item.Claimed || item.PromotionClaimToken != "history-token" {
+			t.Fatalf("aggregate evidence was not fenced: %+v", item)
+		}
 	}
-	if err := store.MarkPoliticalDisclosurePromotion(ctx, "PDHISTORY", "history-token", []string{claimedPending.ReportID}, "rejected", "", "fixture", now); err != nil {
+	if err := store.MarkPoliticalDisclosurePromotion(ctx, "PDHISTORY", "history-token", []string{claimedHistory.ReportID, claimedPending.ReportID}, "rejected", "", "fixture", now); err != nil {
 		t.Fatal(err)
 	}
 	var historyStatus, pendingStatus string
@@ -903,6 +903,139 @@ func TestClaimPoliticalDisclosureCandidatesReturnsHistoryButClaimsOnlyPendingRow
 	}
 	if rows, err := store.ClaimPoliticalDisclosureCandidates(ctx, now.AddDate(0, 0, -7), now, time.Hour, 1, "no-claim-token"); err != nil || len(rows) != 0 {
 		t.Fatalf("no claimable row returned history: rows=%+v err=%v", rows, err)
+	}
+}
+
+func TestPoliticalDisclosureAggregateFenceReleasePreservesHistoricalStatus(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2300, time.March, 16, 12, 0, 0, 0, time.UTC)
+	history := politicalDisclosureClaimFixture("test-aggregate-release-history", "PDRELEASE", now.AddDate(0, 0, -1))
+	pending := politicalDisclosureClaimFixture("test-aggregate-release-pending", "PDRELEASE", now)
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), `
+			DELETE FROM political_disclosure_reports WHERE source='house' AND external_id = ANY($1::text[])`,
+			[]string{history.ExternalID, pending.ExternalID})
+	})
+	for _, report := range []store.PoliticalDisclosureReport{history, pending} {
+		if err := store.SavePoliticalDisclosureReport(ctx, report); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.GetDB().Exec(ctx, `
+		UPDATE political_disclosure_candidates
+		SET promotion_status='promoted', promotion_reason='historical result'
+		WHERE report_id=(SELECT id FROM political_disclosure_reports WHERE source=$1 AND external_id=$2)`,
+		history.Source, history.ExternalID); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimPoliticalDisclosureCandidates(ctx, now.AddDate(0, 0, -7), now, time.Hour, 1, "aggregate-release-token")
+	if err != nil || len(claimed) != 2 {
+		t.Fatalf("claim=%+v err=%v", claimed, err)
+	}
+	if err := store.ReleasePoliticalDisclosurePromotionClaims(ctx, "aggregate-release-token", "scoring unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	for externalID, wantStatus := range map[string]string{history.ExternalID: "promoted", pending.ExternalID: "pending"} {
+		var status, token string
+		if err := store.GetDB().QueryRow(ctx, `
+			SELECT c.promotion_status, COALESCE(c.promotion_claim_token,'')
+			FROM political_disclosure_candidates c
+			JOIN political_disclosure_reports r ON r.id=c.report_id
+			WHERE r.source='house' AND r.external_id=$1 AND c.ticker='PDRELEASE'`, externalID).Scan(&status, &token); err != nil {
+			t.Fatal(err)
+		}
+		if status != wantStatus || token != "" {
+			t.Fatalf("%s after release status=%q token=%q, want %q/empty", externalID, status, token, wantStatus)
+		}
+	}
+}
+
+func TestPoliticalDisclosureAggregateClaimSkipsFreshHistoricalFence(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2300, time.March, 16, 12, 0, 0, 0, time.UTC)
+	history := politicalDisclosureClaimFixture("test-aggregate-fresh-history", "PDFRESHFENCE", now.AddDate(0, 0, -1))
+	pending := politicalDisclosureClaimFixture("test-aggregate-fresh-pending", "PDFRESHFENCE", now)
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), `
+			DELETE FROM political_disclosure_reports WHERE source='house' AND external_id = ANY($1::text[])`,
+			[]string{history.ExternalID, pending.ExternalID})
+	})
+	for _, report := range []store.PoliticalDisclosureReport{history, pending} {
+		if err := store.SavePoliticalDisclosureReport(ctx, report); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.GetDB().Exec(ctx, `
+		UPDATE political_disclosure_candidates
+		SET promotion_status='promoted', promotion_claim_token='foreign-token', promotion_claimed_at=$3
+		WHERE report_id=(SELECT id FROM political_disclosure_reports WHERE source=$1 AND external_id=$2)`,
+		history.Source, history.ExternalID, now); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimPoliticalDisclosureCandidates(ctx, now.AddDate(0, 0, -7), now, time.Hour, 1, "new-token")
+	if err != nil || len(claimed) != 0 {
+		t.Fatalf("fresh historical fence was stolen: claim=%+v err=%v", claimed, err)
+	}
+}
+
+func TestPoliticalDisclosureHistoricalReextractionInvalidatesAggregatePromotion(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2300, time.March, 17, 12, 0, 0, 0, time.UTC)
+	history := politicalDisclosureClaimFixture("test-aggregate-reextract-history", "PDREEXTRACT", now.AddDate(0, 0, -1))
+	pending := politicalDisclosureClaimFixture("test-aggregate-reextract-pending", "PDREEXTRACT", now)
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), `DELETE FROM watchlist WHERE ticker='PDREEXTRACT'`)
+		_, _ = store.GetDB().Exec(context.Background(), `
+			DELETE FROM political_disclosure_reports WHERE source='house' AND external_id = ANY($1::text[])`,
+			[]string{history.ExternalID, pending.ExternalID})
+	})
+	for _, report := range []store.PoliticalDisclosureReport{history, pending} {
+		if err := store.SavePoliticalDisclosureReport(ctx, report); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.GetDB().Exec(ctx, `
+		UPDATE political_disclosure_candidates SET promotion_status='promoted'
+		WHERE report_id=(SELECT id FROM political_disclosure_reports WHERE source=$1 AND external_id=$2)`,
+		history.Source, history.ExternalID); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimPoliticalDisclosureCandidates(ctx, now.AddDate(0, 0, -7), now, time.Hour, 1, "aggregate-reextract-token")
+	if err != nil || len(claimed) != 2 {
+		t.Fatalf("claim=%+v err=%v", claimed, err)
+	}
+	reportIDs := make([]string, 0, len(claimed))
+	for _, item := range claimed {
+		reportIDs = append(reportIDs, item.ReportID)
+	}
+	// The historical row keeps its terminal status but must clear the fence so
+	// a candidate built from the stale aggregate cannot be promoted.
+	if err := store.SavePoliticalDisclosureReport(ctx, history); err != nil {
+		t.Fatal(err)
+	}
+	var historyStatus, historyToken string
+	if err := store.GetDB().QueryRow(ctx, `
+		SELECT c.promotion_status, COALESCE(c.promotion_claim_token,'')
+		FROM political_disclosure_candidates c
+		JOIN political_disclosure_reports r ON r.id=c.report_id
+		WHERE r.source=$1 AND r.external_id=$2 AND c.ticker='PDREEXTRACT'`, history.Source, history.ExternalID).Scan(&historyStatus, &historyToken); err != nil {
+		t.Fatal(err)
+	}
+	if historyStatus != "promoted" || historyToken != "" {
+		t.Fatalf("historical re-extraction status=%q token=%q, want promoted/empty", historyStatus, historyToken)
+	}
+	item := store.WatchlistItem{Ticker: "PDREEXTRACT", Platform: "stock", Strategies: []string{"momentum"}, Timeframes: []string{"1D"}, MinConfidence: .8, Source: "scanner"}
+	err = store.PromoteScannerSourcesToWatchlist(ctx, item,
+		store.ScannerSourcePromotionClaims{PoliticalDisclosure: &store.PoliticalDisclosurePromotionClaim{
+			Ticker: "PDREEXTRACT", Token: "aggregate-reextract-token", ReportIDs: reportIDs,
+		}}, "fixture", now)
+	var claimErr *store.ScannerSourcePromotionClaimError
+	if !errors.As(err, &claimErr) || claimErr.Source != "political_disclosure" {
+		t.Fatalf("promotion error=%v, want stale political disclosure claim", err)
+	}
+	watchlistItem, err := store.GetWatchlistItem(ctx, "PDREEXTRACT", "stock")
+	if err != nil || watchlistItem != nil {
+		t.Fatalf("stale aggregate created watchlist item=%+v err=%v", watchlistItem, err)
 	}
 }
 
@@ -1423,6 +1556,73 @@ func TestPoliticalDisclosureRetryFailureIncrementsAttemptOnce(t *testing.T) {
 		stored.RetryClaimToken != "" {
 		t.Fatalf("retry failure did not increment exactly once: %+v err=%v", stored, err)
 	}
+}
+
+func TestFirstPassDuplicateRetryableFailureIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	newFailure := func(externalID string) store.PoliticalDisclosureReport {
+		return store.PoliticalDisclosureReport{
+			Source: "senate", ExternalID: externalID, Chamber: "senate",
+			FilerName: "Sen. First Pass Retry", ReportType: "periodic_transaction",
+			FilingDate: time.Now().UTC(), DocumentURL: "https://example.test/" + externalID + ".pdf",
+			ExtractionStatus: "failed", ExtractionError: "transient fetch failure", RetryableFailure: true,
+		}
+	}
+	assertSingleAttempt := func(t *testing.T, report store.PoliticalDisclosureReport) {
+		t.Helper()
+		stored, err := store.GetPoliticalDisclosureReport(ctx, report.Source, report.ExternalID)
+		if err != nil || stored == nil || stored.ExtractionStatus != "failed" ||
+			stored.RetryAttemptCount != 1 || !stored.RetryableFailure || stored.NextRetryAt == nil {
+			t.Fatalf("stored=%+v err=%v, want one scheduled retry", stored, err)
+		}
+	}
+	t.Run("sequential duplicate leaves retry schedule unchanged", func(t *testing.T) {
+		report := newFailure("test-first-pass-failure-sequential")
+		t.Cleanup(func() {
+			_, _ = store.GetDB().Exec(context.Background(), `DELETE FROM political_disclosure_reports WHERE source=$1 AND external_id=$2`, report.Source, report.ExternalID)
+		})
+		if err := store.SavePoliticalDisclosureFirstPass(ctx, report); err != nil {
+			t.Fatal(err)
+		}
+		first, err := store.GetPoliticalDisclosureReport(ctx, report.Source, report.ExternalID)
+		if err != nil || first == nil || first.NextRetryAt == nil {
+			t.Fatalf("first=%+v err=%v", first, err)
+		}
+		if err := store.SavePoliticalDisclosureFirstPass(ctx, report); err != nil {
+			t.Fatal(err)
+		}
+		assertSingleAttempt(t, report)
+		second, err := store.GetPoliticalDisclosureReport(ctx, report.Source, report.ExternalID)
+		if err != nil || second == nil || second.NextRetryAt == nil || !second.NextRetryAt.Equal(*first.NextRetryAt) {
+			t.Fatalf("duplicate moved retry schedule: first=%+v second=%+v err=%v", first.NextRetryAt, second, err)
+		}
+	})
+	t.Run("concurrent duplicate observations retain one attempt", func(t *testing.T) {
+		report := newFailure("test-first-pass-failure-concurrent")
+		t.Cleanup(func() {
+			_, _ = store.GetDB().Exec(context.Background(), `DELETE FROM political_disclosure_reports WHERE source=$1 AND external_id=$2`, report.Source, report.ExternalID)
+		})
+		start := make(chan struct{})
+		errs := make(chan error, 2)
+		var workers sync.WaitGroup
+		for range 2 {
+			workers.Add(1)
+			go func() {
+				defer workers.Done()
+				<-start
+				errs <- store.SavePoliticalDisclosureFirstPass(ctx, report)
+			}()
+		}
+		close(start)
+		workers.Wait()
+		close(errs)
+		for err := range errs {
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		assertSingleAttempt(t, report)
+	})
 }
 
 func TestReplacingDisclosureEvidenceInvalidatesActiveCandidateClaim(t *testing.T) {

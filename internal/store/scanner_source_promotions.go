@@ -323,7 +323,10 @@ func promoteScannerSourcesToWatchlist(
 			}
 			_, duplicate := found[reportID]
 			found[reportID] = struct{}{}
-			valid = valid && !duplicate && token == claim.Token && status == "processing"
+			// Terminal history is fenced alongside the one processing row that
+			// made this aggregate eligible. It must still be owned by this
+			// promotion, but its terminal outcome is deliberately immutable.
+			valid = valid && !duplicate && token == claim.Token
 		}
 		err = rows.Err()
 		rows.Close()
@@ -433,15 +436,16 @@ func completeScannerSourcePromotionClaims(
 	}
 	if claim := claims.PoliticalDisclosure; claim != nil {
 		tag, err := tx.Exec(ctx, `
-			UPDATE political_disclosure_candidates
-			SET promotion_status=$4, scanner_run_id=$5, promoted_at=$6,
-			    promotion_reason=$7, promotion_claim_token=NULL,
-			    promotion_claimed_at=NULL
+		UPDATE political_disclosure_candidates
+			SET promotion_status=CASE WHEN promotion_status='processing' THEN $4 ELSE promotion_status END,
+			    scanner_run_id=CASE WHEN promotion_status='processing' THEN $5 ELSE scanner_run_id END,
+			    promoted_at=CASE WHEN promotion_status='processing' THEN $6 ELSE promoted_at END,
+			    promotion_reason=CASE WHEN promotion_status='processing' THEN $7 ELSE promotion_reason END,
+			    promotion_claim_token=NULL, promotion_claimed_at=NULL
 			WHERE ticker=$1
 			  AND report_id IN (
 			    SELECT report_id::uuid FROM unnest($2::text[]) expected(report_id)
 			  )
-			  AND promotion_status='processing'
 			  AND promotion_claim_token=$3`,
 			claim.Ticker, claim.ReportIDs, claim.Token, status,
 			nullableUUID(item.ScannerRunID), at, nullableString(reason),

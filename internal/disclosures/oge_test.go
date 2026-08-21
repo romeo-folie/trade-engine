@@ -346,6 +346,35 @@ func TestParseOGEPDFKeepsAssetActionWordsAndAttachesWrappedFields(t *testing.T) 
 	}
 }
 
+func TestParseOGEPDFHeaderDateBandDoesNotSplitAssetDates(t *testing.T) {
+	filing := OGEFiling{ExternalID: "oge-header-dates", ReportType: "periodic_transaction", FilingDate: time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)}
+	report := ParseOGEPDF(filing, []byte("pdf"), []PageText{{Number: 1, Boxes: []TextBox{
+		{Text: "Transaction Date", Left: 10, Top: 1}, {Text: "Action", Left: 80, Top: 1}, {Text: "Asset", Left: 140, Top: 1}, {Text: "Amount", Left: 260, Top: 1},
+		{Text: "07/01/2026", Left: 10, Top: 10}, {Text: "P", Left: 80, Top: 10}, {Text: "Acme 07/02/2026 Fund (ACME)", Left: 140, Top: 10}, {Text: "$1,001 - $15,000", Left: 260, Top: 10},
+		{Text: "07/03/2026", Left: 10, Top: 20}, {Text: "S", Left: 80, Top: 20}, {Text: "Bravo 07/04/2026 Fund (BRAV)", Left: 140, Top: 20}, {Text: "$15,001 - $50,000", Left: 260, Top: 20},
+	}}})
+	if len(report.Transactions) != 2 {
+		t.Fatalf("transactions=%+v, want two unsplit rows", report.Transactions)
+	}
+	if report.Transactions[0].AssetName != "Acme 07/02/2026 Fund (ACME)" || report.Transactions[1].AssetName != "Bravo 07/04/2026 Fund (BRAV)" {
+		t.Fatalf("asset dates were split from their rows: %+v", report.Transactions)
+	}
+}
+
+func TestParseOGEPDFInfersHeaderlessDateBandWithoutAssetDateAnchors(t *testing.T) {
+	filing := OGEFiling{ExternalID: "oge-headerless-dates", ReportType: "periodic_transaction", FilingDate: time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)}
+	report := ParseOGEPDF(filing, []byte("pdf"), []PageText{{Number: 1, Boxes: []TextBox{
+		{Text: "07/01/2026", Left: 10, Top: 10}, {Text: "P", Left: 80, Top: 10}, {Text: "Acme 07/02/2026 Fund (ACME)", Left: 140, Top: 10}, {Text: "$1,001 - $15,000", Left: 260, Top: 10},
+		{Text: "07/03/2026", Left: 10, Top: 20}, {Text: "S", Left: 80, Top: 20}, {Text: "Bravo 07/04/2026 Fund (BRAV)", Left: 140, Top: 20}, {Text: "$15,001 - $50,000", Left: 260, Top: 20},
+	}}})
+	if len(report.Transactions) != 2 {
+		t.Fatalf("transactions=%+v, want two unsplit rows", report.Transactions)
+	}
+	if report.Transactions[0].TransactionDate.Format("01/02/2006") != "07/01/2026" || report.Transactions[1].TransactionDate.Format("01/02/2006") != "07/03/2026" {
+		t.Fatalf("transaction dates=%+v, want true date column", report.Transactions)
+	}
+}
+
 func TestParseOGEPDFClassifiesNoTextAndParserMiss(t *testing.T) {
 	filing := OGEFiling{ExternalID: "oge-status", ReportType: "periodic_transaction", FilingDate: time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)}
 	tests := []struct {

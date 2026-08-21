@@ -313,17 +313,21 @@ func TestPoliticalDisclosureAmendmentDoesNotInflateIndependentBreadthOrRepeatedA
 	}
 }
 
-func TestPoliticalDisclosureCandidateAggregatesHistoryButOwnsOnlyClaimedRows(t *testing.T) {
+func TestPoliticalDisclosureCandidateAggregateLineageIncludesHistoricalEvidence(t *testing.T) {
 	filing := time.Date(2026, 8, 15, 0, 0, 0, 0, time.UTC)
 	items := []store.PoliticalDisclosureCandidate{
 		politicalCandidateFixture(t, "history", "history", "house", "house", "Alex Example", "CA12", filing, []store.PoliticalDisclosureTransaction{{TransactionType: "purchase", TransactionDate: filing}}),
 		politicalCandidateFixture(t, "pending", "pending", "house", "house", "Alex Example", "CA12", filing.AddDate(0, 0, 1), []store.PoliticalDisclosureTransaction{{TransactionType: "sale", TransactionDate: filing}}),
 	}
-	items[1].Claimed = true
-	items[1].PromotionClaimToken = "claim"
+	for i := range items {
+		items[i].Claimed = true
+		items[i].PromotionClaimToken = "claim"
+	}
 	candidate := buildPoliticalDisclosureCandidate("TEST", "claim", items)
-	if len(candidate.PoliticalDisclosureClaimReportIDs) != 1 || candidate.PoliticalDisclosureClaimReportIDs[0] != "pending" {
-		t.Fatalf("claim report IDs = %v, want only pending claim", candidate.PoliticalDisclosureClaimReportIDs)
+	if len(candidate.PoliticalDisclosureClaimReportIDs) != 2 ||
+		candidate.PoliticalDisclosureClaimReportIDs[0] != "history" ||
+		candidate.PoliticalDisclosureClaimReportIDs[1] != "pending" {
+		t.Fatalf("claim report IDs = %v, want full aggregate lineage", candidate.PoliticalDisclosureClaimReportIDs)
 	}
 	var facts tradeprofile.PoliticalDisclosureEvidence
 	if err := json.Unmarshal(candidate.PoliticalDisclosureFacts, &facts); err != nil {

@@ -13,15 +13,17 @@ import (
 )
 
 type fixtureSenateTransport struct {
-	searchBody []byte
-	fetchBody  []byte
-	fetchErr   error
-	closed     bool
+	searchBody  []byte
+	fetchBody   []byte
+	fetchErr    error
+	closed      bool
+	searchCalls int
 }
 
 func (t *fixtureSenateTransport) SearchPTRs(
 	context.Context, time.Time, time.Time, int, int,
 ) ([]byte, error) {
+	t.searchCalls++
 	return t.searchBody, nil
 }
 
@@ -296,6 +298,53 @@ func TestSenateClientUsesBrowserTransport(t *testing.T) {
 	}
 	if err := client.Close(); err != nil || !transport.closed {
 		t.Fatalf("closed=%v err=%v", transport.closed, err)
+	}
+}
+
+func TestSenateBrowserSearchPacingStopsCanceledSecondCall(t *testing.T) {
+	transport := &fixtureSenateTransport{searchBody: []byte(`{"data":[]}`)}
+	client, err := NewSenateClient("https://efdsearch.senate.gov", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.Transport = transport
+	client.RequestDelay = time.Hour
+	since := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	if _, err := client.ListPTRs(context.Background(), since, since, 10); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := client.ListPTRPage(ctx, since, since, 10, 10); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled browser page error = %v, want context.Canceled", err)
+	}
+	if transport.searchCalls != 1 {
+		t.Fatalf("browser SearchPTRs calls = %d, want 1", transport.searchCalls)
+	}
+}
+
+func TestSenateHTTPListDoesNotDoublePaceSearch(t *testing.T) {
+	client, err := NewSenateClient("https://efdsearch.senate.gov", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.RequestDelay = 120 * time.Millisecond
+	client.UseImportedSession = true
+	home, _ := url.Parse(client.BaseURL)
+	client.HTTP.Jar.SetCookies(home, []*http.Cookie{{Name: "csrftoken", Value: "csrf", Path: "/"}})
+	requests := 0
+	client.HTTP.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		requests++
+		return response(req, http.StatusOK, `{"data":[]}`, nil), nil
+	})
+	client.pacer.last = time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 190*time.Millisecond)
+	defer cancel()
+	if _, err := client.ListPTRs(ctx, time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC), 10); err != nil {
+		t.Fatalf("HTTP search failed before one pacing interval elapsed: %v", err)
+	}
+	if requests != 1 {
+		t.Fatalf("HTTP requests = %d, want 1", requests)
 	}
 }
 

@@ -518,7 +518,15 @@ func savePoliticalDisclosureReportTx(
 		WHERE $18::smallint <> $19::smallint
 			OR (political_disclosure_reports.retry_claim_token IS NULL
 				AND (political_disclosure_reports.extraction_status <> 'completed'
-					OR EXCLUDED.extraction_status = 'completed'))
+					OR EXCLUDED.extraction_status = 'completed')
+				-- Two first-pass workers can observe the same transient failure.
+				-- The later one must not turn the duplicate observation into
+				-- another durable retry attempt (and therefore move its schedule).
+				AND NOT (
+					$18::smallint = $19::smallint
+					AND political_disclosure_reports.extraction_status = 'failed'
+					AND EXCLUDED.extraction_status = 'failed'
+				))
 		RETURNING id, extraction_status`, report.Source, report.ExternalID, report.Chamber,
 		report.FilerName, report.Office, report.ReportType, report.FilingDate,
 		report.DocumentURL, report.ContentHash, report.ExtractionStatus, report.IsAmendment,
@@ -639,14 +647,17 @@ func savePoliticalDisclosureReportTx(
 						 political_disclosure_candidates.promotion_claimed_at IS NOT NULL)
 						THEN NULL
 					WHEN political_disclosure_candidates.promotion_status='superseded' THEN NULL
-					ELSE political_disclosure_candidates.promotion_claim_token END,
+					-- A re-extraction invalidates every aggregate fence, including
+					-- historical terminal evidence that was fenced with the newer
+					-- processing row.
+					ELSE NULL END,
 				promotion_claimed_at=CASE
 					WHEN political_disclosure_candidates.promotion_status='processing' AND
 						(political_disclosure_candidates.promotion_claim_token IS NOT NULL OR
 						 political_disclosure_candidates.promotion_claimed_at IS NOT NULL)
-						THEN NULL
-					WHEN political_disclosure_candidates.promotion_status='superseded' THEN NULL
-					ELSE political_disclosure_candidates.promotion_claimed_at END,
+						THEN NULL::timestamptz
+					WHEN political_disclosure_candidates.promotion_status='superseded' THEN NULL::timestamptz
+					ELSE NULL::timestamptz END,
 				scanner_run_id=CASE WHEN political_disclosure_candidates.promotion_status='superseded' THEN NULL ELSE political_disclosure_candidates.scanner_run_id END,
 				promoted_at=CASE WHEN political_disclosure_candidates.promotion_status='superseded' THEN NULL ELSE political_disclosure_candidates.promoted_at END,
 				promotion_reason=CASE
@@ -679,38 +690,45 @@ func ClaimPoliticalDisclosureCandidates(
 		), selected AS (
 			SELECT c.ticker
 			FROM eligible c
-			WHERE (c.promotion_status='pending' OR (
-				c.promotion_status='processing' AND
-				c.promotion_claimed_at < $2::timestamptz - $3::interval
-			  ))
 			GROUP BY c.ticker
+			HAVING BOOL_OR(c.promotion_status='pending' OR (
+				c.promotion_status='processing' AND
+				(c.promotion_claimed_at IS NULL OR c.promotion_claimed_at < $2::timestamptz - $3::interval)
+			))
+			  -- A ticker's historical evidence is an aggregate ownership unit.
+			  -- Do not publish a partial aggregate while another scanner owns a
+			  -- still-fresh fence on any of its evidence rows.
+			  AND NOT BOOL_OR(
+				c.promotion_claim_token IS NOT NULL AND
+				c.promotion_claimed_at IS NOT NULL AND
+				c.promotion_claimed_at >= $2::timestamptz - $3::interval AND
+				c.promotion_claim_token <> $5
+			  )
 			ORDER BY MAX(c.filing_date) DESC, c.ticker
 			LIMIT $4
 		), claimed AS (
 			UPDATE political_disclosure_candidates c
-			SET promotion_status='processing', promotion_claim_token=$5,
-				promotion_claimed_at=$2::timestamptz
+			SET promotion_status=CASE
+					WHEN c.promotion_status='pending' OR (
+						c.promotion_status='processing' AND
+						(c.promotion_claimed_at IS NULL OR c.promotion_claimed_at < $2::timestamptz - $3::interval)
+					) THEN 'processing'
+					ELSE c.promotion_status
+				END,
+				promotion_claim_token=$5, promotion_claimed_at=$2::timestamptz
 			FROM selected s
 			WHERE c.ticker=s.ticker
 			  AND EXISTS (SELECT 1 FROM eligible e WHERE e.report_id=c.report_id AND e.ticker=c.ticker)
-			  AND (c.promotion_status='pending' OR (
-				c.promotion_status='processing' AND
-				c.promotion_claimed_at < $2::timestamptz - $3::interval
-			))
 			RETURNING c.report_id, c.ticker, c.transaction_count,
 				c.latest_transaction_date, c.evidence, c.promotion_claim_token
 		)
-		SELECT e.report_id, e.external_id, e.ticker, e.source,
+		SELECT e.report_id, e.external_id, c.ticker, e.source,
 			e.chamber, e.filer_name, COALESCE(e.office,''), e.report_type, e.is_amendment, e.filing_date,
-		e.document_url, e.extraction_status,
-			CASE WHEN c.report_id IS NOT NULL THEN c.transaction_count ELSE e.transaction_count END,
-			CASE WHEN c.report_id IS NOT NULL THEN c.latest_transaction_date ELSE e.latest_transaction_date END,
-			CASE WHEN c.report_id IS NOT NULL THEN c.evidence ELSE e.evidence END,
-			CASE WHEN c.report_id IS NOT NULL THEN c.promotion_claim_token ELSE '' END,
-			(c.report_id IS NOT NULL)
-		FROM eligible e LEFT JOIN claimed c ON c.report_id=e.report_id AND c.ticker=e.ticker
-		WHERE e.ticker IN (SELECT ticker FROM selected)
-		ORDER BY e.ticker, e.filing_date DESC, e.report_id`,
+			e.document_url, e.extraction_status,
+			c.transaction_count, c.latest_transaction_date, c.evidence,
+			c.promotion_claim_token, TRUE
+		FROM claimed c JOIN eligible e ON e.report_id=c.report_id AND e.ticker=c.ticker
+		ORDER BY c.ticker, e.filing_date DESC, e.report_id`,
 		since, now, lease.String(), maxTickers, token,
 	)
 	if err != nil {
@@ -740,9 +758,10 @@ func ReleasePoliticalDisclosurePromotionClaims(
 ) error {
 	_, err := GetDB().Exec(ctx, `
 		UPDATE political_disclosure_candidates
-		SET promotion_status='pending', promotion_claim_token=NULL,
-			promotion_claimed_at=NULL, promotion_reason=$2
-		WHERE promotion_status='processing' AND promotion_claim_token=$1`, token, reason)
+		SET promotion_status=CASE WHEN promotion_status='processing' THEN 'pending' ELSE promotion_status END,
+			promotion_claim_token=NULL, promotion_claimed_at=NULL,
+			promotion_reason=CASE WHEN promotion_status='processing' THEN $2 ELSE promotion_reason END
+		WHERE promotion_claim_token=$1`, token, reason)
 	return err
 }
 
@@ -752,19 +771,18 @@ func MarkPoliticalDisclosurePromotion(
 ) error {
 	result, err := GetDB().Exec(ctx, `
 		UPDATE political_disclosure_candidates
-		SET promotion_status=$3, scanner_run_id=NULLIF($4,'')::uuid,
-			promoted_at=CASE WHEN $3='promoted' THEN $6 ELSE promoted_at END,
-			promotion_reason=$5, promotion_claim_token=NULL,
-			promotion_claimed_at=NULL
-		WHERE ticker=$1 AND promotion_status='processing'
-		  AND promotion_claim_token=$2
+		SET promotion_status=CASE WHEN promotion_status='processing' THEN $3 ELSE promotion_status END,
+			scanner_run_id=CASE WHEN promotion_status='processing' THEN NULLIF($4,'')::uuid ELSE scanner_run_id END,
+			promoted_at=CASE WHEN promotion_status='processing' AND $3='promoted' THEN $6 ELSE promoted_at END,
+			promotion_reason=CASE WHEN promotion_status='processing' THEN $5 ELSE promotion_reason END,
+			promotion_claim_token=NULL, promotion_claimed_at=NULL
+		WHERE ticker=$1 AND promotion_claim_token=$2
 		  AND report_id IN (
 			SELECT report_id::uuid FROM unnest($7::text[]) expected(report_id)
 		  )
 		  AND (
 			SELECT COUNT(*) FROM political_disclosure_candidates
-			WHERE ticker=$1 AND promotion_status='processing'
-			  AND promotion_claim_token=$2
+			WHERE ticker=$1 AND promotion_claim_token=$2
 			  AND report_id IN (
 				SELECT report_id::uuid FROM unnest($7::text[]) expected(report_id)
 			  )
