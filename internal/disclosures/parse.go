@@ -57,7 +57,7 @@ func parseAmount(value string) (*int64, *int64) {
 }
 
 func tickerFromAsset(asset string) string {
-	matches := tickerPattern.FindAllStringSubmatch(strings.ToUpper(asset), -1)
+	matches := tickerPattern.FindAllStringSubmatch(asset, -1)
 	for i := len(matches) - 1; i >= 0; i-- {
 		candidate := matches[i][1]
 		if _, rejected := nonTickerParentheticals[candidate]; rejected {

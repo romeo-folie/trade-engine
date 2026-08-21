@@ -260,6 +260,17 @@ func TestParseOGEPDFReconstructsRows(t *testing.T) {
 	}
 }
 
+func TestParseOGEPDFDoesNotPromoteLowercaseParentheticalToTicker(t *testing.T) {
+	filing := OGEFiling{ExternalID: "oge-ticker-case", ReportType: "periodic_transaction", FilingDate: time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)}
+	report := ParseOGEPDF(filing, []byte("pdf"), []PageText{{Number: 2, Boxes: []TextBox{
+		{Text: "07/01/2026", Left: 1, Top: 10}, {Text: "Purchase", Left: 80, Top: 10}, {Text: "Acme Fund (common)", Left: 140, Top: 10}, {Text: "$1,001 - $15,000", Left: 260, Top: 10},
+		{Text: "07/02/2026", Left: 1, Top: 20}, {Text: "Purchase", Left: 80, Top: 20}, {Text: "Bravo Fund (BRAV)", Left: 140, Top: 20}, {Text: "$1,001 - $15,000", Left: 260, Top: 20},
+	}}})
+	if len(report.Transactions) != 2 || report.Transactions[0].Ticker != "" || report.Transactions[1].Ticker != "BRAV" {
+		t.Fatalf("tickers = %+v, want lowercase descriptor ignored and uppercase symbol retained", report.Transactions)
+	}
+}
+
 func TestParseOGEPDFUsesTransactionColumnWhenAssetMentionsPurchase(t *testing.T) {
 	filing := OGEFiling{ExternalID: "oge-test-sale", ReportType: "periodic_transaction", FilingDate: time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)}
 	report := ParseOGEPDF(filing, []byte("pdf"), []PageText{{Number: 2, Boxes: []TextBox{

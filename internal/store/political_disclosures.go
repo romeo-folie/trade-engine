@@ -26,6 +26,127 @@ const (
 	politicalDisclosureOperatorReplace
 )
 
+const (
+	politicalDisclosureReportLockNamespace = "political-disclosure-report:"
+	politicalDisclosureTickerLockNamespace = "political-disclosure-ticker:"
+)
+
+// lockPoliticalDisclosureReport locks a single filing identity independently
+// of candidate ticker locks. Writers always take this first, then take every
+// affected ticker lock in lexical order. The order is deliberately shared by
+// ingestion, claiming, and publication so a multi-ticker re-extraction cannot
+// deadlock a concurrent aggregate promotion.
+func lockPoliticalDisclosureReport(ctx context.Context, tx pgx.Tx, source, externalID string) error {
+	source = strings.ToLower(strings.TrimSpace(source))
+	externalID = strings.TrimSpace(externalID)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+		politicalDisclosureReportLockNamespace+source+":"+externalID); err != nil {
+		return fmt.Errorf("serialize political disclosure report: %w", err)
+	}
+	return nil
+}
+
+func normalizedPoliticalDisclosureTickers(tickers []string) []string {
+	seen := make(map[string]struct{}, len(tickers))
+	for _, ticker := range tickers {
+		ticker = strings.ToUpper(strings.TrimSpace(ticker))
+		if ticker != "" {
+			seen[ticker] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for ticker := range seen {
+		out = append(out, ticker)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func lockPoliticalDisclosureTickers(ctx context.Context, tx pgx.Tx, tickers []string) error {
+	for _, ticker := range normalizedPoliticalDisclosureTickers(tickers) {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+			politicalDisclosureTickerLockNamespace+ticker); err != nil {
+			return fmt.Errorf("serialize political disclosure ticker %s: %w", ticker, err)
+		}
+	}
+	return nil
+}
+
+// lockPoliticalDisclosureIngestion serializes an extracted filing with every
+// aggregate it can change. Existing tickers are included so a re-extraction
+// that removes evidence cannot race a promoter of the old aggregate.
+func lockPoliticalDisclosureIngestion(
+	ctx context.Context, tx pgx.Tx, report PoliticalDisclosureReport,
+) error {
+	if err := lockPoliticalDisclosureReport(ctx, tx, report.Source, report.ExternalID); err != nil {
+		return err
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT c.ticker
+		FROM political_disclosure_candidates c
+		JOIN political_disclosure_reports r ON r.id=c.report_id
+		WHERE r.source=$1 AND r.external_id=$2`, report.Source, report.ExternalID)
+	if err != nil {
+		return fmt.Errorf("load existing political disclosure tickers: %w", err)
+	}
+	defer rows.Close()
+	tickers := make([]string, 0, len(report.Transactions))
+	for rows.Next() {
+		var ticker string
+		if err := rows.Scan(&ticker); err != nil {
+			return err
+		}
+		tickers = append(tickers, ticker)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	rows.Close()
+	for _, item := range report.Transactions {
+		tickers = append(tickers, item.Ticker)
+	}
+	return lockPoliticalDisclosureTickers(ctx, tx, tickers)
+}
+
+// invalidatePoliticalDisclosureTickerFences makes only in-flight aggregate
+// decisions eligible again. Terminal history remains terminal: new evidence
+// must not rewrite a completed/rejected human or scanner outcome, but it must
+// prevent a stale processing claim from publishing a partial aggregate.
+func invalidatePoliticalDisclosureTickerFences(ctx context.Context, tx pgx.Tx, tickers []string) error {
+	tickers = normalizedPoliticalDisclosureTickers(tickers)
+	if len(tickers) == 0 {
+		return nil
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE political_disclosure_candidates
+		SET promotion_status='pending', promotion_claim_token=NULL,
+			promotion_claimed_at=NULL, scanner_run_id=NULL, promoted_at=NULL,
+			promotion_reason='new material political disclosure evidence'
+		WHERE ticker = ANY($1::text[]) AND promotion_status='processing'`, tickers); err != nil {
+		return fmt.Errorf("invalidate political disclosure ticker fences: %w", err)
+	}
+	return nil
+}
+
+func politicalDisclosureCandidateEvidenceChangedTx(
+	ctx context.Context, tx pgx.Tx, reportID, ticker string,
+	count int, latest time.Time, evidence []byte,
+) (bool, error) {
+	var changed bool
+	err := tx.QueryRow(ctx, `
+		SELECT ROW(transaction_count, latest_transaction_date, evidence)
+			IS DISTINCT FROM ROW($3::int, $4::date, $5::jsonb)
+		FROM political_disclosure_candidates
+		WHERE report_id=$1 AND ticker=$2`, reportID, ticker, count, latest, evidence).Scan(&changed)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("compare political disclosure candidate evidence: %w", err)
+	}
+	return changed, nil
+}
+
 type PoliticalDisclosureReport struct {
 	Source            string
 	ExternalID        string
@@ -390,12 +511,20 @@ func SavePoliticalDisclosureRetryResult(ctx context.Context, report PoliticalDis
 	if token == "" {
 		return ErrPoliticalDisclosureRetryLeaseLost
 	}
+	report.Source = strings.ToLower(strings.TrimSpace(report.Source))
+	report.ExternalID = strings.TrimSpace(report.ExternalID)
 	tx, err := GetDB().Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
+	// The retry token is checked only after the report and all affected ticker
+	// locks. Taking the parent row lock first would invert the ingestion and
+	// promotion ordering for a multi-ticker filing.
+	if err := lockPoliticalDisclosureIngestion(ctx, tx, report); err != nil {
+		return err
+	}
 	var currentToken *string
 	err = tx.QueryRow(ctx, `
 		SELECT retry_claim_token
@@ -459,12 +588,20 @@ func SavePoliticalDisclosureReport(
 func savePoliticalDisclosureReportTx(
 	ctx context.Context, tx pgx.Tx, report PoliticalDisclosureReport, ownership politicalDisclosureSaveOwnership,
 ) error {
+	report.Source = strings.ToLower(strings.TrimSpace(report.Source))
+	report.ExternalID = strings.TrimSpace(report.ExternalID)
 	if strings.TrimSpace(report.ExternalID) == "" ||
 		strings.TrimSpace(report.FilerName) == "" {
 		return fmt.Errorf("political disclosure report identity is incomplete")
 	}
 	if len(report.RawMetadata) == 0 {
 		report.RawMetadata = json.RawMessage(`{}`)
+	}
+	// Lock the stable filing identity first, discover both its old and new
+	// aggregate namespaces, then lock those tickers in sorted order before any
+	// report/candidate row lock is acquired.
+	if err := lockPoliticalDisclosureIngestion(ctx, tx, report); err != nil {
+		return err
 	}
 	retryableFailure := report.ExtractionStatus == "failed" && report.RetryableFailure
 	retryAttempts := 0
@@ -475,8 +612,34 @@ func savePoliticalDisclosureReportTx(
 		nextRetryAt = &next
 	}
 
-	var reportID, storedStatus string
+	// Candidate promotion decisions incorporate these report-level fields in
+	// addition to the ticker evidence. Locking the existing parent before its
+	// upsert makes the comparison and subsequent child replacement one atomic
+	// observation: a concurrent promoter takes this same parent lock first.
+	// Content hash and raw metadata deliberately are not scoring inputs.
+	parentScoringChanged := false
 	err := tx.QueryRow(ctx, `
+		SELECT ROW(chamber, filer_name, COALESCE(office,''), report_type,
+			is_amendment, filing_date, document_url, extraction_status)
+			IS DISTINCT FROM ROW(
+				$3::text, $4::text, COALESCE(NULLIF($5::text,''), ''), $6::text,
+				$7::boolean, $8::date, $9::text, $10::text
+			)
+		FROM political_disclosure_reports
+		WHERE source=$1 AND external_id=$2
+		FOR UPDATE`,
+		report.Source, report.ExternalID, report.Chamber, report.FilerName,
+		report.Office, report.ReportType, report.IsAmendment, report.FilingDate,
+		report.DocumentURL, report.ExtractionStatus,
+	).Scan(&parentScoringChanged)
+	if errors.Is(err, pgx.ErrNoRows) {
+		parentScoringChanged = false
+	} else if err != nil {
+		return fmt.Errorf("lock political disclosure report scoring fields: %w", err)
+	}
+
+	var reportID, storedStatus string
+	err = tx.QueryRow(ctx, `
 		INSERT INTO political_disclosure_reports (
 			source, external_id, chamber, filer_name, office, report_type,
 			filing_date, document_url, content_hash, extraction_status, is_amendment,
@@ -543,7 +706,40 @@ func savePoliticalDisclosureReportTx(
 	if err != nil {
 		return fmt.Errorf("upsert political disclosure report: %w", err)
 	}
+	type storedCandidate struct {
+		ticker string
+		status string
+	}
+	oldCandidates := make(map[string]storedCandidate)
+	candidateRows, err := tx.Query(ctx, `
+		SELECT ticker, promotion_status
+		FROM political_disclosure_candidates
+		WHERE report_id=$1
+		FOR UPDATE`, reportID)
+	if err != nil {
+		return fmt.Errorf("lock existing political disclosure candidates: %w", err)
+	}
+	for candidateRows.Next() {
+		var candidate storedCandidate
+		if err := candidateRows.Scan(&candidate.ticker, &candidate.status); err != nil {
+			candidateRows.Close()
+			return err
+		}
+		oldCandidates[candidate.ticker] = candidate
+	}
+	if err := candidateRows.Err(); err != nil {
+		candidateRows.Close()
+		return err
+	}
+	candidateRows.Close()
 	if storedStatus != "completed" {
+		oldTickers := make([]string, 0, len(oldCandidates))
+		for ticker := range oldCandidates {
+			oldTickers = append(oldTickers, ticker)
+		}
+		if err := invalidatePoliticalDisclosureTickerFences(ctx, tx, oldTickers); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx,
 			`DELETE FROM political_disclosure_transactions WHERE report_id=$1`, reportID,
 		); err != nil {
@@ -611,6 +807,32 @@ func savePoliticalDisclosureReportTx(
 		tickers = append(tickers, ticker)
 	}
 	sort.Strings(tickers)
+	materialTickers := make([]string, 0, len(oldCandidates)+len(tickers))
+	for ticker := range oldCandidates {
+		if _, remains := byTicker[ticker]; !remains {
+			materialTickers = append(materialTickers, ticker)
+		}
+	}
+	for _, ticker := range tickers {
+		group := byTicker[ticker]
+		evidence, err := json.Marshal(group.transactions)
+		if err != nil {
+			return fmt.Errorf("marshal political disclosure evidence: %w", err)
+		}
+		old, exists := oldCandidates[ticker]
+		changed, err := politicalDisclosureCandidateEvidenceChangedTx(
+			ctx, tx, reportID, ticker, len(group.transactions), group.latest, evidence,
+		)
+		if err != nil {
+			return err
+		}
+		if parentScoringChanged || !exists || old.status == "superseded" || changed {
+			materialTickers = append(materialTickers, ticker)
+		}
+	}
+	if err := invalidatePoliticalDisclosureTickerFences(ctx, tx, materialTickers); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE political_disclosure_candidates
 		SET promotion_status='superseded', promotion_claim_token=NULL,
@@ -635,39 +857,84 @@ func savePoliticalDisclosureReportTx(
 				latest_transaction_date=EXCLUDED.latest_transaction_date,
 				evidence=EXCLUDED.evidence,
 				promotion_status=CASE
-					WHEN political_disclosure_candidates.promotion_status='superseded' THEN 'pending'
-					WHEN political_disclosure_candidates.promotion_status='processing' AND
-						(political_disclosure_candidates.promotion_claim_token IS NOT NULL OR
-						 political_disclosure_candidates.promotion_claimed_at IS NOT NULL)
-						THEN 'pending'
+					WHEN $6::boolean
+						OR political_disclosure_candidates.promotion_status='superseded'
+						OR ROW(
+							political_disclosure_candidates.transaction_count,
+							political_disclosure_candidates.latest_transaction_date,
+							political_disclosure_candidates.evidence
+						) IS DISTINCT FROM ROW(
+							EXCLUDED.transaction_count,
+							EXCLUDED.latest_transaction_date,
+							EXCLUDED.evidence
+						) THEN 'pending'
 					ELSE political_disclosure_candidates.promotion_status END,
 				promotion_claim_token=CASE
-					WHEN political_disclosure_candidates.promotion_status='processing' AND
-						(political_disclosure_candidates.promotion_claim_token IS NOT NULL OR
-						 political_disclosure_candidates.promotion_claimed_at IS NOT NULL)
-						THEN NULL
-					WHEN political_disclosure_candidates.promotion_status='superseded' THEN NULL
-					-- A re-extraction invalidates every aggregate fence, including
-					-- historical terminal evidence that was fenced with the newer
-					-- processing row.
-					ELSE NULL END,
+					WHEN $6::boolean
+						OR political_disclosure_candidates.promotion_status='superseded'
+						OR ROW(
+							political_disclosure_candidates.transaction_count,
+							political_disclosure_candidates.latest_transaction_date,
+							political_disclosure_candidates.evidence
+						) IS DISTINCT FROM ROW(
+							EXCLUDED.transaction_count,
+							EXCLUDED.latest_transaction_date,
+							EXCLUDED.evidence
+						) THEN NULL
+					ELSE political_disclosure_candidates.promotion_claim_token END,
 				promotion_claimed_at=CASE
-					WHEN political_disclosure_candidates.promotion_status='processing' AND
-						(political_disclosure_candidates.promotion_claim_token IS NOT NULL OR
-						 political_disclosure_candidates.promotion_claimed_at IS NOT NULL)
-						THEN NULL::timestamptz
-					WHEN political_disclosure_candidates.promotion_status='superseded' THEN NULL::timestamptz
-					ELSE NULL::timestamptz END,
-				scanner_run_id=CASE WHEN political_disclosure_candidates.promotion_status='superseded' THEN NULL ELSE political_disclosure_candidates.scanner_run_id END,
-				promoted_at=CASE WHEN political_disclosure_candidates.promotion_status='superseded' THEN NULL ELSE political_disclosure_candidates.promoted_at END,
+					WHEN $6::boolean
+						OR political_disclosure_candidates.promotion_status='superseded'
+						OR ROW(
+							political_disclosure_candidates.transaction_count,
+							political_disclosure_candidates.latest_transaction_date,
+							political_disclosure_candidates.evidence
+						) IS DISTINCT FROM ROW(
+							EXCLUDED.transaction_count,
+							EXCLUDED.latest_transaction_date,
+							EXCLUDED.evidence
+						) THEN NULL::timestamptz
+					ELSE political_disclosure_candidates.promotion_claimed_at END,
+				scanner_run_id=CASE
+					WHEN $6::boolean
+						OR political_disclosure_candidates.promotion_status='superseded'
+						OR ROW(
+							political_disclosure_candidates.transaction_count,
+							political_disclosure_candidates.latest_transaction_date,
+							political_disclosure_candidates.evidence
+						) IS DISTINCT FROM ROW(
+							EXCLUDED.transaction_count,
+							EXCLUDED.latest_transaction_date,
+							EXCLUDED.evidence
+						) THEN NULL
+					ELSE political_disclosure_candidates.scanner_run_id END,
+				promoted_at=CASE
+					WHEN $6::boolean
+						OR political_disclosure_candidates.promotion_status='superseded'
+						OR ROW(
+							political_disclosure_candidates.transaction_count,
+							political_disclosure_candidates.latest_transaction_date,
+							political_disclosure_candidates.evidence
+						) IS DISTINCT FROM ROW(
+							EXCLUDED.transaction_count,
+							EXCLUDED.latest_transaction_date,
+							EXCLUDED.evidence
+						) THEN NULL
+					ELSE political_disclosure_candidates.promoted_at END,
 				promotion_reason=CASE
-					WHEN political_disclosure_candidates.promotion_status='processing' AND
-						(political_disclosure_candidates.promotion_claim_token IS NOT NULL OR
-						 political_disclosure_candidates.promotion_claimed_at IS NOT NULL)
-						THEN 'evidence replaced while claim active'
-					WHEN political_disclosure_candidates.promotion_status='superseded' THEN NULL
+					WHEN $6::boolean
+						OR political_disclosure_candidates.promotion_status='superseded'
+						OR ROW(
+							political_disclosure_candidates.transaction_count,
+							political_disclosure_candidates.latest_transaction_date,
+							political_disclosure_candidates.evidence
+						) IS DISTINCT FROM ROW(
+							EXCLUDED.transaction_count,
+							EXCLUDED.latest_transaction_date,
+							EXCLUDED.evidence
+						) THEN NULL
 					ELSE political_disclosure_candidates.promotion_reason END`,
-			reportID, ticker, len(group.transactions), group.latest, evidence,
+			reportID, ticker, len(group.transactions), group.latest, evidence, parentScoringChanged,
 		)
 		if err != nil {
 			return fmt.Errorf("upsert political disclosure candidate %s: %w", ticker, err)
@@ -680,13 +947,72 @@ func ClaimPoliticalDisclosureCandidates(
 	ctx context.Context, since, now time.Time, lease time.Duration,
 	maxTickers int, token string,
 ) ([]PoliticalDisclosureCandidate, error) {
-	rows, err := GetDB().Query(ctx, `
+	if maxTickers <= 0 || strings.TrimSpace(token) == "" {
+		return nil, nil
+	}
+	tx, err := GetDB().Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	// Propose a bounded set before taking locks. The proposal is intentionally
+	// advisory only; the query below re-evaluates every eligibility/fence after
+	// the per-ticker serialization lock has been acquired.
+	proposalRows, err := tx.Query(ctx, `
+		WITH eligible AS (
+			SELECT c.ticker, c.promotion_status, c.promotion_claim_token,
+				c.promotion_claimed_at, r.filing_date
+			FROM political_disclosure_candidates c
+			JOIN political_disclosure_reports r ON r.id=c.report_id
+			WHERE r.filing_date >= $1::date AND r.filing_date <= $2::date
+			  AND r.extraction_status='completed' AND c.promotion_status <> 'superseded'
+		)
+		SELECT ticker
+		FROM eligible
+		GROUP BY ticker
+		HAVING BOOL_OR(promotion_status='pending' OR (
+			promotion_status='processing' AND
+			(promotion_claimed_at IS NULL OR promotion_claimed_at < $2::timestamptz - $3::interval)
+		))
+		  AND NOT BOOL_OR(
+			promotion_claim_token IS NOT NULL AND promotion_claimed_at IS NOT NULL AND
+			promotion_claimed_at >= $2::timestamptz - $3::interval AND promotion_claim_token <> $5
+		)
+		ORDER BY MAX(filing_date) DESC, ticker
+		LIMIT $4`, since, now, lease.String(), maxTickers, token)
+	if err != nil {
+		return nil, err
+	}
+	proposed := make([]string, 0, maxTickers)
+	for proposalRows.Next() {
+		var ticker string
+		if err := proposalRows.Scan(&ticker); err != nil {
+			proposalRows.Close()
+			return nil, err
+		}
+		proposed = append(proposed, ticker)
+	}
+	if err := proposalRows.Err(); err != nil {
+		proposalRows.Close()
+		return nil, err
+	}
+	proposalRows.Close()
+	if len(proposed) == 0 {
+		return nil, tx.Commit(ctx)
+	}
+	if err := lockPoliticalDisclosureTickers(ctx, tx, proposed); err != nil {
+		return nil, err
+	}
+
+	rows, err := tx.Query(ctx, `
 		WITH eligible AS (
 			SELECT c.*, r.source, r.external_id, r.chamber, r.filer_name, r.office,
 				r.report_type, r.is_amendment, r.filing_date, r.document_url, r.extraction_status
 			FROM political_disclosure_candidates c JOIN political_disclosure_reports r ON r.id=c.report_id
 			WHERE r.filing_date >= $1::date AND r.filing_date <= $2::date
 			  AND r.extraction_status='completed' AND c.promotion_status <> 'superseded'
+			  AND c.ticker = ANY($6::text[])
 		), selected AS (
 			SELECT c.ticker
 			FROM eligible c
@@ -705,7 +1031,7 @@ func ClaimPoliticalDisclosureCandidates(
 				c.promotion_claim_token <> $5
 			  )
 			ORDER BY MAX(c.filing_date) DESC, c.ticker
-			LIMIT $4
+		LIMIT $4
 		), claimed AS (
 			UPDATE political_disclosure_candidates c
 			SET promotion_status=CASE
@@ -729,12 +1055,11 @@ func ClaimPoliticalDisclosureCandidates(
 			c.promotion_claim_token, TRUE
 		FROM claimed c JOIN eligible e ON e.report_id=c.report_id AND e.ticker=c.ticker
 		ORDER BY c.ticker, e.filing_date DESC, e.report_id`,
-		since, now, lease.String(), maxTickers, token,
+		since, now, lease.String(), maxTickers, token, normalizedPoliticalDisclosureTickers(proposed),
 	)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	var out []PoliticalDisclosureCandidate
 	for rows.Next() {
 		var candidate PoliticalDisclosureCandidate
@@ -746,11 +1071,20 @@ func ClaimPoliticalDisclosureCandidates(
 			&candidate.TransactionCount, &candidate.LatestTransaction,
 			&candidate.Evidence, &candidate.PromotionClaimToken, &candidate.Claimed,
 		); err != nil {
+			rows.Close()
 			return nil, err
 		}
 		out = append(out, candidate)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func ReleasePoliticalDisclosurePromotionClaims(
@@ -769,7 +1103,85 @@ func MarkPoliticalDisclosurePromotion(
 	ctx context.Context, ticker, token string, reportIDs []string,
 	status, scannerRunID, reason string, at time.Time,
 ) error {
-	result, err := GetDB().Exec(ctx, `
+	ticker = strings.ToUpper(strings.TrimSpace(ticker))
+	token = strings.TrimSpace(token)
+	normalizedIDs, ok := normalizePoliticalDisclosureReportIDs(reportIDs)
+	if ticker == "" || token == "" || !ok {
+		return &ScannerSourcePromotionClaimError{Source: "political_disclosure"}
+	}
+	tx, err := GetDB().Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if err := lockPoliticalDisclosureTickers(ctx, tx, []string{ticker}); err != nil {
+		return err
+	}
+
+	// Parent locks precede candidate locks everywhere a disclosure claim is
+	// consumed. The completed-state check also prevents a standalone terminal
+	// mark from publishing evidence that was re-extracted while it waited.
+	parentRows, err := tx.Query(ctx, `
+		SELECT id::text, extraction_status
+		FROM political_disclosure_reports
+		WHERE id = ANY($1::uuid[])
+		ORDER BY id
+		FOR UPDATE`, normalizedIDs)
+	if err != nil {
+		return fmt.Errorf("lock political disclosure parent reports: %w", err)
+	}
+	parentCount := 0
+	parentsComplete := true
+	for parentRows.Next() {
+		var reportID, extractionStatus string
+		if err := parentRows.Scan(&reportID, &extractionStatus); err != nil {
+			parentRows.Close()
+			return err
+		}
+		parentCount++
+		parentsComplete = parentsComplete && extractionStatus == "completed"
+	}
+	if err := parentRows.Err(); err != nil {
+		parentRows.Close()
+		return err
+	}
+	parentRows.Close()
+	if parentCount != len(normalizedIDs) || !parentsComplete {
+		return &ScannerSourcePromotionClaimError{Source: "political_disclosure"}
+	}
+
+	candidateRows, err := tx.Query(ctx, `
+		SELECT report_id::text, COALESCE(promotion_claim_token,'')
+		FROM political_disclosure_candidates
+		WHERE ticker=$1 AND report_id = ANY($2::uuid[])
+		ORDER BY report_id
+		FOR UPDATE`, ticker, normalizedIDs)
+	if err != nil {
+		return fmt.Errorf("lock political disclosure promotion: %w", err)
+	}
+	found := make(map[string]struct{}, len(normalizedIDs))
+	for candidateRows.Next() {
+		var reportID, currentToken string
+		if err := candidateRows.Scan(&reportID, &currentToken); err != nil {
+			candidateRows.Close()
+			return err
+		}
+		if _, duplicate := found[reportID]; duplicate || currentToken != token {
+			candidateRows.Close()
+			return &ScannerSourcePromotionClaimError{Source: "political_disclosure"}
+		}
+		found[reportID] = struct{}{}
+	}
+	if err := candidateRows.Err(); err != nil {
+		candidateRows.Close()
+		return err
+	}
+	candidateRows.Close()
+	if len(found) != len(normalizedIDs) {
+		return &ScannerSourcePromotionClaimError{Source: "political_disclosure"}
+	}
+
+	result, err := tx.Exec(ctx, `
 		UPDATE political_disclosure_candidates
 		SET promotion_status=CASE WHEN promotion_status='processing' THEN $3 ELSE promotion_status END,
 			scanner_run_id=CASE WHEN promotion_status='processing' THEN NULLIF($4,'')::uuid ELSE scanner_run_id END,
@@ -777,21 +1189,12 @@ func MarkPoliticalDisclosurePromotion(
 			promotion_reason=CASE WHEN promotion_status='processing' THEN $5 ELSE promotion_reason END,
 			promotion_claim_token=NULL, promotion_claimed_at=NULL
 		WHERE ticker=$1 AND promotion_claim_token=$2
-		  AND report_id IN (
-			SELECT report_id::uuid FROM unnest($7::text[]) expected(report_id)
-		  )
-		  AND (
-			SELECT COUNT(*) FROM political_disclosure_candidates
-			WHERE ticker=$1 AND promotion_claim_token=$2
-			  AND report_id IN (
-				SELECT report_id::uuid FROM unnest($7::text[]) expected(report_id)
-			  )
-		  ) = $8`, ticker, token, status, scannerRunID, reason, at, reportIDs, len(reportIDs))
+		  AND report_id = ANY($7::uuid[])`, ticker, token, status, scannerRunID, reason, at, normalizedIDs)
 	if err != nil {
 		return err
 	}
-	if result.RowsAffected() != int64(len(reportIDs)) {
+	if result.RowsAffected() != int64(len(normalizedIDs)) {
 		return &ScannerSourcePromotionClaimError{Source: "political_disclosure"}
 	}
-	return nil
+	return tx.Commit(ctx)
 }

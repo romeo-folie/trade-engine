@@ -184,16 +184,10 @@ func parseHousePage(page PageText) []Transaction {
 		}
 		return boxes[i].Left < boxes[j].Left
 	})
+	anchors := housePTRTransactionDateAnchors(boxes)
 	var out []Transaction
-	for _, dateBox := range boxes {
-		if dateBox.Left < 300 || dateBox.Left > 380 {
-			continue
-		}
-		transactionDate, err := parseDate(dateBox.Text)
-		if err != nil {
-			continue
-		}
-		y := dateBox.Top
+	for index, anchor := range anchors {
+		y := anchor.Top
 		typeText := joinHouseBoxes(boxes, y, 2.5, 245, 300)
 		transactionType := normalizeTransactionType(typeText)
 		if transactionType != "purchase" && transactionType != "sale" &&
@@ -206,13 +200,21 @@ func parseHousePage(page PageText) []Transaction {
 			continue
 		}
 		asset := joinHouseBoxes(boxes, y, 2.5, 95, 260)
-		previousAsset := wrappedHouseAsset(boxes, y)
+		previousAsset := wrappedHouseAsset(boxes, y, housePTRAnchorLowerBound(anchors, index))
 		if previousAsset != "" {
 			asset = strings.TrimSpace(asset + " " + previousAsset)
 		}
+		asset = strings.Join(strings.Fields(asset), " ")
+		if asset == "" {
+			// A structurally recognizable row without an asset is not a
+			// transaction. Keep scanning so mixed-quality PDFs retain their
+			// valid rows; ParseHousePTR's postcondition classifies an all-empty
+			// reconstruction as retryable.
+			continue
+		}
 		amount := joinHouseBoxes(boxes, y, 2.5, 440, 520)
 		if strings.HasSuffix(strings.TrimSpace(amount), "-") {
-			amount += " " + nearestWrappedHouseText(boxes, y, 440, 520, func(text string) bool {
+			amount += " " + nearestWrappedHouseText(boxes, y, housePTRAnchorLowerBound(anchors, index), 440, 520, func(text string) bool {
 				return strings.Contains(text, "$")
 			})
 		}
@@ -225,14 +227,47 @@ func parseHousePage(page PageText) []Transaction {
 		raw, _ := json.Marshal(map[string]any{"page": page.Number, "y": y})
 		out = append(out, Transaction{
 			Owner:     owner,
-			AssetName: strings.Join(strings.Fields(asset), " "),
+			AssetName: asset,
 			Ticker:    tickerFromAsset(asset), AssetType: assetType,
-			TransactionType: transactionType, TransactionDate: transactionDate,
+			TransactionType: transactionType, TransactionDate: anchor.Date,
 			NotificationDate: &notificationDate, AmountMin: minimum, AmountMax: maximum,
 			AmountText: strings.Join(strings.Fields(amount), " "), RawData: raw,
 		})
 	}
 	return out
+}
+
+type housePTRDateAnchor struct {
+	Top  float64
+	Date time.Time
+}
+
+// housePTRTransactionDateAnchors establishes the vertical ownership bands before
+// validating a row. A dated but otherwise malformed row still owns the space
+// around it, so a following valid row cannot consume its wrapped fields.
+func housePTRTransactionDateAnchors(boxes []TextBox) []housePTRDateAnchor {
+	anchors := make([]housePTRDateAnchor, 0)
+	for _, box := range boxes {
+		if box.Left < 300 || box.Left > 380 {
+			continue
+		}
+		date, err := parseDate(box.Text)
+		if err != nil {
+			continue
+		}
+		if len(anchors) > 0 && abs(box.Top-anchors[len(anchors)-1].Top) <= 2.5 {
+			continue
+		}
+		anchors = append(anchors, housePTRDateAnchor{Top: box.Top, Date: date})
+	}
+	return anchors
+}
+
+func housePTRAnchorLowerBound(anchors []housePTRDateAnchor, index int) float64 {
+	if index == 0 {
+		return -1 << 62
+	}
+	return (anchors[index-1].Top + anchors[index].Top) / 2
 }
 
 func canonicalHouseOwner(value string) string {
@@ -251,15 +286,15 @@ func canonicalHouseOwner(value string) string {
 	}
 }
 
-func wrappedHouseAsset(boxes []TextBox, y float64) string {
+func wrappedHouseAsset(boxes []TextBox, y, lowerBound float64) string {
 	seen := make(map[int]string)
 	for _, box := range boxes {
-		if box.Top < y-32 || box.Top >= y-3 || box.Left < 95 || box.Left >= 260 {
+		if box.Top < lowerBound || box.Top < y-32 || box.Top >= y-3 || box.Left < 95 || box.Left >= 260 {
 			continue
 		}
 		key := int(box.Top * 2)
 		line := joinHouseBoxes(boxes, box.Top, 2.5, 95, 260)
-		if strings.Contains(line, "[") || tickerPattern.MatchString(strings.ToUpper(line)) {
+		if strings.Contains(line, "[") || tickerPattern.MatchString(line) {
 			seen[key] = line
 		}
 	}
@@ -293,11 +328,11 @@ func joinHouseBoxes(boxes []TextBox, y, tolerance, minX, maxX float64) string {
 }
 
 func nearestWrappedHouseText(
-	boxes []TextBox, y, minX, maxX float64, accept func(string) bool,
+	boxes []TextBox, y, lowerBound, minX, maxX float64, accept func(string) bool,
 ) string {
 	bestY := -1.0
 	for _, box := range boxes {
-		if box.Top >= y-28 && box.Top < y-3 && box.Left >= minX && box.Left < maxX && box.Top > bestY {
+		if box.Top >= lowerBound && box.Top >= y-28 && box.Top < y-3 && box.Left >= minX && box.Left < maxX && box.Top > bestY {
 			line := joinHouseBoxes(boxes, box.Top, 2.5, minX, maxX)
 			if accept(line) {
 				bestY = box.Top

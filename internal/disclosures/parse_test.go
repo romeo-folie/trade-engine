@@ -2,13 +2,22 @@ package disclosures
 
 import "testing"
 
-func TestTickerFromAssetRejectsAccountDescriptors(t *testing.T) {
-	for _, asset := range []string{"Example Fund (IRA)", "Index Fund (ETF)", "Diversified Holding (EIF)"} {
-		if got := tickerFromAsset(asset); got != "" {
-			t.Fatalf("tickerFromAsset(%q) = %q", asset, got)
-		}
+func TestTickerFromAssetRequiresOriginalUppercaseSymbol(t *testing.T) {
+	tests := []struct {
+		asset string
+		want  string
+	}{
+		{asset: "Apple Inc. (AAPL)", want: "AAPL"},
+		{asset: "Example Fund (IRA)", want: ""},
+		{asset: "Index Fund (ETF)", want: ""},
+		{asset: "Diversified Holding (EIF)", want: ""},
+		{asset: "Acme Fund (common)", want: ""},
+		{asset: "Acme Fund (MiXeD)", want: ""},
+		{asset: "Acme Fund (AAPL) (retirement account)", want: "AAPL"},
 	}
-	if got := tickerFromAsset("Apple Inc. (AAPL)"); got != "AAPL" {
-		t.Fatalf("valid ticker = %q", got)
+	for _, test := range tests {
+		if got := tickerFromAsset(test.asset); got != test.want {
+			t.Errorf("tickerFromAsset(%q) = %q, want %q", test.asset, got, test.want)
+		}
 	}
 }

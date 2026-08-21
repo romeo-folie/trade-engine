@@ -164,6 +164,13 @@ func promoteScannerSourcesToWatchlist(
 		return err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	// Political evidence is an aggregate by ticker. Take its namespace before
+	// any parent/candidate row locks, matching ingestion and claim ordering.
+	if claim := claims.PoliticalDisclosure; claim != nil {
+		if err := lockPoliticalDisclosureTickers(ctx, tx, []string{claim.Ticker}); err != nil {
+			return err
+		}
+	}
 
 	// Match the completion locks in a fixed order. This prevents a newer
 	// completed observation from superseding a claim between validation and

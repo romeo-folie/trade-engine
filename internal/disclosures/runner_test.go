@@ -579,6 +579,71 @@ func TestSenateSyncPersistsTransientFailureAsRetryable(t *testing.T) {
 	}
 }
 
+func TestSenateSyncPersistsCanonicalHeaderWithoutRowsForRetry(t *testing.T) {
+	client, err := NewSenateClient("https://efdsearch.senate.gov", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("<table><tr><th>Transaction Date</th><th>Asset Name</th><th>Transaction Type</th><th>Amount</th></tr></table>")
+	client.Transport = &fixtureSenateTransport{
+		searchBody: []byte(`{"recordsFiltered":1,"data":[["Header","Only","Office","<a href='/search/view/ptr/header-only/'>PTR</a>","08/10/2026"]]}`),
+		fetchBody:  body,
+	}
+	var persisted []Report
+	runner := &Runner{
+		Senate:         client,
+		reportTerminal: func(context.Context, string, string) (bool, error) { return false, nil },
+		persistReport: func(_ context.Context, report Report) error {
+			persisted = append(persisted, report)
+			return nil
+		},
+	}
+	processed, err := runner.syncSenate(context.Background(),
+		time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 8, 12, 0, 0, 0, 0, time.UTC), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if processed != 1 || len(persisted) != 1 || persisted[0].ExtractionStatus != "failed" ||
+		!persisted[0].RetryableFailure ||
+		!strings.Contains(persisted[0].ExtractionError, "no transaction rows to reconstruct") ||
+		persisted[0].ContentHash != hashBytes(body) {
+		t.Fatalf("processed=%d persisted=%+v", processed, persisted)
+	}
+}
+
+func TestSenateSyncPersistsMissingCanonicalTableAsStructuralFailure(t *testing.T) {
+	client, err := NewSenateClient("https://efdsearch.senate.gov", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.Transport = &fixtureSenateTransport{
+		searchBody: []byte(`{"recordsFiltered":1,"data":[["Unavailable","Senator","Office","<a href='/search/view/ptr/no-canonical-table/'>PTR</a>","08/10/2026"]]}`),
+		fetchBody:  []byte("<html><p>temporarily unavailable</p></html>"),
+	}
+	var persisted []Report
+	runner := &Runner{
+		Senate:         client,
+		reportTerminal: func(context.Context, string, string) (bool, error) { return false, nil },
+		persistReport: func(_ context.Context, report Report) error {
+			persisted = append(persisted, report)
+			return nil
+		},
+	}
+	processed, err := runner.syncSenate(context.Background(),
+		time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 8, 12, 0, 0, 0, 0, time.UTC), 1)
+	if err == nil {
+		t.Fatal("missing canonical table did not fail sync")
+	}
+	if processed != 1 || len(persisted) != 1 || persisted[0].ExtractionStatus != "failed" ||
+		!persisted[0].RetryableFailure ||
+		!strings.Contains(persisted[0].ExtractionError, "no canonical transaction table") ||
+		persisted[0].ExtractionStatus == "no_text" || strings.Contains(strings.ToLower(persisted[0].ExtractionError), "ocr") {
+		t.Fatalf("processed=%d persisted=%+v err=%v", processed, persisted, err)
+	}
+}
+
 func TestSenateSyncAuthorizationFailureDoesNotConsumeBudgetOrPersist(t *testing.T) {
 	client, err := NewSenateClient("https://efdsearch.senate.gov", time.Second)
 	if err != nil {

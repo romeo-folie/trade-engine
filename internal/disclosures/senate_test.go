@@ -2,6 +2,8 @@ package disclosures
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"net/http"
@@ -51,9 +53,115 @@ func TestParseSenatePTRTable(t *testing.T) {
 		t.Fatalf("transactions = %+v", report.Transactions)
 	}
 	item := report.Transactions[0]
-	if item.Ticker != "MSFT" || item.Owner != "Spouse" ||
-		item.TransactionType != "purchase" || item.AmountMax == nil || *item.AmountMax != 50000 {
+	if item.Ticker != "MSFT" || item.Owner != "Spouse" || item.AssetType != "Stock" ||
+		item.Comment != "Test note" || item.TransactionType != "purchase" ||
+		item.AmountMax == nil || *item.AmountMax != 50000 {
 		t.Fatalf("unexpected transaction: %+v", item)
+	}
+}
+
+func TestParseSenatePTROmittedOptionalHeadersDoNotReadRequiredColumnZero(t *testing.T) {
+	filing := SenateFiling{ExternalID: "no-optionals", FilerName: "Jane Senator", FilingDate: time.Date(2026, 3, 5, 0, 0, 0, 0, time.UTC), DocumentURL: "https://efdsearch.senate.gov/search/view/ptr/no-optionals/"}
+	body := `<table><tr><th>Transaction Date</th><th>Asset Name</th><th>Transaction Type</th><th>Amount</th></tr><tr><td>03/01/2026</td><td>Microsoft Corporation (MSFT)</td><td>Purchase</td><td>$1,001 - $15,000</td></tr></table>`
+	report, err := ParseSenatePTR(filing, []byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Transactions) != 1 {
+		t.Fatalf("transactions = %+v", report.Transactions)
+	}
+	item := report.Transactions[0]
+	if item.Owner != "" || item.AssetType != "" || item.Comment != "" || item.Ticker != "MSFT" {
+		t.Fatalf("optional fields = %+v, want omitted fields empty and asset ticker fallback retained", item)
+	}
+}
+
+func TestParseSenatePTROwnerAtColumnZeroIsOptionalColumn(t *testing.T) {
+	filing := SenateFiling{ExternalID: "owner-zero", FilerName: "Jane Senator", FilingDate: time.Date(2026, 3, 5, 0, 0, 0, 0, time.UTC), DocumentURL: "https://efdsearch.senate.gov/search/view/ptr/owner-zero/"}
+	body := `<table><tr><th>Owner</th><th>Transaction Date</th><th>Asset Name</th><th>Transaction Type</th><th>Amount</th></tr><tr><td>Spouse</td><td>03/01/2026</td><td>Microsoft Corporation</td><td>Purchase</td><td>$1,001 - $15,000</td></tr></table>`
+	report, err := ParseSenatePTR(filing, []byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Transactions) != 1 {
+		t.Fatalf("transactions = %+v", report.Transactions)
+	}
+	item := report.Transactions[0]
+	if item.Owner != "Spouse" || item.Ticker != "" || item.AssetType != "" || item.Comment != "" {
+		t.Fatalf("optional fields = %+v, want owner at column zero and other optionals empty", item)
+	}
+}
+
+func TestParseSenatePTRFallbackTickerRequiresOriginalUppercaseSymbol(t *testing.T) {
+	filing := SenateFiling{ExternalID: "ticker-case", FilerName: "Jane Senator", FilingDate: time.Date(2026, 3, 5, 0, 0, 0, 0, time.UTC), DocumentURL: "https://efdsearch.senate.gov/search/view/ptr/ticker-case/"}
+	body := `<table><tr><th>Transaction Date</th><th>Asset Name</th><th>Transaction Type</th><th>Amount</th></tr><tr><td>03/01/2026</td><td>Acme Fund (common)</td><td>Purchase</td><td>$1,001 - $15,000</td></tr><tr><td>03/02/2026</td><td>Bravo Fund (BRAV)</td><td>Purchase</td><td>$1,001 - $15,000</td></tr></table>`
+	report, err := ParseSenatePTR(filing, []byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Transactions) != 2 || report.Transactions[0].Ticker != "" || report.Transactions[1].Ticker != "BRAV" {
+		t.Fatalf("tickers = %+v, want lowercase descriptor ignored and uppercase symbol retained", report.Transactions)
+	}
+}
+
+func TestParseSenatePTRContentHashUsesExactResponseBytes(t *testing.T) {
+	filing := SenateFiling{
+		ExternalID: "content-hash", FilerName: "Jane Senator",
+		FilingDate:  time.Date(2026, 8, 7, 0, 0, 0, 0, time.UTC),
+		DocumentURL: "https://efdsearch.senate.gov/search/view/ptr/content-hash/",
+	}
+	body := []byte("<table><tr><th>Transaction Date</th><th>Asset Name</th><th>Transaction Type</th><th>Amount</th></tr><tr><td>07/23/2026</td><td>Microsoft</td><td>Purchase</td><td>$1,001 - $15,000</td></tr></table>\n")
+	wantHash := sha256.Sum256(body)
+	report, err := ParseSenatePTR(filing, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.ContentHash != hex.EncodeToString(wantHash[:]) {
+		t.Fatalf("content hash = %q, want exact-body SHA-256 %q", report.ContentHash, hex.EncodeToString(wantHash[:]))
+	}
+	if report.ExtractionStatus != "completed" || len(report.Transactions) != 1 {
+		t.Fatalf("report = %+v", report)
+	}
+}
+
+func TestParseSenatePTRCanonicalHeaderWithoutRowsSchedulesRetry(t *testing.T) {
+	filing := SenateFiling{
+		ExternalID: "header-only", FilerName: "Jane Senator",
+		FilingDate:  time.Date(2026, 8, 7, 0, 0, 0, 0, time.UTC),
+		DocumentURL: "https://efdsearch.senate.gov/search/view/ptr/header-only/",
+	}
+	body := []byte("<table><tr><th>Transaction Date</th><th>Asset Name</th><th>Transaction Type</th><th>Amount</th></tr></table>")
+	wantHash := sha256.Sum256(body)
+	report, err := ParseSenatePTR(filing, body)
+	if err != nil {
+		t.Fatalf("header-only canonical table parse error = %v", err)
+	}
+	if report.ExtractionStatus != "failed" || !report.RetryableFailure ||
+		!strings.Contains(report.ExtractionError, "no transaction rows to reconstruct") ||
+		report.ContentHash != hex.EncodeToString(wantHash[:]) {
+		t.Fatalf("header-only report = %+v", report)
+	}
+}
+
+func TestParseSenatePTRWithoutCanonicalTableIsStructuralFailure(t *testing.T) {
+	filing := SenateFiling{
+		ExternalID: "not-a-ptr", FilerName: "Jane Senator",
+		FilingDate:  time.Date(2026, 8, 7, 0, 0, 0, 0, time.UTC),
+		DocumentURL: "https://efdsearch.senate.gov/search/view/ptr/not-a-ptr/",
+	}
+	for name, body := range map[string][]byte{
+		"no table":        []byte("<html><p>temporarily unavailable</p></html>"),
+		"unrelated table": []byte("<table><tr><th>Asset</th><th>Amount</th></tr><tr><td>Microsoft</td><td>$1,001</td></tr></table>"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			report, err := ParseSenatePTR(filing, body)
+			if err == nil || !strings.Contains(err.Error(), "no canonical transaction table") {
+				t.Fatalf("report=%+v err=%v, want structural canonical-table failure", report, err)
+			}
+			if report.ExtractionStatus == "no_text" || strings.Contains(strings.ToLower(report.ExtractionError), "ocr") {
+				t.Fatalf("structural failure was misclassified as OCR/no_text: %+v", report)
+			}
+		})
 	}
 }
 

@@ -687,12 +687,10 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			recorder.watchlistResult(sc.candidate, sc.score, strategies, addErr)
 			if !errors.Is(addErr, store.ErrScannerSourcePromotionClaimLost) {
 				// Watchlist persistence failures are transient and must not
-				// terminalize discovery evidence. Release every source claim for
-				// a later cycle; the political-disclosure path already requeues
-				// its claims when it sees the failed status.
-				if candidate := sc.candidate; candidate.PoliticalDisclosureClaimToken != "" {
-					s.releasePoliticalDisclosureClaims(ctx, []SwingCandidate{candidate})
-				}
+				// terminalize discovery evidence. Each source owns its retry
+				// transition; political disclosures requeue this candidate's
+				// exact report IDs below, without releasing sibling claims that
+				// share the batch token.
 				s.markDiscoveryCandidate(
 					ctx, sc.candidate, "failed", recorder.run.ID, addErr.Error(),
 				)

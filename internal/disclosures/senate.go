@@ -431,11 +431,15 @@ func ParseSenatePTR(filing SenateFiling, body []byte) (Report, error) {
 		FilerName: filing.FilerName, Office: filing.Office,
 		ReportType: "periodic_transaction", FilingDate: filing.FilingDate,
 		DocumentURL: filing.DocumentURL, ExtractionStatus: "completed",
-		Transactions: transactions,
+		ContentHash: hashBytes(body), Transactions: transactions,
 	}
 	if len(transactions) == 0 {
-		report.ExtractionStatus = "no_text"
-		report.ExtractionError = "no Senate PTR transaction rows were found"
+		// A canonical header proves this is a PTR document with text, but the
+		// absence of rows can be caused by a changed table shape. Keep it
+		// retryable rather than treating it as a terminal OCR/no-text result.
+		report.ExtractionStatus = "failed"
+		report.ExtractionError = "Senate PTR canonical transaction table had no transaction rows to reconstruct"
+		report.RetryableFailure = true
 	}
 	return report, nil
 }
@@ -493,14 +497,14 @@ func senateTransactions(document *html.Node) ([]Transaction, error) {
 			return nil, fmt.Errorf("senate PTR has malformed transaction %s: unknown action %q", context, transactionType)
 		}
 		minimum, maximum := parseAmount(amount)
-		ticker, _ := cell(row, optional["ticker"])
+		ticker := senateOptionalCell(row, optional, "ticker")
 		ticker = sanitizeSenateTicker(ticker)
 		if ticker == "" {
 			ticker = tickerFromAsset(asset)
 		}
-		owner, _ := cell(row, optional["owner"])
-		assetType, _ := cell(row, optional["asset type"])
-		comment, _ := cell(row, optional["comment"])
+		owner := senateOptionalCell(row, optional, "owner")
+		assetType := senateOptionalCell(row, optional, "asset type")
+		comment := senateOptionalCell(row, optional, "comment")
 		raw, _ := json.Marshal(row)
 		out = append(out, Transaction{
 			Ordinal: len(out) + 1, Owner: owner, AssetName: asset,
@@ -559,6 +563,19 @@ func senateOptionalHeaderIndexes(header []string) map[string]int {
 		}
 	}
 	return indexes
+}
+
+// senateOptionalCell returns an optional field only when the table header
+// actually supplied its column. Missing map entries have Go's zero value of
+// zero, which must not be confused with a legitimate optional column at index
+// zero. A truncated row also leaves the optional field empty.
+func senateOptionalCell(row []string, indexes map[string]int, field string) string {
+	index, ok := indexes[field]
+	if !ok {
+		return ""
+	}
+	value, _ := cell(row, index)
+	return value
 }
 
 func sanitizeSenateTicker(value string) string {

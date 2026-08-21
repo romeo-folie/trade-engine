@@ -786,7 +786,7 @@ func TestMarkPoliticalDisclosurePromotionRequiresAllClaimedReportIDs(t *testing.
 	}
 }
 
-func TestMarkPoliticalDisclosurePromotionRequeuesOnlyCapSuppressedTicker(t *testing.T) {
+func TestMarkPoliticalDisclosurePromotionRequeuesOnlyCurrentTicker(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2300, time.April, 11, 12, 0, 0, 0, time.UTC)
 	suppressed := politicalDisclosureClaimFixture("test-disclosure-cap-suppressed", "PDCAPONE", now)
@@ -821,7 +821,7 @@ func TestMarkPoliticalDisclosurePromotionRequeuesOnlyCapSuppressedTicker(t *test
 	}
 	if err := store.MarkPoliticalDisclosurePromotion(
 		ctx, suppressedClaim.Ticker, "cap-batch-token", []string{suppressedClaim.ReportID},
-		"pending", "", "candidate ranked beyond available scanner slots", now,
+		"pending", "", "candidate watchlist persistence failed", now,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -1008,9 +1008,13 @@ func TestPoliticalDisclosureHistoricalReextractionInvalidatesAggregatePromotion(
 	for _, item := range claimed {
 		reportIDs = append(reportIDs, item.ReportID)
 	}
-	// The historical row keeps its terminal status but must clear the fence so
-	// a candidate built from the stale aggregate cannot be promoted.
-	if err := store.SavePoliticalDisclosureReport(ctx, history); err != nil {
+	// Only material re-extraction invalidates a promoted historical row's
+	// aggregate fence. The changed raw transaction becomes different candidate
+	// evidence while preserving the ticker lineage.
+	reextracted := history
+	reextracted.Transactions = append([]store.PoliticalDisclosureTransaction(nil), history.Transactions...)
+	reextracted.Transactions[0].RawData = json.RawMessage(`{"reextracted":true}`)
+	if err := store.SavePoliticalDisclosureReport(ctx, reextracted); err != nil {
 		t.Fatal(err)
 	}
 	var historyStatus, historyToken string
@@ -1021,8 +1025,8 @@ func TestPoliticalDisclosureHistoricalReextractionInvalidatesAggregatePromotion(
 		WHERE r.source=$1 AND r.external_id=$2 AND c.ticker='PDREEXTRACT'`, history.Source, history.ExternalID).Scan(&historyStatus, &historyToken); err != nil {
 		t.Fatal(err)
 	}
-	if historyStatus != "promoted" || historyToken != "" {
-		t.Fatalf("historical re-extraction status=%q token=%q, want promoted/empty", historyStatus, historyToken)
+	if historyStatus != "pending" || historyToken != "" {
+		t.Fatalf("material historical re-extraction status=%q token=%q, want pending/empty", historyStatus, historyToken)
 	}
 	item := store.WatchlistItem{Ticker: "PDREEXTRACT", Platform: "stock", Strategies: []string{"momentum"}, Timeframes: []string{"1D"}, MinConfidence: .8, Source: "scanner"}
 	err = store.PromoteScannerSourcesToWatchlist(ctx, item,
@@ -1054,6 +1058,277 @@ func politicalDisclosureClaimFixture(externalID, ticker string, filingDate time.
 			AmountMin: &minimum, AmountMax: &maximum, AmountText: "$1,001 - $15,000",
 			RawData: json.RawMessage(`{"row":1}`),
 		}},
+	}
+}
+
+func TestConcurrentPoliticalDisclosureCandidateClaimHasSingleWinner(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2300, time.April, 18, 12, 0, 0, 0, time.UTC)
+	report := politicalDisclosureClaimFixture("test-concurrent-disclosure-claim", "PDCONCURRENT", now)
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), `
+			DELETE FROM political_disclosure_reports WHERE source=$1 AND external_id=$2`, report.Source, report.ExternalID)
+	})
+	if err := store.SavePoliticalDisclosureReport(ctx, report); err != nil {
+		t.Fatal(err)
+	}
+
+	start := make(chan struct{})
+	type result struct {
+		items []store.PoliticalDisclosureCandidate
+		err   error
+	}
+	results := make(chan result, 2)
+	for _, token := range []string{"concurrent-a", "concurrent-b"} {
+		go func(token string) {
+			<-start
+			items, err := store.ClaimPoliticalDisclosureCandidates(
+				ctx, now.AddDate(0, 0, -7), now, time.Hour, 1, token,
+			)
+			results <- result{items: items, err: err}
+		}(token)
+	}
+	close(start)
+	winners := 0
+	for range 2 {
+		got := <-results
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		if len(got.items) > 0 {
+			winners++
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("concurrent claim winners=%d, want 1", winners)
+	}
+}
+
+func TestPoliticalDisclosureMaterialEvidenceRequeuesTickerFenceButKeepsHistoryTerminal(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2300, time.April, 19, 12, 0, 0, 0, time.UTC)
+	history := politicalDisclosureClaimFixture("test-ticker-fence-history", "PDFENCE", now.AddDate(0, 0, -1))
+	pending := politicalDisclosureClaimFixture("test-ticker-fence-pending", "PDFENCE", now)
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), `
+			DELETE FROM political_disclosure_reports WHERE source='house' AND external_id = ANY($1::text[])`,
+			[]string{history.ExternalID, pending.ExternalID})
+	})
+	for _, report := range []store.PoliticalDisclosureReport{history, pending} {
+		if err := store.SavePoliticalDisclosureReport(ctx, report); err != nil {
+			t.Fatal(err)
+		}
+	}
+	claimed, err := store.ClaimPoliticalDisclosureCandidates(
+		ctx, now.AddDate(0, 0, -7), now, time.Hour, 1, "ticker-fence-token",
+	)
+	if err != nil || len(claimed) != 2 {
+		t.Fatalf("claim=%+v err=%v", claimed, err)
+	}
+	if _, err := store.GetDB().Exec(ctx, `
+		UPDATE political_disclosure_candidates
+		SET promotion_status='promoted', promotion_claim_token=NULL, promotion_claimed_at=NULL
+		WHERE report_id=(SELECT id FROM political_disclosure_reports WHERE source=$1 AND external_id=$2)
+		  AND ticker='PDFENCE'`, history.Source, history.ExternalID); err != nil {
+		t.Fatal(err)
+	}
+	// This is the newer report, so it invalidates only in-flight aggregate
+	// ownership. The historical terminal outcome is immutable.
+	pending.Transactions = append([]store.PoliticalDisclosureTransaction(nil), pending.Transactions...)
+	pending.Transactions[0].TransactionDate = pending.Transactions[0].TransactionDate.AddDate(0, 0, 1)
+	if err := store.SavePoliticalDisclosureReport(ctx, pending); err != nil {
+		t.Fatal(err)
+	}
+	var historyStatus, pendingStatus, pendingToken string
+	if err := store.GetDB().QueryRow(ctx, `
+		SELECT promotion_status FROM political_disclosure_candidates
+		WHERE report_id=(SELECT id FROM political_disclosure_reports WHERE source=$1 AND external_id=$2)
+		  AND ticker='PDFENCE'`, history.Source, history.ExternalID).Scan(&historyStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.GetDB().QueryRow(ctx, `
+		SELECT promotion_status, COALESCE(promotion_claim_token,'')
+		FROM political_disclosure_candidates
+		WHERE report_id=(SELECT id FROM political_disclosure_reports WHERE source=$1 AND external_id=$2)
+		  AND ticker='PDFENCE'`, pending.Source, pending.ExternalID).Scan(&pendingStatus, &pendingToken); err != nil {
+		t.Fatal(err)
+	}
+	if historyStatus != "promoted" || pendingStatus != "pending" || pendingToken != "" {
+		t.Fatalf("ticker fence states history=%q pending=%q/%q, want promoted and pending/empty", historyStatus, pendingStatus, pendingToken)
+	}
+}
+
+func TestPoliticalDisclosureSortedMultiTickerReextractionsDoNotDeadlock(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2300, time.April, 20, 12, 0, 0, 0, time.UTC)
+	first := politicalDisclosureClaimFixture("test-multiticker-first", "PDLOCKA", now)
+	second := politicalDisclosureClaimFixture("test-multiticker-second", "PDLOCKB", now)
+	for _, report := range []*store.PoliticalDisclosureReport{&first, &second} {
+		report.Transactions = append(report.Transactions, store.PoliticalDisclosureTransaction{
+			Ordinal: 2, AssetName: "Other lock ticker", Ticker: map[string]string{"test-multiticker-first": "PDLOCKB", "test-multiticker-second": "PDLOCKA"}[report.ExternalID],
+			AssetType: "ST", TransactionType: "purchase", TransactionDate: now,
+			AmountText: "$1,001 - $15,000", RawData: json.RawMessage(`{"row":2}`),
+		})
+	}
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), `
+			DELETE FROM political_disclosure_reports WHERE source='house' AND external_id = ANY($1::text[])`,
+			[]string{first.ExternalID, second.ExternalID})
+	})
+	for _, report := range []store.PoliticalDisclosureReport{first, second} {
+		if err := store.SavePoliticalDisclosureReport(ctx, report); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first.Transactions[0].RawData = json.RawMessage(`{"revision":1}`)
+	second.Transactions[0].RawData = json.RawMessage(`{"revision":1}`)
+	done := make(chan error, 2)
+	for _, report := range []store.PoliticalDisclosureReport{first, second} {
+		go func(report store.PoliticalDisclosureReport) { done <- store.SavePoliticalDisclosureReport(ctx, report) }(report)
+	}
+	for range 2 {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("multi-ticker re-extractions deadlocked")
+		}
+	}
+}
+
+func TestPoliticalDisclosureIngestionWinsQueuedPromotionWithoutWatchlist(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2300, time.April, 21, 12, 0, 0, 0, time.UTC)
+	report := politicalDisclosureClaimFixture("test-ingestion-wins-promotion", "PDINGESTWINS", now)
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), "DELETE FROM watchlist WHERE ticker=$1", "PDINGESTWINS")
+		_, _ = store.GetDB().Exec(context.Background(), `
+			DELETE FROM political_disclosure_reports WHERE source=$1 AND external_id=$2`, report.Source, report.ExternalID)
+	})
+	if err := store.SavePoliticalDisclosureReport(ctx, report); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimPoliticalDisclosureCandidates(
+		ctx, now.AddDate(0, 0, -7), now, time.Hour, 1, "ingestion-wins-token",
+	)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim=%+v err=%v", claimed, err)
+	}
+
+	// Hold the parent so ingestion acquires the report/ticker advisory locks and
+	// queues ahead of promotion. Releasing this lock then proves the save gets
+	// to invalidate the claim before the promoter can publish its watchlist row.
+	lockTx, err := store.GetDB().Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lockTx.Rollback(ctx) //nolint:errcheck
+	var backendPID int
+	if err := lockTx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&backendPID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lockTx.Exec(ctx, `
+		SELECT 1 FROM political_disclosure_reports WHERE id=$1::uuid FOR UPDATE`, claimed[0].ReportID); err != nil {
+		t.Fatal(err)
+	}
+	updated := report
+	updated.Transactions = append([]store.PoliticalDisclosureTransaction(nil), report.Transactions...)
+	updated.Transactions[0].RawData = json.RawMessage(`{"ingestion_won":true}`)
+	saved := make(chan error, 1)
+	go func() { saved <- store.SavePoliticalDisclosureReport(ctx, updated) }()
+	blocked := false
+	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+		if err := store.GetDB().QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM pg_stat_activity a
+				WHERE $1 = ANY(pg_blocking_pids(a.pid))
+				  AND a.query LIKE '%political_disclosure_reports%'
+			)`, backendPID).Scan(&blocked); err != nil {
+			t.Fatal(err)
+		}
+		if blocked {
+			break
+		}
+	}
+	if !blocked {
+		t.Fatal("ingestion did not queue on the parent after taking advisory locks")
+	}
+	item := store.WatchlistItem{Ticker: "PDINGESTWINS", Platform: "stock", Strategies: []string{"momentum"}, Timeframes: []string{"1D"}, MinConfidence: .8, Source: "scanner"}
+	promoted := make(chan error, 1)
+	go func() {
+		promoted <- store.PromoteScannerSourcesToWatchlist(ctx, item,
+			store.ScannerSourcePromotionClaims{PoliticalDisclosure: &store.PoliticalDisclosurePromotionClaim{
+				Ticker: "PDINGESTWINS", Token: "ingestion-wins-token", ReportIDs: []string{claimed[0].ReportID},
+			}}, "fixture", now)
+	}()
+	if err := lockTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-saved:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ingestion did not complete after parent release")
+	}
+	var claimErr *store.ScannerSourcePromotionClaimError
+	select {
+	case err := <-promoted:
+		if !errors.As(err, &claimErr) || claimErr.Source != "political_disclosure" {
+			t.Fatalf("promotion error=%v, want stale political disclosure claim", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued promotion did not finish after ingestion")
+	}
+	watchlistItem, err := store.GetWatchlistItem(ctx, "PDINGESTWINS", "stock")
+	if err != nil || watchlistItem != nil {
+		t.Fatalf("stale promotion created watchlist item=%+v err=%v", watchlistItem, err)
+	}
+}
+
+func TestPoliticalDisclosurePromotionWinsThenMaterialEvidenceIsPending(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2300, time.April, 22, 12, 0, 0, 0, time.UTC)
+	report := politicalDisclosureClaimFixture("test-promotion-wins-evidence", "PDPROMOTEWINS", now)
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), "DELETE FROM watchlist WHERE ticker=$1", "PDPROMOTEWINS")
+		_, _ = store.GetDB().Exec(context.Background(), `
+			DELETE FROM political_disclosure_reports WHERE source=$1 AND external_id=$2`, report.Source, report.ExternalID)
+	})
+	if err := store.SavePoliticalDisclosureReport(ctx, report); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimPoliticalDisclosureCandidates(
+		ctx, now.AddDate(0, 0, -7), now, time.Hour, 1, "promotion-wins-token",
+	)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim=%+v err=%v", claimed, err)
+	}
+	item := store.WatchlistItem{Ticker: "PDPROMOTEWINS", Platform: "stock", Strategies: []string{"momentum"}, Timeframes: []string{"1D"}, MinConfidence: .8, Source: "scanner"}
+	if err := store.PromoteScannerSourcesToWatchlist(ctx, item,
+		store.ScannerSourcePromotionClaims{PoliticalDisclosure: &store.PoliticalDisclosurePromotionClaim{
+			Ticker: "PDPROMOTEWINS", Token: "promotion-wins-token", ReportIDs: []string{claimed[0].ReportID},
+		}}, "fixture", now); err != nil {
+		t.Fatal(err)
+	}
+	updated := report
+	updated.Transactions = append([]store.PoliticalDisclosureTransaction(nil), report.Transactions...)
+	updated.Transactions[0].RawData = json.RawMessage(`{"promotion_won":true}`)
+	if err := store.SavePoliticalDisclosureReport(ctx, updated); err != nil {
+		t.Fatal(err)
+	}
+	var status, token string
+	if err := store.GetDB().QueryRow(ctx, `
+		SELECT promotion_status, COALESCE(promotion_claim_token,'')
+		FROM political_disclosure_candidates
+		WHERE report_id=$1::uuid AND ticker='PDPROMOTEWINS'`, claimed[0].ReportID).Scan(&status, &token); err != nil {
+		t.Fatal(err)
+	}
+	if status != "pending" || token != "" {
+		t.Fatalf("promotion-winner re-extraction = %q/%q, want pending/empty", status, token)
 	}
 }
 
@@ -1215,6 +1490,59 @@ func TestHousePTRParseOutcomesPersistTerminalAndScheduledRetryStates(t *testing.
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestSenatePTRCanonicalHeaderOnlyPersistsScheduledRetryAndClaim(t *testing.T) {
+	ctx := context.Background()
+	externalID := "test-senate-ptr-header-only-retry"
+	parsed, err := disclosures.ParseSenatePTR(disclosures.SenateFiling{
+		ExternalID: externalID, FilerName: "Jane Senator", Office: "TS",
+		FilingDate:  time.Date(2026, time.August, 10, 0, 0, 0, 0, time.UTC),
+		DocumentURL: "https://efdsearch.senate.gov/search/view/ptr/" + externalID + "/",
+	}, []byte("<table><tr><th>Transaction Date</th><th>Asset Name</th><th>Transaction Type</th><th>Amount</th></tr></table>"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.ExtractionStatus != "failed" || !parsed.RetryableFailure {
+		t.Fatalf("parsed header-only Senate PTR = %+v", parsed)
+	}
+	report := store.PoliticalDisclosureReport{
+		Source: parsed.Source, ExternalID: parsed.ExternalID, Chamber: parsed.Chamber,
+		FilerName: parsed.FilerName, Office: parsed.Office, ReportType: parsed.ReportType,
+		FilingDate: parsed.FilingDate, DocumentURL: parsed.DocumentURL, ContentHash: parsed.ContentHash,
+		ExtractionStatus: parsed.ExtractionStatus, ExtractionError: parsed.ExtractionError,
+		RetryableFailure: parsed.RetryableFailure, RawMetadata: json.RawMessage(`{"fixture":true}`),
+	}
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(),
+			"DELETE FROM political_disclosure_reports WHERE source=$1 AND external_id=$2", report.Source, report.ExternalID)
+	})
+	if err := store.SavePoliticalDisclosureFirstPass(ctx, report); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := store.GetPoliticalDisclosureReport(ctx, report.Source, report.ExternalID)
+	if err != nil || stored == nil || stored.ExtractionStatus != "failed" || !stored.RetryableFailure ||
+		stored.RetryAttemptCount != 1 || stored.NextRetryAt == nil {
+		t.Fatalf("stored header-only Senate PTR=%+v err=%v", stored, err)
+	}
+	if terminal, err := store.PoliticalDisclosureReportTerminal(ctx, report.Source, report.ExternalID); err != nil || !terminal {
+		t.Fatalf("backoff report terminal=%v err=%v", terminal, err)
+	}
+	if _, err := store.GetDB().Exec(ctx, `
+		UPDATE political_disclosure_reports SET next_retry_at=NOW()-INTERVAL '1 second'
+		WHERE source=$1 AND external_id=$2`, report.Source, report.ExternalID); err != nil {
+		t.Fatal(err)
+	}
+	if terminal, err := store.PoliticalDisclosureReportTerminal(ctx, report.Source, report.ExternalID); err != nil || terminal {
+		t.Fatalf("due header-only Senate PTR terminal=%v err=%v", terminal, err)
+	}
+	claims, err := store.ClaimDuePoliticalDisclosureRetries(ctx, report.Source, time.Now().UTC(), 1, time.Minute)
+	if err != nil || len(claims) != 1 || claims[0].ExternalID != report.ExternalID || claims[0].RetryClaimToken == "" {
+		t.Fatalf("due header-only Senate PTR claims=%+v err=%v", claims, err)
+	}
+	if err := store.ReleasePoliticalDisclosureRetryClaims(ctx, claims[0].RetryClaimToken); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -1718,4 +2046,212 @@ func TestReplacingDisclosureEvidenceInvalidatesActiveCandidateClaim(t *testing.T
 	if activeStatus != "pending" || activeToken != "" {
 		t.Fatalf("same-ticker evidence replacement preserved active claim: status=%q token=%q", activeStatus, activeToken)
 	}
+}
+
+func TestPoliticalDisclosureCandidateRefreshRequeuesOnlyMaterialChanges(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2099, time.January, 2, 3, 4, 5, 0, time.UTC)
+	scannerRunID := "00000000-0000-0000-0000-000000000532"
+	if _, err := store.GetDB().Exec(ctx, `
+		INSERT INTO scanner_runs (
+			id, started_at, status, pullback_universe_enabled,
+			pullback_min_momentum_return_pct, pullback_min_market_cap_mm,
+			pullback_min_dollar_volume, candidate_cap, min_conviction, ttl_days
+		) VALUES ($1, NOW(), 'completed', false, 0, 0, 0, 1, 0, 1)
+		ON CONFLICT (id) DO NOTHING`, scannerRunID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(),
+			"DELETE FROM scanner_runs WHERE id=$1", scannerRunID)
+	})
+
+	type candidateState struct {
+		status, token, scannerRunID, reason string
+		claimedAt, promotedAt               *time.Time
+	}
+	readCandidate := func(t *testing.T, report store.PoliticalDisclosureReport, ticker string) candidateState {
+		t.Helper()
+		var state candidateState
+		if err := store.GetDB().QueryRow(ctx, `
+			SELECT promotion_status, COALESCE(promotion_claim_token,''),
+				COALESCE(scanner_run_id::text,''), COALESCE(promotion_reason,''),
+				promotion_claimed_at, promoted_at
+			FROM political_disclosure_candidates
+			WHERE report_id=(
+				SELECT id FROM political_disclosure_reports WHERE source=$1 AND external_id=$2
+			) AND ticker=$3`, report.Source, report.ExternalID, ticker,
+		).Scan(&state.status, &state.token, &state.scannerRunID, &state.reason,
+			&state.claimedAt, &state.promotedAt); err != nil {
+			t.Fatal(err)
+		}
+		return state
+	}
+	setCandidateState := func(t *testing.T, report store.PoliticalDisclosureReport, ticker, status, token, reason string) {
+		t.Helper()
+		if _, err := store.GetDB().Exec(ctx, `
+			UPDATE political_disclosure_candidates
+			SET promotion_status=$4, promotion_claim_token=$5, promotion_claimed_at=$6,
+				scanner_run_id=$7::uuid, promoted_at=$6, promotion_reason=$8
+			WHERE report_id=(
+				SELECT id FROM political_disclosure_reports WHERE source=$1 AND external_id=$2
+			) AND ticker=$3`, report.Source, report.ExternalID, ticker, status, token, now, scannerRunID, reason,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertReset := func(t *testing.T, state candidateState) {
+		t.Helper()
+		if state.status != "pending" || state.token != "" || state.scannerRunID != "" ||
+			state.reason != "" || state.claimedAt != nil || state.promotedAt != nil {
+			t.Fatalf("candidate was not requeued cleanly: %+v", state)
+		}
+	}
+	assertPreserved := func(t *testing.T, state candidateState, status, token, reason string) {
+		t.Helper()
+		if state.status != status || state.token != token || state.scannerRunID != scannerRunID ||
+			state.reason != reason || state.claimedAt == nil || state.promotedAt == nil {
+			t.Fatalf("candidate outcome/fence was not preserved: %+v", state)
+		}
+	}
+	newReport := func(t *testing.T, suffix string) store.PoliticalDisclosureReport {
+		t.Helper()
+		ticker := "RQ" + strings.ToUpper(suffix)
+		report := politicalDisclosureClaimFixture("test-candidate-requeue-"+suffix, ticker, now)
+		report.ContentHash = "original-content-hash"
+		if err := store.SavePoliticalDisclosureReport(ctx, report); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_, _ = store.GetDB().Exec(context.Background(),
+				"DELETE FROM political_disclosure_reports WHERE source=$1 AND external_id=$2", report.Source, report.ExternalID)
+		})
+		return report
+	}
+
+	t.Run("changed evidence resets terminal and active outcomes", func(t *testing.T) {
+		for _, status := range []string{"rejected", "processing"} {
+			t.Run(status, func(t *testing.T) {
+				report := newReport(t, "changed-"+status)
+				ticker := report.Transactions[0].Ticker
+				setCandidateState(t, report, ticker, status, status+"-fence", status+" outcome")
+				changed := report
+				changed.Transactions = append([]store.PoliticalDisclosureTransaction(nil), report.Transactions...)
+				changed.Transactions[0].RawData = json.RawMessage(`{"changed":true}`)
+				if err := store.SavePoliticalDisclosureReport(ctx, changed); err != nil {
+					t.Fatal(err)
+				}
+				assertReset(t, readCandidate(t, report, ticker))
+			})
+		}
+	})
+
+	t.Run("idempotent and content-only refresh preserve outcomes", func(t *testing.T) {
+		report := newReport(t, "idempotent")
+		ticker := report.Transactions[0].Ticker
+		setCandidateState(t, report, ticker, "processing", "active-fence", "active outcome")
+		if err := store.SavePoliticalDisclosureReport(ctx, report); err != nil {
+			t.Fatal(err)
+		}
+		assertPreserved(t, readCandidate(t, report, ticker), "processing", "active-fence", "active outcome")
+
+		setCandidateState(t, report, ticker, "rejected", "terminal-fence", "terminal outcome")
+		contentOnly := report
+		contentOnly.ContentHash = "new-content-hash"
+		contentOnly.RawMetadata = json.RawMessage(`{"changed":"metadata only"}`)
+		if err := store.SavePoliticalDisclosureReport(ctx, contentOnly); err != nil {
+			t.Fatal(err)
+		}
+		assertPreserved(t, readCandidate(t, report, ticker), "rejected", "terminal-fence", "terminal outcome")
+	})
+
+	t.Run("every evidence tuple component is material", func(t *testing.T) {
+		tests := []struct {
+			name   string
+			change func(*store.PoliticalDisclosureReport)
+		}{
+			{
+				name: "transaction count",
+				change: func(report *store.PoliticalDisclosureReport) {
+					additional := report.Transactions[0]
+					additional.Ordinal = 2
+					report.Transactions = append(report.Transactions, additional)
+				},
+			},
+			{
+				name: "latest transaction date",
+				change: func(report *store.PoliticalDisclosureReport) {
+					report.Transactions[0].TransactionDate = report.Transactions[0].TransactionDate.AddDate(0, 0, 1)
+				},
+			},
+			{
+				name: "evidence json",
+				change: func(report *store.PoliticalDisclosureReport) {
+					report.Transactions[0].RawData = json.RawMessage(`{"different":"evidence"}`)
+				},
+			},
+		}
+		for _, test := range tests {
+			t.Run(test.name, func(t *testing.T) {
+				report := newReport(t, strings.ReplaceAll(test.name, " ", "-"))
+				ticker := report.Transactions[0].Ticker
+				setCandidateState(t, report, ticker, "rejected", "terminal-fence", "terminal outcome")
+				changed := report
+				changed.Transactions = append([]store.PoliticalDisclosureTransaction(nil), report.Transactions...)
+				test.change(&changed)
+				if err := store.SavePoliticalDisclosureReport(ctx, changed); err != nil {
+					t.Fatal(err)
+				}
+				assertReset(t, readCandidate(t, report, ticker))
+			})
+		}
+	})
+
+	t.Run("superseded reappearance and parent scoring changes requeue", func(t *testing.T) {
+		report := newReport(t, "parent")
+		ticker := report.Transactions[0].Ticker
+		setCandidateState(t, report, ticker, "superseded", "old-fence", "old outcome")
+		if err := store.SavePoliticalDisclosureReport(ctx, report); err != nil {
+			t.Fatal(err)
+		}
+		assertReset(t, readCandidate(t, report, ticker))
+
+		parentChanges := []struct {
+			name   string
+			change func(*store.PoliticalDisclosureReport)
+		}{
+			{"chamber", func(report *store.PoliticalDisclosureReport) { report.Chamber = "senate" }},
+			{"filer", func(report *store.PoliticalDisclosureReport) { report.FilerName = "Hon. Parent Score Changed" }},
+			{"office", func(report *store.PoliticalDisclosureReport) { report.Office = "TS99" }},
+			{"report type", func(report *store.PoliticalDisclosureReport) { report.ReportType = "annual" }},
+			{"amendment", func(report *store.PoliticalDisclosureReport) { report.IsAmendment = !report.IsAmendment }},
+			{"filing date", func(report *store.PoliticalDisclosureReport) { report.FilingDate = report.FilingDate.AddDate(0, 0, 1) }},
+			{"document URL", func(report *store.PoliticalDisclosureReport) { report.DocumentURL += "?rescored=1" }},
+		}
+		current := report
+		for _, parentChange := range parentChanges {
+			t.Run(parentChange.name, func(t *testing.T) {
+				setCandidateState(t, current, ticker, "rejected", "terminal-fence", "terminal outcome")
+				changed := current
+				parentChange.change(&changed)
+				if err := store.SavePoliticalDisclosureReport(ctx, changed); err != nil {
+					t.Fatal(err)
+				}
+				assertReset(t, readCandidate(t, changed, ticker))
+				current = changed
+			})
+		}
+
+		setCandidateState(t, current, ticker, "processing", "status-fence", "status outcome")
+		statusChanged := current
+		statusChanged.ExtractionStatus = "no_text"
+		statusChanged.Transactions = nil
+		if err := store.SavePoliticalDisclosureReport(ctx, statusChanged); err != nil {
+			t.Fatal(err)
+		}
+		state := readCandidate(t, statusChanged, ticker)
+		if state.status != "superseded" || state.token != "" || state.claimedAt != nil {
+			t.Fatalf("non-completed parent status did not invalidate candidate: %+v", state)
+		}
+	})
 }
