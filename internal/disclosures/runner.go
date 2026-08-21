@@ -691,12 +691,14 @@ func (r *Runner) syncSenate(
 		}
 		page, err := r.Senate.ListPTRPage(ctx, since, now, start, pageSize)
 		if err != nil {
+			logListingRowIssues("senate", start, page.Issues)
 			return processed, senateSourceBlocked(err)
 		}
 		done, err := pagination.advance("Senate eFD search", "recordsFiltered", start, page.RowCount, page.Total)
 		if err != nil {
 			return processed, senateSourceBlocked(err)
 		}
+		logListingRowIssues("senate", start, page.Issues)
 		for _, filing := range page.Filings {
 			if processed >= limit {
 				break
@@ -766,12 +768,14 @@ func (r *Runner) syncOGE(ctx context.Context, since, until time.Time, limit int)
 		}
 		page, err := r.OGE.ListFilingsPage(ctx, since, until, start, pageSize)
 		if err != nil {
+			logListingRowIssues("oge", start, page.Issues)
 			return processed, err
 		}
 		done, err := pagination.advance("OGE API", "recordsTotal", start, page.RowCount, page.Total)
 		if err != nil {
 			return processed, err
 		}
+		logListingRowIssues("oge", start, page.Issues)
 		for _, filing := range page.Filings {
 			if processed >= limit {
 				break
@@ -825,6 +829,18 @@ func (r *Runner) syncOGE(ctx context.Context, since, until time.Time, limit int)
 		return processed, fmt.Errorf("%d OGE filing(s) failed: %w", len(failures), errors.Join(failures...))
 	}
 	return processed, nil
+}
+
+func logListingRowIssues(source string, start int, issues []ListingRowIssue) {
+	for _, issue := range issues {
+		slog.Warn("congressional disclosure listing row skipped",
+			"source", source,
+			"page_start", start,
+			"row", issue.Row,
+			"reason", issue.Reason,
+			"fingerprint", issue.Fingerprint,
+		)
+	}
 }
 
 func (r *Runner) isReportTerminal(

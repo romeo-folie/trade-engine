@@ -30,8 +30,8 @@ type OGEClient struct {
 	pacer        requestPacer
 }
 type ogePage struct {
-	RecordsTotal int      `json:"recordsTotal"`
-	Data         []ogeRow `json:"data"`
+	RecordsTotal int               `json:"recordsTotal"`
+	Data         []json.RawMessage `json:"data"`
 }
 type ogeRow struct {
 	Type    string `json:"type"`
@@ -57,6 +57,7 @@ func NewOGEClient(base string, timeout time.Duration) *OGEClient {
 type OGEFilingPage struct {
 	Filings         []OGEFiling
 	RowCount, Total int
+	Issues          []ListingRowIssue
 }
 
 func (c *OGEClient) ListFilings(ctx context.Context, since, until time.Time, limit int) ([]OGEFiling, error) {
@@ -132,44 +133,71 @@ func (c *OGEClient) ListFilingsPage(ctx context.Context, since, until time.Time,
 		return OGEFilingPage{}, err
 	}
 	out := make([]OGEFiling, 0, len(raw.Data))
-	for index, row := range raw.Data {
-		link := ogePDF.FindString(html.UnescapeString(row.Type))
-		if link == "" {
-			label := strings.ToLower(stripHTML(html.UnescapeString(row.Type)))
-			if strings.Contains(label, "request") || strings.Contains(label, "not available") {
-				continue
-			}
-			return OGEFilingPage{}, fmt.Errorf("OGE filing row %d has no downloadable PDF", index+1)
-		}
-		document, err := trustedDocumentURL(c.BaseURL, link, ogeDocumentPathPrefix(c.BaseURL))
-		if err != nil || !strings.HasSuffix(strings.ToLower(document.Path), ".pdf") {
-			return OGEFilingPage{}, fmt.Errorf("OGE filing row %d has an untrusted PDF URL", index+1)
-		}
-		name := strings.TrimSpace(html.UnescapeString(row.Name))
-		if name == "" {
-			return OGEFilingPage{}, fmt.Errorf("OGE filing row %d has no filer name", index+1)
-		}
-		d, ok := parseOGEFilingDate(row.DocDate)
-		if !ok {
-			return OGEFilingPage{}, fmt.Errorf("OGE filing row %d has invalid filing date", index+1)
-		}
-		filingDay := disclosureCalendarDay(d)
-		if filingDay.Before(disclosureCalendarDay(since)) {
+	issues := make([]ListingRowIssue, 0)
+	for index, rawRow := range raw.Data {
+		var row ogeRow
+		if err := json.Unmarshal(rawRow, &row); err != nil {
+			issues = append(issues, newListingRowIssue(start+index+1, "invalid_listing_row", rawRow))
 			continue
 		}
-		if filingDay.After(disclosureCalendarDay(until)) {
+		filing, filtered, reason := parseOGEListingRow(c.BaseURL, row, since, until)
+		if reason != "" {
+			issues = append(issues, newListingRowIssue(start+index+1, reason, rawRow))
 			continue
 		}
-		documentURL := document.String()
-		sum := sha256.Sum256([]byte(documentURL))
-		meta, _ := json.Marshal(row)
-		isAmendment := ogeLabelIsAmendment(strings.ToLower(stripHTML(html.UnescapeString(row.Type)))) || ogeAmendedFieldIsAmendment(row.Amended)
-		if len(meta) == 0 {
-			return OGEFilingPage{}, fmt.Errorf("OGE filing row %d metadata is invalid", index+1)
+		if filtered {
+			continue
 		}
-		out = append(out, OGEFiling{ExternalID: "oge-" + hex.EncodeToString(sum[:8]), FilerName: name, Office: strings.Trim(strings.Join([]string{row.Title, row.Agency}, " — "), " —"), ReportType: normalizeOGEReportType(row.Type, row.Amended), IsAmendment: isAmendment, FilingDate: d, DocumentURL: documentURL, RawMetadata: meta})
+		out = append(out, filing)
 	}
-	return OGEFilingPage{Filings: out, RowCount: len(raw.Data), Total: raw.RecordsTotal}, nil
+	if allListingRowsMalformed(len(raw.Data), issues) {
+		// Return the safe row diagnostics with the fatal page error so the runner
+		// can log them before stopping the source sync.
+		return OGEFilingPage{RowCount: len(raw.Data), Total: raw.RecordsTotal, Issues: issues}, fmt.Errorf("OGE API page at start %d has no usable rows", start)
+	}
+	return OGEFilingPage{Filings: out, RowCount: len(raw.Data), Total: raw.RecordsTotal, Issues: issues}, nil
+}
+
+// parseOGEListingRow returns a filing, whether the row is an intentional
+// source-side filter, and a fixed diagnostic code for malformed rows.
+func parseOGEListingRow(baseURL string, row ogeRow, since, until time.Time) (OGEFiling, bool, string) {
+	label := strings.ToLower(stripHTML(html.UnescapeString(row.Type)))
+	link := ogePDF.FindString(html.UnescapeString(row.Type))
+	if link == "" {
+		if strings.Contains(label, "request") || strings.Contains(label, "not available") {
+			return OGEFiling{}, true, ""
+		}
+		return OGEFiling{}, false, "missing_downloadable_pdf"
+	}
+	d, ok := parseOGEFilingDate(row.DocDate)
+	if !ok {
+		return OGEFiling{}, false, "invalid_filing_date"
+	}
+	filingDay := disclosureCalendarDay(d)
+	if filingDay.Before(disclosureCalendarDay(since)) || filingDay.After(disclosureCalendarDay(until)) {
+		return OGEFiling{}, true, ""
+	}
+	document, err := trustedDocumentURL(baseURL, link, ogeDocumentPathPrefix(baseURL))
+	if err != nil || !strings.HasSuffix(strings.ToLower(document.Path), ".pdf") {
+		return OGEFiling{}, false, "untrusted_pdf_url"
+	}
+	name := strings.TrimSpace(html.UnescapeString(row.Name))
+	if name == "" {
+		return OGEFiling{}, false, "missing_filer_name"
+	}
+	documentURL := document.String()
+	sum := sha256.Sum256([]byte(documentURL))
+	meta, err := json.Marshal(row)
+	if err != nil {
+		return OGEFiling{}, false, "invalid_metadata"
+	}
+	isAmendment := ogeLabelIsAmendment(label) || ogeAmendedFieldIsAmendment(row.Amended)
+	return OGEFiling{
+		ExternalID: "oge-" + hex.EncodeToString(sum[:8]), FilerName: name,
+		Office:     strings.Trim(strings.Join([]string{row.Title, row.Agency}, " — "), " —"),
+		ReportType: normalizeOGEReportType(row.Type, row.Amended), IsAmendment: isAmendment,
+		FilingDate: d, DocumentURL: documentURL, RawMetadata: meta,
+	}, false, ""
 }
 
 // validateOGEPageExtent ensures an OGE page can neither skip nor overrun a

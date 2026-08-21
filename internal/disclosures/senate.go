@@ -137,6 +137,7 @@ func (c *SenateClient) searchPTRsHTTP(
 type SenateFilingPage struct {
 	Filings         []SenateFiling
 	RowCount, Total int
+	Issues          []ListingRowIssue
 }
 
 func (c *SenateClient) ListPTRPage(ctx context.Context, since, until time.Time, start, length int) (SenateFilingPage, error) {
@@ -153,7 +154,7 @@ func (c *SenateClient) ListPTRPage(ctx context.Context, since, until time.Time, 
 	if err != nil {
 		return SenateFilingPage{}, err
 	}
-	return parseSenateSearchPage(c.BaseURL, body)
+	return parseSenateSearchPageAt(c.BaseURL, body, start)
 }
 
 func parseSenateSearchResponse(baseURL string, body []byte) ([]SenateFiling, error) {
@@ -162,9 +163,13 @@ func parseSenateSearchResponse(baseURL string, body []byte) ([]SenateFiling, err
 }
 
 func parseSenateSearchPage(baseURL string, body []byte) (SenateFilingPage, error) {
+	return parseSenateSearchPageAt(baseURL, body, 0)
+}
+
+func parseSenateSearchPageAt(baseURL string, body []byte, start int) (SenateFilingPage, error) {
 	var response struct {
-		Data            [][]any `json:"data"`
-		RecordsFiltered int     `json:"recordsFiltered"`
+		Data            []json.RawMessage `json:"data"`
+		RecordsFiltered int               `json:"recordsFiltered"`
 	}
 	if err := json.Unmarshal(body, &response); err != nil {
 		return SenateFilingPage{}, fmt.Errorf("decode Senate eFD search response: %w", err)
@@ -176,20 +181,32 @@ func parseSenateSearchPage(baseURL string, body []byte) (SenateFilingPage, error
 		)
 	}
 	filings := make([]SenateFiling, 0, len(response.Data))
+	issues := make([]ListingRowIssue, 0)
 	if len(response.Data) > 0 {
-		for index, row := range response.Data {
+		for index, rawRow := range response.Data {
+			var row []any
+			if err := json.Unmarshal(rawRow, &row); err != nil {
+				issues = append(issues, newListingRowIssue(start+index+1, "invalid_listing_row", rawRow))
+				continue
+			}
 			cells := make([]string, 0, len(row))
 			for _, value := range row {
 				cells = append(cells, fmt.Sprint(value))
 			}
-			filing, ok := parseSenateSearchRow(baseURL, cells)
-			if !ok {
-				return SenateFilingPage{}, fmt.Errorf("senate eFD search row %d did not match the expected filing shape", index+1)
+			filing, reason := parseSenateSearchRow(baseURL, cells)
+			if reason != "" {
+				issues = append(issues, newListingRowIssue(start+index+1, reason, rawRow))
+				continue
 			}
 			filings = append(filings, filing)
 		}
 	}
-	return SenateFilingPage{Filings: filings, RowCount: len(response.Data), Total: response.RecordsFiltered}, nil
+	if allListingRowsMalformed(len(response.Data), issues) {
+		// Return the safe row diagnostics with the fatal page error so the runner
+		// can log them before stopping the source sync.
+		return SenateFilingPage{RowCount: len(response.Data), Total: response.RecordsFiltered, Issues: issues}, fmt.Errorf("Senate eFD search page at start %d has no usable rows", start)
+	}
+	return SenateFilingPage{Filings: filings, RowCount: len(response.Data), Total: response.RecordsFiltered, Issues: issues}, nil
 }
 
 func (c *SenateClient) FetchPTR(ctx context.Context, filing SenateFiling) (Report, error) {
@@ -388,12 +405,15 @@ func csrfToken(body []byte) string {
 	return token
 }
 
-func parseSenateSearchRow(baseURL string, cells []string) (SenateFiling, bool) {
+func parseSenateSearchRow(baseURL string, cells []string) (SenateFiling, string) {
 	var filing SenateFiling
 	var names []string
+	ptrLinkFound := false
+	ptrLinkTrusted := false
 	for index, raw := range cells {
 		plain := strings.Join(strings.Fields(stripHTML(raw)), " ")
 		if match := senatePTRLinkPattern.FindStringSubmatch(raw); len(match) == 3 {
+			ptrLinkFound = true
 			filing.ExternalID = match[2]
 			reference, err := url.Parse(match[1])
 			if err == nil {
@@ -403,6 +423,7 @@ func parseSenateSearchRow(baseURL string, cells []string) (SenateFiling, bool) {
 				if err == nil {
 					if document, trustedErr := trustedDocumentURL(baseURL, reference.String(), "/search/view/ptr/"); trustedErr == nil {
 						filing.DocumentURL = document.String()
+						ptrLinkTrusted = true
 					}
 				}
 			}
@@ -419,8 +440,18 @@ func parseSenateSearchRow(baseURL string, cells []string) (SenateFiling, bool) {
 		}
 	}
 	filing.FilerName = strings.Join(names, " ")
-	return filing, filing.ExternalID != "" && filing.DocumentURL != "" &&
-		filing.FilerName != "" && !filing.FilingDate.IsZero()
+	switch {
+	case !ptrLinkFound:
+		return SenateFiling{}, "missing_ptr_link"
+	case !ptrLinkTrusted || filing.ExternalID == "" || filing.DocumentURL == "":
+		return SenateFiling{}, "untrusted_ptr_link"
+	case filing.FilerName == "":
+		return SenateFiling{}, "missing_filer_name"
+	case filing.FilingDate.IsZero():
+		return SenateFiling{}, "invalid_filing_date"
+	default:
+		return filing, ""
+	}
 }
 
 func ParseSenatePTR(filing SenateFiling, body []byte) (Report, error) {

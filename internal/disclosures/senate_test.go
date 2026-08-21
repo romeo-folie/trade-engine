@@ -165,13 +165,30 @@ func TestParseSenatePTRWithoutCanonicalTableIsStructuralFailure(t *testing.T) {
 	}
 }
 
-func TestParseSenateSearchPageRejectsMixedValidAndMalformedRows(t *testing.T) {
+func TestParseSenateSearchPageSkipsMixedValidAndMalformedRows(t *testing.T) {
 	page, err := parseSenateSearchPage("https://efdsearch.senate.gov", []byte(`{"recordsFiltered":2,"data":[["Jane","Senator","Office","<a href='/search/view/ptr/valid/'>PTR</a>","03/05/2026"],["broken"]]}`))
-	if err == nil {
-		t.Fatal("mixed valid/malformed Senate page was accepted")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if len(page.Filings) != 0 || page.RowCount != 0 || page.Total != 0 {
-		t.Fatalf("partial page = %+v, want zero value", page)
+	if len(page.Filings) != 1 || page.Filings[0].ExternalID != "valid" || page.RowCount != 2 || page.Total != 2 {
+		t.Fatalf("page = %+v", page)
+	}
+	if len(page.Issues) != 1 || page.Issues[0].Row != 2 || page.Issues[0].Reason != "missing_ptr_link" || len(page.Issues[0].Fingerprint) != 16 {
+		t.Fatalf("issues = %+v", page.Issues)
+	}
+}
+
+func TestParseSenateSearchPageSkipsMalformedJSONRow(t *testing.T) {
+	page, err := parseSenateSearchPage("https://efdsearch.senate.gov", []byte(`{"recordsFiltered":2,"data":[{"invalid":"row"},["Jane","Senator","Office","<a href='/search/view/ptr/valid/'>PTR</a>","03/05/2026"]]}`))
+	if err != nil || len(page.Filings) != 1 || page.Filings[0].ExternalID != "valid" || len(page.Issues) != 1 || page.Issues[0].Reason != "invalid_listing_row" {
+		t.Fatalf("page=%+v err=%v", page, err)
+	}
+}
+
+func TestParseSenateSearchPageRejectsAllMalformedRows(t *testing.T) {
+	page, err := parseSenateSearchPage("https://efdsearch.senate.gov", []byte(`{"recordsFiltered":1,"data":[["broken"]]}`))
+	if err == nil || !strings.Contains(err.Error(), "no usable rows") || page.RowCount != 1 || len(page.Issues) != 1 {
+		t.Fatalf("page=%+v err=%v", page, err)
 	}
 }
 
@@ -559,12 +576,12 @@ func TestReadBoundedSenateResponseAcceptsExactLimit(t *testing.T) {
 }
 
 func TestParseSenateSearchRowRejectsCrossOriginDocumentURL(t *testing.T) {
-	filing, ok := parseSenateSearchRow("https://efdsearch.senate.gov", []string{
+	filing, reason := parseSenateSearchRow("https://efdsearch.senate.gov", []string{
 		"Jane", "Senator", "Office",
 		`<a href="https://evil.example/search/view/ptr/abc/">PTR</a>`, "07/05/2026",
 	})
-	if ok || filing.DocumentURL != "" {
-		t.Fatalf("cross-origin filing accepted: %+v", filing)
+	if reason != "untrusted_ptr_link" || filing.DocumentURL != "" {
+		t.Fatalf("cross-origin filing accepted: filing=%+v reason=%q", filing, reason)
 	}
 }
 
