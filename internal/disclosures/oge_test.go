@@ -36,7 +36,7 @@ func TestOGEListFilingsSkipsRequestOnly(t *testing.T) {
 	var s *httptest.Server
 	s = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(strings.ReplaceAll(`{"recordsTotal":2,"data":[{"type":"<a href='{base}/a.pdf'>278 Transaction</a>","name":"A. Person","agency":"White House","title":"Advisor","docDate":"2026-07-09"},{"type":"Annual (2026) (<a href='{base}/request'>Request this Document</a>)","name":"B","docDate":"2026-07-10"}]}`, "{base}", s.URL)))
+		_, _ = w.Write([]byte(strings.ReplaceAll(`{"recordsTotal":2,"data":[{"type":"<a href='{base}/a.pdf'>278 Transaction</a>","name":"A. Person","agency":"White House","title":"Advisor","docDate":"2026-07-09"},{"type":"Annual (2026) (<a href='{base}/request'>Request this Document</a>)","name":"B","docDate":"not-a-date"}]}`, "{base}", s.URL)))
 	}))
 	defer s.Close()
 	c := NewOGEClient(s.URL, time.Second)
@@ -46,6 +46,20 @@ func TestOGEListFilingsSkipsRequestOnly(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].ReportType != "periodic_transaction" {
 		t.Fatalf("got %#v", got)
+	}
+}
+
+func TestOGEListFilingsKeepsPDFWithRequestLabel(t *testing.T) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(strings.ReplaceAll(`{"recordsTotal":1,"data":[{"type":"<a href='{base}/document.pdf'>Request this Document</a>","name":"A. Person","docDate":"2026-07-09"}]}`, "{base}", server.URL)))
+	}))
+	defer server.Close()
+
+	got, err := NewOGEClient(server.URL, time.Second).ListFilings(context.Background(), time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC), 10)
+	if err != nil || len(got) != 1 || got[0].FilerName != "A. Person" {
+		t.Fatalf("filings=%+v err=%v", got, err)
 	}
 }
 
@@ -130,7 +144,7 @@ func TestOGEListFilingsKeepsTimestampedInclusiveEndDate(t *testing.T) {
 	}
 }
 
-func TestOGEListFilingsRejectsMalformedDateAtomically(t *testing.T) {
+func TestOGEListFilingsSkipsMalformedDate(t *testing.T) {
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -144,21 +158,55 @@ func TestOGEListFilingsRejectsMalformedDateAtomically(t *testing.T) {
 		time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC),
 		time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC), 0, 100,
 	)
-	if err == nil || len(page.Filings) != 0 || page.RowCount != 0 {
+	if err != nil || len(page.Filings) != 1 || page.Filings[0].FilerName != "Valid" || page.RowCount != 2 || page.Total != 2 {
 		t.Fatalf("page=%+v err=%v", page, err)
+	}
+	if len(page.Issues) != 1 || page.Issues[0].Row != 1 || page.Issues[0].Reason != "invalid_filing_date" {
+		t.Fatalf("issues=%+v", page.Issues)
 	}
 }
 
-func TestOGEListFilingsRejectsUntrustedPDFAtomically(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+func TestOGEListFilingsSkipsMalformedJSONRow(t *testing.T) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"recordsTotal":2,"data":[{"type":"<a href='https://untrusted.example/document.pdf'>278 Transaction</a>","name":"Untrusted","docDate":"2026-07-15"},{"type":"<a href='https://untrusted.example/other.pdf'>278 Transaction</a>","name":"Also Untrusted","docDate":"2026-07-15"}]}`))
+		_, _ = w.Write([]byte(strings.ReplaceAll(`{"recordsTotal":2,"data":[{"type":"<a href='{base}/invalid.pdf'>278 Transaction</a>","name":42,"docDate":"2026-07-15"},{"type":"<a href='{base}/valid.pdf'>278 Transaction</a>","name":"Valid","docDate":"2026-07-15"}]}`, "{base}", server.URL)))
 	}))
 	defer server.Close()
 
 	page, err := NewOGEClient(server.URL, time.Second).ListFilingsPage(context.Background(), time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC), 0, 100)
-	if err == nil || len(page.Filings) != 0 || page.RowCount != 0 {
-		t.Fatalf("page=%+v err=%v, want atomic untrusted URL rejection", page, err)
+	if err != nil || len(page.Filings) != 1 || page.Filings[0].FilerName != "Valid" || len(page.Issues) != 1 || page.Issues[0].Reason != "invalid_listing_row" {
+		t.Fatalf("page=%+v err=%v", page, err)
+	}
+}
+
+func TestOGEListFilingsSkipsUntrustedPDF(t *testing.T) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(strings.ReplaceAll(`{"recordsTotal":2,"data":[{"type":"<a href='https://untrusted.example/document.pdf'>278 Transaction</a>","name":"Untrusted","docDate":"2026-07-15"},{"type":"<a href='{base}/valid.pdf'>278 Transaction</a>","name":"Valid","docDate":"2026-07-15"}]}`, "{base}", server.URL)))
+	}))
+	defer server.Close()
+
+	page, err := NewOGEClient(server.URL, time.Second).ListFilingsPage(context.Background(), time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC), 0, 100)
+	if err != nil || len(page.Filings) != 1 || page.Filings[0].FilerName != "Valid" || page.RowCount != 2 {
+		t.Fatalf("page=%+v err=%v", page, err)
+	}
+	if len(page.Issues) != 1 || page.Issues[0].Reason != "untrusted_pdf_url" {
+		t.Fatalf("issues=%+v", page.Issues)
+	}
+}
+
+func TestOGEListFilingsRejectsAllMalformedRows(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"recordsTotal":1,"data":[{"type":"278 Transaction","name":"Malformed","docDate":"2026-07-15"}]}`))
+	}))
+	defer server.Close()
+
+	page, err := NewOGEClient(server.URL, time.Second).ListFilingsPage(context.Background(), time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC), 0, 100)
+	if err == nil || !strings.Contains(err.Error(), "no usable rows") || page.RowCount != 1 || len(page.Issues) != 1 {
+		t.Fatalf("page=%+v err=%v", page, err)
 	}
 }
 

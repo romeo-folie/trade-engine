@@ -688,17 +688,52 @@ func TestSenateSyncAuthorizationFailureDoesNotConsumeBudgetOrPersist(t *testing.
 	}
 }
 
-func TestSenateSyncRejectsMixedMalformedPageWithoutFetchingOrPersisting(t *testing.T) {
+func TestSenateSyncSkipsMalformedListingRowAndPersistsValidNeighbor(t *testing.T) {
 	client, err := NewSenateClient("https://efdsearch.senate.gov", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	client.Transport = &fixtureSenateTransport{searchBody: []byte(`{"recordsFiltered":2,"data":[["Valid","Member","Office","<a href='/search/view/ptr/valid/'>PTR</a>","08/10/2026"],["malformed"]]}`)}
+	client.Transport = &fixtureSenateTransport{
+		searchBody: []byte(`{"recordsFiltered":2,"data":[["Valid","Member","Office","<a href='/search/view/ptr/valid/'>PTR</a>","08/10/2026"],["malformed"]]}`),
+		fetchBody:  []byte(`<table><tr><th>Transaction Date</th><th>Asset Name</th><th>Transaction Type</th><th>Amount</th></tr><tr><td>08/09/2026</td><td>Microsoft (MSFT)</td><td>Purchase</td><td>$1,001 - $15,000</td></tr></table>`),
+	}
 	persisted := 0
-	runner := &Runner{Senate: client, persistReport: func(context.Context, Report) error { persisted++; return nil }}
+	runner := &Runner{
+		Senate:         client,
+		reportTerminal: func(context.Context, string, string) (bool, error) { return false, nil },
+		persistReport:  func(context.Context, Report) error { persisted++; return nil },
+	}
 	processed, err := runner.syncSenate(context.Background(), time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 8, 12, 0, 0, 0, 0, time.UTC), 2)
-	if err == nil || processed != 0 || persisted != 0 {
+	if err != nil || processed != 1 || persisted != 1 {
 		t.Fatalf("processed=%d persisted=%d err=%v", processed, persisted, err)
+	}
+}
+
+func TestOGESyncSkipsMalformedListingRowAndPersistsValidNeighbor(t *testing.T) {
+	var pdfCalls, persisted int
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/valid.pdf" {
+			pdfCalls++
+			_, _ = w.Write([]byte("pdf"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(strings.ReplaceAll(`{"recordsTotal":2,"data":[{"type":"278 Transaction","name":"Malformed","docDate":"2026-08-10"},{"type":"<a href='{base}/valid.pdf'>278 Transaction</a>","name":"Valid","docDate":"2026-08-10"}]}`, "{base}", server.URL)))
+	}))
+	defer server.Close()
+
+	runner := &Runner{
+		OGE:            NewOGEClient(server.URL, time.Second),
+		Extractor:      runnerTestExtractor{},
+		reportTerminal: func(context.Context, string, string) (bool, error) { return false, nil },
+		persistReport:  func(context.Context, Report) error { persisted++; return nil },
+	}
+	processed, err := runner.syncOGE(context.Background(),
+		time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 8, 12, 0, 0, 0, 0, time.UTC), 2)
+	if err != nil || processed != 1 || pdfCalls != 1 || persisted != 1 {
+		t.Fatalf("processed=%d pdf_calls=%d persisted=%d err=%v", processed, pdfCalls, persisted, err)
 	}
 }
 
