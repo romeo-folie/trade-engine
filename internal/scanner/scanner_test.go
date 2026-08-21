@@ -1,10 +1,14 @@
 package scanner
 
 import (
+	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/analysis"
 	"github.com/romeo-folie/trade-engine/internal/config"
+	"github.com/romeo-folie/trade-engine/internal/store"
+	"github.com/romeo-folie/trade-engine/internal/tradeprofile"
 )
 
 func TestCandidateTTLDaysUsesSourcePolicy(t *testing.T) {
@@ -88,5 +92,47 @@ func TestParseSwingResult_FallbackDefaultsToSkip(t *testing.T) {
 	})
 	if got.Action != "skip" {
 		t.Fatalf("fallback should default to skip, got %q", got.Action)
+	}
+}
+
+func TestExpiredScannerResidencyAllowsReadmissionBesideAdditiveContext(t *testing.T) {
+	now := time.Date(2026, time.August, 21, 12, 0, 0, 0, time.UTC)
+	expired := now.Add(-time.Minute)
+	item := store.WatchlistItem{
+		Ticker: "REENTER", ScannerOrigin: true, ExpiresAt: &expired,
+		DiscoveryContexts: []store.WatchlistDiscoveryContext{{Key: "earnings_scheduled:2026-08-24"}},
+	}
+	if !expiredScannerResidency(item, now) {
+		t.Fatal("expired scanner origin with a live additive context was not recognized for readmission")
+	}
+	existing := map[string]struct{}{}
+	if !expiredScannerResidency(item, now) {
+		existing[normalizePromotionKey(item.Ticker)] = struct{}{}
+	}
+	if got := filterActiveCandidates([]SwingCandidate{{Ticker: item.Ticker}}, existing); len(got) != 1 {
+		t.Fatalf("expired scanner origin was still excluded from normal admission: %+v", got)
+	}
+	earningsTakeover := store.WatchlistItem{Ticker: "REENTER_EARNINGS", Source: "earnings_watchlist", ScannerOrigin: true}
+	if !expiredScannerResidency(earningsTakeover, now) {
+		t.Fatal("scanner-origin earnings takeover with cleared expiry was not recognized for readmission")
+	}
+}
+
+func TestScannerDiscoveryNewsRestoresPersistedNews(t *testing.T) {
+	now := time.Date(2026, time.August, 21, 12, 0, 0, 0, time.UTC)
+	discovery := &tradeprofile.DiscoveryContext{
+		Version: tradeprofile.DiscoveryContextVersion, Sources: []string{"mover"}, Thesis: "mover news",
+		EvidenceBySource: map[string]json.RawMessage{
+			"mover": json.RawMessage(`{"recent_news":[{"Headline":"Prior catalyst","Sentiment":"POSITIVE","PublishedAt":"2026-08-21T11:00:00Z"}]}`),
+		},
+	}
+	news := scannerDiscoveryNews(discovery)
+	if len(news) != 1 || news[0].Headline != "Prior catalyst" || !news[0].PublishedAt.Equal(now.Add(-time.Hour)) {
+		t.Fatalf("persisted news = %#v", news)
+	}
+	candidate := SwingCandidate{Ticker: "NEWS", Sources: []string{"mover"}}
+	restoreActiveRefreshNews(&candidate, store.WatchlistItem{DiscoveryContext: discovery})
+	if len(candidate.News) != 1 || candidate.News[0].Headline != "Prior catalyst" {
+		t.Fatalf("provider-disabled refresh lost persisted news: %#v", candidate.News)
 	}
 }

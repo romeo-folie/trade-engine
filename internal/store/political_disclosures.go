@@ -947,8 +947,26 @@ func ClaimPoliticalDisclosureCandidates(
 	ctx context.Context, since, now time.Time, lease time.Duration,
 	maxTickers int, token string,
 ) ([]PoliticalDisclosureCandidate, error) {
+	return ClaimPoliticalDisclosureCandidatesWithEvidence(
+		ctx, since, since, now, lease, maxTickers, token,
+	)
+}
+
+// ClaimPoliticalDisclosureCandidatesWithEvidence claims tickers that have a
+// fresh trigger filing while returning a longer completed-filing horizon for
+// analyst context. Only trigger-window rows are claimed and promotion-fenced;
+// older evidence is context, never a reason to re-promote a ticker.
+func ClaimPoliticalDisclosureCandidatesWithEvidence(
+	ctx context.Context, triggerSince, evidenceSince, now time.Time, lease time.Duration,
+	maxTickers int, token string,
+) ([]PoliticalDisclosureCandidate, error) {
 	if maxTickers <= 0 || strings.TrimSpace(token) == "" {
 		return nil, nil
+	}
+	if evidenceSince.After(triggerSince) {
+		// A shorter analyst horizon would hide the filing that made the ticker
+		// eligible. Clamp it rather than returning an incomplete claim set.
+		evidenceSince = triggerSince
 	}
 	tx, err := GetDB().Begin(ctx)
 	if err != nil {
@@ -960,16 +978,26 @@ func ClaimPoliticalDisclosureCandidates(
 	// advisory only; the query below re-evaluates every eligibility/fence after
 	// the per-ticker serialization lock has been acquired.
 	proposalRows, err := tx.Query(ctx, `
-		WITH eligible AS (
+		WITH trigger_eligible AS (
 			SELECT c.ticker, c.promotion_status, c.promotion_claim_token,
 				c.promotion_claimed_at, r.filing_date
-			FROM political_disclosure_candidates c
-			JOIN political_disclosure_reports r ON r.id=c.report_id
-			WHERE r.filing_date >= $1::date AND r.filing_date <= $2::date
-			  AND r.extraction_status='completed' AND c.promotion_status <> 'superseded'
+				FROM political_disclosure_candidates c
+				JOIN political_disclosure_reports r ON r.id=c.report_id
+				WHERE r.filing_date >= $1::date AND r.filing_date <= $2::date
+				  AND r.extraction_status='completed' AND c.promotion_status <> 'superseded'
+				  AND NOT EXISTS (
+					SELECT 1
+					FROM political_disclosure_candidates claimed
+					JOIN political_disclosure_reports claim_report ON claim_report.id=claimed.report_id
+					WHERE claimed.ticker=c.ticker
+					  AND claim_report.filing_date >= $6::date AND claim_report.filing_date <= $2::date
+					  AND claimed.promotion_claim_token IS NOT NULL AND claimed.promotion_claimed_at IS NOT NULL
+					  AND claimed.promotion_claimed_at >= $2::timestamptz - $3::interval
+					  AND claimed.promotion_claim_token <> $5
+				  )
 		)
 		SELECT ticker
-		FROM eligible
+		FROM trigger_eligible
 		GROUP BY ticker
 		HAVING BOOL_OR(promotion_status='pending' OR (
 			promotion_status='processing' AND
@@ -979,8 +1007,8 @@ func ClaimPoliticalDisclosureCandidates(
 			promotion_claim_token IS NOT NULL AND promotion_claimed_at IS NOT NULL AND
 			promotion_claimed_at >= $2::timestamptz - $3::interval AND promotion_claim_token <> $5
 		)
-		ORDER BY MAX(filing_date) DESC, ticker
-		LIMIT $4`, since, now, lease.String(), maxTickers, token)
+			ORDER BY MAX(filing_date) DESC, ticker
+			LIMIT $4`, triggerSince, now, lease.String(), maxTickers, token, evidenceSince)
 	if err != nil {
 		return nil, err
 	}
@@ -1006,16 +1034,23 @@ func ClaimPoliticalDisclosureCandidates(
 	}
 
 	rows, err := tx.Query(ctx, `
-		WITH eligible AS (
+		WITH trigger_eligible AS (
 			SELECT c.*, r.source, r.external_id, r.chamber, r.filer_name, r.office,
 				r.report_type, r.is_amendment, r.filing_date, r.document_url, r.extraction_status
 			FROM political_disclosure_candidates c JOIN political_disclosure_reports r ON r.id=c.report_id
 			WHERE r.filing_date >= $1::date AND r.filing_date <= $2::date
 			  AND r.extraction_status='completed' AND c.promotion_status <> 'superseded'
 			  AND c.ticker = ANY($6::text[])
+		), evidence AS (
+			SELECT c.*, r.source, r.external_id, r.chamber, r.filer_name, r.office,
+				r.report_type, r.is_amendment, r.filing_date, r.document_url, r.extraction_status
+			FROM political_disclosure_candidates c JOIN political_disclosure_reports r ON r.id=c.report_id
+			WHERE r.filing_date >= $7::date AND r.filing_date <= $2::date
+			  AND r.extraction_status='completed' AND c.promotion_status <> 'superseded'
+			  AND c.ticker = ANY($6::text[])
 		), selected AS (
 			SELECT c.ticker
-			FROM eligible c
+			FROM trigger_eligible c
 			GROUP BY c.ticker
 			HAVING BOOL_OR(c.promotion_status='pending' OR (
 				c.promotion_status='processing' AND
@@ -1024,38 +1059,38 @@ func ClaimPoliticalDisclosureCandidates(
 			  -- A ticker's historical evidence is an aggregate ownership unit.
 			  -- Do not publish a partial aggregate while another scanner owns a
 			  -- still-fresh fence on any of its evidence rows.
-			  AND NOT BOOL_OR(
-				c.promotion_claim_token IS NOT NULL AND
-				c.promotion_claimed_at IS NOT NULL AND
-				c.promotion_claimed_at >= $2::timestamptz - $3::interval AND
-				c.promotion_claim_token <> $5
-			  )
+			AND NOT EXISTS (SELECT 1 FROM evidence e WHERE e.ticker=c.ticker
+				AND e.promotion_claim_token IS NOT NULL AND e.promotion_claimed_at IS NOT NULL
+				AND e.promotion_claimed_at >= $2::timestamptz - $3::interval AND e.promotion_claim_token <> $5)
 			ORDER BY MAX(c.filing_date) DESC, c.ticker
 		LIMIT $4
 		), claimed AS (
 			UPDATE political_disclosure_candidates c
 			SET promotion_status=CASE
-					WHEN c.promotion_status='pending' OR (
-						c.promotion_status='processing' AND
-						(c.promotion_claimed_at IS NULL OR c.promotion_claimed_at < $2::timestamptz - $3::interval)
-					) THEN 'processing'
+				WHEN EXISTS (SELECT 1 FROM trigger_eligible t WHERE t.report_id=c.report_id AND t.ticker=c.ticker) AND (c.promotion_status='pending' OR (
+					c.promotion_status='processing' AND
+					(c.promotion_claimed_at IS NULL OR c.promotion_claimed_at < $2::timestamptz - $3::interval)
+				)) THEN 'processing'
 					ELSE c.promotion_status
 				END,
 				promotion_claim_token=$5, promotion_claimed_at=$2::timestamptz
 			FROM selected s
 			WHERE c.ticker=s.ticker
-			  AND EXISTS (SELECT 1 FROM eligible e WHERE e.report_id=c.report_id AND e.ticker=c.ticker)
+			  AND EXISTS (SELECT 1 FROM evidence e WHERE e.report_id=c.report_id AND e.ticker=c.ticker)
 			RETURNING c.report_id, c.ticker, c.transaction_count,
 				c.latest_transaction_date, c.evidence, c.promotion_claim_token
 		)
-		SELECT e.report_id, e.external_id, c.ticker, e.source,
+		SELECT e.report_id, e.external_id, e.ticker, e.source,
 			e.chamber, e.filer_name, COALESCE(e.office,''), e.report_type, e.is_amendment, e.filing_date,
 			e.document_url, e.extraction_status,
-			c.transaction_count, c.latest_transaction_date, c.evidence,
-			c.promotion_claim_token, TRUE
-		FROM claimed c JOIN eligible e ON e.report_id=c.report_id AND e.ticker=c.ticker
-		ORDER BY c.ticker, e.filing_date DESC, e.report_id`,
-		since, now, lease.String(), maxTickers, token, normalizedPoliticalDisclosureTickers(proposed),
+			COALESCE(c.transaction_count, e.transaction_count),
+			COALESCE(c.latest_transaction_date, e.latest_transaction_date),
+			COALESCE(c.evidence, e.evidence),
+			COALESCE(c.promotion_claim_token, ''), c.report_id IS NOT NULL
+		FROM evidence e JOIN selected s ON s.ticker=e.ticker
+		LEFT JOIN claimed c ON c.report_id=e.report_id AND c.ticker=e.ticker
+		ORDER BY e.ticker, e.filing_date DESC, e.report_id`,
+		triggerSince, now, lease.String(), maxTickers, token, normalizedPoliticalDisclosureTickers(proposed), evidenceSince,
 	)
 	if err != nil {
 		return nil, err

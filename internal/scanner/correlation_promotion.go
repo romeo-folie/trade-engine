@@ -14,9 +14,10 @@ import (
 // symbols with insufficient bars are left without correlation evidence and the
 // candidate remains in the auditable funnel.
 type promotionExposure struct {
-	watchlist map[string]struct{}
-	positions map[string]struct{}
-	all       []string
+	watchlist      map[string]struct{}
+	admissionGuard map[string]struct{}
+	positions      map[string]struct{}
+	all            []string
 }
 
 const correlationCalendarBufferDays = 14
@@ -115,8 +116,9 @@ func loadPromotionExposure(ctx context.Context) (promotionExposure, error) {
 		return promotionExposure{}, err
 	}
 	exposure := promotionExposure{
-		watchlist: make(map[string]struct{}, len(items)),
-		positions: make(map[string]struct{}, len(trades)),
+		watchlist:      make(map[string]struct{}, len(items)),
+		admissionGuard: make(map[string]struct{}, len(items)),
+		positions:      make(map[string]struct{}, len(trades)),
 	}
 	seen := make(map[string]struct{}, len(items)+len(trades))
 	add := func(target map[string]struct{}, symbol string) {
@@ -131,6 +133,9 @@ func loadPromotionExposure(ctx context.Context) (promotionExposure, error) {
 	}
 	for _, item := range items {
 		add(exposure.watchlist, item.Ticker)
+		if !expiredScannerResidency(item, time.Now()) {
+			add(exposure.admissionGuard, item.Ticker)
+		}
 	}
 	for _, trade := range trades {
 		add(exposure.positions, trade.Ticker)

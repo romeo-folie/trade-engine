@@ -70,7 +70,7 @@ func PromoteScannerSourcesToWatchlist(
 	reason string,
 	at time.Time,
 ) error {
-	return promoteScannerSourcesToWatchlist(ctx, item, claims, reason, at, false, nil)
+	return promoteScannerSourcesToWatchlist(ctx, item, claims, reason, at, false, false, nil)
 }
 
 // PromoteScannerSourcesToWatchlistWithScannerLease fences source-claim
@@ -83,7 +83,7 @@ func PromoteScannerSourcesToWatchlistWithScannerLease(
 	at time.Time,
 	lease ScannerCycleLease,
 ) error {
-	return promoteScannerSourcesToWatchlist(ctx, item, claims, reason, at, false, &lease)
+	return promoteScannerSourcesToWatchlist(ctx, item, claims, reason, at, false, false, &lease)
 }
 
 // PromoteScannerSourcesToWatchlistUnlessActive consumes all still-current
@@ -96,7 +96,7 @@ func PromoteScannerSourcesToWatchlistUnlessActive(
 	reason string,
 	at time.Time,
 ) error {
-	return promoteScannerSourcesToWatchlist(ctx, item, claims, reason, at, true, nil)
+	return promoteScannerSourcesToWatchlist(ctx, item, claims, reason, at, true, false, nil)
 }
 
 // PromoteScannerSourcesToWatchlistUnlessActiveWithScannerLease is the fenced
@@ -109,7 +109,17 @@ func PromoteScannerSourcesToWatchlistUnlessActiveWithScannerLease(
 	at time.Time,
 	lease ScannerCycleLease,
 ) error {
-	return promoteScannerSourcesToWatchlist(ctx, item, claims, reason, at, true, &lease)
+	return promoteScannerSourcesToWatchlist(ctx, item, claims, reason, at, true, false, &lease)
+}
+
+// RefreshScannerSourcesOnActiveWatchlist consumes current source claims and
+// refreshes only an already-live scanner row. It cannot re-admit an expired or
+// removed ticker without the normal scoring and cap-selection path.
+func RefreshScannerSourcesOnActiveWatchlist(
+	ctx context.Context, item WatchlistItem, claims ScannerSourcePromotionClaims,
+	reason string, at time.Time, lease *ScannerCycleLease,
+) error {
+	return promoteScannerSourcesToWatchlist(ctx, item, claims, reason, at, true, true, lease)
 }
 
 func promoteScannerSourcesToWatchlist(
@@ -119,6 +129,7 @@ func promoteScannerSourcesToWatchlist(
 	reason string,
 	at time.Time,
 	preserveActive bool,
+	refreshOnly bool,
 	lease *ScannerCycleLease,
 ) error {
 	if strings.TrimSpace(item.Ticker) == "" ||
@@ -348,13 +359,38 @@ func promoteScannerSourcesToWatchlist(
 	// Take all potentially blocking source/advisory locks before touching the
 	// lease row. This leaves an expired lease reclaimable while this transaction
 	// waits, then fences the final watchlist write with the current owner.
-	if lease != nil {
+	if lease != nil || refreshOnly {
 		if err := lockScannerWatchlistItem(ctx, tx, item); err != nil {
 			return err
 		}
+	}
+	if lease != nil {
 		if err := renewScannerCycleTx(ctx, tx, *lease); err != nil {
 			return err
 		}
+	}
+	if refreshOnly {
+		var active bool
+		err := tx.QueryRow(ctx, `
+			SELECT active AND (
+					EXISTS (SELECT 1 FROM watchlist_source_leases l WHERE l.watchlist_id=watchlist.id AND l.expires_at > clock_timestamp())
+					OR (NOT EXISTS (SELECT 1 FROM watchlist_source_leases l WHERE l.watchlist_id=watchlist.id)
+						AND (expires_at IS NULL OR expires_at > clock_timestamp()))
+			)
+			FROM watchlist WHERE ticker=$1 AND platform=$2 AND source='scanner' FOR UPDATE`,
+			strings.ToUpper(strings.TrimSpace(item.Ticker)), item.Platform,
+		).Scan(&active)
+		if err := refreshActivityResult(active, err); err != nil {
+			return err
+		}
+		if _, err := refreshWatchlistSourceLeases(ctx, tx, item); err != nil {
+			return err
+		}
+		if err := completeScannerSourcePromotionClaims(ctx, tx, item, claims,
+			"active_watchlist", reason, at); err != nil {
+			return err
+		}
+		return tx.Commit(ctx)
 	}
 	if err := addWatchlistItem(ctx, tx, item, preserveActive); err != nil {
 		if !errors.Is(err, ErrWatchlistActiveItemExists) {
@@ -377,6 +413,19 @@ func promoteScannerSourcesToWatchlist(
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+func refreshActivityResult(active bool, err error) error {
+	if err != nil {
+		if isNoRows(err) {
+			return ErrWatchlistRefreshNotActive
+		}
+		return err
+	}
+	if !active {
+		return ErrWatchlistRefreshNotActive
+	}
+	return nil
 }
 
 func completeScannerSourcePromotionClaims(

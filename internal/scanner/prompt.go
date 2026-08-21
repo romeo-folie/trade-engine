@@ -83,10 +83,22 @@ type SwingCandidate struct {
 	FailureStage                      string
 	FailureReason                     string
 	News                              []SwingNewsItem
+	// sourceMarketObservations retains the raw observation belonging to each
+	// ordinary screener source. Later source merges intentionally replace the
+	// shared candidate fields for scoring, but must not rewrite a mover or
+	// activity lease's independent identity.
+	sourceMarketObservations map[string]map[string]any
+	sourceGraphContexts      map[string]string
 	// GraphContext, when set, explains why a knowledge-graph neighbour was surfaced
 	// (e.g. "TSMC (on watchlist) supplies_to this company"). Empty for screener
 	// candidates. Injected into the prompt so the LLM weighs the relational thesis.
-	GraphContext string
+	GraphContext         string
+	SympathySeed         string
+	SympathyRelationship string
+	// SympathyTrigger is the immutable seed article that belongs only to the
+	// news-sympathy source. Candidate News always describes this ticker, so an
+	// overlapping mover/activity source cannot inherit the seed's evidence.
+	SympathyTrigger *SwingNewsItem
 }
 
 // SwingNewsItem is a lightweight news record for prompt injection.

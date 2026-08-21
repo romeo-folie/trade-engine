@@ -906,6 +906,40 @@ func TestClaimPoliticalDisclosureCandidatesFencesEntireAggregateLineage(t *testi
 	}
 }
 
+func TestClaimPoliticalDisclosureCandidatesSeparatesTriggerFromEvidenceHorizon(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2300, time.March, 15, 12, 0, 0, 0, time.UTC)
+	history := politicalDisclosureClaimFixture("test-trigger-horizon-history", "PDHORIZON", now.AddDate(0, 0, -21))
+	trigger := politicalDisclosureClaimFixture("test-trigger-horizon-current", "PDHORIZON", now.AddDate(0, 0, -1))
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), `
+			DELETE FROM political_disclosure_reports
+			WHERE source='house' AND external_id = ANY($1::text[])`,
+			[]string{history.ExternalID, trigger.ExternalID})
+	})
+	for _, report := range []store.PoliticalDisclosureReport{history, trigger} {
+		if err := store.SavePoliticalDisclosureReport(ctx, report); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows, err := store.ClaimPoliticalDisclosureCandidatesWithEvidence(
+		ctx, now.AddDate(0, 0, -7), now.AddDate(0, 0, -30), now, time.Hour, 1, "horizon-token",
+	)
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("claim rows=%+v err=%v", rows, err)
+	}
+	byExternalID := make(map[string]store.PoliticalDisclosureCandidate, len(rows))
+	for _, row := range rows {
+		byExternalID[row.ExternalID] = row
+	}
+	if !byExternalID[history.ExternalID].Claimed || byExternalID[history.ExternalID].PromotionClaimToken != "horizon-token" {
+		t.Fatalf("historical context was not aggregate-fenced: %+v", byExternalID[history.ExternalID])
+	}
+	if !byExternalID[trigger.ExternalID].Claimed || byExternalID[trigger.ExternalID].PromotionClaimToken != "horizon-token" {
+		t.Fatalf("fresh trigger was not claimed: %+v", byExternalID[trigger.ExternalID])
+	}
+}
+
 func TestPoliticalDisclosureAggregateFenceReleasePreservesHistoricalStatus(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2300, time.March, 16, 12, 0, 0, 0, time.UTC)

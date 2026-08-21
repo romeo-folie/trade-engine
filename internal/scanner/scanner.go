@@ -31,6 +31,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/events"
 	"github.com/romeo-folie/trade-engine/internal/store"
+	"github.com/romeo-folie/trade-engine/internal/tradeprofile"
 )
 
 // bus wraps events.Bus so we can nil-check before calling Publish.
@@ -295,6 +296,9 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 		candidates = append(candidates, graphCands...)
 		slog.Info("scanner: graph neighbors added to pool", "count", len(graphCands))
 	}
+	// Collapse ordinary/graph/sympathy overlaps before sources carrying durable
+	// claim lineage are merged below.
+	candidates = deduplicateScannerCandidates(candidates)
 	candidates = mergeWeeklyLeaderCandidates(candidates, weeklyCandidates)
 	candidates = mergePotentIndustryCandidates(candidates, industryCandidates)
 	candidates = mergePremarketEpisodicCandidates(candidates, premarketCandidates)
@@ -364,6 +368,39 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			"failed", recorder.run.ID, "pullback requalification evidence unavailable")
 	}
 
+	// An active ticker is not a fresh promotion candidate, but it may carry
+	// genuinely new source evidence. Refresh its source lease before the normal
+	// active-watchlist exclusion and before cap accounting. This keeps a full
+	// watchlist renewable without allowing renewals to consume a promotion slot
+	// or replace its admission-time conviction/execution profile.
+	//
+	// News is part of ordinary mover/activity evidence, so active refreshes must
+	// see the same bounded news view as new admissions. Restrict this early pass
+	// to actual active scanner rows: when the cap is full, enriching every fresh
+	// candidate would spend provider calls even though none can be admitted.
+	candidates, err = s.enrichActiveRefreshCandidates(ctx, candidates)
+	if err != nil {
+		return fmt.Errorf("enrich active watchlist refresh candidates: %w", err)
+	}
+	handledRefreshes, err := s.refreshActiveSourceLeases(ctx, candidates, recorder.run.ID, cycleLease)
+	if err != nil {
+		return fmt.Errorf("refresh active watchlist source leases: %w", err)
+	}
+	if len(handledRefreshes) > 0 {
+		beforeRefreshFilter := candidates
+		filtered := candidates[:0]
+		for _, candidate := range candidates {
+			if !handledRefreshes[normalizePromotionKey(candidate.Ticker)] {
+				filtered = append(filtered, candidate)
+			}
+		}
+		candidates = filtered
+		recorder.markRemoved(beforeRefreshFilter, candidates, "active_watchlist")
+	}
+	// A ticker that lost active status while its refresh was in flight can have
+	// both ordinary and graph/sympathy candidates in this pool. Admit it once,
+	// retaining the combined source attribution for its normal scoring path.
+
 	// 3.5 Dedup against active watchlist/position exposure only after universe
 	// selection. Correlation mode takes one normalized exposure snapshot and
 	// reuses it for both same-ticker guards and pairwise selection.
@@ -382,7 +419,7 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 		s.markDiscoveryCandidates(ctx, beforeExposureFilter, candidates,
 			"open_position", recorder.run.ID, "ticker already has an open position")
 		beforeWatchlistFilter := candidates
-		candidates = filterActiveCandidates(candidates, exposure.watchlist)
+		candidates = filterActiveCandidates(candidates, exposure.admissionGuard)
 		recorder.markRemoved(beforeWatchlistFilter, candidates, "active_watchlist")
 		s.markDiscoveryCandidates(ctx, beforeWatchlistFilter, candidates,
 			"active_watchlist", recorder.run.ID, "already active on watchlist")
@@ -421,7 +458,9 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 		return nil // cap reached; nothing to add until items expire
 	}
 
-	// 5. Enrich candidates with news.
+	// 5. Enrich new admissions after cap accounting. Active refresh candidates
+	// were enriched above and need not be included here because they were removed
+	// by the active-watchlist filter.
 	since := s.now().Add(-time.Duration(s.Cfg.NewsLookbackHours) * time.Hour)
 	candidates = s.enrichWithNews(ctx, candidates, since)
 	recorder.setEligible(candidates)
@@ -521,7 +560,8 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			return err
 		}
 		sc := scored[index]
-		expiresAt := s.now().AddDate(0, 0, s.candidateTTLDays(sc.candidate))
+		now := s.now()
+		expiresAt := now.AddDate(0, 0, s.candidateTTLDays(sc.candidate))
 		// A claim-loss fallback may change the candidate's effective taxonomy.
 		// Re-check later candidates against peers that were actually admitted,
 		// without allowing unattempted lower-ranked candidates to consume the cap.
@@ -552,6 +592,13 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 		); err != nil {
 			return fmt.Errorf("record scanner trade profile for %s: %w", sc.candidate.Ticker, err)
 		}
+		leases := s.scannerSourceLeases(sc.candidate, discoveryContext, now)
+		if len(leases) > 0 {
+			// The row expiration must be derived from the same leases that
+			// govern retention. A scanner-wide fallback here could keep a
+			// political-only notification alive after its shorter source lease.
+			expiresAt = maxSourceLeaseExpiry(leases, leases[0].ExpiresAt)
+		}
 		item := store.WatchlistItem{
 			Ticker:     sc.candidate.Ticker,
 			Platform:   "stock",
@@ -570,6 +617,7 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			ExecutionProfile:                executionProfile,
 			ScannerRunID:                    recorder.run.ID,
 			ExpiresAt:                       &expiresAt,
+			SourceLeases:                    leases,
 			PullbackRequalificationComplete: sc.candidate.PullbackQualificationKnown,
 		}
 		if err := s.renewScannerCycleBeforePromotion(ctx, cycleKey, cycleOwner, interval); err != nil {
@@ -644,6 +692,8 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			item.GraphContext = fallback.GraphContext
 			item.DiscoveryContext = fallbackDiscovery
 			item.ExecutionProfile = fallbackProfile
+			now = s.now()
+			item.SourceLeases = s.scannerSourceLeases(fallback, fallbackDiscovery, now)
 			item.PullbackRequalificationComplete =
 				fallback.PullbackQualificationKnown
 			sc = scoredCandidate{candidate: fallback, score: fallbackScore}
@@ -660,7 +710,9 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			}
 			promotionState[index] = sc
 			scored[index] = sc
-			expiresAt = s.now().AddDate(0, 0, s.candidateTTLDays(sc.candidate))
+			if len(item.SourceLeases) > 0 {
+				expiresAt = maxSourceLeaseExpiry(item.SourceLeases, item.SourceLeases[0].ExpiresAt)
+			}
 			item.ExpiresAt = &expiresAt
 			if err := s.renewScannerCycleBeforePromotion(ctx, cycleKey, cycleOwner, interval); err != nil {
 				return err
@@ -751,6 +803,249 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 	}
 
 	return nil
+}
+
+func deduplicateScannerCandidates(candidates []SwingCandidate) []SwingCandidate {
+	byTicker := make(map[string]int, len(candidates))
+	out := make([]SwingCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		captureSourceGraphContext(&candidate)
+		key := normalizePromotionKey(candidate.Ticker)
+		if index, exists := byTicker[key]; exists {
+			merged := &out[index]
+			captureSourceGraphContext(merged)
+			merged.Sources = mergeSources(merged.Sources, candidate.Sources)
+			if merged.SourceScores == nil {
+				merged.SourceScores = make(map[string]float64)
+			}
+			for source, score := range candidate.SourceScores {
+				merged.SourceScores[source] = score
+			}
+			if merged.GraphContext == "" {
+				merged.GraphContext = candidate.GraphContext
+			}
+			for source, context := range candidate.sourceGraphContexts {
+				if merged.sourceGraphContexts == nil {
+					merged.sourceGraphContexts = make(map[string]string)
+				}
+				merged.sourceGraphContexts[source] = context
+			}
+			if hasSource(candidate.Sources, "news_sympathy") {
+				// A sympathy source owns its seed trigger and relationship. Keep
+				// those fields even when an ordinary/graph candidate was first.
+				merged.SympathySeed = candidate.SympathySeed
+				merged.SympathyRelationship = candidate.SympathyRelationship
+				if candidate.SympathyTrigger != nil {
+					trigger := *candidate.SympathyTrigger
+					merged.SympathyTrigger = &trigger
+				} else {
+					// Compatibility for an old in-memory candidate that predates the
+					// source-owned trigger. Fresh sympathy candidates never place the
+					// seed article in the shared ticker-news slice.
+					merged.News = append(append([]SwingNewsItem(nil), candidate.News...), merged.News...)
+				}
+			} else if len(merged.News) == 0 {
+				merged.News = append([]SwingNewsItem(nil), candidate.News...)
+			}
+			continue
+		}
+		byTicker[key] = len(out)
+		out = append(out, candidate)
+	}
+	return out
+}
+
+func captureSourceGraphContext(candidate *SwingCandidate) {
+	if candidate.GraphContext == "" {
+		return
+	}
+	for _, source := range candidate.Sources {
+		if source != "graph_neighbor" && source != "news_sympathy" {
+			continue
+		}
+		if candidate.sourceGraphContexts == nil {
+			candidate.sourceGraphContexts = make(map[string]string)
+		}
+		candidate.sourceGraphContexts[source] = candidate.GraphContext
+	}
+}
+
+func (s *MarketScanner) refreshActiveSourceLeases(
+	ctx context.Context, candidates []SwingCandidate, scannerRunID string, cycleLease *store.ScannerCycleLease,
+) (map[string]bool, error) {
+	items, err := store.GetWatchlistItems(ctx, true)
+	if err != nil {
+		return nil, err
+	}
+	active := make(map[string]struct{}, len(items))
+	handled := make(map[string]bool)
+	for _, item := range items {
+		if item.Source == "scanner" {
+			active[normalizePromotionKey(item.Ticker)] = struct{}{}
+		}
+	}
+	for _, candidate := range candidates {
+		if _, ok := active[normalizePromotionKey(candidate.Ticker)]; !ok {
+			continue
+		}
+		refreshCandidate := candidate
+		for {
+			// The profile is validation scaffolding only. The store preserves the
+			// original one on an active-row refresh; it is never re-scored here.
+			discovery, profile, err := buildScannerTradeProfile(refreshCandidate, SwingScoreResult{})
+			if err != nil {
+				return nil, fmt.Errorf("build refresh profile for %s: %w", refreshCandidate.Ticker, err)
+			}
+			now := s.now()
+			leases := s.scannerSourceLeases(refreshCandidate, discovery, now)
+			expiresAt := now.AddDate(0, 0, s.candidateTTLDays(refreshCandidate))
+			if len(leases) > 0 {
+				expiresAt = maxSourceLeaseExpiry(leases, leases[0].ExpiresAt)
+			}
+			item := store.WatchlistItem{
+				Ticker: refreshCandidate.Ticker, Platform: "stock", Source: "scanner",
+				Strategies: scannerCandidateStrategies(refreshCandidate, SwingScoreResult{}),
+				Timeframes: []string{"1H", "4H"}, DiscoveryContext: discovery,
+				ExecutionProfile: profile, ScannerRunID: scannerRunID, ExpiresAt: &expiresAt,
+				GraphContext:                    refreshCandidate.GraphContext,
+				SourceLeases:                    leases,
+				PullbackRequalificationComplete: refreshCandidate.PullbackQualificationKnown,
+			}
+			claims := scannerSourcePromotionClaims(refreshCandidate)
+			if claims.WeeklyLeader != nil || claims.PotentIndustry != nil ||
+				claims.PremarketEpisodic != nil || claims.PoliticalDisclosure != nil {
+				err = store.RefreshScannerSourcesOnActiveWatchlist(
+					ctx, item, claims, "meaningful scanner evidence refreshed an active watchlist lease", now, cycleLease,
+				)
+			} else {
+				_, err = store.RefreshActiveScannerWatchlistItem(ctx, item, cycleLease)
+			}
+			if errors.Is(err, store.ErrWatchlistRefreshNotActive) {
+				// It will be handled by normal scoring if it is not active by the
+				// later exposure filter; do not turn this refresh into re-admission.
+				break
+			}
+			if errors.Is(err, store.ErrScannerSourcePromotionClaimLost) {
+				var claimErr *store.ScannerSourcePromotionClaimError
+				if errors.As(err, &claimErr) {
+					if fallback, ok := candidateAfterPromotionClaimLoss(refreshCandidate, claimErr.Source); ok {
+						refreshCandidate = fallback
+						continue
+					}
+				}
+				// No safe reduced provenance exists (for example, premarket data
+				// cannot be reconstructed). Keep the remaining claims retryable.
+				handled[normalizePromotionKey(candidate.Ticker)] = true
+				slog.Info("scanner: active source refresh lost stale claim", "ticker", refreshCandidate.Ticker)
+				break
+			}
+			if err != nil {
+				return nil, fmt.Errorf("refresh %s: %w", refreshCandidate.Ticker, err)
+			}
+			handled[normalizePromotionKey(candidate.Ticker)] = true
+			break
+		}
+	}
+	return handled, nil
+}
+
+func (s *MarketScanner) enrichActiveRefreshCandidates(
+	ctx context.Context, candidates []SwingCandidate,
+) ([]SwingCandidate, error) {
+	if len(candidates) == 0 {
+		return candidates, nil
+	}
+	items, err := store.GetWatchlistItems(ctx, true)
+	if err != nil {
+		return nil, err
+	}
+	active := make(map[string]store.WatchlistItem, len(items))
+	for _, item := range items {
+		if item.Source == "scanner" {
+			active[normalizePromotionKey(item.Ticker)] = item
+		}
+	}
+	refresh := make([]SwingCandidate, 0, len(active))
+	refreshIndexes := make([]int, 0, len(active))
+	for index, candidate := range candidates {
+		if _, ok := active[normalizePromotionKey(candidate.Ticker)]; ok {
+			refresh = append(refresh, candidate)
+			refreshIndexes = append(refreshIndexes, index)
+		}
+	}
+	if len(refresh) == 0 {
+		return candidates, nil
+	}
+	for index := range refresh {
+		if s.News == nil {
+			restoreActiveRefreshNews(&refresh[index], active[normalizePromotionKey(refresh[index].Ticker)])
+			continue
+		}
+		rawNews, err := s.News.FetchNews(ctx, refresh[index].Ticker,
+			s.now().Add(-time.Duration(s.Cfg.NewsLookbackHours)*time.Hour))
+		if err != nil {
+			// A transient provider failure is not fresh "no news" evidence. Keep
+			// the persisted source view so it cannot alter a lease fingerprint or
+			// erase analyst provenance.
+			// The immutable sympathy trigger is held separately. Preserve the
+			// persisted ticker-specific news on transient provider failures so
+			// ordinary leases cannot churn because enrichment was unavailable.
+			restoreActiveRefreshNews(&refresh[index], active[normalizePromotionKey(refresh[index].Ticker)])
+			continue
+		}
+		if len(rawNews) > maxNewsPerTicker {
+			rawNews = rawNews[:maxNewsPerTicker]
+		}
+		refresh[index].News = refresh[index].News[:0]
+		for _, news := range rawNews {
+			sentiment := "NEUTRAL"
+			if news.SentimentScore > sentimentPositiveThreshold {
+				sentiment = "POSITIVE"
+			} else if news.SentimentScore < sentimentNegativeThreshold {
+				sentiment = "NEGATIVE"
+			}
+			refresh[index].News = append(refresh[index].News, SwingNewsItem{
+				Headline: news.Headline, Sentiment: sentiment, PublishedAt: news.PublishedAt,
+			})
+		}
+	}
+	out := append([]SwingCandidate(nil), candidates...)
+	for index, candidate := range refresh {
+		out[refreshIndexes[index]] = candidate
+	}
+	return out, nil
+}
+
+func restoreActiveRefreshNews(candidate *SwingCandidate, item store.WatchlistItem) {
+	candidate.News = scannerDiscoveryNews(item.DiscoveryContext)
+}
+
+func scannerDiscoveryNews(discovery *tradeprofile.DiscoveryContext) []SwingNewsItem {
+	if discovery == nil {
+		return nil
+	}
+	for _, source := range discovery.Sources {
+		if source == "news_sympathy" {
+			continue
+		}
+		var evidence struct {
+			RecentNews []SwingNewsItem `json:"recent_news"`
+		}
+		if json.Unmarshal(discovery.EvidenceBySource[source], &evidence) == nil && len(evidence.RecentNews) > 0 {
+			return append([]SwingNewsItem(nil), evidence.RecentNews...)
+		}
+	}
+	return nil
+}
+
+func scannerNewsSentiment(score float64) string {
+	if score > sentimentPositiveThreshold {
+		return "POSITIVE"
+	}
+	if score < sentimentNegativeThreshold {
+		return "NEGATIVE"
+	}
+	return "NEUTRAL"
 }
 
 type pullbackQualification struct {
@@ -959,6 +1254,9 @@ func (s *MarketScanner) fetchCandidates(ctx context.Context) ([]SwingCandidate, 
 			ChangePct: m.GapPct,
 			Volume:    m.PreMarketVol,
 			Sources:   []string{"mover"},
+			sourceMarketObservations: map[string]map[string]any{
+				"mover": moverMarketObservation(m.PreMarketLast, m.GapPct, m.PreMarketVol),
+			},
 		}
 	}
 
@@ -974,6 +1272,10 @@ func (s *MarketScanner) fetchCandidates(ctx context.Context) ([]SwingCandidate, 
 	for _, a := range actives {
 		if existing, ok := byTicker[a.Ticker]; ok {
 			existing.Sources = append(existing.Sources, "active")
+			if existing.sourceMarketObservations == nil {
+				existing.sourceMarketObservations = make(map[string]map[string]any)
+			}
+			existing.sourceMarketObservations["active"] = activeMarketObservation(a.Price, a.Volume, a.TradeCount)
 			if a.Volume > existing.Volume {
 				existing.Volume = a.Volume
 			}
@@ -987,6 +1289,9 @@ func (s *MarketScanner) fetchCandidates(ctx context.Context) ([]SwingCandidate, 
 				Volume:     a.Volume,
 				TradeCount: a.TradeCount,
 				Sources:    []string{"active"},
+				sourceMarketObservations: map[string]map[string]any{
+					"active": activeMarketObservation(a.Price, a.Volume, a.TradeCount),
+				},
 			}
 		}
 	}
@@ -1089,13 +1394,34 @@ func (s *MarketScanner) filterExistingWatchlist(ctx context.Context, candidates 
 		return nil, err
 	}
 	existing := make(map[string]struct{}, len(items))
+	now := s.now()
 	for _, item := range items {
+		// An additive context can keep an expired scanner row visible for engine
+		// analysis. It is no longer scanner-resident, so fresh scanner evidence
+		// must proceed through ordinary scoring and cap admission.
+		if expiredScannerResidency(item, now) {
+			continue
+		}
 		if key := normalizePromotionKey(item.Ticker); key != "" {
 			existing[key] = struct{}{}
 		}
 	}
 
 	return filterActiveCandidates(candidates, existing), nil
+}
+
+func expiredScannerResidency(item store.WatchlistItem, now time.Time) bool {
+	if !item.ScannerOrigin {
+		return false
+	}
+	// An earnings context may take over an expired scanner row and intentionally
+	// clear the row-level expiry. Its durable scanner origin still means fresh
+	// scanner evidence must re-enter normal admission rather than be filtered as
+	// an ordinary earnings watchlist duplicate.
+	if item.Source == "earnings_watchlist" && item.ExpiresAt == nil {
+		return true
+	}
+	return item.ExpiresAt != nil && !item.ExpiresAt.After(now)
 }
 
 func filterActiveCandidates(

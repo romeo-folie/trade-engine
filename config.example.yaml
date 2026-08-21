@@ -901,7 +901,7 @@ scanner:
   enabled: false
   scan_interval_hours: 2       # Scan cadence during market hours (9:30–16:00 ET)
   candidate_cap: 10            # Max scanner-sourced items on the watchlist at once
-  ttl_days: 3                  # Auto-expire scanner picks after N days without a signal
+  ttl_days: 3                  # Default source-lease duration; expire only after every scanner source lease ends
   min_conviction: 0.65         # Min LLM conviction to add — discovery gate, not trade approval
   news_lookback_hours: 24      # News window when enriching candidates before scoring
   top_movers: 20               # Top gainers+losers fetched per scan
@@ -1026,7 +1026,10 @@ scanner:
     promote_candidates: false              # Observation-only until explicitly enabled
     max_candidates_per_run: 20             # Bound filing-driven LLM reviews per scan
     claim_lease_minutes: 60                 # Reclaim a scanner cycle that crashed mid-review
-    ttl_days: 7                             # Filing freshness window for scanner eligibility; watchlist uses scanner.ttl_days
+    ttl_days: 7                             # Legacy fallback for all three windows; retain when upgrading an existing config
+    trigger_lookback_days: 7                # New/retried filing must be this recent to enter promotion
+    analyst_evidence_horizon_days: 30       # Older completed filings retained in the analyst's disclosure context
+    watchlist_lease_days: 7                 # Meaningful new disclosure evidence renews this source's residency lease
   graph_neighbors:
     enabled: false             # Source candidates from knowledge-graph neighbors of manually-watched tickers
     max_per_scan: 5            # Cap graph candidates per scan so they don't crowd out screener picks

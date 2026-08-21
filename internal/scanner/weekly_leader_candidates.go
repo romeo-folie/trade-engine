@@ -160,6 +160,10 @@ func cloneSwingCandidate(candidate SwingCandidate) SwingCandidate {
 	clone := candidate
 	clone.Sources = append([]string(nil), candidate.Sources...)
 	clone.News = append([]SwingNewsItem(nil), candidate.News...)
+	if candidate.SympathyTrigger != nil {
+		trigger := *candidate.SympathyTrigger
+		clone.SympathyTrigger = &trigger
+	}
 	clone.PoliticalDisclosureClaimReportIDs = append(
 		[]string(nil), candidate.PoliticalDisclosureClaimReportIDs...,
 	)
@@ -171,6 +175,22 @@ func cloneSwingCandidate(candidate SwingCandidate) SwingCandidate {
 		clone.SourceScores = make(map[string]float64, len(candidate.SourceScores))
 		for source, score := range candidate.SourceScores {
 			clone.SourceScores[source] = score
+		}
+	}
+	if candidate.sourceMarketObservations != nil {
+		clone.sourceMarketObservations = make(map[string]map[string]any, len(candidate.sourceMarketObservations))
+		for source, observation := range candidate.sourceMarketObservations {
+			copy := make(map[string]any, len(observation))
+			for key, value := range observation {
+				copy[key] = value
+			}
+			clone.sourceMarketObservations[source] = copy
+		}
+	}
+	if candidate.sourceGraphContexts != nil {
+		clone.sourceGraphContexts = make(map[string]string, len(candidate.sourceGraphContexts))
+		for source, context := range candidate.sourceGraphContexts {
+			clone.sourceGraphContexts[source] = context
 		}
 	}
 	if candidate.UniverseMember != nil {

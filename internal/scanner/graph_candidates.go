@@ -60,15 +60,21 @@ func (s *MarketScanner) graphNeighborCandidates(ctx context.Context, existing []
 	// Safe in the single-threaded scan loop: no watchlist writes occur between this
 	// read and step 3.
 	covered := make(map[string]struct{}, len(items)+len(existing))
+	refreshable := make(map[string]bool, len(items))
 	var seeds []string
 	for _, it := range items {
-		covered[strings.ToUpper(it.Ticker)] = struct{}{}
+		refreshable[strings.ToUpper(it.Ticker)] = it.Source == "scanner"
+		if !it.ScannerOrigin {
+			covered[strings.ToUpper(it.Ticker)] = struct{}{}
+		}
 		if it.Source != "scanner" && it.Source != "earnings_watchlist" {
 			seeds = append(seeds, it.Ticker)
 		}
 	}
 	for _, c := range existing {
-		covered[strings.ToUpper(c.Ticker)] = struct{}{}
+		if !refreshable[strings.ToUpper(c.Ticker)] {
+			covered[strings.ToUpper(c.Ticker)] = struct{}{}
+		}
 	}
 
 	if len(seeds) == 0 {
@@ -129,9 +135,13 @@ func (s *MarketScanner) graphNeighborCandidates(ctx context.Context, existing []
 	// budget and starve valid lower-ranked neighbours. Keep pricing down the ranking
 	// until the budget fills.
 	var out []SwingCandidate
+	admissions := 0
 	for _, n := range ranked {
-		if len(out) >= maxPerScan || ctx.Err() != nil {
+		if ctx.Err() != nil {
 			break
+		}
+		if admissions >= maxPerScan && !refreshable[strings.ToUpper(n.Ticker)] {
+			continue
 		}
 		q, err := s.AlpacaClient.FetchQuote(ctx, n.Ticker)
 		if err != nil || q == nil || q.Last <= 0 {
@@ -145,6 +155,9 @@ func (s *MarketScanner) graphNeighborCandidates(ctx context.Context, existing []
 			Sources:      []string{"graph_neighbor"},
 			GraphContext: graphLinkPhrase(n),
 		})
+		if !refreshable[strings.ToUpper(n.Ticker)] {
+			admissions++
+		}
 	}
 	return out
 }

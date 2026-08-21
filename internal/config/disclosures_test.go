@@ -59,6 +59,49 @@ func TestValidateDisclosureBudgetCoversEnabledSources(t *testing.T) {
 	}
 }
 
+func TestPoliticalDisclosureTimingSplitFallsBackForLegacyConfigAndValidatesExplicitValues(t *testing.T) {
+	legacy := PoliticalDisclosureScannerConfig{TTLDays: 7}
+	if legacy.TriggerWindowDays() != 7 || legacy.EvidenceHorizonDays() != 7 || legacy.WatchlistLeaseWindowDays() != 7 {
+		t.Fatalf("legacy timing fallback = %+v", legacy)
+	}
+	loaded := Defaults()
+	loaded.Scanner.PoliticalDisclosures.TTLDays = 9
+	migratePoliticalDisclosureTimingConfig(loaded, []byte("scanner:\n  political_disclosures:\n    ttl_days: 9\n"))
+	if got := loaded.Scanner.PoliticalDisclosures; got.TriggerLookbackDays != 9 ||
+		got.AnalystEvidenceHorizonDays != 9 || got.WatchlistLeaseDays != 9 {
+		t.Fatalf("legacy config migration = %+v, want all timing values 9", got)
+	}
+	cfg := Defaults()
+	cfg.Scanner.Enabled = true
+	cfg.Disclosures.Enabled = true
+	cfg.Disclosures.AcknowledgeUseRestrictions = true
+	cfg.Scanner.PoliticalDisclosures.Enabled = true
+	cfg.Scanner.PoliticalDisclosures.TriggerLookbackDays = -1
+	cfg.Scanner.PoliticalDisclosures.AnalystEvidenceHorizonDays = -1
+	cfg.Scanner.PoliticalDisclosures.WatchlistLeaseDays = -1
+	errs := Validate(cfg)
+	for _, field := range []string{"trigger_lookback_days", "analyst_evidence_horizon_days", "watchlist_lease_days"} {
+		if !containsConfigError(errs, field) {
+			t.Fatalf("validation errors %v did not include %s", errs, field)
+		}
+	}
+	explicitZero := Defaults()
+	explicitZero.Scanner.Enabled = true
+	explicitZero.Disclosures.Enabled = true
+	explicitZero.Disclosures.AcknowledgeUseRestrictions = true
+	explicitZero.Scanner.PoliticalDisclosures.Enabled = true
+	explicitZero.Scanner.PoliticalDisclosures.TTLDays = 7
+	explicitZero.Scanner.PoliticalDisclosures.TriggerLookbackDays = 0
+	explicitZero.Scanner.PoliticalDisclosures.AnalystEvidenceHorizonDays = 0
+	explicitZero.Scanner.PoliticalDisclosures.WatchlistLeaseDays = 0
+	migratePoliticalDisclosureTimingConfig(explicitZero, []byte("scanner:\n  political_disclosures:\n    ttl_days: 7\n    trigger_lookback_days: 0\n    analyst_evidence_horizon_days: 0\n    watchlist_lease_days: 0\n"))
+	for _, field := range []string{"trigger_lookback_days", "analyst_evidence_horizon_days", "watchlist_lease_days"} {
+		if !containsConfigError(Validate(explicitZero), field) {
+			t.Fatalf("explicit zero validation errors %v did not include %s", Validate(explicitZero), field)
+		}
+	}
+}
+
 func TestValidateDisclosuresConfigReportsInvalidEnabledSettingsDeterministically(t *testing.T) {
 	cfg := Defaults().Disclosures
 	cfg.Enabled = true

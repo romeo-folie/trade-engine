@@ -17,10 +17,11 @@ import (
 // sympathyTrigger is a fresh, sentiment-strong article on a watched seed ticker
 // that qualifies to fan out to the seed's graph neighbours.
 type sympathyTrigger struct {
-	Seed      string
-	Headline  string
-	Sentiment float64
-	AgeHours  float64
+	Seed        string
+	Headline    string
+	Sentiment   float64
+	AgeHours    float64
+	PublishedAt time.Time
 }
 
 // newsSympathyCandidates sources candidates from live news events: when a fresh,
@@ -80,15 +81,21 @@ func (s *MarketScanner) newsSympathyCandidates(ctx context.Context, existing []S
 	}
 
 	covered := make(map[string]struct{}, len(items)+len(existing))
+	refreshable := make(map[string]bool, len(items))
 	var seeds []string
 	for _, it := range items {
-		covered[strings.ToUpper(it.Ticker)] = struct{}{}
+		refreshable[strings.ToUpper(it.Ticker)] = it.Source == "scanner"
+		if !it.ScannerOrigin {
+			covered[strings.ToUpper(it.Ticker)] = struct{}{}
+		}
 		if it.Source != "scanner" && it.Source != "earnings_watchlist" {
 			seeds = append(seeds, it.Ticker)
 		}
 	}
 	for _, c := range existing {
-		covered[strings.ToUpper(c.Ticker)] = struct{}{}
+		if !refreshable[strings.ToUpper(c.Ticker)] {
+			covered[strings.ToUpper(c.Ticker)] = struct{}{}
+		}
 	}
 	if len(seeds) == 0 {
 		return nil
@@ -169,9 +176,13 @@ func (s *MarketScanner) newsSympathyCandidates(ctx context.Context, existing []S
 
 	// Cap applies to PRICED candidates (same rationale as graph sourcing).
 	var out []SwingCandidate
+	admissions := 0
 	for _, p := range ranked {
-		if len(out) >= maxPerScan || ctx.Err() != nil {
+		if ctx.Err() != nil {
 			break
+		}
+		if admissions >= maxPerScan && !refreshable[strings.ToUpper(p.neighbor.Ticker)] {
+			continue
 		}
 		q, err := s.AlpacaClient.FetchQuote(ctx, p.neighbor.Ticker)
 		if err != nil || q == nil || q.Last <= 0 {
@@ -184,7 +195,14 @@ func (s *MarketScanner) newsSympathyCandidates(ctx context.Context, existing []S
 			Price:        q.Last,
 			Sources:      []string{"news_sympathy"},
 			GraphContext: sympathyPhrase(p.trigger, p.neighbor),
+			SympathySeed: p.trigger.Seed, SympathyRelationship: graphLinkPhrase(p.neighbor),
+			SympathyTrigger: &SwingNewsItem{
+				Headline: p.trigger.Headline, Sentiment: scannerNewsSentiment(p.trigger.Sentiment), PublishedAt: p.trigger.PublishedAt,
+			},
 		})
+		if !refreshable[strings.ToUpper(p.neighbor.Ticker)] {
+			admissions++
+		}
 		s.markSympathyFired(p.trigger.Seed, p.neighbor.Ticker, now)
 	}
 	return out
@@ -210,10 +228,11 @@ func pickSympathyTrigger(seed string, news []data.NewsItem, now time.Time, minAb
 		return sympathyTrigger{}, false
 	}
 	return sympathyTrigger{
-		Seed:      seed,
-		Headline:  bestItem.Headline,
-		Sentiment: bestItem.SentimentScore,
-		AgeHours:  now.Sub(bestItem.PublishedAt).Hours(),
+		Seed:        seed,
+		Headline:    bestItem.Headline,
+		Sentiment:   bestItem.SentimentScore,
+		AgeHours:    now.Sub(bestItem.PublishedAt).Hours(),
+		PublishedAt: bestItem.PublishedAt,
 	}, true
 }
 

@@ -379,13 +379,26 @@ func TestCanonicalPoliticalFilerIdentityNormalizesTitlesButKeepsSuffixes(t *test
 	}
 }
 
-func TestPoliticalDisclosureTTL(t *testing.T) {
+func TestPoliticalDisclosureLeaseTTLIsIndependentFromScannerAndTriggerWindows(t *testing.T) {
 	scanner := MarketScanner{Cfg: config.ScannerConfig{
-		TTLDays:              3,
-		PoliticalDisclosures: config.PoliticalDisclosureScannerConfig{TTLDays: 7},
+		TTLDays: 3,
+		PoliticalDisclosures: config.PoliticalDisclosureScannerConfig{
+			TTLDays: 7, TriggerLookbackDays: 2, AnalystEvidenceHorizonDays: 30,
+			WatchlistLeaseDays: 11,
+		},
 	}}
-	if got := scanner.candidateTTLDays(SwingCandidate{Sources: []string{"political_disclosure"}}); got != 3 {
-		t.Fatalf("disclosure provenance changed watchlist scheduling: TTL = %d, want 3", got)
+	if got := scanner.sourceLeaseTTLDays("political_disclosure"); got != 11 {
+		t.Fatalf("disclosure watchlist lease = %d, want 11", got)
+	}
+	if got := scanner.Cfg.PoliticalDisclosures.TriggerWindowDays(); got != 2 {
+		t.Fatalf("disclosure trigger window = %d, want 2", got)
+	}
+	if got := scanner.Cfg.PoliticalDisclosures.EvidenceHorizonDays(); got != 30 {
+		t.Fatalf("disclosure evidence horizon = %d, want 30", got)
+	}
+	legacy := config.PoliticalDisclosureScannerConfig{TTLDays: 7}
+	if legacy.TriggerWindowDays() != 7 || legacy.EvidenceHorizonDays() != 7 || legacy.WatchlistLeaseWindowDays() != 7 {
+		t.Fatalf("legacy ttl_days did not safely backfill split windows: %+v", legacy)
 	}
 }
 
