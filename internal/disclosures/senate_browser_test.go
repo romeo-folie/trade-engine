@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/chromedp/chromedp"
 	"github.com/dop251/goja"
 )
 
@@ -258,6 +259,175 @@ func TestSenateBrowserStartupIsBoundedByRequestContext(t *testing.T) {
 	}
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("startup error = %v, want context.Canceled", err)
+	}
+}
+
+func TestSenateBrowserStartupUsesPersistentContext(t *testing.T) {
+	browser, err := NewSenateChromeTransport(SenateBrowserOptions{
+		BaseURL: "https://efdsearch.senate.gov", ProfileDir: filepath.Join(t.TempDir(), "profile"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var startupContext context.Context
+	gracefulCancels := 0
+	browser.runBrowser = func(ctx context.Context, _ ...chromedp.Action) error {
+		startupContext = ctx
+		return nil
+	}
+	browser.gracefulCancel = func(context.Context) error {
+		gracefulCancels++
+		return nil
+	}
+	request, cancel := context.WithCancel(context.Background())
+	if err := browser.startLockedWithContext(request); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	if startupContext != browser.browserContext {
+		t.Fatal("Chrome startup did not use the persistent browser context")
+	}
+	if err := browser.browserContext.Err(); err != nil {
+		t.Fatalf("request cancellation stopped persistent browser: %v", err)
+	}
+	if err := browser.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if gracefulCancels != 1 {
+		t.Fatalf("graceful close calls = %d, want 1", gracefulCancels)
+	}
+	if err := browser.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if gracefulCancels != 1 {
+		t.Fatalf("repeated graceful close calls = %d, want 1", gracefulCancels)
+	}
+}
+
+func TestSenateBrowserCanceledOperationKeepsTransportRunning(t *testing.T) {
+	browser, err := NewSenateChromeTransport(SenateBrowserOptions{
+		BaseURL: "https://efdsearch.senate.gov", ProfileDir: filepath.Join(t.TempDir(), "profile"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	browser.browserContext, browser.browserCancel = context.WithCancel(context.Background())
+	defer browser.Close()
+	browser.runBrowser = func(ctx context.Context, _ ...chromedp.Action) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	request, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- browser.runLocked(request) }()
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled browser operation error = %v", err)
+	}
+	if err := browser.browserContext.Err(); err != nil {
+		t.Fatalf("canceled operation stopped transport: %v", err)
+	}
+}
+
+func TestSenateBrowserAbortedStartupCleansUp(t *testing.T) {
+	for _, test := range []struct {
+		name             string
+		timeout          time.Duration
+		cancelRequest    bool
+		wantCancellation error
+	}{
+		{name: "request cancellation", timeout: time.Second, cancelRequest: true, wantCancellation: context.Canceled},
+		{name: "startup timeout", timeout: 10 * time.Millisecond, wantCancellation: context.DeadlineExceeded},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			browser, err := NewSenateChromeTransport(SenateBrowserOptions{
+				BaseURL: "https://efdsearch.senate.gov", ProfileDir: filepath.Join(t.TempDir(), "profile"),
+				Timeout: test.timeout,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			started := make(chan struct{})
+			var startupContext context.Context
+			gracefulCancels := 0
+			browser.gracefulCancel = func(context.Context) error {
+				gracefulCancels++
+				return nil
+			}
+			browser.runBrowser = func(ctx context.Context, _ ...chromedp.Action) error {
+				startupContext = ctx
+				close(started)
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			request, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			result := make(chan error, 1)
+			go func() { result <- browser.startLockedWithContext(request) }()
+			<-started
+			if test.cancelRequest {
+				cancel()
+			}
+			err = <-result
+			if !errors.Is(err, test.wantCancellation) {
+				t.Fatalf("startup error = %v, want %v", err, test.wantCancellation)
+			}
+			if browser.allocatorContext != nil || browser.allocatorCancel != nil ||
+				browser.browserContext != nil || browser.browserCancel != nil {
+				t.Fatal("aborted startup left browser state behind")
+			}
+			if gracefulCancels != 0 {
+				t.Fatalf("aborted startup graceful close calls = %d, want 0", gracefulCancels)
+			}
+			if !errors.Is(startupContext.Err(), context.Canceled) {
+				t.Fatalf("aborted startup lifetime error = %v, want context.Canceled", startupContext.Err())
+			}
+		})
+	}
+}
+
+func TestSenateBrowserRestoreFailureCleansUp(t *testing.T) {
+	browser, err := NewSenateChromeTransport(SenateBrowserOptions{
+		BaseURL: "https://efdsearch.senate.gov", ProfileDir: filepath.Join(t.TempDir(), "profile"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(browser.ProfileDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(browser.ProfileDir(), ".tradeengine-senate-profile"), []byte("fixture"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeSenateBrowserSessionState(browser.sessionPath(), senateBrowserSessionState{Version: 1, Cookies: []senateStoredCookie{{
+		Name: "sessionid", Value: "value", Domain: "efdsearch.senate.gov", Path: "/",
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	restoreErr := errors.New("restore failed")
+	calls := 0
+	gracefulCancels := 0
+	browser.gracefulCancel = func(context.Context) error {
+		gracefulCancels++
+		return nil
+	}
+	browser.runBrowser = func(context.Context, ...chromedp.Action) error {
+		calls++
+		if calls == 2 {
+			return restoreErr
+		}
+		return nil
+	}
+	err = browser.startLockedWithContext(context.Background())
+	if !errors.Is(err, restoreErr) {
+		t.Fatalf("start error = %v, want restore failure", err)
+	}
+	if browser.allocatorContext != nil || browser.allocatorCancel != nil ||
+		browser.browserContext != nil || browser.browserCancel != nil {
+		t.Fatal("restore failure left browser state behind")
+	}
+	if gracefulCancels != 1 {
+		t.Fatalf("restore failure graceful close calls = %d, want 1", gracefulCancels)
 	}
 }
 

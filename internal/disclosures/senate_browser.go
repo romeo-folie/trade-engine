@@ -44,6 +44,9 @@ type SenateChromeTransport struct {
 	allocatorCancel  context.CancelFunc
 	browserContext   context.Context
 	browserCancel    context.CancelFunc
+	browserReady     bool
+	runBrowser       func(context.Context, ...chromedp.Action) error
+	gracefulCancel   func(context.Context) error
 }
 
 type senateBrowserPageState struct {
@@ -342,18 +345,45 @@ func (t *SenateChromeTransport) Close() error {
 
 func (t *SenateChromeTransport) stopLocked() error {
 	var closeErr error
-	if t.browserContext != nil {
-		closeErr = chromedp.Cancel(t.browserContext)
+	if t.browserReady && t.browserContext != nil {
+		closeErr = t.cancelBrowserGracefully(t.browserContext)
 	}
+	t.cancelBrowserLifetimeLocked()
+	t.clearBrowserStateLocked()
+	return closeErr
+}
+
+// abortStartupLocked stops a first Run that has not yet established a browser.
+// chromedp.Cancel must not race that first Run: it can try to issue Chrome's
+// graceful-close command while allocation is still in progress. Cancel the
+// lifetime contexts instead, wait for Run to observe that cancellation, and
+// only then discard the lifecycle state.
+func (t *SenateChromeTransport) abortStartupLocked(startup <-chan error) {
+	t.cancelBrowserLifetimeLocked()
+	<-startup
+	t.clearBrowserStateLocked()
+}
+
+func (t *SenateChromeTransport) cancelBrowserLifetimeLocked() {
 	if t.browserCancel != nil {
 		t.browserCancel()
 	}
 	if t.allocatorCancel != nil {
 		t.allocatorCancel()
 	}
+}
+
+func (t *SenateChromeTransport) clearBrowserStateLocked() {
 	t.allocatorContext, t.allocatorCancel = nil, nil
 	t.browserContext, t.browserCancel = nil, nil
-	return closeErr
+	t.browserReady = false
+}
+
+func (t *SenateChromeTransport) cancelBrowserGracefully(ctx context.Context) error {
+	if t.gracefulCancel != nil {
+		return t.gracefulCancel(ctx)
+	}
+	return chromedp.Cancel(ctx)
 }
 
 func (t *SenateChromeTransport) startLocked() error {
@@ -363,6 +393,9 @@ func (t *SenateChromeTransport) startLocked() error {
 func (t *SenateChromeTransport) startLockedWithContext(ctx context.Context) error {
 	if t.browserContext != nil {
 		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("start Senate Chrome profile: %w", err)
 	}
 	marker := filepath.Join(t.opts.ProfileDir, ".tradeengine-senate-profile")
 	_, statErr := os.Stat(t.opts.ProfileDir)
@@ -411,30 +444,35 @@ func (t *SenateChromeTransport) startLockedWithContext(ctx context.Context) erro
 		allocatorOptions = append(allocatorOptions, chromedp.ExecPath(t.opts.ExecutablePath))
 	}
 	t.allocatorContext, t.allocatorCancel = chromedp.NewExecAllocator(
-		ctx, allocatorOptions...,
+		context.Background(), allocatorOptions...,
 	)
 	t.browserContext, t.browserCancel = chromedp.NewContext(t.allocatorContext)
-	// The first Run allocates Chrome with this context. It must use the
-	// persistent browser context; a short-lived child would own and terminate
-	// the Chrome process when its request timeout is cancelled.
-	startCtx, cancelStart := context.WithTimeout(t.browserContext, t.opts.Timeout)
-	defer cancelStart()
-	if err := chromedp.Run(startCtx); err != nil {
-		t.browserCancel()
-		t.allocatorCancel()
-		t.allocatorContext, t.allocatorCancel = nil, nil
-		t.browserContext, t.browserCancel = nil, nil
+	// Chrome must be allocated by the persistent browser context. The caller
+	// only bounds how long we wait for that allocation, never owns it.
+	browserCtx := t.browserContext
+	startup := make(chan error, 1)
+	go func() { startup <- t.browserRun(browserCtx) }()
+	startupCtx, cancelStartup := context.WithTimeout(ctx, t.opts.Timeout)
+	defer cancelStartup()
+	select {
+	case err := <-startup:
+		if err != nil {
+			_ = t.stopLocked()
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return fmt.Errorf("start Senate Chrome profile: %w", ctxErr)
+			}
+			return fmt.Errorf("start Senate Chrome profile: %w", err)
+		}
+	case <-startupCtx.Done():
+		t.abortStartupLocked(startup)
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return fmt.Errorf("start Senate Chrome profile: %w", ctxErr)
 		}
-		return fmt.Errorf("start Senate Chrome profile: %w", err)
+		return fmt.Errorf("start Senate Chrome profile: %w", startupCtx.Err())
 	}
-	if err := t.restoreSessionLocked(); err != nil {
-		_ = chromedp.Cancel(t.browserContext)
-		t.browserCancel()
-		t.allocatorCancel()
-		t.allocatorContext, t.allocatorCancel = nil, nil
-		t.browserContext, t.browserCancel = nil, nil
+	t.browserReady = true
+	if err := t.restoreSessionLocked(ctx); err != nil {
+		_ = t.stopLocked()
 		return err
 	}
 	return nil
@@ -444,7 +482,7 @@ func (t *SenateChromeTransport) sessionPath() string {
 	return filepath.Join(t.opts.ProfileDir, ".tradeengine-senate-session.json")
 }
 
-func (t *SenateChromeTransport) restoreSessionLocked() error {
+func (t *SenateChromeTransport) restoreSessionLocked(ctx context.Context) error {
 	state, err := readSenateBrowserSessionState(t.sessionPath())
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -472,7 +510,7 @@ func (t *SenateChromeTransport) restoreSessionLocked() error {
 	if len(cookies) == 0 {
 		return nil
 	}
-	if err := t.runLocked(context.Background(), chromedp.ActionFunc(func(ctx context.Context) error {
+	if err := t.runLocked(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
 		return network.SetCookies(cookies).Do(ctx)
 	})); err != nil {
 		return fmt.Errorf("restore Senate Chrome session: %w", err)
@@ -551,7 +589,14 @@ func (t *SenateChromeTransport) runLocked(ctx context.Context, actions ...chrome
 		stop()
 		cancel()
 	}()
-	return chromedp.Run(taskContext, actions...)
+	return t.browserRun(taskContext, actions...)
+}
+
+func (t *SenateChromeTransport) browserRun(ctx context.Context, actions ...chromedp.Action) error {
+	if t.runBrowser != nil {
+		return t.runBrowser(ctx, actions...)
+	}
+	return chromedp.Run(ctx, actions...)
 }
 
 func senatePageAuthorized(state senateBrowserPageState) bool {
