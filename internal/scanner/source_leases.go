@@ -26,9 +26,15 @@ func (s *MarketScanner) scannerSourceLeases(
 	leases := make([]store.WatchlistSourceLease, 0, len(discovery.Sources))
 	for _, source := range discovery.Sources {
 		evidence := append(json.RawMessage(nil), discovery.EvidenceBySource[source]...)
+		fingerprintEvidence := evidence
+		if source == "news_sympathy" {
+			// Rendered sympathy prose contains relative article age. Its immutable
+			// news identity below is the lease fingerprint instead.
+			fingerprintEvidence = json.RawMessage(`{}`)
+		}
 		identity := scannerSourceIdentity(candidate, source)
 		fingerprintInput := map[string]any{
-			"source": source, "identity": identity, "evidence": json.RawMessage(evidence),
+			"source": source, "identity": identity, "evidence": json.RawMessage(fingerprintEvidence),
 		}
 		encoded, err := json.Marshal(fingerprintInput)
 		if err != nil {
@@ -93,7 +99,8 @@ func scannerSourceIdentity(candidate SwingCandidate, source string) map[string]a
 	case "graph_neighbor":
 		identity["relationship"] = candidate.GraphContext
 	case "news_sympathy":
-		identity["relationship"] = candidate.GraphContext
+		identity["seed"] = candidate.SympathySeed
+		identity["relationship"] = candidate.SympathyRelationship
 		identity["news"] = scannerNewsIdentity(candidate.News)
 	default:
 		// Movers/actives have no immutable upstream ID. Use the bounded market

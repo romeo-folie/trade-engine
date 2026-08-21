@@ -86,7 +86,9 @@ type SwingCandidate struct {
 	// GraphContext, when set, explains why a knowledge-graph neighbour was surfaced
 	// (e.g. "TSMC (on watchlist) supplies_to this company"). Empty for screener
 	// candidates. Injected into the prompt so the LLM weighs the relational thesis.
-	GraphContext string
+	GraphContext         string
+	SympathySeed         string
+	SympathyRelationship string
 }
 
 // SwingNewsItem is a lightweight news record for prompt injection.

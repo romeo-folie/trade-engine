@@ -30,7 +30,11 @@ ALTER TABLE watchlist
 WITH legacy_sources AS (
     SELECT w.id AS watchlist_id,
            lower(trim(source.value)) AS source,
-           COALESCE(w.discovery_context->'evidence_by_source'->lower(trim(source.value)), '{}'::jsonb) AS evidence,
+           CASE
+             WHEN jsonb_typeof(w.discovery_context->'evidence_by_source'->lower(trim(source.value))) = 'object'
+             THEN w.discovery_context->'evidence_by_source'->lower(trim(source.value))
+             ELSE '{}'::jsonb
+           END AS evidence,
            w.created_at,
            w.updated_at,
            w.expires_at

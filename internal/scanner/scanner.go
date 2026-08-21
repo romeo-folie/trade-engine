@@ -401,7 +401,7 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 		s.markDiscoveryCandidates(ctx, beforeExposureFilter, candidates,
 			"open_position", recorder.run.ID, "ticker already has an open position")
 		beforeWatchlistFilter := candidates
-		candidates = filterActiveCandidates(candidates, exposure.watchlist)
+		candidates = filterActiveCandidates(candidates, exposure.admissionGuard)
 		recorder.markRemoved(beforeWatchlistFilter, candidates, "active_watchlist")
 		s.markDiscoveryCandidates(ctx, beforeWatchlistFilter, candidates,
 			"active_watchlist", recorder.run.ID, "already active on watchlist")
