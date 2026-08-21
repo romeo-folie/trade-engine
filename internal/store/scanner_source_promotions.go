@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -46,10 +47,17 @@ type PremarketEpisodicPromotionClaim struct {
 	Token  string
 }
 
+type PoliticalDisclosurePromotionClaim struct {
+	Ticker    string
+	Token     string
+	ReportIDs []string
+}
+
 type ScannerSourcePromotionClaims struct {
-	WeeklyLeader      *WeeklyLeaderPromotionClaim
-	PotentIndustry    *PotentIndustryPromotionClaim
-	PremarketEpisodic *PremarketEpisodicPromotionClaim
+	WeeklyLeader        *WeeklyLeaderPromotionClaim
+	PotentIndustry      *PotentIndustryPromotionClaim
+	PremarketEpisodic   *PremarketEpisodicPromotionClaim
+	PoliticalDisclosure *PoliticalDisclosurePromotionClaim
 }
 
 // PromoteScannerSourcesToWatchlist validates every discovery-source claim,
@@ -115,7 +123,7 @@ func promoteScannerSourcesToWatchlist(
 ) error {
 	if strings.TrimSpace(item.Ticker) == "" ||
 		(claims.WeeklyLeader == nil && claims.PotentIndustry == nil &&
-			claims.PremarketEpisodic == nil) {
+			claims.PremarketEpisodic == nil && claims.PoliticalDisclosure == nil) {
 		return fmt.Errorf("scanner source watchlist promotion lineage is incomplete")
 	}
 	if claims.WeeklyLeader != nil &&
@@ -138,12 +146,31 @@ func promoteScannerSourcesToWatchlist(
 			strings.TrimSpace(claims.PremarketEpisodic.Token) == "") {
 		return fmt.Errorf("premarket episodic watchlist promotion lineage is incomplete")
 	}
+	if claim := claims.PoliticalDisclosure; claim != nil {
+		reportIDs, ok := normalizePoliticalDisclosureReportIDs(claim.ReportIDs)
+		if claim.Ticker != item.Ticker || strings.TrimSpace(claim.Token) == "" || !ok {
+			return fmt.Errorf("political disclosure watchlist promotion lineage is incomplete")
+		}
+		// Use canonical, deduplicated UUIDs for each lock and terminal update.
+		// This makes the parent-first lock ordering stable even when a caller
+		// supplied equivalent UUID spellings.
+		politicalClaim := *claim
+		politicalClaim.ReportIDs = reportIDs
+		claims.PoliticalDisclosure = &politicalClaim
+	}
 
 	tx, err := GetDB().Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	// Political evidence is an aggregate by ticker. Take its namespace before
+	// any parent/candidate row locks, matching ingestion and claim ordering.
+	if claim := claims.PoliticalDisclosure; claim != nil {
+		if err := lockPoliticalDisclosureTickers(ctx, tx, []string{claim.Ticker}); err != nil {
+			return err
+		}
+	}
 
 	// Match the completion locks in a fixed order. This prevents a newer
 	// completed observation from superseding a claim between validation and
@@ -251,6 +278,72 @@ func promoteScannerSourcesToWatchlist(
 			return &ScannerSourcePromotionClaimError{Source: "premarket_episodic"}
 		}
 	}
+	if claim := claims.PoliticalDisclosure; claim != nil {
+		parentRows, err := tx.Query(ctx, `
+			SELECT id::text, extraction_status
+			FROM political_disclosure_reports
+			WHERE id = ANY($1::uuid[])
+			ORDER BY id
+			FOR UPDATE`, claim.ReportIDs)
+		if err != nil {
+			return fmt.Errorf("lock political disclosure parent reports: %w", err)
+		}
+		parentCount := 0
+		parentsComplete := true
+		for parentRows.Next() {
+			var reportID, extractionStatus string
+			if err := parentRows.Scan(&reportID, &extractionStatus); err != nil {
+				parentRows.Close()
+				return err
+			}
+			parentCount++
+			parentsComplete = parentsComplete && extractionStatus == "completed"
+		}
+		err = parentRows.Err()
+		parentRows.Close()
+		if err != nil {
+			return err
+		}
+		if parentCount != len(claim.ReportIDs) || !parentsComplete {
+			return &ScannerSourcePromotionClaimError{Source: "political_disclosure"}
+		}
+
+		rows, err := tx.Query(ctx, `
+			SELECT c.report_id::text, COALESCE(c.promotion_claim_token,''),
+			       c.promotion_status
+			FROM political_disclosure_candidates c
+			JOIN unnest($2::uuid[]) expected(report_id)
+			  ON c.report_id=expected.report_id
+			WHERE c.ticker=$1
+			ORDER BY c.report_id
+			FOR UPDATE OF c`, claim.Ticker, claim.ReportIDs)
+		if err != nil {
+			return fmt.Errorf("lock political disclosure promotion: %w", err)
+		}
+		found := make(map[string]struct{}, len(claim.ReportIDs))
+		valid := true
+		for rows.Next() {
+			var reportID, token, status string
+			if err := rows.Scan(&reportID, &token, &status); err != nil {
+				rows.Close()
+				return err
+			}
+			_, duplicate := found[reportID]
+			found[reportID] = struct{}{}
+			// Terminal history is fenced alongside the one processing row that
+			// made this aggregate eligible. It must still be owned by this
+			// promotion, but its terminal outcome is deliberately immutable.
+			valid = valid && !duplicate && token == claim.Token
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return err
+		}
+		if len(found) != len(claim.ReportIDs) || !valid {
+			return &ScannerSourcePromotionClaimError{Source: "political_disclosure"}
+		}
+	}
 
 	// Take all potentially blocking source/advisory locks before touching the
 	// lease row. This leaves an expired lease reclaimable while this transaction
@@ -348,5 +441,49 @@ func completeScannerSourcePromotionClaims(
 			return &ScannerSourcePromotionClaimError{Source: "premarket_episodic"}
 		}
 	}
+	if claim := claims.PoliticalDisclosure; claim != nil {
+		tag, err := tx.Exec(ctx, `
+		UPDATE political_disclosure_candidates
+			SET promotion_status=CASE WHEN promotion_status='processing' THEN $4 ELSE promotion_status END,
+			    scanner_run_id=CASE WHEN promotion_status='processing' THEN $5 ELSE scanner_run_id END,
+			    promoted_at=CASE WHEN promotion_status='processing' THEN $6 ELSE promoted_at END,
+			    promotion_reason=CASE WHEN promotion_status='processing' THEN $7 ELSE promotion_reason END,
+			    promotion_claim_token=NULL, promotion_claimed_at=NULL
+			WHERE ticker=$1
+			  AND report_id IN (
+			    SELECT report_id::uuid FROM unnest($2::text[]) expected(report_id)
+			  )
+			  AND promotion_claim_token=$3`,
+			claim.Ticker, claim.ReportIDs, claim.Token, status,
+			nullableUUID(item.ScannerRunID), at, nullableString(reason),
+		)
+		if err != nil {
+			return fmt.Errorf("complete political disclosure watchlist promotion: %w", err)
+		}
+		if tag.RowsAffected() != int64(len(claim.ReportIDs)) {
+			return &ScannerSourcePromotionClaimError{Source: "political_disclosure"}
+		}
+	}
 	return nil
+}
+
+func normalizePoliticalDisclosureReportIDs(reportIDs []string) ([]string, bool) {
+	if len(reportIDs) == 0 {
+		return nil, false
+	}
+	seen := make(map[string]struct{}, len(reportIDs))
+	normalized := make([]string, 0, len(reportIDs))
+	for _, reportID := range reportIDs {
+		parsed, err := uuid.Parse(strings.TrimSpace(reportID))
+		if err != nil {
+			return nil, false
+		}
+		reportID = parsed.String()
+		if _, duplicate := seen[reportID]; duplicate {
+			return nil, false
+		}
+		seen[reportID] = struct{}{}
+		normalized = append(normalized, reportID)
+	}
+	return normalized, true
 }

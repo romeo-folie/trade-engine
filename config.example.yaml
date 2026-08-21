@@ -861,6 +861,38 @@ futures_orb_metals:
       runner_take_profit_r: 0.0
     - { symbol: SI, exchange: COMEX, asset_class: metal, expiry_cycle: monthly, tick_size: 0.005, tick_value: 25.00, tick_buffer: 5, margin_rate: 0.10 }
 
+# ── Congressional financial disclosures ──────────────────────────────────────
+# Ingestion stores official filing observations only. Scanner promotion is a
+# separate opt-in below, and still passes the normal LLM/risk review path.
+disclosures:
+  enabled: false
+  # Review the current official-site terms/use restrictions before enabling.
+  acknowledge_use_restrictions: false
+  sync_interval_hours: 24
+  lookback_days: 90
+  max_reports_per_sync: 250
+  request_timeout_seconds: 30
+  house:
+    enabled: true
+    base_url: https://disclosures-clerk.house.gov/public_disc
+    request_delay_milliseconds: 250
+  senate:
+    enabled: false
+    base_url: https://efdsearch.senate.gov
+    request_delay_milliseconds: 2000
+    # Browser transport uses a dedicated persistent Chrome profile so eFD sees
+    # real browser cookies and network behavior. Empty paths use local defaults.
+    transport: browser
+    browser_profile_dir: ""
+    browser_executable: ""
+    # Required when Senate ingestion is enabled. Review the current eFD use
+    # restrictions before accepting them for this deployment.
+    acknowledge_use_restrictions: false
+  oge:
+    enabled: true
+    base_url: https://extapps2.oge.gov/201/Presiden.nsf/API.xsp/v2/rest
+    request_delay_milliseconds: 250
+
 # ── Market scanner — autonomous candidate discovery ───────────────────────────
 # Runs during market hours, sourcing candidates from screeners (top movers,
 # most active), the knowledge graph, and news-sympathy triggers. Every candidate
@@ -989,6 +1021,12 @@ scanner:
     candidate_cap: 5                       # Top names by prior-session dollar volume
     watchlist_sessions: 5                  # Independent earnings context lifetime in trading sessions
     bar_batch_size: 100                    # Maximum symbols per Alpaca daily-bars request
+  political_disclosures:
+    enabled: false                         # Add persisted STOCK Act tickers to scanner sourcing
+    promote_candidates: false              # Observation-only until explicitly enabled
+    max_candidates_per_run: 20             # Bound filing-driven LLM reviews per scan
+    claim_lease_minutes: 60                 # Reclaim a scanner cycle that crashed mid-review
+    ttl_days: 7                             # Filing freshness window for scanner eligibility; watchlist uses scanner.ttl_days
   graph_neighbors:
     enabled: false             # Source candidates from knowledge-graph neighbors of manually-watched tickers
     max_per_scan: 5            # Cap graph candidates per scan so they don't crowd out screener picks

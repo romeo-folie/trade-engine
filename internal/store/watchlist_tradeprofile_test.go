@@ -23,9 +23,10 @@ func TestWatchlistTradeProfileRoundTrip(t *testing.T) {
 		Strategies: []string{"momentum"}, Timeframes: []string{"1D", "4H"},
 		DiscoveryContext: &tradeprofile.DiscoveryContext{
 			Version: tradeprofile.DiscoveryContextVersion,
-			Sources: []string{"weekly_leader"}, Thesis: "Relative leader with sustained participation.",
+			Sources: []string{"weekly_leader", "political_disclosure"}, Thesis: "Relative leader with disclosure provenance.",
 			EvidenceBySource: map[string]json.RawMessage{
-				"weekly_leader": json.RawMessage(`{"rank":1,"return_6m":72.4}`),
+				"weekly_leader":        json.RawMessage(`{"rank":1,"return_6m":72.4}`),
+				"political_disclosure": json.RawMessage(`{"version":1,"ticker":"PROFILE_RT","distinct_filer_count":2,"distinct_buyer_count":2,"report_count":2,"transaction_count":2,"purchase_count":2,"sale_count":0,"exchange_count":0,"other_transaction_count":0,"purchase_amounts":{"known_transaction_count":0,"unknown_transaction_count":2,"minimum_total":0,"maximum_total":0},"sale_amounts":{"known_transaction_count":0,"unknown_transaction_count":0,"minimum_total":0,"maximum_total":0},"disclosure_lag_days":{"known_transaction_count":0,"minimum_days":0,"maximum_days":0,"latest_transaction_days":0},"repeated_activity_by_one_filer":false,"independent_buyer_activity":true,"contradictory_buying_and_selling":false,"filers":[],"data_quality":{"canonical_identity_basis":"normalized source, chamber, and filer-name tokens"}}`),
 			},
 		},
 		ExecutionProfile: &tradeprofile.ExecutionProfile{
@@ -45,6 +46,11 @@ func TestWatchlistTradeProfileRoundTrip(t *testing.T) {
 	if item.DiscoveryContext == nil || item.DiscoveryContext.Thesis == "" ||
 		item.ExecutionProfile == nil || item.ExecutionProfile.RecommendedLens != "momentum" {
 		t.Fatalf("watchlist trade profile = %+v", item)
+	}
+	var political tradeprofile.PoliticalDisclosureEvidence
+	if err := json.Unmarshal(item.DiscoveryContext.EvidenceBySource["political_disclosure"], &political); err != nil ||
+		political.DistinctFilerCount != 2 || political.DistinctBuyerCount != 2 {
+		t.Fatalf("watchlist political evidence = %+v, err=%v", political, err)
 	}
 
 	items, err := store.GetWatchlistItems(ctx, true)

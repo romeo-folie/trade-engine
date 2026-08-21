@@ -160,6 +160,12 @@ func cloneSwingCandidate(candidate SwingCandidate) SwingCandidate {
 	clone := candidate
 	clone.Sources = append([]string(nil), candidate.Sources...)
 	clone.News = append([]SwingNewsItem(nil), candidate.News...)
+	clone.PoliticalDisclosureClaimReportIDs = append(
+		[]string(nil), candidate.PoliticalDisclosureClaimReportIDs...,
+	)
+	clone.PoliticalDisclosureFacts = append(
+		json.RawMessage(nil), candidate.PoliticalDisclosureFacts...,
+	)
 	clone.TaxonomyEvidence = append(json.RawMessage(nil), candidate.TaxonomyEvidence...)
 	if candidate.SourceScores != nil {
 		clone.SourceScores = make(map[string]float64, len(candidate.SourceScores))
@@ -176,6 +182,35 @@ func cloneSwingCandidate(candidate SwingCandidate) SwingCandidate {
 		clone.TaxonomyAsOf = &asOf
 	}
 	return clone
+}
+
+// cloneSwingCandidateLineage copies a candidate together with every fallback
+// and source edge.  A fallback graph can share nodes (and, defensively, may
+// contain a cycle), so callers that will mutate one branch must use this
+// memoized clone rather than the shallow candidate copy above.
+func cloneSwingCandidateLineage(candidate *SwingCandidate) *SwingCandidate {
+	clones := make(map[*SwingCandidate]*SwingCandidate)
+	var clone func(*SwingCandidate) *SwingCandidate
+	clone = func(source *SwingCandidate) *SwingCandidate {
+		if source == nil {
+			return nil
+		}
+		if existing := clones[source]; existing != nil {
+			return existing
+		}
+		copy := cloneSwingCandidate(*source)
+		clones[source] = &copy
+		copy.weeklyLeaderFallback = clone(source.weeklyLeaderFallback)
+		copy.potentIndustryFallback = clone(source.potentIndustryFallback)
+		copy.potentIndustrySource = clone(source.potentIndustrySource)
+		copy.politicalDisclosureFallback = clone(source.politicalDisclosureFallback)
+		copy.politicalDisclosureSource = clone(source.politicalDisclosureSource)
+		return &copy
+	}
+	if candidate == nil {
+		return nil
+	}
+	return clone(candidate)
 }
 
 func (s *MarketScanner) markWeeklyLeaderCandidates(

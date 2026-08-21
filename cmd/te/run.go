@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -17,6 +19,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/analysis"
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
+	"github.com/romeo-folie/trade-engine/internal/disclosures"
 	"github.com/romeo-folie/trade-engine/internal/earnings"
 	"github.com/romeo-folie/trade-engine/internal/embeddings"
 	"github.com/romeo-folie/trade-engine/internal/engine"
@@ -45,6 +48,46 @@ var (
 	runWeb     bool
 	runWebPort string
 )
+
+type disclosureRunner interface {
+	Run(context.Context) error
+}
+
+// disclosureRunnerLifecycle owns the background disclosure worker. Stop
+// cancels its private context and joins it so Runner.Run can close its Senate
+// browser before the command returns.
+type disclosureRunnerLifecycle struct {
+	cancel   context.CancelFunc
+	done     <-chan struct{}
+	stopOnce sync.Once
+}
+
+func startDisclosureRunner(
+	ctx context.Context, runner disclosureRunner, reportFailure func(error),
+) *disclosureRunnerLifecycle {
+	if runner == nil {
+		return nil
+	}
+	runnerCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := runner.Run(runnerCtx); err != nil && !errors.Is(err, context.Canceled) && reportFailure != nil {
+			reportFailure(err)
+		}
+	}()
+	return &disclosureRunnerLifecycle{cancel: cancel, done: done}
+}
+
+func (l *disclosureRunnerLifecycle) Stop() {
+	if l == nil {
+		return
+	}
+	l.stopOnce.Do(func() {
+		l.cancel()
+		<-l.done
+	})
+}
 
 var runCmd = &cobra.Command{
 	Use:   "run",
@@ -184,6 +227,26 @@ Modes:
 		// Graceful shutdown on SIGTERM / SIGINT.
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
+
+		if cfg.Disclosures.Enabled {
+			if !store.IsConnected() {
+				logger.Warn("congressional disclosure ingestion requested but DB not connected; skipping startup")
+			} else {
+				disclosureRunner, err := disclosures.NewRunner(cfg.Disclosures)
+				if err != nil {
+					return fmt.Errorf("initialize congressional disclosure ingestion: %w", err)
+				}
+				disclosureLifecycle := startDisclosureRunner(ctx, disclosureRunner, func(err error) {
+					logger.Warn("congressional disclosure ingestion stopped with error", "err", err.Error())
+				})
+				defer disclosureLifecycle.Stop()
+				logger.Info("congressional disclosure ingestion started",
+					"house", cfg.Disclosures.House.Enabled,
+					"senate", cfg.Disclosures.Senate.Enabled,
+					"interval_hours", cfg.Disclosures.SyncIntervalHours,
+				)
+			}
+		}
 
 		// Start independent portfolio poller for any broker that implements BrokerView.
 		// Backfill is Alpaca-only (IBKR has no history endpoint).
@@ -891,6 +954,8 @@ Modes:
 				)
 				mscanner := &scanner.MarketScanner{
 					AlpacaClient:                 alpacaClient,
+					StockAssets:                  universeProvider,
+					StockSnapshots:               universeProvider,
 					DailyBars:                    universeProvider,
 					Analyzer:                     scanAnalyzer,
 					News:                         newsProvider,

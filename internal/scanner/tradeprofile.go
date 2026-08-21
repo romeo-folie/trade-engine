@@ -72,13 +72,6 @@ func scannerDefaultsForSources(sources []string) scannerProfileDefaults {
 		defaults scannerProfileDefaults
 	}{
 		{
-			name: "political_disclosure",
-			defaults: scannerProfileDefaults{
-				lenses: []string{"trend_following", "momentum"}, primary: "1D", entryTiming: "4H",
-				rationale: "Political-disclosure provenance is a swing thesis; evaluate daily trend and momentum.",
-			},
-		},
-		{
 			name: "weekly_leader",
 			defaults: scannerProfileDefaults{
 				lenses: []string{"trend_following", "momentum", "pullback_strength"}, primary: "1D", entryTiming: "4H",
@@ -171,6 +164,27 @@ func scannerEvidenceBySource(
 			if candidate.PremarketEpisodicRunID != "" {
 				evidence["source_run_id"] = candidate.PremarketEpisodicRunID
 			}
+		case "political_disclosure":
+			if politicalDisclosureEvidenceObject(candidate.PoliticalDisclosureFacts) {
+				// Preserve the common market/news observations for the first
+				// source and attach the structured disclosure facts alongside
+				// them. Replacing the whole object would drop the exact
+				// point-in-time evidence the scanner and later audits need.
+				var facts map[string]any
+				if err := json.Unmarshal(candidate.PoliticalDisclosureFacts, &facts); err == nil {
+					for key, value := range facts {
+						evidence[key] = value
+					}
+				}
+			}
+			if candidate.PoliticalDisclosureEvidence != "" {
+				evidence["summary"] = candidate.PoliticalDisclosureEvidence
+			}
+			if !politicalDisclosureEvidenceObject(candidate.PoliticalDisclosureFacts) {
+				evidence["data_quality"] = map[string]any{
+					"limitations": []string{"structured disclosure evidence was unavailable"},
+				}
+			}
 		}
 		encoded, err := json.Marshal(evidence)
 		if err != nil {
@@ -211,6 +225,8 @@ func scannerDiscoveryThesis(candidate SwingCandidate, sources []string) string {
 			evidence = candidate.PotentIndustryEvidence
 		case "premarket_episodic":
 			evidence = candidate.PremarketEpisodicEvidence
+		case "political_disclosure":
+			evidence = politicalDisclosureThesis(candidate)
 		case "graph_neighbor", "news_sympathy":
 			evidence = candidate.GraphContext
 		}
@@ -223,6 +239,21 @@ func scannerDiscoveryThesis(candidate SwingCandidate, sources []string) string {
 			candidate.Ticker, strings.Join(sources, ", "), candidate.News[0].Headline), 280)
 	}
 	return compactScannerText(fmt.Sprintf("%s surfaced by %s", candidate.Ticker, strings.Join(sources, ", ")), 280)
+}
+
+func politicalDisclosureEvidenceObject(raw json.RawMessage) bool {
+	raw = json.RawMessage(strings.TrimSpace(string(raw)))
+	return len(raw) > 1 && raw[0] == '{' && json.Valid(raw)
+}
+
+func politicalDisclosureThesis(candidate SwingCandidate) string {
+	var facts tradeprofile.PoliticalDisclosureEvidence
+	if err := json.Unmarshal(candidate.PoliticalDisclosureFacts, &facts); err == nil &&
+		facts.Version == tradeprofile.PoliticalDisclosureEvidenceVersion &&
+		facts.ReportCount > 0 {
+		return summarizePoliticalDisclosure(facts)
+	}
+	return candidate.PoliticalDisclosureEvidence
 }
 
 func scannerProfileRationale(defaultRationale string, score SwingScoreResult) string {

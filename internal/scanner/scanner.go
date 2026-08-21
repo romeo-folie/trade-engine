@@ -61,6 +61,8 @@ type Notifier interface {
 // watchlist of scanner-sourced tickers.
 type MarketScanner struct {
 	AlpacaClient    *data.AlpacaClient
+	StockAssets     data.AssetUniverseProvider
+	StockSnapshots  data.BulkStockSnapshotProvider
 	Analyzer        *analysis.Analyzer
 	News            data.NewsProvider
 	Fundamentals    CompanyFundamentalsProvider
@@ -216,6 +218,11 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 		return fmt.Errorf("load premarket episodic candidates: %w", err)
 	}
 	defer s.releasePremarketEpisodicClaims(ctx, premarketCandidates)
+	politicalCandidates, err := s.politicalDisclosureCandidates(ctx)
+	if err != nil {
+		return fmt.Errorf("load political disclosure candidates: %w", err)
+	}
+	defer s.releasePoliticalDisclosureClaims(ctx, politicalCandidates)
 	if len(weeklyCandidates) > 0 && len(industryCandidates) > 0 &&
 		weeklyCandidates[0].UniverseVersionID != industryCandidates[0].UniverseVersionID {
 		return fmt.Errorf(
@@ -291,6 +298,7 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 	candidates = mergeWeeklyLeaderCandidates(candidates, weeklyCandidates)
 	candidates = mergePotentIndustryCandidates(candidates, industryCandidates)
 	candidates = mergePremarketEpisodicCandidates(candidates, premarketCandidates)
+	candidates = mergePoliticalDisclosureCandidates(candidates, politicalCandidates)
 	promotionCapActive := s.Cfg.PromotionMaxPerIndustry > 0
 	if promotionCapActive {
 		if strings.TrimSpace(recorder.run.UniverseVersionID) == "" || !store.IsConnected() {
@@ -532,16 +540,7 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 		if len(timeframes) == 0 {
 			timeframes = []string{"1H", "4H"}
 		}
-		strategies := candidateStrategies(sc.score.Strategy, sc.candidate.PullbackQualified)
-		if hasSource(sc.candidate.Sources, "weekly_leader") {
-			strategies = appendUniqueStrategy(strategies, "weekly_leader")
-		}
-		if hasSource(sc.candidate.Sources, "potent_industry") {
-			strategies = appendUniqueStrategy(strategies, "potent_industry")
-		}
-		if hasSource(sc.candidate.Sources, "premarket_episodic") {
-			strategies = appendUniqueStrategy(strategies, "premarket_episodic")
-		}
+		strategies := scannerCandidateStrategies(sc.candidate, sc.score)
 		discoveryContext, executionProfile, profileErr := buildScannerTradeProfile(
 			sc.candidate, sc.score,
 		)
@@ -638,18 +637,7 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			if len(timeframes) == 0 {
 				timeframes = []string{"1H", "4H"}
 			}
-			strategies = candidateStrategies(
-				fallbackScore.Strategy, fallback.PullbackQualified,
-			)
-			if hasSource(fallback.Sources, "weekly_leader") {
-				strategies = appendUniqueStrategy(strategies, "weekly_leader")
-			}
-			if hasSource(fallback.Sources, "potent_industry") {
-				strategies = appendUniqueStrategy(strategies, "potent_industry")
-			}
-			if hasSource(fallback.Sources, "premarket_episodic") {
-				strategies = appendUniqueStrategy(strategies, "premarket_episodic")
-			}
+			strategies = scannerCandidateStrategies(fallback, fallbackScore)
 			item.Strategies = strategies
 			item.Timeframes = timeframes
 			item.MinConfidence = fallbackScore.Conviction
@@ -698,6 +686,11 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			promotionActive[index] = false
 			recorder.watchlistResult(sc.candidate, sc.score, strategies, addErr)
 			if !errors.Is(addErr, store.ErrScannerSourcePromotionClaimLost) {
+				// Watchlist persistence failures are transient and must not
+				// terminalize discovery evidence. Each source owns its retry
+				// transition; political disclosures requeue this candidate's
+				// exact report IDs below, without releasing sibling claims that
+				// share the batch token.
 				s.markDiscoveryCandidate(
 					ctx, sc.candidate, "failed", recorder.run.ID, addErr.Error(),
 				)
@@ -717,18 +710,19 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 
 		if s.Bus != nil {
 			s.Bus.Publish(events.ScannerItemAdded, events.ScannerItemAddedPayload{
-				Ticker:                    sc.candidate.Ticker,
-				Conviction:                sc.score.Conviction,
-				SetupType:                 sc.score.SetupType,
-				Strategy:                  sc.score.Strategy,
-				Timeframes:                timeframes,
-				Reasoning:                 sc.score.Reasoning,
-				ExpiresAt:                 expiresAt.Format(time.RFC3339),
-				Sources:                   sc.candidate.Sources,
-				GraphContext:              sc.candidate.GraphContext,
-				WeeklyLeaderEvidence:      sc.candidate.WeeklyLeaderEvidence,
-				PotentIndustryEvidence:    sc.candidate.PotentIndustryEvidence,
-				PremarketEpisodicEvidence: sc.candidate.PremarketEpisodicEvidence,
+				Ticker:                      sc.candidate.Ticker,
+				Conviction:                  sc.score.Conviction,
+				SetupType:                   sc.score.SetupType,
+				Strategy:                    sc.score.Strategy,
+				Timeframes:                  timeframes,
+				Reasoning:                   sc.score.Reasoning,
+				ExpiresAt:                   expiresAt.Format(time.RFC3339),
+				Sources:                     sc.candidate.Sources,
+				GraphContext:                sc.candidate.GraphContext,
+				WeeklyLeaderEvidence:        sc.candidate.WeeklyLeaderEvidence,
+				PotentIndustryEvidence:      sc.candidate.PotentIndustryEvidence,
+				PremarketEpisodicEvidence:   sc.candidate.PremarketEpisodicEvidence,
+				PoliticalDisclosureEvidence: sc.candidate.PoliticalDisclosureEvidence,
 			})
 		}
 	}
@@ -1036,30 +1030,35 @@ func applyUniverseTaxonomyToLineage(candidate *SwingCandidate, member *store.Swi
 	if candidate == nil || member == nil {
 		return
 	}
-	applyUniverseTaxonomy(candidate, member)
-	for _, nested := range []*SwingCandidate{
-		candidate.weeklyLeaderFallback,
-		candidate.potentIndustryFallback,
-		candidate.potentIndustrySource,
-	} {
-		applyUniverseTaxonomy(nested, member)
-	}
+	visitCandidateLineage(candidate, func(item *SwingCandidate) { applyUniverseTaxonomy(item, member) })
 }
 
 func excludeUniverseTaxonomyFromPromotion(candidate *SwingCandidate) {
 	if candidate == nil {
 		return
 	}
-	candidate.promotionTaxonomyExcluded = true
-	for _, nested := range []*SwingCandidate{
-		candidate.weeklyLeaderFallback,
-		candidate.potentIndustryFallback,
-		candidate.potentIndustrySource,
-	} {
-		if nested != nil {
-			nested.promotionTaxonomyExcluded = true
+	visitCandidateLineage(candidate, func(item *SwingCandidate) { item.promotionTaxonomyExcluded = true })
+}
+
+func visitCandidateLineage(candidate *SwingCandidate, visit func(*SwingCandidate)) {
+	seen := make(map[*SwingCandidate]struct{})
+	var walk func(*SwingCandidate)
+	walk = func(item *SwingCandidate) {
+		if item == nil {
+			return
 		}
+		if _, exists := seen[item]; exists {
+			return
+		}
+		seen[item] = struct{}{}
+		visit(item)
+		walk(item.weeklyLeaderFallback)
+		walk(item.potentIndustryFallback)
+		walk(item.potentIndustrySource)
+		walk(item.politicalDisclosureFallback)
+		walk(item.politicalDisclosureSource)
 	}
+	walk(candidate)
 }
 
 func applyUniverseTaxonomy(candidate *SwingCandidate, member *store.SwingUniverseMember) {
@@ -1494,4 +1493,14 @@ func sortByConviction(items []scoredCandidate) {
 			items[j], items[j-1] = items[j-1], items[j]
 		}
 	}
+}
+
+func scannerCandidateStrategies(candidate SwingCandidate, score SwingScoreResult) []string {
+	strategies := candidateStrategies(score.Strategy, candidate.PullbackQualified)
+	for _, source := range []string{"weekly_leader", "potent_industry", "premarket_episodic"} {
+		if hasSource(candidate.Sources, source) {
+			strategies = appendUniqueStrategy(strategies, source)
+		}
+	}
+	return strategies
 }

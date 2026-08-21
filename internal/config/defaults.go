@@ -515,6 +515,13 @@ func Defaults() *Config {
 				Enabled: true, AfterCloseDelayMinutes: 20, CandidateCap: 5,
 				WatchlistSessions: 5, BarBatchSize: 100,
 			},
+			PoliticalDisclosures: PoliticalDisclosureScannerConfig{
+				Enabled:             false,
+				PromoteCandidates:   false,
+				MaxCandidatesPerRun: 20,
+				ClaimLeaseMinutes:   60,
+				TTLDays:             7,
+			},
 			GraphNeighbors: GraphNeighborsConfig{
 				Enabled:          false,
 				MaxPerScan:       5,
@@ -528,6 +535,33 @@ func Defaults() *Config {
 				MinAbsSentiment:   0.35,
 				MaxPerScan:        5,
 				PairCooldownHours: 24,
+			},
+		},
+		Disclosures: DisclosuresConfig{
+			Enabled:                    false,
+			AcknowledgeUseRestrictions: false,
+			SyncIntervalHours:          24,
+			LookbackDays:               90,
+			MaxReportsPerSync:          250,
+			RequestTimeoutSeconds:      30,
+			House: DisclosureSourceConfig{
+				Enabled:                  true,
+				BaseURL:                  "https://disclosures-clerk.house.gov/public_disc",
+				RequestDelayMilliseconds: 250,
+			},
+			Senate: SenateDisclosureConfig{
+				DisclosureSourceConfig: DisclosureSourceConfig{
+					Enabled:                  false,
+					BaseURL:                  "https://efdsearch.senate.gov",
+					RequestDelayMilliseconds: 2000,
+				},
+				AcknowledgeUseRestrictions: false,
+				Transport:                  "browser",
+			},
+			OGE: DisclosureSourceConfig{
+				Enabled: true,
+				BaseURL: "https://extapps2.oge.gov/201/Presiden.nsf/API.xsp/v2/rest",
+				RequestDelayMilliseconds: 250,
 			},
 		},
 		Feedback: FeedbackConfig{

@@ -48,56 +48,57 @@ type ScannerCandidateSnapshot struct {
 	// DiscoveryContext and ExecutionProfile are immutable copies of the
 	// scanner contracts at scan completion. They deliberately do not follow
 	// later live-watchlist refreshes.
-	DiscoveryContext          *tradeprofile.DiscoveryContext
-	ExecutionProfile          *tradeprofile.ExecutionProfile
-	GraphContext              string
-	WeeklyLeaderEvidence      string
-	PotentIndustryEvidence    string
-	PremarketEpisodicEvidence string
-	Price                     float64
-	ChangePct                 float64
-	Volume                    int64
-	TradeCount                int64
-	DollarVolume              float64
-	MarketCapMM               float64
-	Return1M                  float64
-	Return3M                  float64
-	Return6M                  float64
-	MomentumComposite         float64
-	MomentumRank              int
-	QualificationKnown        bool
-	PullbackQualified         bool
-	QualificationStage        string
-	QualificationReason       string
-	QuarantineRequired        bool
-	ActiveWatchlistDuplicate  bool
-	EligibleForScoring        bool
-	LLMAction                 string
-	LLMConviction             float64
-	LLMSetupType              string
-	LLMStrategy               string
-	LLMTimeframes             []string
-	LLMReasoning              string
-	LLMRisks                  []string
-	LLMError                  string
-	PassedMinConviction       bool
-	CapSelected               bool
-	WatchlistAdded            bool
-	WatchlistError            string
-	Strategies                []string
-	FinalStage                string
-	SourceScores              map[string]float64
-	UniverseMember            *bool
-	Sector                    string
-	Industry                  string
-	TaxonomyStatus            string
-	TaxonomyAsOf              *time.Time
-	TaxonomyProvider          string
-	TaxonomyEvidence          json.RawMessage
-	RemovalStage              string
-	FailureStage              string
-	FailureReason             string
-	PromotionEvidence         json.RawMessage
+	DiscoveryContext            *tradeprofile.DiscoveryContext
+	ExecutionProfile            *tradeprofile.ExecutionProfile
+	GraphContext                string
+	WeeklyLeaderEvidence        string
+	PotentIndustryEvidence      string
+	PremarketEpisodicEvidence   string
+	PoliticalDisclosureEvidence string
+	Price                       float64
+	ChangePct                   float64
+	Volume                      int64
+	TradeCount                  int64
+	DollarVolume                float64
+	MarketCapMM                 float64
+	Return1M                    float64
+	Return3M                    float64
+	Return6M                    float64
+	MomentumComposite           float64
+	MomentumRank                int
+	QualificationKnown          bool
+	PullbackQualified           bool
+	QualificationStage          string
+	QualificationReason         string
+	QuarantineRequired          bool
+	ActiveWatchlistDuplicate    bool
+	EligibleForScoring          bool
+	LLMAction                   string
+	LLMConviction               float64
+	LLMSetupType                string
+	LLMStrategy                 string
+	LLMTimeframes               []string
+	LLMReasoning                string
+	LLMRisks                    []string
+	LLMError                    string
+	PassedMinConviction         bool
+	CapSelected                 bool
+	WatchlistAdded              bool
+	WatchlistError              string
+	Strategies                  []string
+	FinalStage                  string
+	SourceScores                map[string]float64
+	UniverseMember              *bool
+	Sector                      string
+	Industry                    string
+	TaxonomyStatus              string
+	TaxonomyAsOf                *time.Time
+	TaxonomyProvider            string
+	TaxonomyEvidence            json.RawMessage
+	RemovalStage                string
+	FailureStage                string
+	FailureReason               string
+	PromotionEvidence           json.RawMessage
 }
 
 type ScannerEngineOutcome struct {
@@ -289,12 +290,13 @@ func FinishScannerRun(ctx context.Context, run ScannerRun, candidates []ScannerC
 					strategies, final_stage, source_scores, universe_member, sector,
 					industry, taxonomy_status, taxonomy_as_of, taxonomy_provider,
 				taxonomy_evidence, removal_stage, failure_stage, failure_reason,
-				promotion_evidence, discovery_context, execution_profile
+				promotion_evidence, political_disclosure_evidence,
+				discovery_context, execution_profile
 				) VALUES (
 					$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
 					$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,
 					$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$50,$51,
-					$52,$53
+					$52,$53,$54
 				)`,
 			c.ScannerRunID, c.Ticker, c.Sources, nullableString(c.GraphContext),
 			nullableString(c.WeeklyLeaderEvidence),
@@ -318,6 +320,7 @@ func FinishScannerRun(ctx context.Context, run ScannerRun, candidates []ScannerC
 			nonNilJSON(c.TaxonomyEvidence), nullableString(c.RemovalStage),
 			nullableString(c.FailureStage), nullableString(c.FailureReason),
 			nonNilJSON(c.PromotionEvidence),
+			nullableString(c.PoliticalDisclosureEvidence),
 			discoveryContext, executionProfile,
 		)
 		if err != nil {

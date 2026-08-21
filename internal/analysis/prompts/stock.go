@@ -725,6 +725,9 @@ func writeDiscoveryContext(b *strings.Builder, context *tradeprofile.DiscoveryCo
 	b.WriteString("Thesis: " + truncateStr(canonical.Thesis, 320) + "\n")
 	for _, source := range canonical.Sources {
 		evidence := canonical.EvidenceBySource[source]
+		if source == "political_disclosure" && writePoliticalDisclosureEvidence(b, evidence) {
+			continue
+		}
 		var compact bytes.Buffer
 		if err := json.Compact(&compact, evidence); err != nil {
 			continue
@@ -732,6 +735,148 @@ func writeDiscoveryContext(b *strings.Builder, context *tradeprofile.DiscoveryCo
 		b.WriteString(fmt.Sprintf("Evidence[%s]: %s\n", source, truncateStr(compact.String(), 600)))
 	}
 	b.WriteString("\n")
+}
+
+// writePoliticalDisclosureEvidence renders aggregate facts and independently
+// bounded filer/report details. The generic 600-character source limit would
+// otherwise erase the distinction between repeated filings and independent
+// participants.
+func writePoliticalDisclosureEvidence(b *strings.Builder, raw json.RawMessage) bool {
+	var evidence tradeprofile.PoliticalDisclosureEvidence
+	if err := json.Unmarshal(raw, &evidence); err != nil ||
+		(evidence.Version != 1 && evidence.Version != tradeprofile.PoliticalDisclosureEvidenceVersion) {
+		return false
+	}
+	if evidence.Version == 1 {
+		b.WriteString(fmt.Sprintf(
+			"Evidence[political_disclosure].aggregate: filers=%d; buyers=%d; reports=%d; amendments=%d; transactions=%d; purchases=%d; sales=%d; exchanges=%d; other=%d\n",
+			evidence.DistinctFilerCount, evidence.DistinctBuyerCount,
+			evidence.ReportCount, evidence.AmendmentReportCount,
+			evidence.TransactionCount, evidence.PurchaseCount,
+			evidence.SaleCount, evidence.ExchangeCount, evidence.OtherTransactionCount,
+		))
+	} else {
+		b.WriteString(fmt.Sprintf(
+			"Evidence[political_disclosure].aggregate: filers=%d; buyers=%d; reports=%d; independent_reports=%d; amendments=%d; raw_transaction_rows=%d (independent=%d amendment=%d); independent_purchases=%d; independent_sales=%d; independent_exchanges=%d; independent_other=%d. Amendment rows remain in report detail/raw counts but are excluded from independent semantic aggregates.\n",
+			evidence.DistinctFilerCount, evidence.DistinctBuyerCount,
+			evidence.ReportCount, evidence.IndependentReportCount, evidence.AmendmentReportCount,
+			evidence.TransactionCount, evidence.IndependentTransactionCount, evidence.AmendmentTransactionCount, evidence.PurchaseCount,
+			evidence.SaleCount, evidence.ExchangeCount, evidence.OtherTransactionCount,
+		))
+	}
+	b.WriteString(fmt.Sprintf(
+		"Evidence[political_disclosure].amounts: purchases=%s; sales=%s\n",
+		formatPoliticalAmountSummary(evidence.PurchaseAmounts),
+		formatPoliticalAmountSummary(evidence.SaleAmounts),
+	))
+	b.WriteString(fmt.Sprintf(
+		"Evidence[political_disclosure].timing: latest_transaction=%s; latest_filing_or_publication=%s; disclosure_lag=%s\n",
+		valueOrUnknown(evidence.LatestTransactionDate),
+		valueOrUnknown(evidence.LatestFilingOrPublicationDate),
+		formatPoliticalLagSummary(evidence.DisclosureLagDays),
+	))
+	b.WriteString(fmt.Sprintf(
+		"Evidence[political_disclosure].patterns: repeated_filer=%t; independent_buyers=%t; contradictory_buying_and_selling=%t\n",
+		evidence.RepeatedFilerActivity, evidence.IndependentBuyerActivity,
+		evidence.ContradictoryActivity,
+	))
+
+	const maxPromptFilers = 6
+	promptOmittedReports := 0
+	for index, filer := range evidence.Filers {
+		if index >= maxPromptFilers {
+			break
+		}
+		if evidence.Version == 1 {
+			b.WriteString(fmt.Sprintf(
+				"Evidence[political_disclosure].filer[%d]: id=%s; name=%s; source=%s; chamber=%s; office=%s; owners=%s; reports=%d; amendments=%d; transactions=%d; purchases=%d (%s); sales=%d (%s); exchanges=%d; repeated=%t; contradictory=%t; latest_transaction=%s; latest_filing_or_publication=%s; lag=%s\n",
+				index+1, truncateStr(filer.CanonicalFilerID, 100),
+				truncateStr(filer.FilerName, 100), truncateStr(filer.Source, 30),
+				truncateStr(valueOrUnknown(filer.Chamber), 40), truncateStr(valueOrUnknown(filer.Office), 100),
+				truncateStr(valueOrUnknown(strings.Join(filer.ReportedOwners, ", ")), 100),
+				filer.ReportCount, filer.AmendmentReportCount, filer.TransactionCount, filer.PurchaseCount,
+				formatPoliticalAmountSummary(filer.PurchaseAmounts), filer.SaleCount,
+				formatPoliticalAmountSummary(filer.SaleAmounts), filer.ExchangeCount, filer.RepeatedActivity,
+				filer.ContradictoryActivity, valueOrUnknown(filer.LatestTransactionDate),
+				valueOrUnknown(filer.LatestFilingOrPublicationDate), formatPoliticalLagSummary(filer.DisclosureLagDays),
+			))
+		} else {
+			b.WriteString(fmt.Sprintf(
+				"Evidence[political_disclosure].filer[%d]: id=%s; name=%s; source=%s; chamber=%s; office=%s; owners=%s; reports=%d; independent_reports=%d; amendments=%d; transactions=%d; purchases=%d (%s); sales=%d (%s); exchanges=%d; repeated=%t; contradictory=%t; latest_transaction=%s; latest_filing_or_publication=%s; lag=%s\n",
+				index+1, truncateStr(filer.CanonicalFilerID, 100),
+				truncateStr(filer.FilerName, 100), truncateStr(filer.Source, 30),
+				truncateStr(valueOrUnknown(filer.Chamber), 40),
+				truncateStr(valueOrUnknown(filer.Office), 100),
+				truncateStr(valueOrUnknown(strings.Join(filer.ReportedOwners, ", ")), 100),
+				filer.ReportCount, filer.IndependentReportCount, filer.AmendmentReportCount,
+				filer.TransactionCount, filer.PurchaseCount,
+				formatPoliticalAmountSummary(filer.PurchaseAmounts), filer.SaleCount,
+				formatPoliticalAmountSummary(filer.SaleAmounts), filer.ExchangeCount, filer.RepeatedActivity,
+				filer.ContradictoryActivity, valueOrUnknown(filer.LatestTransactionDate),
+				valueOrUnknown(filer.LatestFilingOrPublicationDate),
+				formatPoliticalLagSummary(filer.DisclosureLagDays),
+			))
+		}
+		const maxPromptReportsPerFiler = 2
+		if len(filer.Reports) > maxPromptReportsPerFiler {
+			promptOmittedReports += len(filer.Reports) - maxPromptReportsPerFiler
+		}
+		for reportIndex, report := range filer.Reports {
+			if reportIndex >= maxPromptReportsPerFiler {
+				break
+			}
+			lag := "unknown"
+			if report.DisclosureLagDays != nil {
+				lag = fmt.Sprintf("%dd", *report.DisclosureLagDays)
+			}
+			b.WriteString(fmt.Sprintf(
+				"  report[%d]: id=%s; type=%s; amendment=%t; filing_or_publication=%s; latest_transaction=%s; lag=%s; transactions=%d (purchases=%d sales=%d exchanges=%d); owners=%s; extraction=%s; document=%s\n",
+				reportIndex+1, truncateStr(report.ReportID, 100),
+				truncateStr(valueOrUnknown(report.ReportType), 60), report.IsAmendment,
+				valueOrUnknown(report.FilingOrPublicationDate),
+				valueOrUnknown(report.LatestTransactionDate), lag,
+				report.TransactionCount, report.PurchaseCount, report.SaleCount,
+				report.ExchangeCount,
+				truncateStr(valueOrUnknown(strings.Join(report.ReportedOwners, ", ")), 100),
+				truncateStr(valueOrUnknown(report.ExtractionStatus), 30),
+				truncateStr(report.DocumentURL, 180),
+			))
+		}
+	}
+	limitations := append([]string(nil), evidence.DataQuality.Limitations...)
+	if omitted := len(evidence.Filers) - maxPromptFilers; omitted > 0 {
+		limitations = append(limitations, fmt.Sprintf("prompt omitted %d bounded filer detail record(s)", omitted))
+	}
+	if promptOmittedReports > 0 {
+		limitations = append(limitations, fmt.Sprintf("prompt omitted %d bounded report detail record(s)", promptOmittedReports))
+	}
+	b.WriteString(fmt.Sprintf(
+		"Evidence[political_disclosure].quality: identity_basis=%s; aggregate_omitted_filers=%d; aggregate_omitted_reports=%d; prompt_omitted_reports=%d; limitations=%s\n",
+		truncateStr(evidence.DataQuality.CanonicalIdentityBasis, 160),
+		evidence.DataQuality.OmittedFilerDetailCount,
+		evidence.DataQuality.OmittedReportDetailCount,
+		promptOmittedReports,
+		truncateStr(valueOrUnknown(strings.Join(limitations, "; ")), 500),
+	))
+	return true
+}
+
+func formatPoliticalAmountSummary(summary tradeprofile.PoliticalDisclosureAmountSummary) string {
+	if summary.KnownTransactionCount == 0 {
+		return fmt.Sprintf("unknown (missing_ranges=%d)", summary.UnknownTransactionCount)
+	}
+	return fmt.Sprintf("$%d-$%d across %d known range(s); missing_ranges=%d",
+		summary.MinimumTotal, summary.MaximumTotal,
+		summary.KnownTransactionCount, summary.UnknownTransactionCount)
+}
+
+func formatPoliticalLagSummary(summary tradeprofile.PoliticalDisclosureLagSummary) string {
+	if summary.KnownTransactionCount == 0 {
+		return "unknown"
+	}
+	return fmt.Sprintf("%d-%dd; latest_transaction=%dd; known=%d",
+		summary.MinimumDays, summary.MaximumDays,
+		summary.LatestTransactionDays, summary.KnownTransactionCount)
 }
 
 // writePullbackContext renders the evaluator's daily facts without turning

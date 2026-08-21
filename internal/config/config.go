@@ -40,8 +40,112 @@ type Config struct {
 	OptionsORB       OptionsORBConfig       `yaml:"options_orb"`
 	FuturesORBMetals FuturesORBConfig       `yaml:"futures_orb_metals"`
 	Scanner          ScannerConfig          `yaml:"scanner"`
+	Disclosures      DisclosuresConfig      `yaml:"disclosures"`
 	Feedback         FeedbackConfig         `yaml:"feedback"`
 	Portfolio        PortfolioConfig        `yaml:"portfolio"`
+}
+
+// DisclosuresConfig controls periodic ingestion of official congressional
+// financial-disclosure filings. Ingestion is observation-only; promotion into
+// the scanner remains independently gated by scanner.political_disclosures.
+type DisclosuresConfig struct {
+	Enabled                    bool                   `yaml:"enabled"`
+	AcknowledgeUseRestrictions bool                   `yaml:"acknowledge_use_restrictions"`
+	SyncIntervalHours          int                    `yaml:"sync_interval_hours"`
+	LookbackDays               int                    `yaml:"lookback_days"`
+	MaxReportsPerSync          int                    `yaml:"max_reports_per_sync"`
+	RequestTimeoutSeconds      int                    `yaml:"request_timeout_seconds"`
+	House                      DisclosureSourceConfig `yaml:"house"`
+	Senate                     SenateDisclosureConfig `yaml:"senate"`
+	OGE                        DisclosureSourceConfig `yaml:"oge"`
+}
+
+type DisclosureSourceConfig struct {
+	Enabled                  bool   `yaml:"enabled"`
+	BaseURL                  string `yaml:"base_url"`
+	RequestDelayMilliseconds int    `yaml:"request_delay_milliseconds"`
+}
+
+type SenateDisclosureConfig struct {
+	DisclosureSourceConfig `yaml:",inline"`
+	// AcknowledgeUseRestrictions must be explicitly enabled before the client
+	// accesses Senate eFD. Browser authorization accepts the agreement visibly.
+	AcknowledgeUseRestrictions bool `yaml:"acknowledge_use_restrictions"`
+	// Transport is "browser" (recommended) or "http" (legacy/testing).
+	Transport         string `yaml:"transport"`
+	BrowserProfileDir string `yaml:"browser_profile_dir"`
+	BrowserExecutable string `yaml:"browser_executable"`
+}
+
+// ValidateDisclosuresConfig validates the independently runnable disclosure
+// ingester. Keeping this separate lets CLI overrides and NewRunner reject bad
+// values before constructing database, HTTP, PDFium, or Chrome resources.
+func ValidateDisclosuresConfig(disclosures DisclosuresConfig) []string {
+	if !disclosures.Enabled {
+		return nil
+	}
+	const prefix = "disclosures"
+	var errs []string
+	if !disclosures.AcknowledgeUseRestrictions {
+		errs = append(errs, prefix+".acknowledge_use_restrictions must be true")
+	}
+	if disclosures.SyncIntervalHours <= 0 || !durationConfigFits(disclosures.SyncIntervalHours, time.Hour) {
+		errs = append(errs, prefix+".sync_interval_hours must be a safe positive duration")
+	}
+	if disclosures.LookbackDays <= 0 {
+		errs = append(errs, prefix+".lookback_days must be > 0")
+	}
+	if disclosures.MaxReportsPerSync <= 0 {
+		errs = append(errs, prefix+".max_reports_per_sync must be > 0")
+	}
+	if disclosures.RequestTimeoutSeconds <= 0 || !durationConfigFits(disclosures.RequestTimeoutSeconds, time.Second) {
+		errs = append(errs, prefix+".request_timeout_seconds must be a safe positive duration")
+	}
+	enabledSources := 0
+	for _, enabled := range []bool{disclosures.House.Enabled, disclosures.Senate.Enabled, disclosures.OGE.Enabled} {
+		if enabled {
+			enabledSources++
+		}
+	}
+	if enabledSources == 0 {
+		errs = append(errs, prefix+" requires at least one enabled source")
+	}
+	if disclosures.MaxReportsPerSync > 0 && disclosures.MaxReportsPerSync < enabledSources {
+		errs = append(errs, fmt.Sprintf(prefix+".max_reports_per_sync must be >= %d enabled sources", enabledSources))
+	}
+	if disclosures.House.Enabled && strings.TrimSpace(disclosures.House.BaseURL) == "" {
+		errs = append(errs, prefix+".house.base_url must not be blank")
+	}
+	for _, delay := range []struct {
+		name  string
+		value int
+	}{
+		{"house.request_delay_milliseconds", disclosures.House.RequestDelayMilliseconds},
+		{"senate.request_delay_milliseconds", disclosures.Senate.RequestDelayMilliseconds},
+		{"oge.request_delay_milliseconds", disclosures.OGE.RequestDelayMilliseconds},
+	} {
+		if delay.value < 0 {
+			errs = append(errs, prefix+"."+delay.name+" must be >= 0")
+		} else if !durationConfigFits(delay.value, time.Millisecond) {
+			errs = append(errs, prefix+"."+delay.name+" must be a safe nonnegative duration")
+		}
+	}
+	if disclosures.Senate.Enabled {
+		if strings.TrimSpace(disclosures.Senate.BaseURL) == "" {
+			errs = append(errs, prefix+".senate.base_url must not be blank")
+		}
+		if !disclosures.Senate.AcknowledgeUseRestrictions {
+			errs = append(errs, prefix+".senate.acknowledge_use_restrictions must be true")
+		}
+		transport := strings.ToLower(strings.TrimSpace(disclosures.Senate.Transport))
+		if transport != "" && transport != "browser" && transport != "http" {
+			errs = append(errs, prefix+".senate.transport must be browser or http")
+		}
+	}
+	if disclosures.OGE.Enabled && strings.TrimSpace(disclosures.OGE.BaseURL) == "" {
+		errs = append(errs, prefix+".oge.base_url must not be blank")
+	}
+	return errs
 }
 
 // ── Portfolio ──────────────────────────────────────────────────────────────────
@@ -1235,6 +1339,10 @@ type ScannerConfig struct {
 	// analyst funnel before the next regular session.
 	EarningsWatchlist EarningsWatchlistConfig `yaml:"earnings_watchlist"`
 
+	// PoliticalDisclosures introduces persisted STOCK Act purchase/sale filings
+	// to the normal scanner review path. It never bypasses LLM/risk gates.
+	PoliticalDisclosures PoliticalDisclosureScannerConfig `yaml:"political_disclosures"`
+
 	// GraphNeighbors configures sourcing scanner candidates from the knowledge
 	// graph — tradeable companies one hop from a manually-watched ticker.
 	GraphNeighbors GraphNeighborsConfig `yaml:"graph_neighbors"`
@@ -1243,6 +1351,14 @@ type ScannerConfig struct {
 	// sentiment-strong news on a manually-watched ticker fans out to its graph
 	// neighbours as candidates, carrying the triggering headline as the thesis.
 	NewsSympathy NewsSympathyConfig `yaml:"news_sympathy"`
+}
+
+type PoliticalDisclosureScannerConfig struct {
+	Enabled             bool `yaml:"enabled"`
+	PromoteCandidates   bool `yaml:"promote_candidates"`
+	MaxCandidatesPerRun int  `yaml:"max_candidates_per_run"`
+	ClaimLeaseMinutes   int  `yaml:"claim_lease_minutes"`
+	TTLDays             int  `yaml:"ttl_days"`
 }
 
 // WeeklyLeaderConfig controls the point-in-time weekly-leadership lens. The
@@ -2727,6 +2843,26 @@ func Validate(cfg *Config) []string {
 			if value <= 0 {
 				errs = append(errs, prefix+"."+field+" must be > 0")
 			}
+		}
+	}
+	errs = append(errs, ValidateDisclosuresConfig(cfg.Disclosures)...)
+	if political := cfg.Scanner.PoliticalDisclosures; political.Enabled {
+		const prefix = "scanner.political_disclosures"
+		if !cfg.Scanner.Enabled {
+			errs = append(errs, prefix+" requires scanner.enabled=true")
+		}
+		if !cfg.Disclosures.Enabled {
+			errs = append(errs, prefix+" requires disclosures.enabled=true")
+		}
+		if political.MaxCandidatesPerRun <= 0 {
+			errs = append(errs, prefix+".max_candidates_per_run must be > 0")
+		}
+		if political.ClaimLeaseMinutes <= 0 ||
+			!durationConfigFits(political.ClaimLeaseMinutes, time.Minute) {
+			errs = append(errs, prefix+".claim_lease_minutes must be a safe positive duration")
+		}
+		if political.TTLDays <= 0 {
+			errs = append(errs, prefix+".ttl_days must be > 0")
 		}
 	}
 

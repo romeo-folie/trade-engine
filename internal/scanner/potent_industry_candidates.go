@@ -147,13 +147,13 @@ func candidateAfterPromotionClaimLoss(
 	// rebuilding a partially attributed candidate from them could silently
 	// replace point-in-time price/liquidity evidence. Fail closed and release
 	// the remaining claims at cycle end instead.
-	if candidate.PremarketEpisodicRunID != "" {
+	if candidate.PremarketEpisodicRunID != "" && source != "political_disclosure" {
 		return SwingCandidate{}, false
 	}
 	switch source {
 	case "potent_industry":
 		if candidate.potentIndustryFallback == nil {
-			return SwingCandidate{}, false
+			return politicalDisclosureOnlyFallback(candidate)
 		}
 		fallback := cloneSwingCandidate(*candidate.potentIndustryFallback)
 		copyDynamicCandidateState(&fallback, candidate)
@@ -199,16 +199,155 @@ func candidateAfterPromotionClaimLoss(
 			}
 			return fallback, len(fallback.Sources) > 0
 		}
-		return ordinaryCandidateAfterWeeklyClaimLoss(candidate)
+		fallback, ok := ordinaryCandidateAfterWeeklyClaimLoss(candidate)
+		if ok {
+			return fallback, true
+		}
+		return politicalDisclosureOnlyFallback(candidate)
+	case "political_disclosure":
+		if candidate.politicalDisclosureFallback == nil {
+			return SwingCandidate{}, false
+		}
+		fallback := cloneSwingCandidate(*candidate.politicalDisclosureFallback)
+		copyDynamicCandidateState(&fallback, candidate)
+		fallback.Sources = withoutSource(fallback.Sources, "political_disclosure")
+		delete(fallback.SourceScores, "political_disclosure")
+		fallback.PoliticalDisclosureClaimToken = ""
+		fallback.PoliticalDisclosureClaimReportIDs = nil
+		fallback.PoliticalDisclosureEvidence = ""
+		fallback.PoliticalDisclosureFacts = nil
+		fallback.politicalDisclosureFallback = nil
+		fallback.politicalDisclosureSource = nil
+		return fallback, len(fallback.Sources) > 0
 	default:
 		return SwingCandidate{}, false
 	}
 }
 
-func copyDynamicCandidateState(target *SwingCandidate, source SwingCandidate) {
+func politicalDisclosureOnlyFallback(candidate SwingCandidate) (SwingCandidate, bool) {
+	if candidate.politicalDisclosureSource == nil {
+		return SwingCandidate{}, false
+	}
+	fallback := cloneSwingCandidate(*candidate.politicalDisclosureSource)
+	// The dedicated political source carries the snapshot that passed the
+	// disclosure-only hydration gate. Do not replace that evidence with a
+	// zero-valued weekly/industry candidate; only borrow a validated current
+	// snapshot when the source snapshot is absent, and always carry the current
+	// selected-universe taxonomy.
+	copyCandidatePresentationState(&fallback, candidate)
+	copyCandidateTaxonomyState(&fallback, candidate)
+	if candidate.PullbackQualified {
+		fallback.Return1M = candidate.Return1M
+		fallback.Return3M = candidate.Return3M
+		fallback.Return6M = candidate.Return6M
+		fallback.MarketCapMM = candidate.MarketCapMM
+	}
+	if !hasPoliticalMarketEvidence(fallback) && hasPoliticalMarketEvidence(candidate) {
+		snapshotCandidateEvidence(candidate).apply(&fallback)
+	}
+	fallback.politicalDisclosureFallback = nil
+	fallback.politicalDisclosureSource = nil
+	return fallback, hasSource(fallback.Sources, "political_disclosure") && hasPoliticalMarketEvidence(fallback)
+}
+
+func hasPoliticalMarketEvidence(candidate SwingCandidate) bool {
+	return candidate.Price > 0 && candidate.Volume > 0 && candidate.DollarVolume >= pullbackMinDollarVolume
+}
+
+func copyCandidatePresentationState(target *SwingCandidate, source SwingCandidate) {
 	target.News = append([]SwingNewsItem(nil), source.News...)
 	target.PullbackQualified = source.PullbackQualified
 	target.PullbackQualificationKnown = source.PullbackQualificationKnown
+}
+
+func copyCandidateTaxonomyState(target *SwingCandidate, source SwingCandidate) {
+	target.Sector, target.Industry, target.TaxonomyStatus = source.Sector, source.Industry, source.TaxonomyStatus
+	target.TaxonomyAsOf = cloneTimePointer(source.TaxonomyAsOf)
+	target.TaxonomyProvider = source.TaxonomyProvider
+	target.TaxonomyEvidence = append(json.RawMessage(nil), source.TaxonomyEvidence...)
+	target.promotionTaxonomyExcluded = source.promotionTaxonomyExcluded
+	target.UniverseVersionID, target.UniverseAsOf = source.UniverseVersionID, source.UniverseAsOf
+	if source.UniverseMember == nil {
+		target.UniverseMember = nil
+	} else {
+		member := *source.UniverseMember
+		target.UniverseMember = &member
+	}
+}
+
+// candidateEvidenceSnapshot is the point-in-time market and taxonomy evidence
+// needed to safely reconstruct a source fallback after another claim is lost.
+// Keeping it explicit prevents new lineage edges from quietly dropping a
+// liquidity gate or selected-universe taxonomy.
+type candidateEvidenceSnapshot struct {
+	Price, ChangePct                 float64
+	Volume, TradeCount               int64
+	Return1M, Return3M, Return6M     float64
+	MarketCapMM, DollarVolume        float64
+	PullbackQualified                bool
+	PullbackQualificationKnown       bool
+	UniverseMember                   *bool
+	Sector, Industry, TaxonomyStatus string
+	TaxonomyAsOf                     *time.Time
+	TaxonomyProvider                 string
+	TaxonomyEvidence                 json.RawMessage
+	PromotionTaxonomyExcluded        bool
+	UniverseVersionID                string
+	UniverseAsOf                     time.Time
+	News                             []SwingNewsItem
+}
+
+func snapshotCandidateEvidence(source SwingCandidate) candidateEvidenceSnapshot {
+	snapshot := candidateEvidenceSnapshot{
+		Price: source.Price, ChangePct: source.ChangePct, Volume: source.Volume,
+		TradeCount: source.TradeCount, Return1M: source.Return1M,
+		Return3M: source.Return3M, Return6M: source.Return6M,
+		MarketCapMM: source.MarketCapMM, DollarVolume: source.DollarVolume,
+		PullbackQualified:          source.PullbackQualified,
+		PullbackQualificationKnown: source.PullbackQualificationKnown,
+		Sector:                     source.Sector, Industry: source.Industry,
+		TaxonomyStatus:            source.TaxonomyStatus,
+		TaxonomyAsOf:              cloneTimePointer(source.TaxonomyAsOf),
+		TaxonomyProvider:          source.TaxonomyProvider,
+		TaxonomyEvidence:          append(json.RawMessage(nil), source.TaxonomyEvidence...),
+		PromotionTaxonomyExcluded: source.promotionTaxonomyExcluded,
+		UniverseVersionID:         source.UniverseVersionID, UniverseAsOf: source.UniverseAsOf,
+		News: append([]SwingNewsItem(nil), source.News...),
+	}
+	if source.UniverseMember != nil {
+		member := *source.UniverseMember
+		snapshot.UniverseMember = &member
+	}
+	return snapshot
+}
+
+func (snapshot candidateEvidenceSnapshot) apply(target *SwingCandidate) {
+	if target == nil {
+		return
+	}
+	target.Price, target.ChangePct = snapshot.Price, snapshot.ChangePct
+	target.Volume, target.TradeCount = snapshot.Volume, snapshot.TradeCount
+	target.Return1M, target.Return3M, target.Return6M = snapshot.Return1M, snapshot.Return3M, snapshot.Return6M
+	target.MarketCapMM, target.DollarVolume = snapshot.MarketCapMM, snapshot.DollarVolume
+	target.PullbackQualified = snapshot.PullbackQualified
+	target.PullbackQualificationKnown = snapshot.PullbackQualificationKnown
+	target.Sector, target.Industry, target.TaxonomyStatus = snapshot.Sector, snapshot.Industry, snapshot.TaxonomyStatus
+	target.TaxonomyAsOf = cloneTimePointer(snapshot.TaxonomyAsOf)
+	target.TaxonomyProvider = snapshot.TaxonomyProvider
+	target.TaxonomyEvidence = append(json.RawMessage(nil), snapshot.TaxonomyEvidence...)
+	target.promotionTaxonomyExcluded = snapshot.PromotionTaxonomyExcluded
+	target.UniverseVersionID, target.UniverseAsOf = snapshot.UniverseVersionID, snapshot.UniverseAsOf
+	target.News = append([]SwingNewsItem(nil), snapshot.News...)
+	if snapshot.UniverseMember == nil {
+		target.UniverseMember = nil
+	} else {
+		member := *snapshot.UniverseMember
+		target.UniverseMember = &member
+	}
+}
+
+func copyDynamicCandidateState(target *SwingCandidate, source SwingCandidate) {
+	snapshotCandidateEvidence(source).apply(target)
 }
 
 func withoutSource(sources []string, remove string) []string {
@@ -255,6 +394,7 @@ func (s *MarketScanner) markDiscoveryCandidate(
 	s.markWeeklyLeaderCandidate(ctx, candidate, status, scannerRunID, reason)
 	s.markPotentIndustryCandidate(ctx, candidate, status, scannerRunID, reason)
 	s.markPremarketEpisodicCandidate(ctx, candidate, status, scannerRunID, reason)
+	s.markPoliticalDisclosureCandidate(ctx, candidate, status, scannerRunID, reason)
 }
 
 func (s *MarketScanner) markDiscoveryCandidates(
@@ -316,6 +456,12 @@ func scannerSourcePromotionClaims(
 			Token: candidate.PremarketEpisodicClaimToken,
 		}
 	}
+	if candidate.PoliticalDisclosureClaimToken != "" {
+		claims.PoliticalDisclosure = &store.PoliticalDisclosurePromotionClaim{
+			Ticker: candidate.Ticker, Token: candidate.PoliticalDisclosureClaimToken,
+			ReportIDs: append([]string(nil), candidate.PoliticalDisclosureClaimReportIDs...),
+		}
+	}
 	return claims
 }
 
@@ -325,7 +471,7 @@ func (s *MarketScanner) promoteDiscoveryCandidate(
 ) error {
 	claims := scannerSourcePromotionClaims(candidate)
 	if claims.WeeklyLeader == nil && claims.PotentIndustry == nil &&
-		claims.PremarketEpisodic == nil {
+		claims.PremarketEpisodic == nil && claims.PoliticalDisclosure == nil {
 		if lease != nil {
 			return store.AddWatchlistItemWithScannerLease(ctx, item, *lease)
 		}
@@ -347,7 +493,7 @@ func (s *MarketScanner) promoteDiscoveryFallback(
 ) error {
 	claims := scannerSourcePromotionClaims(candidate)
 	if claims.WeeklyLeader == nil && claims.PotentIndustry == nil &&
-		claims.PremarketEpisodic == nil {
+		claims.PremarketEpisodic == nil && claims.PoliticalDisclosure == nil {
 		if lease != nil {
 			return store.AddWatchlistItemUnlessActiveWithScannerLease(ctx, item, *lease)
 		}

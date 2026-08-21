@@ -69,12 +69,20 @@ type SwingCandidate struct {
 	PremarketEpisodicRunID      string
 	PremarketEpisodicClaimToken string
 	PremarketEpisodicEvidence   string
-	UniverseVersionID           string
-	UniverseAsOf                time.Time
-	RemovalStage                string
-	FailureStage                string
-	FailureReason               string
-	News                        []SwingNewsItem
+	// PoliticalDisclosureClaimToken fences all pending filing rows for this
+	// ticker that were claimed by the current scanner cycle.
+	PoliticalDisclosureClaimToken     string
+	PoliticalDisclosureClaimReportIDs []string
+	PoliticalDisclosureEvidence       string
+	PoliticalDisclosureFacts          json.RawMessage
+	politicalDisclosureFallback       *SwingCandidate
+	politicalDisclosureSource         *SwingCandidate
+	UniverseVersionID                 string
+	UniverseAsOf                      time.Time
+	RemovalStage                      string
+	FailureStage                      string
+	FailureReason                     string
+	News                              []SwingNewsItem
 	// GraphContext, when set, explains why a knowledge-graph neighbour was surfaced
 	// (e.g. "TSMC (on watchlist) supplies_to this company"). Empty for screener
 	// candidates. Injected into the prompt so the LLM weighs the relational thesis.
@@ -146,7 +154,11 @@ Rules:
 
 	sb.WriteString("## CANDIDATE\n")
 	sb.WriteString(fmt.Sprintf("Ticker:       %s\n", candidate.Ticker))
-	sb.WriteString(fmt.Sprintf("Price:        %.2f\n", candidate.Price))
+	if candidate.Price > 0 {
+		sb.WriteString(fmt.Sprintf("Price:        %.2f\n", candidate.Price))
+	} else {
+		sb.WriteString("Market data:  unavailable; do not infer price, liquidity, or momentum\n")
+	}
 	if candidate.ChangePct != 0 {
 		sb.WriteString(fmt.Sprintf("Change:       %+.2f%% (%s)\n", candidate.ChangePct, direction))
 	}
@@ -184,6 +196,12 @@ Rules:
 		sb.WriteString(fmt.Sprintf(
 			"Premarket episodic evidence: %s\n",
 			candidate.PremarketEpisodicEvidence,
+		))
+	}
+	if candidate.PoliticalDisclosureEvidence != "" {
+		sb.WriteString(fmt.Sprintf(
+			"Political disclosure evidence: %s\n",
+			candidate.PoliticalDisclosureEvidence,
 		))
 	}
 	sb.WriteString("\n")
