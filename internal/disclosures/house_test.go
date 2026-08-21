@@ -187,7 +187,7 @@ func TestParseHousePTRUsesPositionedColumnsAndWrappedLines(t *testing.T) {
 		{Text: "$15,001 -", Left: 447, Top: 150},
 	}}}
 	report := ParseHousePTR(filing, "https://example.test/20034138.pdf", []byte("pdf"), pages)
-	if report.ExtractionStatus != "completed" || len(report.Transactions) != 2 {
+	if report.ExtractionStatus != "completed" || report.RetryableFailure || len(report.Transactions) != 2 {
 		t.Fatalf("unexpected report: status=%s transactions=%+v", report.ExtractionStatus, report.Transactions)
 	}
 	first := report.Transactions[0]
@@ -201,5 +201,49 @@ func TestParseHousePTRUsesPositionedColumnsAndWrappedLines(t *testing.T) {
 		second.AmountMin == nil || *second.AmountMin != 15001 ||
 		second.AmountMax == nil || *second.AmountMax != 50000 {
 		t.Fatalf("unexpected second transaction: %+v", second)
+	}
+}
+
+func TestParseHousePTRClassifiesEmptyAndUnreconstructedText(t *testing.T) {
+	filing := HouseFiling{
+		First: "Jane", Last: "Member", Year: 2026,
+		FilingDate: time.Date(2026, 8, 10, 0, 0, 0, 0, time.UTC),
+		DocumentID: "empty", StateDistrict: "CA01",
+	}
+	tests := []struct {
+		name      string
+		pages     []PageText
+		status    string
+		retryable bool
+		errorText string
+	}{
+		{
+			name:      "no pages requires OCR but is terminal",
+			status:    "no_text",
+			errorText: "requires OCR",
+		},
+		{
+			name: "no meaningful text requires OCR but is terminal",
+			pages: []PageText{{Number: 1, Boxes: []TextBox{
+				{Text: " \t\n "},
+			}}},
+			status: "no_text", errorText: "requires OCR",
+		},
+		{
+			name: "extracted text without reconstructable rows retries",
+			pages: []PageText{{Number: 1, Boxes: []TextBox{
+				{Text: "Transaction Date Ticker Asset"},
+			}}},
+			status: "failed", retryable: true, errorText: "no transaction rows were reconstructed",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			report := ParseHousePTR(filing, "https://example.test/empty.pdf", []byte("pdf"), test.pages)
+			if report.ExtractionStatus != test.status || report.RetryableFailure != test.retryable ||
+				!strings.Contains(report.ExtractionError, test.errorText) {
+				t.Fatalf("report=%+v, want status=%q retryable=%v error containing %q", report, test.status, test.retryable, test.errorText)
+			}
+		})
 	}
 }

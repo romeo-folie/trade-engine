@@ -243,44 +243,63 @@ func ogeAmendedFieldIsAmendment(value string) bool {
 }
 
 type ogeAction struct {
-	position        int
+	box             ogePositionedBox
 	transactionType string
 }
 
-type ogeLine struct {
-	text    string
+type ogePositionedBox struct {
+	TextBox
+	index int
+}
+
+type ogeTransactionRow struct {
+	boxes   []ogePositionedBox
+	date    ogePositionedBox
 	actions []ogeAction
+}
+
+type ogeColumnBands struct {
+	date, action, asset, amount             float64
+	hasDate, hasAction, hasAsset, hasAmount bool
 }
 
 func ParseOGEPDF(f OGEFiling, pdf []byte, pages []PageText) Report {
 	r := Report{Source: "oge", ExternalID: f.ExternalID, Chamber: "executive", FilerName: f.FilerName, Office: f.Office, ReportType: f.ReportType, IsAmendment: f.IsAmendment, FilingDate: f.FilingDate, DocumentURL: f.DocumentURL, RawMetadata: f.RawMetadata, ContentHash: hashBytes(pdf), ExtractionStatus: "no_text"}
 	for _, p := range pages {
-		lines := ogeLines(p)
-		for _, line := range lines {
-			match := ogeDate.FindString(line.text)
-			if match == "" {
-				continue
-			}
-			date, err := parseDate(match)
+		bands := ogeHeaderBands(p)
+		for _, row := range ogeRows(p) {
+			dateText := ogeDate.FindString(row.date.Text)
+			date, err := parseDate(dateText)
 			if err != nil {
 				continue
 			}
-			typ := ogeTransactionType(line)
-			if typ != "purchase" && typ != "sale" && typ != "exchange" {
+			action := ogeTransactionType(row)
+			if action != "purchase" && action != "sale" && action != "exchange" {
 				continue
 			}
-			amountMin, amountMax := parseAmount(line.text)
-			asset := strings.TrimSpace(ogeDate.ReplaceAllString(line.text, ""))
-			asset = strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(asset, "Purchase", ""), "Sale", ""))
-			asset = strings.TrimSpace(strings.ReplaceAll(asset, "Exchange", ""))
-			raw, _ := json.Marshal(map[string]any{"page": p.Number, "line": line.text})
-			r.Transactions = append(r.Transactions, Transaction{Ordinal: len(r.Transactions) + 1, AssetName: asset, Ticker: tickerFromAsset(asset), TransactionType: typ, TransactionDate: date, AmountMin: amountMin, AmountMax: amountMax, AmountText: strings.TrimSpace(line.text), RawData: raw})
+			amountText := ogeRowAmountText(row, bands)
+			amountMin, amountMax := parseAmount(amountText)
+			if amountMin == nil {
+				continue
+			}
+			asset := ogeRowAsset(row, bands)
+			if asset == "" {
+				continue
+			}
+			raw, _ := json.Marshal(map[string]any{"page": p.Number, "line": ogeRowText(row)})
+			r.Transactions = append(r.Transactions, Transaction{Ordinal: len(r.Transactions) + 1, AssetName: asset, Ticker: tickerFromAsset(asset), TransactionType: action, TransactionDate: date, AmountMin: amountMin, AmountMax: amountMax, AmountText: amountText, RawData: raw})
 		}
 	}
 	if len(r.Transactions) > 0 {
 		r.ExtractionStatus = "completed"
 	} else {
-		r.ExtractionError = "no OGE transaction rows were reconstructed"
+		if ogeMeaningfulTextBoxCount(pages) == 0 {
+			r.ExtractionError = "OGE PDF has no extractable text; legacy paper/scanned filing requires OCR"
+		} else {
+			r.ExtractionStatus = "failed"
+			r.ExtractionError = "OGE text was extracted but no transaction rows were reconstructed"
+			r.RetryableFailure = true
+		}
 	}
 	return r
 }
@@ -288,29 +307,41 @@ func ParseOGEPDF(f OGEFiling, pdf []byte, pages []PageText) Report {
 // ogeTransactionType determines the reported action from the positioned action
 // box nearest to the transaction date. It accepts both expanded words and the
 // compact P/S/E codes, while ignoring action words inside asset descriptions.
-func ogeTransactionType(line ogeLine) string {
-	datePosition := -1
-	if dateText := ogeDate.FindString(line.text); dateText != "" {
-		datePosition = strings.Index(strings.ToLower(line.text), strings.ToLower(dateText))
+func ogeTransactionType(row ogeTransactionRow) string {
+	action, ok := ogeTransactionAction(row)
+	if !ok {
+		return ""
 	}
-	best, bestDistance := "", int(^uint(0)>>1)
-	for _, action := range line.actions {
-		distance := absInt(action.position - datePosition)
-		if distance < bestDistance {
-			best, bestDistance = action.transactionType, distance
+	return action.transactionType
+}
+
+func ogeTransactionAction(row ogeTransactionRow) (ogeAction, bool) {
+	best, bestDistance := "", 0.0
+	var selected ogeAction
+	for _, action := range row.actions {
+		distance := action.box.Left - row.date.Left
+		if distance < 0 {
+			distance = -distance
+		}
+		if best == "" || distance < bestDistance {
+			best, bestDistance, selected = action.transactionType, distance, action
 		}
 	}
-	return best
+	return selected, best != ""
 }
 
-func absInt(v int) int {
-	if v < 0 {
-		return -v
+func ogeStandaloneAction(text string) string {
+	text = strings.ToLower(strings.TrimSpace(text))
+	if text == "p" || text == "s" || text == "e" || text == "purchase" || text == "sale" || text == "exchange" || text == "buy" || text == "sell" {
+		return normalizeTransactionType(text)
 	}
-	return v
+	if strings.HasPrefix(text, "p (") || strings.HasPrefix(text, "s (") || strings.HasPrefix(text, "e (") {
+		return normalizeTransactionType(text)
+	}
+	return ""
 }
 
-func ogeLines(p PageText) []ogeLine {
+func ogeRows(p PageText) []ogeTransactionRow {
 	boxes := append([]TextBox(nil), p.Boxes...)
 	sort.SliceStable(boxes, func(i, j int) bool {
 		if boxes[i].Top != boxes[j].Top {
@@ -318,27 +349,157 @@ func ogeLines(p PageText) []ogeLine {
 		}
 		return boxes[i].Left < boxes[j].Left
 	})
-	var lines []ogeLine
-	for i := 0; i < len(boxes); {
-		top := boxes[i].Top
-		line := ogeLine{}
-		position := 0
-		for i < len(boxes) && boxes[i].Top-top <= 3 {
-			box := boxes[i]
-			if line.text != "" {
-				line.text += " "
-				position++
-			}
-			if typ := normalizeTransactionType(box.Text); typ == "purchase" || typ == "sale" || typ == "exchange" {
-				line.actions = append(line.actions, ogeAction{position: position, transactionType: typ})
-			}
-			line.text += box.Text
-			position += len(box.Text)
-			i++
-		}
-		lines = append(lines, line)
+	positioned := make([]ogePositionedBox, 0, len(boxes))
+	for i, box := range boxes {
+		positioned = append(positioned, ogePositionedBox{TextBox: box, index: i})
 	}
-	return lines
+	anchors := make([]ogePositionedBox, 0)
+	for _, box := range positioned {
+		if dateText := ogeDate.FindString(box.Text); dateText != "" {
+			if _, err := parseDate(dateText); err == nil {
+				anchors = append(anchors, box)
+			}
+		}
+	}
+	rows := make([]ogeTransactionRow, 0, len(anchors))
+	for i, anchor := range anchors {
+		rowEnd := 1e100
+		if i+1 < len(anchors) {
+			// The next dated row owns every box at its y-coordinate. Everything
+			// above it, including wrapped field continuations, belongs here.
+			rowEnd = anchors[i+1].Top
+		}
+		row := ogeTransactionRow{date: anchor}
+		for _, box := range positioned {
+			if box.Top < anchor.Top-3 || box.Top >= rowEnd {
+				continue
+			}
+			row.boxes = append(row.boxes, box)
+			if typ := ogeStandaloneAction(box.Text); typ != "" {
+				row.actions = append(row.actions, ogeAction{box: box, transactionType: typ})
+			}
+		}
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+func ogeHeaderBands(p PageText) ogeColumnBands {
+	var bands ogeColumnBands
+	for _, box := range p.Boxes {
+		text := strings.ToLower(strings.TrimSpace(box.Text))
+		switch {
+		case strings.Contains(text, "transaction date") || text == "date":
+			bands.date, bands.hasDate = box.Left, true
+		case strings.Contains(text, "transaction type") || text == "action":
+			bands.action, bands.hasAction = box.Left, true
+		case strings.Contains(text, "asset") || strings.Contains(text, "description"):
+			bands.asset, bands.hasAsset = box.Left, true
+		case strings.Contains(text, "amount") || strings.Contains(text, "value"):
+			bands.amount, bands.hasAmount = box.Left, true
+		}
+	}
+	return bands
+}
+
+func ogeRowAmountText(row ogeTransactionRow, bands ogeColumnBands) string {
+	amountStart := 0.0
+	found := false
+	for _, box := range row.boxes {
+		if !strings.Contains(box.Text, "$") {
+			continue
+		}
+		if !found || box.Left < amountStart {
+			amountStart, found = box.Left, true
+		}
+	}
+	if !found {
+		return ""
+	}
+	if bands.hasAmount && bands.amount > amountStart-4 {
+		amountStart = bands.amount
+	}
+	parts := make([]string, 0)
+	for _, box := range row.boxes {
+		if box.Left < amountStart-3 {
+			continue
+		}
+		text := strings.TrimSpace(box.Text)
+		if text == "" || !ogeAmountFieldText(text) {
+			continue
+		}
+		parts = append(parts, text)
+	}
+	return strings.Join(parts, " ")
+}
+
+func ogeAmountFieldText(text string) bool {
+	text = strings.TrimSpace(text)
+	if len(text) >= len("over ") && strings.EqualFold(text[:len("over ")], "over ") {
+		text = strings.TrimSpace(text[len("over "):])
+	}
+	for _, r := range text {
+		if (r >= '0' && r <= '9') || r == '$' || r == ',' || r == '-' || r == '–' || r == ' ' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func ogeRowAsset(row ogeTransactionRow, bands ogeColumnBands) string {
+	action, ok := ogeTransactionAction(row)
+	if !ok {
+		return ""
+	}
+	amountStart := 1e100
+	for _, box := range row.boxes {
+		if strings.Contains(box.Text, "$") && box.Left < amountStart {
+			amountStart = box.Left
+		}
+	}
+	if bands.hasAmount && bands.amount < amountStart {
+		amountStart = bands.amount
+	}
+	assetStart := action.box.Left + 0.01
+	if bands.hasAsset {
+		assetStart = bands.asset - 3
+	}
+	parts := make([]string, 0)
+	for _, box := range row.boxes {
+		if box.index == row.date.index || box.index == action.box.index || (box.Left < assetStart || box.Left >= amountStart-3) {
+			continue
+		}
+		if strings.Contains(box.Text, "$") {
+			continue
+		}
+		if text := strings.TrimSpace(box.Text); text != "" {
+			parts = append(parts, text)
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+func ogeRowText(row ogeTransactionRow) string {
+	parts := make([]string, 0, len(row.boxes))
+	for _, box := range row.boxes {
+		if text := strings.TrimSpace(box.Text); text != "" {
+			parts = append(parts, text)
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+func ogeMeaningfulTextBoxCount(pages []PageText) int {
+	count := 0
+	for _, page := range pages {
+		for _, box := range page.Boxes {
+			if strings.TrimSpace(box.Text) != "" {
+				count++
+			}
+		}
+	}
+	return count
 }
 
 func hashBytes(b []byte) string { sum := sha256.Sum256(b); return hex.EncodeToString(sum[:]) }

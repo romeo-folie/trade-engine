@@ -115,7 +115,40 @@ func (t *SenateChromeTransport) SearchPTRs(
 	if maxReports <= 0 {
 		return nil, fmt.Errorf("senate browser report limit must be positive")
 	}
-	form := url.Values{
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if err := t.startLockedWithContext(ctx); err != nil {
+		return nil, err
+	}
+	if _, err := t.ensureAuthorizedLocked(ctx); err != nil {
+		if errors.Is(err, ErrSenateAuthorizationRequired) {
+			_ = t.stopLocked()
+		}
+		return nil, err
+	}
+	expression, err := buildSenateSearchPTRExpression(
+		senateSearchPTRForm(since, until, start, maxReports), maxSenateSearchResponseSize,
+	)
+	if err != nil {
+		return nil, err
+	}
+	var response senateBrowserResponse
+	if err := t.runLocked(ctx, chromedp.Evaluate(
+		expression, &response, awaitSenateBrowserPromise,
+	)); err != nil {
+		return nil, fmt.Errorf("search Senate eFD in Chrome: %w", err)
+	}
+	if err := validateSenateBrowserResponse(response, t.opts.BaseURL, "/search/report/data/", maxSenateSearchResponseSize); err != nil {
+		return nil, err
+	}
+	if err := t.saveSessionLocked(ctx); err != nil {
+		return nil, err
+	}
+	return []byte(response.Body), nil
+}
+
+func senateSearchPTRForm(since, until time.Time, start, maxReports int) url.Values {
+	return url.Values{
 		"start":                {strconv.Itoa(start)},
 		"length":               {strconv.Itoa(maxReports)},
 		"report_types":         {"[11]"},
@@ -128,25 +161,19 @@ func (t *SenateChromeTransport) SearchPTRs(
 		"first_name":           {""},
 		"last_name":            {""},
 	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if err := t.startLockedWithContext(ctx); err != nil {
-		return nil, err
-	}
-	if _, err := t.ensureAuthorizedLocked(ctx); err != nil {
-		if errors.Is(err, ErrSenateAuthorizationRequired) {
-			_ = t.stopLocked()
-		}
-		return nil, err
-	}
+}
+
+// buildSenateSearchPTRExpression is kept pure so the browser request can be
+// syntax-checked and regression-tested without starting Chrome.
+func buildSenateSearchPTRExpression(form url.Values, responseLimit int) (string, error) {
 	encodedForm, err := json.Marshal(form.Encode())
 	if err != nil {
-		return nil, err
+		return "", fmt.Errorf("encode Senate PTR search form: %w", err)
 	}
-	expression := fmt.Sprintf(`(async () => {
+	return fmt.Sprintf(`(async () => {
 		const csrfMatch = document.cookie.match(/(?:^|;\s*)(?:csrftoken|csrf)=([^;]+)/i);
 		if (!csrfMatch) return {status: 0, url: location.href, body: "missing csrf cookie"};
-		const body = %s + "&csrfmiddlewaretoken=" + encodeURIComponent(decodeURIComponent(csrfMatch[1]));
+		const requestBody = %s + "&csrfmiddlewaretoken=" + encodeURIComponent(decodeURIComponent(csrfMatch[1]));
 		const response = await fetch("/search/report/data/", {
 			method: "POST", credentials: "same-origin", redirect: "follow",
 			headers: {
@@ -155,7 +182,7 @@ func (t *SenateChromeTransport) SearchPTRs(
 				"X-CSRFToken": decodeURIComponent(csrfMatch[1]),
 				"X-Requested-With": "XMLHttpRequest"
 			},
-			body
+			body: requestBody
 		});
 		const limit = %d;
 		const reader = response.body ? response.body.getReader() : null;
@@ -179,24 +206,11 @@ func (t *SenateChromeTransport) SearchPTRs(
 			}
 			chunks.push(value);
 		}
-		const body = oversized ? "" : new TextDecoder().decode(
+		const responseBody = oversized ? "" : new TextDecoder().decode(
 			chunks.length ? await new Blob(chunks).arrayBuffer() : new ArrayBuffer(0)
 		);
-		return {status: response.status, url: response.url, body, bodyBytes, oversized};
-	})()`, string(encodedForm), maxSenateSearchResponseSize)
-	var response senateBrowserResponse
-	if err := t.runLocked(ctx, chromedp.Evaluate(
-		expression, &response, awaitSenateBrowserPromise,
-	)); err != nil {
-		return nil, fmt.Errorf("search Senate eFD in Chrome: %w", err)
-	}
-	if err := validateSenateBrowserResponse(response, t.opts.BaseURL, "/search/report/data/", maxSenateSearchResponseSize); err != nil {
-		return nil, err
-	}
-	if err := t.saveSessionLocked(ctx); err != nil {
-		return nil, err
-	}
-	return []byte(response.Body), nil
+		return {status: response.status, url: response.url, body: responseBody, bodyBytes, oversized};
+	})()`, string(encodedForm), responseLimit), nil
 }
 
 func (t *SenateChromeTransport) FetchPTR(ctx context.Context, documentURL string) ([]byte, error) {

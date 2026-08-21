@@ -125,30 +125,47 @@ func TestRetryPoliticalDisclosureReportAtUsesCallerClock(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	report := PoliticalDisclosureReport{
-		Source: "senate", ExternalID: "test-retry-caller-clock", Chamber: "senate",
-		FilerName: "Clock Senator", ReportType: "periodic_transaction",
-		FilingDate: time.Now().UTC(), DocumentURL: "https://example.test/caller-clock",
-		ExtractionStatus: "failed", ExtractionError: "temporary", RetryableFailure: true,
-	}
-	t.Cleanup(func() {
-		_, _ = GetDB().Exec(context.Background(),
-			"DELETE FROM political_disclosure_reports WHERE source=$1 AND external_id=$2",
-			report.Source, report.ExternalID)
-	})
-	if err := SavePoliticalDisclosureReport(ctx, report); err != nil {
-		t.Fatal(err)
-	}
+	for _, tc := range []struct {
+		name       string
+		offset     time.Duration
+		externalID string
+		token      string
+	}{
+		{name: "app clock behind database", offset: -24 * time.Hour, externalID: "test-retry-caller-clock-behind", token: "caller-clock-behind"},
+		{name: "app clock ahead database", offset: 24 * time.Hour, externalID: "test-retry-caller-clock-ahead", token: "caller-clock-ahead"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			report := PoliticalDisclosureReport{
+				Source: "senate", ExternalID: tc.externalID, Chamber: "senate",
+				FilerName: "Clock Senator", ReportType: "periodic_transaction",
+				FilingDate: time.Now().UTC(), DocumentURL: "https://example.test/caller-clock",
+				ExtractionStatus: "failed", ExtractionError: "temporary", RetryableFailure: true,
+			}
+			t.Cleanup(func() {
+				_, _ = GetDB().Exec(context.Background(),
+					"DELETE FROM political_disclosure_reports WHERE source=$1 AND external_id=$2",
+					report.Source, report.ExternalID)
+			})
+			if err := SavePoliticalDisclosureReport(ctx, report); err != nil {
+				t.Fatal(err)
+			}
 
-	// Deliberately put the app clock well behind PostgreSQL's clock. A reset
-	// based on NOW() would not be claimable by this caller immediately.
-	appNow := time.Now().UTC().Add(-24 * time.Hour)
-	found, err := retryPoliticalDisclosureReportAt(ctx, report.Source, report.ExternalID, appNow)
-	if err != nil || !found {
-		t.Fatalf("manual retry found=%v err=%v", found, err)
-	}
-	claimed, err := ClaimPoliticalDisclosureRetries(ctx, report.Source, appNow, 1, time.Minute, "caller-clock")
-	if err != nil || len(claimed) != 1 || claimed[0].ExternalID != report.ExternalID {
-		t.Fatalf("immediate claim under skew = %+v, err=%v", claimed, err)
+			appNow := time.Now().UTC().Add(tc.offset)
+			found, err := retryPoliticalDisclosureReportAt(ctx, report.Source, report.ExternalID, appNow)
+			if err != nil || !found {
+				t.Fatalf("manual retry found=%v err=%v", found, err)
+			}
+			terminal, err := PoliticalDisclosureReportTerminal(ctx, report.Source, report.ExternalID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if terminal {
+				t.Fatal("manual retry is terminal immediately after reset")
+			}
+			claimed, err := ClaimPoliticalDisclosureRetries(ctx, report.Source, appNow, 1, time.Minute, tc.token)
+			if err != nil || len(claimed) != 1 || claimed[0].ExternalID != report.ExternalID {
+				t.Fatalf("immediate claim under skew = %+v, err=%v", claimed, err)
+			}
+		})
 	}
 }

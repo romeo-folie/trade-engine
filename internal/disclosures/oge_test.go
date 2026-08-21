@@ -252,6 +252,12 @@ func TestParseOGEPDFReconstructsRows(t *testing.T) {
 	if report.Transactions[0].TransactionDate.IsZero() || report.Transactions[0].AmountMin == nil {
 		t.Fatalf("row fields were not reconstructed: %#v", report.Transactions[0])
 	}
+	if got, want := report.Transactions[0].AssetName, "Acme Corp (ACME)"; got != want {
+		t.Fatalf("asset = %q, want %q", got, want)
+	}
+	if got, want := report.Transactions[0].AmountText, "$1,001 - $15,000"; got != want {
+		t.Fatalf("amount text = %q, want exact amount range %q", got, want)
+	}
 }
 
 func TestParseOGEPDFUsesTransactionColumnWhenAssetMentionsPurchase(t *testing.T) {
@@ -277,5 +283,88 @@ func TestParseOGEPDFReconstructsCompactActionCodes(t *testing.T) {
 	}}})
 	if len(report.Transactions) != 1 || report.Transactions[0].TransactionType != "purchase" || report.Transactions[0].Ticker != "CMPT" {
 		t.Fatalf("unexpected compact report: %#v", report)
+	}
+}
+
+func TestParseOGEPDFReconstructsEveryCompactActionCode(t *testing.T) {
+	filing := OGEFiling{ExternalID: "oge-compact-codes", ReportType: "periodic_transaction", FilingDate: time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)}
+	tests := []struct {
+		code, want string
+	}{
+		{code: "P", want: "purchase"},
+		{code: "S", want: "sale"},
+		{code: "E", want: "exchange"},
+	}
+	for _, test := range tests {
+		t.Run(test.code, func(t *testing.T) {
+			report := ParseOGEPDF(filing, []byte("pdf"), []PageText{{Number: 2, Boxes: []TextBox{
+				{Text: "07/01/2026", Left: 1, Top: 10},
+				{Text: test.code, Left: 80, Top: 10},
+				{Text: "Compact Corp (CMPT)", Left: 140, Top: 10},
+				{Text: "$1,001 - $15,000", Left: 260, Top: 10},
+			}}})
+			if len(report.Transactions) != 1 || report.Transactions[0].TransactionType != test.want {
+				t.Fatalf("compact code %q report=%+v", test.code, report)
+			}
+		})
+	}
+}
+
+func TestParseOGEPDFKeepsAssetActionWordsAndAttachesWrappedFields(t *testing.T) {
+	filing := OGEFiling{ExternalID: "oge-wrapped", ReportType: "periodic_transaction", FilingDate: time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)}
+	report := ParseOGEPDF(filing, []byte("pdf"), []PageText{{Number: 2, Boxes: []TextBox{
+		{Text: "Transaction Date", Left: 1, Top: 1},
+		{Text: "Transaction Type", Left: 80, Top: 1},
+		{Text: "Asset", Left: 140, Top: 1},
+		{Text: "Amount", Left: 260, Top: 1},
+		{Text: "07/01/2026", Left: 1, Top: 10},
+		{Text: "P", Left: 80, Top: 10},
+		{Text: "Purchase Preference Corp", Left: 140, Top: 10},
+		{Text: "(PPC)", Left: 140, Top: 14},
+		{Text: "$1,001 -", Left: 260, Top: 10},
+		{Text: "$15,000", Left: 260, Top: 14},
+		// The next dated transaction is deliberately close: neither its asset
+		// nor its amount may become a continuation of the first row.
+		{Text: "07/02/2026", Left: 1, Top: 20},
+		{Text: "S", Left: 80, Top: 20},
+		{Text: "Second Corp (NEXT)", Left: 140, Top: 20},
+		{Text: "$15,001 - $50,000", Left: 260, Top: 20},
+	}}})
+	if report.ExtractionStatus != "completed" || report.RetryableFailure || len(report.Transactions) != 2 {
+		t.Fatalf("report=%+v", report)
+	}
+	first := report.Transactions[0]
+	if first.TransactionType != "purchase" || first.AssetName != "Purchase Preference Corp (PPC)" ||
+		first.Ticker != "PPC" || first.AmountText != "$1,001 - $15,000" ||
+		first.AmountMin == nil || *first.AmountMin != 1001 || first.AmountMax == nil || *first.AmountMax != 15000 {
+		t.Fatalf("first transaction=%+v", first)
+	}
+	second := report.Transactions[1]
+	if second.TransactionType != "sale" || second.AssetName != "Second Corp (NEXT)" ||
+		second.AmountText != "$15,001 - $50,000" {
+		t.Fatalf("second transaction=%+v", second)
+	}
+}
+
+func TestParseOGEPDFClassifiesNoTextAndParserMiss(t *testing.T) {
+	filing := OGEFiling{ExternalID: "oge-status", ReportType: "periodic_transaction", FilingDate: time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)}
+	tests := []struct {
+		name      string
+		pages     []PageText
+		status    string
+		retryable bool
+		errorText string
+	}{
+		{name: "empty is terminal OCR", status: "no_text", errorText: "requires OCR"},
+		{name: "whitespace is terminal OCR", pages: []PageText{{Number: 1, Boxes: []TextBox{{Text: " \t\n "}}}}, status: "no_text", errorText: "requires OCR"},
+		{name: "text parser miss retries", pages: []PageText{{Number: 1, Boxes: []TextBox{{Text: "transaction table heading"}}}}, status: "failed", retryable: true, errorText: "no transaction rows were reconstructed"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			report := ParseOGEPDF(filing, []byte("pdf"), test.pages)
+			if report.ExtractionStatus != test.status || report.RetryableFailure != test.retryable || !strings.Contains(report.ExtractionError, test.errorText) {
+				t.Fatalf("report=%+v, want status=%q retryable=%v error containing %q", report, test.status, test.retryable, test.errorText)
+			}
+		})
 	}
 }

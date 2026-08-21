@@ -4,12 +4,79 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/dop251/goja"
 )
+
+func TestBuildSenateSearchPTRExpressionEscapesFormAndParses(t *testing.T) {
+	form := url.Values{
+		"first_name": {`Renée "Zoë" \`},
+		"last_name":  {"李 & O'Neil"},
+		"start":      {"0"},
+	}
+	const encodedForm = "first_name=Ren%C3%A9e+%22Zo%C3%AB%22+%5C&last_name=%E6%9D%8E+%26+O%27Neil&start=0"
+	if got := form.Encode(); got != encodedForm {
+		t.Fatalf("encoded form = %q, want %q", got, encodedForm)
+	}
+
+	got, err := buildSenateSearchPTRExpression(form, 123)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = `(async () => {
+		const csrfMatch = document.cookie.match(/(?:^|;\s*)(?:csrftoken|csrf)=([^;]+)/i);
+		if (!csrfMatch) return {status: 0, url: location.href, body: "missing csrf cookie"};
+		const requestBody = "first_name=Ren%C3%A9e+%22Zo%C3%AB%22+%5C\u0026last_name=%E6%9D%8E+%26+O%27Neil\u0026start=0" + "&csrfmiddlewaretoken=" + encodeURIComponent(decodeURIComponent(csrfMatch[1]));
+		const response = await fetch("/search/report/data/", {
+			method: "POST", credentials: "same-origin", redirect: "follow",
+			headers: {
+				"Accept": "application/json, text/javascript, */*; q=0.01",
+				"Content-Type": "application/x-www-form-urlencoded",
+				"X-CSRFToken": decodeURIComponent(csrfMatch[1]),
+				"X-Requested-With": "XMLHttpRequest"
+			},
+			body: requestBody
+		});
+		const limit = 123;
+		const reader = response.body ? response.body.getReader() : null;
+		if (!reader) {
+			const text = await response.text();
+			const bodyBytes = new TextEncoder().encode(text).byteLength;
+			const oversized = bodyBytes > limit;
+			return {status: response.status, url: response.url, body: oversized ? "" : text, bodyBytes, oversized};
+		}
+		const chunks = [];
+		let bodyBytes = 0;
+		let oversized = false;
+		while (true) {
+			const {done, value} = await reader.read();
+			if (done) break;
+			bodyBytes += value.byteLength;
+			if (bodyBytes > limit) {
+				oversized = true;
+				await reader.cancel();
+				break;
+			}
+			chunks.push(value);
+		}
+		const responseBody = oversized ? "" : new TextDecoder().decode(
+			chunks.length ? await new Blob(chunks).arrayBuffer() : new ArrayBuffer(0)
+		);
+		return {status: response.status, url: response.url, body: responseBody, bodyBytes, oversized};
+	})()`
+	if got != want {
+		t.Fatalf("generated Senate search expression changed unexpectedly:\n%s", got)
+	}
+	if _, err := goja.Parse("senate-search-ptr.js", got); err != nil {
+		t.Fatalf("generated Senate search expression does not parse: %v", err)
+	}
+}
 
 func TestSenatePageAuthorized(t *testing.T) {
 	tests := []struct {

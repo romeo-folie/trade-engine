@@ -152,17 +152,28 @@ func ParseHousePTR(filing HouseFiling, documentURL string, pdfData []byte, pages
 		report.Transactions[index].Ordinal = index + 1
 	}
 	if len(report.Transactions) == 0 {
-		report.ExtractionStatus = "no_text"
-		report.ExtractionError = "no House PTR transaction rows were reconstructed"
-		boxCount := 0
-		for _, page := range pages {
-			boxCount += len(page.Boxes)
-		}
-		if boxCount == 0 {
+		if housePTRMeaningfulTextBoxCount(pages) == 0 {
+			report.ExtractionStatus = "no_text"
 			report.ExtractionError = "PDF has no extractable text; legacy paper/scanned PTR requires OCR"
+		} else {
+			report.ExtractionStatus = "failed"
+			report.ExtractionError = "House PTR text was extracted but no transaction rows were reconstructed"
+			report.RetryableFailure = true
 		}
 	}
 	return report
+}
+
+func housePTRMeaningfulTextBoxCount(pages []PageText) int {
+	count := 0
+	for _, page := range pages {
+		for _, box := range page.Boxes {
+			if strings.TrimSpace(box.Text) != "" {
+				count++
+			}
+		}
+	}
+	return count
 }
 
 func parseHousePage(page PageText) []Transaction {

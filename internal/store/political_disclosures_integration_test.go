@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +16,13 @@ import (
 
 type mutableSenateTransport struct {
 	failNewest bool
+}
+
+func rawJSONEqual(left, right json.RawMessage) bool {
+	var decodedLeft, decodedRight any
+	return json.Unmarshal(left, &decodedLeft) == nil &&
+		json.Unmarshal(right, &decodedRight) == nil &&
+		reflect.DeepEqual(decodedLeft, decodedRight)
 }
 
 func (t *mutableSenateTransport) SearchPTRs(
@@ -486,6 +494,237 @@ func TestClaimPoliticalDisclosureCandidatesExcludesFutureReportsFromClaimSet(t *
 	}
 }
 
+func TestClaimPoliticalDisclosureCandidatesReturnsCurrentClaimedEvidenceAfterConcurrentRefresh(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2300, time.March, 1, 12, 0, 0, 0, time.UTC)
+	report := politicalDisclosureClaimFixture("test-claim-current-evidence", "PDCURRENT", now)
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), `
+			DELETE FROM political_disclosure_reports WHERE source=$1 AND external_id=$2`, report.Source, report.ExternalID)
+	})
+	if err := store.SavePoliticalDisclosureReport(ctx, report); err != nil {
+		t.Fatal(err)
+	}
+
+	lockTx, err := store.GetDB().Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lockTx.Rollback(ctx) //nolint:errcheck
+	var backendPID int
+	if err := lockTx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&backendPID); err != nil {
+		t.Fatal(err)
+	}
+	var reportID string
+	if err := lockTx.QueryRow(ctx, `
+		SELECT c.report_id::text
+		FROM political_disclosure_candidates c
+		JOIN political_disclosure_reports r ON r.id=c.report_id
+		WHERE r.source=$1 AND r.external_id=$2 AND c.ticker=$3
+		FOR UPDATE OF c`, report.Source, report.ExternalID, "PDCURRENT").Scan(&reportID); err != nil {
+		t.Fatal(err)
+	}
+
+	claimCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	claimedResult := make(chan []store.PoliticalDisclosureCandidate, 1)
+	claimErr := make(chan error, 1)
+	go func() {
+		claimed, err := store.ClaimPoliticalDisclosureCandidates(
+			claimCtx, now.AddDate(0, 0, -7), now, time.Hour, 1, "current-evidence-token",
+		)
+		if err != nil {
+			claimErr <- err
+			return
+		}
+		claimedResult <- claimed
+	}()
+
+	// Wait until ClaimPoliticalDisclosureCandidates has materialized its eligible
+	// history and is blocked attempting to claim this candidate row. Updating the
+	// row in the lock holder then reproduces a report re-extraction between the
+	// history read and claim update without relying on timing.
+	blocked := false
+	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+		if err := store.GetDB().QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM pg_stat_activity a
+				WHERE $1 = ANY(pg_blocking_pids(a.pid))
+				  AND a.query LIKE '%political_disclosure_candidates%'
+			)`, backendPID).Scan(&blocked); err != nil {
+			t.Fatal(err)
+		}
+		if blocked {
+			break
+		}
+	}
+	if !blocked {
+		t.Fatal("candidate claim did not block on the locked row")
+	}
+	freshDate := now.AddDate(0, 0, -2)
+	if _, err := lockTx.Exec(ctx, `
+		UPDATE political_disclosure_candidates
+		SET transaction_count=2, latest_transaction_date=$3,
+			evidence='[{"fresh":true}]'::jsonb
+		WHERE report_id=$1::uuid AND ticker=$2`, reportID, "PDCURRENT", freshDate); err != nil {
+		t.Fatal(err)
+	}
+	if err := lockTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case err := <-claimErr:
+		t.Fatal(err)
+	case claimed := <-claimedResult:
+		if len(claimed) != 1 || !claimed[0].Claimed ||
+			claimed[0].PromotionClaimToken != "current-evidence-token" ||
+			claimed[0].TransactionCount != 2 ||
+			claimed[0].LatestTransaction.Format(time.DateOnly) != freshDate.Format(time.DateOnly) {
+			t.Fatalf("claimed=%+v, want refreshed claimed evidence", claimed)
+		}
+		var evidence []map[string]bool
+		if err := json.Unmarshal(claimed[0].Evidence, &evidence); err != nil || len(evidence) != 1 || !evidence[0]["fresh"] {
+			t.Fatalf("claimed evidence=%s err=%v, want refreshed evidence", claimed[0].Evidence, err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("candidate claim did not finish after refresh committed")
+	}
+}
+
+func TestPoliticalDisclosureParentLockPreventsReextractedClaimFromCreatingWatchlist(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2300, time.March, 2, 12, 0, 0, 0, time.UTC)
+	report := politicalDisclosureClaimFixture("test-parent-lock-refresh", "PDPARENTLOCK", now)
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), `DELETE FROM watchlist WHERE ticker=$1`, "PDPARENTLOCK")
+		_, _ = store.GetDB().Exec(context.Background(), `
+			DELETE FROM political_disclosure_reports WHERE source=$1 AND external_id=$2`, report.Source, report.ExternalID)
+	})
+	if err := store.SavePoliticalDisclosureReport(ctx, report); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimPoliticalDisclosureCandidates(
+		ctx, now.AddDate(0, 0, -7), now, time.Hour, 1, "parent-lock-token",
+	)
+	if err != nil || len(claimed) != 1 || !claimed[0].Claimed {
+		t.Fatalf("claim=%+v err=%v", claimed, err)
+	}
+
+	lockTx, err := store.GetDB().Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lockTx.Rollback(ctx) //nolint:errcheck
+	var backendPID int
+	if err := lockTx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&backendPID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lockTx.Exec(ctx, `
+		SELECT 1 FROM political_disclosure_reports WHERE id=$1::uuid FOR UPDATE`, claimed[0].ReportID); err != nil {
+		t.Fatal(err)
+	}
+	item := store.WatchlistItem{Ticker: "PDPARENTLOCK", Platform: "stock", Strategies: []string{"momentum"}, Timeframes: []string{"1D"}, MinConfidence: .8, Source: "scanner"}
+	promoteDone := make(chan error, 1)
+	go func() {
+		promoteDone <- store.PromoteScannerSourcesToWatchlist(ctx, item,
+			store.ScannerSourcePromotionClaims{PoliticalDisclosure: &store.PoliticalDisclosurePromotionClaim{
+				Ticker: "PDPARENTLOCK", Token: "parent-lock-token", ReportIDs: []string{claimed[0].ReportID},
+			}}, "fixture", now)
+	}()
+
+	blocked := false
+	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+		if err := store.GetDB().QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM pg_stat_activity a
+				WHERE $1 = ANY(pg_blocking_pids(a.pid))
+				  AND a.wait_event_type='Lock'
+				  AND a.query LIKE '%political_disclosure_reports%'
+			)`, backendPID).Scan(&blocked); err != nil {
+			t.Fatal(err)
+		}
+		if blocked {
+			break
+		}
+	}
+	if !blocked {
+		select {
+		case err := <-promoteDone:
+			t.Fatalf("promotion escaped parent lock before re-extraction: %v", err)
+		default:
+		}
+		t.Fatal("promotion did not block on the claimed parent report")
+	}
+	if _, err := lockTx.Exec(ctx, `
+		UPDATE political_disclosure_reports
+		SET extraction_status='failed', extraction_error='re-extracted during promotion'
+		WHERE id=$1::uuid`, claimed[0].ReportID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lockTx.Exec(ctx, `
+		UPDATE political_disclosure_candidates
+		SET promotion_status='superseded', promotion_claim_token=NULL, promotion_claimed_at=NULL
+		WHERE report_id=$1::uuid AND ticker=$2`, claimed[0].ReportID, "PDPARENTLOCK"); err != nil {
+		t.Fatal(err)
+	}
+	if err := lockTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var claimErr *store.ScannerSourcePromotionClaimError
+	select {
+	case err := <-promoteDone:
+		if !errors.As(err, &claimErr) || claimErr.Source != "political_disclosure" {
+			t.Fatalf("promotion error=%v, want stale political disclosure claim", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("promotion did not resume after parent lock released")
+	}
+	watchlistItem, err := store.GetWatchlistItem(ctx, "PDPARENTLOCK", "stock")
+	if err != nil || watchlistItem != nil {
+		t.Fatalf("stale disclosure created watchlist item=%+v err=%v", watchlistItem, err)
+	}
+}
+
+func TestPoliticalDisclosurePromotionRejectsNonCompletedClaimedParent(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2300, time.March, 3, 12, 0, 0, 0, time.UTC)
+	report := politicalDisclosureClaimFixture("test-parent-not-completed", "PDPARENTSTATUS", now)
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), `DELETE FROM watchlist WHERE ticker=$1`, "PDPARENTSTATUS")
+		_, _ = store.GetDB().Exec(context.Background(), `
+			DELETE FROM political_disclosure_reports WHERE source=$1 AND external_id=$2`, report.Source, report.ExternalID)
+	})
+	if err := store.SavePoliticalDisclosureReport(ctx, report); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimPoliticalDisclosureCandidates(
+		ctx, now.AddDate(0, 0, -7), now, time.Hour, 1, "parent-status-token",
+	)
+	if err != nil || len(claimed) != 1 || !claimed[0].Claimed {
+		t.Fatalf("claim=%+v err=%v", claimed, err)
+	}
+	if _, err := store.GetDB().Exec(ctx, `
+		UPDATE political_disclosure_reports SET extraction_status='failed'
+		WHERE id=$1::uuid`, claimed[0].ReportID); err != nil {
+		t.Fatal(err)
+	}
+	item := store.WatchlistItem{Ticker: "PDPARENTSTATUS", Platform: "stock", Strategies: []string{"momentum"}, Timeframes: []string{"1D"}, MinConfidence: .8, Source: "scanner"}
+	err = store.PromoteScannerSourcesToWatchlist(ctx, item,
+		store.ScannerSourcePromotionClaims{PoliticalDisclosure: &store.PoliticalDisclosurePromotionClaim{
+			Ticker: "PDPARENTSTATUS", Token: "parent-status-token", ReportIDs: []string{claimed[0].ReportID},
+		}}, "fixture", now)
+	var claimErr *store.ScannerSourcePromotionClaimError
+	if !errors.As(err, &claimErr) || claimErr.Source != "political_disclosure" {
+		t.Fatalf("promotion error=%v, want stale political disclosure claim", err)
+	}
+	watchlistItem, err := store.GetWatchlistItem(ctx, "PDPARENTSTATUS", "stock")
+	if err != nil || watchlistItem != nil {
+		t.Fatalf("non-completed parent created watchlist item=%+v err=%v", watchlistItem, err)
+	}
+}
+
 func TestMarkPoliticalDisclosurePromotionRequiresAllClaimedReportIDs(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2300, time.April, 10, 12, 0, 0, 0, time.UTC)
@@ -761,6 +1000,177 @@ func TestFailedPoliticalDisclosureReportRetriesWithBoundedBackoffAndManualReset(
 	}
 }
 
+func TestHousePTRParseOutcomesPersistTerminalAndScheduledRetryStates(t *testing.T) {
+	ctx := context.Background()
+	filingDate := time.Date(2026, time.August, 10, 0, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name       string
+		externalID string
+		pages      []disclosures.PageText
+		status     string
+		retryable  bool
+	}{
+		{
+			name:       "no text is terminal",
+			externalID: "test-house-ptr-no-text-terminal",
+			pages: []disclosures.PageText{{Number: 1, Boxes: []disclosures.TextBox{
+				{Text: " \n\t "},
+			}}},
+			status: "no_text",
+		},
+		{
+			name:       "unreconstructed text schedules retry",
+			externalID: "test-house-ptr-unreconstructed-retry",
+			pages: []disclosures.PageText{{Number: 1, Boxes: []disclosures.TextBox{
+				{Text: "transaction table heading without a parseable row"},
+			}}},
+			status: "failed", retryable: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			parsed := disclosures.ParseHousePTR(disclosures.HouseFiling{
+				First: "Jane", Last: "Member", FilingType: "P", StateDistrict: "TS01",
+				Year: 2026, FilingDate: filingDate, DocumentID: test.externalID,
+			}, "https://example.test/"+test.externalID+".pdf", []byte("pdf"), test.pages)
+			report := store.PoliticalDisclosureReport{
+				Source: parsed.Source, ExternalID: parsed.ExternalID, Chamber: parsed.Chamber,
+				FilerName: parsed.FilerName, Office: parsed.Office, ReportType: parsed.ReportType,
+				FilingDate: parsed.FilingDate, DocumentURL: parsed.DocumentURL, ContentHash: parsed.ContentHash,
+				ExtractionStatus: parsed.ExtractionStatus, ExtractionError: parsed.ExtractionError,
+				RetryableFailure: parsed.RetryableFailure, RawMetadata: json.RawMessage(parsed.RawMetadata),
+			}
+			t.Cleanup(func() {
+				_, _ = store.GetDB().Exec(context.Background(),
+					"DELETE FROM political_disclosure_reports WHERE source=$1 AND external_id=$2", report.Source, report.ExternalID)
+			})
+			if err := store.SavePoliticalDisclosureFirstPass(ctx, report); err != nil {
+				t.Fatal(err)
+			}
+			stored, err := store.GetPoliticalDisclosureReport(ctx, report.Source, report.ExternalID)
+			if err != nil || stored == nil || stored.ExtractionStatus != test.status || stored.RetryableFailure != test.retryable {
+				t.Fatalf("stored=%+v err=%v, want status=%q retryable=%v", stored, err, test.status, test.retryable)
+			}
+
+			terminal, err := store.PoliticalDisclosureReportTerminal(ctx, report.Source, report.ExternalID)
+			if err != nil || !terminal {
+				t.Fatalf("freshly persisted report terminal=%v err=%v", terminal, err)
+			}
+			if !test.retryable {
+				if stored.NextRetryAt != nil || stored.RetryAttemptCount != 0 {
+					t.Fatalf("terminal no-text report scheduled retry: %+v", stored)
+				}
+				return
+			}
+			if stored.NextRetryAt == nil || stored.RetryAttemptCount != 1 {
+				t.Fatalf("retryable parser miss was not scheduled: %+v", stored)
+			}
+			if _, err := store.GetDB().Exec(ctx, `
+				UPDATE political_disclosure_reports SET next_retry_at=NOW()-INTERVAL '1 second'
+				WHERE source=$1 AND external_id=$2`, report.Source, report.ExternalID); err != nil {
+				t.Fatal(err)
+			}
+			terminal, err = store.PoliticalDisclosureReportTerminal(ctx, report.Source, report.ExternalID)
+			if err != nil || terminal {
+				t.Fatalf("due parser miss terminal=%v err=%v", terminal, err)
+			}
+			claims, err := store.ClaimDuePoliticalDisclosureRetries(ctx, report.Source, time.Now().UTC(), 1, time.Minute)
+			if err != nil || len(claims) != 1 || claims[0].ExternalID != report.ExternalID {
+				t.Fatalf("due retry claims=%+v err=%v", claims, err)
+			}
+			if err := store.ReleasePoliticalDisclosureRetryClaims(ctx, claims[0].RetryClaimToken); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestOGEPDFParseOutcomesPersistTerminalAndScheduledRetryStates(t *testing.T) {
+	ctx := context.Background()
+	filingDate := time.Date(2026, time.August, 10, 0, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name       string
+		externalID string
+		pages      []disclosures.PageText
+		status     string
+		retryable  bool
+	}{
+		{
+			name:       "no text is terminal",
+			externalID: "test-oge-pdf-no-text-terminal",
+			pages: []disclosures.PageText{{Number: 1, Boxes: []disclosures.TextBox{
+				{Text: " \n\t "},
+			}}},
+			status: "no_text",
+		},
+		{
+			name:       "unreconstructed text schedules retry",
+			externalID: "test-oge-pdf-unreconstructed-retry",
+			pages: []disclosures.PageText{{Number: 1, Boxes: []disclosures.TextBox{
+				{Text: "transaction table heading without a parseable row"},
+			}}},
+			status: "failed", retryable: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			parsed := disclosures.ParseOGEPDF(disclosures.OGEFiling{
+				ExternalID: test.externalID, FilerName: "Jane Official", Office: "Executive Office",
+				ReportType: "periodic_transaction", FilingDate: filingDate,
+				DocumentURL: "https://example.test/" + test.externalID + ".pdf",
+			}, []byte("pdf"), test.pages)
+			report := store.PoliticalDisclosureReport{
+				Source: parsed.Source, ExternalID: parsed.ExternalID, Chamber: parsed.Chamber,
+				FilerName: parsed.FilerName, Office: parsed.Office, ReportType: parsed.ReportType,
+				FilingDate: parsed.FilingDate, DocumentURL: parsed.DocumentURL, ContentHash: parsed.ContentHash,
+				ExtractionStatus: parsed.ExtractionStatus, ExtractionError: parsed.ExtractionError,
+				RetryableFailure: parsed.RetryableFailure, RawMetadata: json.RawMessage(parsed.RawMetadata),
+			}
+			t.Cleanup(func() {
+				_, _ = store.GetDB().Exec(context.Background(),
+					"DELETE FROM political_disclosure_reports WHERE source=$1 AND external_id=$2", report.Source, report.ExternalID)
+			})
+			if err := store.SavePoliticalDisclosureFirstPass(ctx, report); err != nil {
+				t.Fatal(err)
+			}
+			stored, err := store.GetPoliticalDisclosureReport(ctx, report.Source, report.ExternalID)
+			if err != nil || stored == nil || stored.ExtractionStatus != test.status || stored.RetryableFailure != test.retryable {
+				t.Fatalf("stored=%+v err=%v, want status=%q retryable=%v", stored, err, test.status, test.retryable)
+			}
+
+			terminal, err := store.PoliticalDisclosureReportTerminal(ctx, report.Source, report.ExternalID)
+			if err != nil || !terminal {
+				t.Fatalf("freshly persisted report terminal=%v err=%v", terminal, err)
+			}
+			if !test.retryable {
+				if stored.NextRetryAt != nil || stored.RetryAttemptCount != 0 {
+					t.Fatalf("terminal no-text report scheduled retry: %+v", stored)
+				}
+				return
+			}
+			if stored.NextRetryAt == nil || stored.RetryAttemptCount != 1 {
+				t.Fatalf("retryable parser miss was not scheduled: %+v", stored)
+			}
+			if _, err := store.GetDB().Exec(ctx, `
+				UPDATE political_disclosure_reports SET next_retry_at=NOW()-INTERVAL '1 second'
+				WHERE source=$1 AND external_id=$2`, report.Source, report.ExternalID); err != nil {
+				t.Fatal(err)
+			}
+			terminal, err = store.PoliticalDisclosureReportTerminal(ctx, report.Source, report.ExternalID)
+			if err != nil || terminal {
+				t.Fatalf("due parser miss terminal=%v err=%v", terminal, err)
+			}
+			claims, err := store.ClaimDuePoliticalDisclosureRetries(ctx, report.Source, time.Now().UTC(), 1, time.Minute)
+			if err != nil || len(claims) != 1 || claims[0].ExternalID != report.ExternalID {
+				t.Fatalf("due retry claims=%+v err=%v", claims, err)
+			}
+			if err := store.ReleasePoliticalDisclosureRetryClaims(ctx, claims[0].RetryClaimToken); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestNonCompletedDisclosureReExtractionClearsChildEvidence(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2099, time.May, 5, 0, 0, 0, 0, time.UTC)
@@ -865,7 +1275,15 @@ func TestFirstPassDisclosureFailureDoesNotDowngradeCompletedReport(t *testing.T)
 	late.ExtractionStatus = "failed"
 	late.ExtractionError = "temporary loser"
 	late.RetryableFailure = true
+	late.Chamber = "senate"
+	late.FilerName = "Sen. Stale First Pass"
+	late.Office = "ST99"
+	late.ReportType = "annual"
+	late.IsAmendment = true
+	late.FilingDate = late.FilingDate.AddDate(1, 0, 0)
+	late.DocumentURL = "https://example.test/stale-first-pass.pdf"
 	late.ContentHash = ""
+	late.RawMetadata = json.RawMessage(`{"fixture":"stale-first-pass"}`)
 	late.Transactions = nil
 	if err := store.SavePoliticalDisclosureFirstPass(ctx, late); err != nil {
 		t.Fatal(err)
@@ -875,8 +1293,135 @@ func TestFirstPassDisclosureFailureDoesNotDowngradeCompletedReport(t *testing.T)
 		stored.ContentHash != "completed-hash" || stored.RetryableFailure || stored.RetryAttemptCount != 0 || len(stored.Transactions) != 1 {
 		t.Fatalf("late failure downgraded completed report: %+v err=%v", stored, err)
 	}
+	if stored.Chamber != report.Chamber || stored.FilerName != report.FilerName ||
+		stored.Office != report.Office || stored.ReportType != report.ReportType ||
+		stored.IsAmendment != report.IsAmendment ||
+		stored.FilingDate.Format("2006-01-02") != report.FilingDate.Format("2006-01-02") ||
+		stored.DocumentURL != report.DocumentURL || !rawJSONEqual(stored.RawMetadata, report.RawMetadata) {
+		t.Fatalf("late failure changed completed observation: %+v", stored)
+	}
 	if stored.Transactions[0].Ticker != "CMF" {
 		t.Fatalf("completed transaction evidence lost: %+v", stored.Transactions)
+	}
+}
+
+func TestFirstPassDisclosureDoesNotOverwriteActiveRetryClaim(t *testing.T) {
+	ctx := context.Background()
+	report := store.PoliticalDisclosureReport{
+		Source: "house", ExternalID: "test-disclosure-first-pass-active-retry", Chamber: "house",
+		FilerName: "Hon. Retry Owner", Office: "TS06", ReportType: "periodic_transaction",
+		FilingDate: time.Now().UTC(), DocumentURL: "https://example.test/retry-owner.pdf",
+		ExtractionStatus: "failed", ExtractionError: "temporary", RetryableFailure: true,
+		RawMetadata: json.RawMessage(`{"owner":"retry"}`),
+	}
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(),
+			"DELETE FROM political_disclosure_reports WHERE source=$1 AND external_id=$2",
+			report.Source, report.ExternalID)
+	})
+	if err := store.SavePoliticalDisclosureReport(ctx, report); err != nil {
+		t.Fatal(err)
+	}
+	claimNow := time.Now().UTC().Add(time.Minute)
+	if _, err := store.GetDB().Exec(ctx, `
+		UPDATE political_disclosure_reports SET next_retry_at=$3
+		WHERE source=$1 AND external_id=$2`, report.Source, report.ExternalID, claimNow.Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimPoliticalDisclosureRetries(
+		ctx, report.Source, claimNow, 1, time.Minute, "retry-owner",
+	)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim=%+v err=%v", claimed, err)
+	}
+
+	staleFirstPass := report
+	staleFirstPass.Chamber = "senate"
+	staleFirstPass.FilerName = "Sen. Stale First Pass"
+	staleFirstPass.Office = "ST99"
+	staleFirstPass.ReportType = "annual"
+	staleFirstPass.FilingDate = report.FilingDate.AddDate(1, 0, 0)
+	staleFirstPass.DocumentURL = "https://example.test/stale-completion.pdf"
+	staleFirstPass.ContentHash = "stale-completed-hash"
+	staleFirstPass.ExtractionStatus = "completed"
+	staleFirstPass.ExtractionError = ""
+	staleFirstPass.RetryableFailure = false
+	staleFirstPass.RawMetadata = json.RawMessage(`{"owner":"stale-first-pass"}`)
+	staleFirstPass.Transactions = []store.PoliticalDisclosureTransaction{{
+		Ordinal: 1, AssetName: "Stale Corp", Ticker: "STAL", TransactionType: "purchase",
+		TransactionDate: staleFirstPass.FilingDate,
+	}}
+	if err := store.SavePoliticalDisclosureFirstPass(ctx, staleFirstPass); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := store.GetPoliticalDisclosureReport(ctx, report.Source, report.ExternalID)
+	if err != nil || stored == nil || stored.ExtractionStatus != "failed" ||
+		stored.RetryAttemptCount != 1 || stored.RetryClaimToken != "retry-owner" ||
+		stored.FilerName != report.FilerName || !rawJSONEqual(stored.RawMetadata, report.RawMetadata) ||
+		len(stored.Transactions) != 0 {
+		t.Fatalf("stale first pass changed active retry: %+v err=%v", stored, err)
+	}
+
+	ownedRetryCompletion := staleFirstPass
+	ownedRetryCompletion.Chamber = report.Chamber
+	ownedRetryCompletion.FilerName = report.FilerName
+	ownedRetryCompletion.Office = report.Office
+	ownedRetryCompletion.ReportType = report.ReportType
+	ownedRetryCompletion.FilingDate = report.FilingDate
+	ownedRetryCompletion.DocumentURL = report.DocumentURL
+	ownedRetryCompletion.ContentHash = "retry-owner-hash"
+	ownedRetryCompletion.RawMetadata = json.RawMessage(`{"owner":"retry-result"}`)
+	ownedRetryCompletion.Transactions[0].Ticker = "OWNED"
+	if err := store.SavePoliticalDisclosureRetryResult(ctx, ownedRetryCompletion, "retry-owner"); err != nil {
+		t.Fatal(err)
+	}
+	stored, err = store.GetPoliticalDisclosureReport(ctx, report.Source, report.ExternalID)
+	if err != nil || stored == nil || stored.ExtractionStatus != "completed" ||
+		stored.RetryClaimToken != "" || stored.ContentHash != "retry-owner-hash" ||
+		!rawJSONEqual(stored.RawMetadata, ownedRetryCompletion.RawMetadata) || len(stored.Transactions) != 1 ||
+		stored.Transactions[0].Ticker != "OWNED" {
+		t.Fatalf("owned retry completion did not win: %+v err=%v", stored, err)
+	}
+}
+
+func TestPoliticalDisclosureRetryFailureIncrementsAttemptOnce(t *testing.T) {
+	ctx := context.Background()
+	report := store.PoliticalDisclosureReport{
+		Source: "senate", ExternalID: "test-disclosure-retry-failure-once", Chamber: "senate",
+		FilerName: "Sen. Retry Failure", ReportType: "periodic_transaction",
+		FilingDate: time.Now().UTC(), DocumentURL: "https://example.test/retry-failure.pdf",
+		ExtractionStatus: "failed", ExtractionError: "first failure", RetryableFailure: true,
+	}
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(),
+			"DELETE FROM political_disclosure_reports WHERE source=$1 AND external_id=$2",
+			report.Source, report.ExternalID)
+	})
+	if err := store.SavePoliticalDisclosureReport(ctx, report); err != nil {
+		t.Fatal(err)
+	}
+	claimNow := time.Now().UTC().Add(time.Minute)
+	if _, err := store.GetDB().Exec(ctx, `
+		UPDATE political_disclosure_reports SET next_retry_at=$3
+		WHERE source=$1 AND external_id=$2`, report.Source, report.ExternalID, claimNow.Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimPoliticalDisclosureRetries(
+		ctx, report.Source, claimNow, 1, time.Minute, "retry-failure-owner",
+	)
+	if err != nil || len(claimed) != 1 || claimed[0].RetryAttemptCount != 1 {
+		t.Fatalf("claim=%+v err=%v", claimed, err)
+	}
+	retryFailure := report
+	retryFailure.ExtractionError = "second failure"
+	if err := store.SavePoliticalDisclosureRetryResult(ctx, retryFailure, "retry-failure-owner"); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := store.GetPoliticalDisclosureReport(ctx, report.Source, report.ExternalID)
+	if err != nil || stored == nil || stored.ExtractionStatus != "failed" ||
+		stored.RetryAttemptCount != 2 || !stored.RetryableFailure || stored.NextRetryAt == nil ||
+		stored.RetryClaimToken != "" {
+		t.Fatalf("retry failure did not increment exactly once: %+v err=%v", stored, err)
 	}
 }
 

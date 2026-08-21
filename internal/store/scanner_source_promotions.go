@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -145,11 +146,17 @@ func promoteScannerSourcesToWatchlist(
 			strings.TrimSpace(claims.PremarketEpisodic.Token) == "") {
 		return fmt.Errorf("premarket episodic watchlist promotion lineage is incomplete")
 	}
-	if claims.PoliticalDisclosure != nil &&
-		(claims.PoliticalDisclosure.Ticker != item.Ticker ||
-			strings.TrimSpace(claims.PoliticalDisclosure.Token) == "" ||
-			!completePoliticalDisclosureReportIDs(claims.PoliticalDisclosure.ReportIDs)) {
-		return fmt.Errorf("political disclosure watchlist promotion lineage is incomplete")
+	if claim := claims.PoliticalDisclosure; claim != nil {
+		reportIDs, ok := normalizePoliticalDisclosureReportIDs(claim.ReportIDs)
+		if claim.Ticker != item.Ticker || strings.TrimSpace(claim.Token) == "" || !ok {
+			return fmt.Errorf("political disclosure watchlist promotion lineage is incomplete")
+		}
+		// Use canonical, deduplicated UUIDs for each lock and terminal update.
+		// This makes the parent-first lock ordering stable even when a caller
+		// supplied equivalent UUID spellings.
+		politicalClaim := *claim
+		politicalClaim.ReportIDs = reportIDs
+		claims.PoliticalDisclosure = &politicalClaim
 	}
 
 	tx, err := GetDB().Begin(ctx)
@@ -265,13 +272,43 @@ func promoteScannerSourcesToWatchlist(
 		}
 	}
 	if claim := claims.PoliticalDisclosure; claim != nil {
+		parentRows, err := tx.Query(ctx, `
+			SELECT id::text, extraction_status
+			FROM political_disclosure_reports
+			WHERE id = ANY($1::uuid[])
+			ORDER BY id
+			FOR UPDATE`, claim.ReportIDs)
+		if err != nil {
+			return fmt.Errorf("lock political disclosure parent reports: %w", err)
+		}
+		parentCount := 0
+		parentsComplete := true
+		for parentRows.Next() {
+			var reportID, extractionStatus string
+			if err := parentRows.Scan(&reportID, &extractionStatus); err != nil {
+				parentRows.Close()
+				return err
+			}
+			parentCount++
+			parentsComplete = parentsComplete && extractionStatus == "completed"
+		}
+		err = parentRows.Err()
+		parentRows.Close()
+		if err != nil {
+			return err
+		}
+		if parentCount != len(claim.ReportIDs) || !parentsComplete {
+			return &ScannerSourcePromotionClaimError{Source: "political_disclosure"}
+		}
+
 		rows, err := tx.Query(ctx, `
 			SELECT c.report_id::text, COALESCE(c.promotion_claim_token,''),
 			       c.promotion_status
 			FROM political_disclosure_candidates c
-			JOIN unnest($2::text[]) expected(report_id)
-			  ON c.report_id=expected.report_id::uuid
+			JOIN unnest($2::uuid[]) expected(report_id)
+			  ON c.report_id=expected.report_id
 			WHERE c.ticker=$1
+			ORDER BY c.report_id
 			FOR UPDATE OF c`, claim.Ticker, claim.ReportIDs)
 		if err != nil {
 			return fmt.Errorf("lock political disclosure promotion: %w", err)
@@ -419,20 +456,23 @@ func completeScannerSourcePromotionClaims(
 	return nil
 }
 
-func completePoliticalDisclosureReportIDs(reportIDs []string) bool {
+func normalizePoliticalDisclosureReportIDs(reportIDs []string) ([]string, bool) {
 	if len(reportIDs) == 0 {
-		return false
+		return nil, false
 	}
 	seen := make(map[string]struct{}, len(reportIDs))
+	normalized := make([]string, 0, len(reportIDs))
 	for _, reportID := range reportIDs {
-		reportID = strings.TrimSpace(reportID)
-		if reportID == "" {
-			return false
+		parsed, err := uuid.Parse(strings.TrimSpace(reportID))
+		if err != nil {
+			return nil, false
 		}
+		reportID = parsed.String()
 		if _, duplicate := seen[reportID]; duplicate {
-			return false
+			return nil, false
 		}
 		seen[reportID] = struct{}{}
+		normalized = append(normalized, reportID)
 	}
-	return true
+	return normalized, true
 }

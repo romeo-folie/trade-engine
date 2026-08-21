@@ -18,11 +18,16 @@ import (
 )
 
 type Runner struct {
-	Cfg                config.DisclosuresConfig
-	House              *HouseClient
-	Senate             *SenateClient
-	OGE                *OGEClient
-	Extractor          PDFExtractor
+	Cfg       config.DisclosuresConfig
+	House     *HouseClient
+	Senate    *SenateClient
+	OGE       *OGEClient
+	Extractor PDFExtractor
+	// ExtractionTimeout bounds a single PDF extraction independently of the
+	// source request. NewRunner resolves it from RequestTimeoutSeconds; keeping
+	// it on Runner also lets callers that construct a Runner directly choose a
+	// suitable deadline.
+	ExtractionTimeout  time.Duration
 	Now                func() time.Time
 	RetryLease         time.Duration
 	reportTerminal     func(context.Context, string, string) (bool, error)
@@ -46,7 +51,7 @@ func NewRunner(cfg config.DisclosuresConfig) (*Runner, error) {
 		return nil, fmt.Errorf("invalid disclosure config: %s", strings.Join(validation, "; "))
 	}
 	timeout := time.Duration(cfg.RequestTimeoutSeconds) * time.Second
-	runner := &Runner{Cfg: cfg, Now: time.Now}
+	runner := &Runner{Cfg: cfg, Now: time.Now, ExtractionTimeout: timeout}
 	if cfg.House.Enabled {
 		runner.House = &HouseClient{
 			BaseURL:      cfg.House.BaseURL,
@@ -108,6 +113,21 @@ func (r *Runner) Close() error {
 		senateErr = r.Senate.Close()
 	}
 	return errors.Join(extractorErr, senateErr)
+}
+
+// extractPDF gives every extraction its own bounded child context. HTTP
+// request deadlines do not protect a potentially blocked PDF worker, while a
+// child of ctx still immediately observes caller cancellation during shutdown.
+func (r *Runner) extractPDF(ctx context.Context, pdf []byte) ([]PageText, error) {
+	if r.Extractor == nil {
+		return nil, permanentDisclosureError(errors.New("PDF extractor is not configured"))
+	}
+	if r.ExtractionTimeout <= 0 {
+		return r.Extractor.Extract(ctx, pdf)
+	}
+	extractCtx, cancel := context.WithTimeout(ctx, r.ExtractionTimeout)
+	defer cancel()
+	return r.Extractor.Extract(extractCtx, pdf)
 }
 
 func (r *Runner) Run(ctx context.Context) error {
@@ -331,22 +351,19 @@ func (r *Runner) retryHouse(ctx context.Context, limit int) (int, error) {
 		}
 		pdf, documentURL, fetchErr := r.House.FetchPDF(ctx, filing)
 		if fetchErr == nil {
-			if r.Extractor == nil {
-				fetchErr = permanentDisclosureError(errors.New("house retry has no PDF extractor"))
-			} else {
-				pages, extractErr := r.Extractor.Extract(ctx, pdf)
-				if extractErr == nil {
-					if saveErr := r.saveRetry(ctx, ParseHousePTR(filing, documentURL, pdf, pages), claim.RetryClaimToken); saveErr != nil {
-						return processed, fmt.Errorf("persist House retry %s: %w", claim.ExternalID, saveErr)
-					}
-					continue
+			pages, extractErr := r.extractPDF(ctx, pdf)
+			if extractErr == nil {
+				if saveErr := r.saveRetry(ctx, ParseHousePTR(filing, documentURL, pdf, pages), claim.RetryClaimToken); saveErr != nil {
+					return processed, fmt.Errorf("persist House retry %s: %w", claim.ExternalID, saveErr)
 				}
-				if extractErr != nil {
-					fetchErr = extractErr
-				}
+				continue
 			}
+			fetchErr = extractErr
 		}
 		if fetchErr != nil {
+			if err := ctx.Err(); err != nil {
+				return processed, err
+			}
 			if saveErr := r.saveRetry(ctx, retryFailure(claim, fetchErr), claim.RetryClaimToken); saveErr != nil {
 				return processed, fmt.Errorf("persist failed House retry %s: %w", claim.ExternalID, saveErr)
 			}
@@ -393,6 +410,9 @@ func (r *Runner) retrySenate(ctx context.Context, limit int) (int, error) {
 			continue
 		}
 		if fetchErr != nil {
+			if err := ctx.Err(); err != nil {
+				return processed, err
+			}
 			if saveErr := r.saveRetry(ctx, retryFailure(claim, fetchErr), claim.RetryClaimToken); saveErr != nil {
 				return processed, fmt.Errorf("persist failed Senate retry %s: %w", claim.ExternalID, saveErr)
 			}
@@ -428,21 +448,19 @@ func (r *Runner) retryOGE(ctx context.Context, limit int) (int, error) {
 		filing := OGEFiling{ExternalID: claim.ExternalID, FilerName: claim.FilerName, Office: claim.Office, ReportType: claim.ReportType, IsAmendment: claim.IsAmendment, FilingDate: claim.FilingDate, DocumentURL: claim.DocumentURL, RawMetadata: claim.RawMetadata}
 		pdf, fetchErr := r.OGE.FetchPDF(ctx, filing)
 		if fetchErr == nil {
-			if r.Extractor == nil {
-				fetchErr = permanentDisclosureError(errors.New("OGE retry has no PDF extractor"))
-			} else {
-				pages, extractErr := r.Extractor.Extract(ctx, pdf)
-				if extractErr == nil {
-					if saveErr := r.saveRetry(ctx, ParseOGEPDF(filing, pdf, pages), claim.RetryClaimToken); saveErr != nil {
-						return processed, fmt.Errorf("persist OGE retry %s: %w", claim.ExternalID, saveErr)
-					}
-					continue
-				} else {
-					fetchErr = extractErr
+			pages, extractErr := r.extractPDF(ctx, pdf)
+			if extractErr == nil {
+				if saveErr := r.saveRetry(ctx, ParseOGEPDF(filing, pdf, pages), claim.RetryClaimToken); saveErr != nil {
+					return processed, fmt.Errorf("persist OGE retry %s: %w", claim.ExternalID, saveErr)
 				}
+				continue
 			}
+			fetchErr = extractErr
 		}
 		if fetchErr != nil {
+			if err := ctx.Err(); err != nil {
+				return processed, err
+			}
 			if saveErr := r.saveRetry(ctx, retryFailure(claim, fetchErr), claim.RetryClaimToken); saveErr != nil {
 				return processed, fmt.Errorf("persist failed OGE retry %s: %w", claim.ExternalID, saveErr)
 			}
@@ -612,7 +630,7 @@ func (r *Runner) syncHouse(
 			}
 			continue
 		}
-		pages, err := r.Extractor.Extract(ctx, pdfData)
+		pages, err := r.extractPDF(ctx, pdfData)
 		if err != nil {
 			if ctx.Err() != nil {
 				return processed, ctx.Err()
@@ -770,7 +788,7 @@ func (r *Runner) syncOGE(ctx context.Context, since, until time.Time, limit int)
 				}
 				continue
 			}
-			pages, err := r.Extractor.Extract(ctx, pdf)
+			pages, err := r.extractPDF(ctx, pdf)
 			if err != nil {
 				if ctx.Err() != nil {
 					return processed, ctx.Err()

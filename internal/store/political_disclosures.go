@@ -14,6 +14,18 @@ import (
 
 var ErrPoliticalDisclosureRetryLeaseLost = errors.New("political disclosure retry claim is no longer active")
 
+// politicalDisclosureSaveOwnership specifies which caller owns a report save.
+// Keeping these cases distinct is important: a first-pass discovery must not
+// clobber an active retry worker, while a retry worker that still owns its
+// exact token and an explicit operator re-extraction may replace the report.
+type politicalDisclosureSaveOwnership int
+
+const (
+	politicalDisclosureFirstPass politicalDisclosureSaveOwnership = iota
+	politicalDisclosureRetryResult
+	politicalDisclosureOperatorReplace
+)
+
 type PoliticalDisclosureReport struct {
 	Source            string
 	ExternalID        string
@@ -259,15 +271,17 @@ func RetryPoliticalDisclosureReport(
 }
 
 // retryPoliticalDisclosureReportAt makes a failed report due according to the
-// caller's clock. Keeping the same clock for this reset and the subsequent
-// claim prevents a database/app clock skew from stranding a manual retry.
+// caller's clock when it is behind the database, so that a subsequent claim
+// using that same clock can acquire it. LEAST also keeps a caller clock ahead
+// of the database from setting a future retry time that the database considers
+// terminal until that caller-time delay elapses.
 func retryPoliticalDisclosureReportAt(
 	ctx context.Context, source, externalID string, now time.Time,
 ) (bool, error) {
 	result, err := GetDB().Exec(ctx, `
 		UPDATE political_disclosure_reports
 		SET extraction_status='failed', extraction_error=NULL,
-			retryable_failure=TRUE, retry_attempt_count=0, next_retry_at=$3,
+			retryable_failure=TRUE, retry_attempt_count=0, next_retry_at=LEAST($3::timestamptz, NOW()),
 			retry_claim_token=NULL, retry_claimed_at=NULL, retry_lease_until=NULL,
 			updated_at=NOW()
 		WHERE source=$1 AND external_id=$2 AND extraction_status='failed'`,
@@ -399,16 +413,17 @@ func SavePoliticalDisclosureRetryResult(ctx context.Context, report PoliticalDis
 	if currentToken == nil || *currentToken != token {
 		return ErrPoliticalDisclosureRetryLeaseLost
 	}
-	if err := savePoliticalDisclosureReportTx(ctx, tx, report, false); err != nil {
+	if err := savePoliticalDisclosureReportTx(ctx, tx, report, politicalDisclosureRetryResult); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
 }
 
-// SavePoliticalDisclosureFirstPass stores a freshly discovered report and
-// fences completed rows against a concurrent loser. A later sync worker that
-// saw the filing before this worker committed must not downgrade it after a
-// transient fetch/parse failure.
+// SavePoliticalDisclosureFirstPass stores a freshly discovered report only
+// when no retry worker owns the existing row. It also fences completed rows
+// against a concurrent loser: a later sync worker that saw the filing before
+// this worker committed must not downgrade it after a transient fetch/parse
+// failure.
 func SavePoliticalDisclosureFirstPass(
 	ctx context.Context, report PoliticalDisclosureReport,
 ) error {
@@ -417,7 +432,7 @@ func SavePoliticalDisclosureFirstPass(
 		return err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
-	if err := savePoliticalDisclosureReportTx(ctx, tx, report, false); err != nil {
+	if err := savePoliticalDisclosureReportTx(ctx, tx, report, politicalDisclosureFirstPass); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -435,14 +450,14 @@ func SavePoliticalDisclosureReport(
 		return err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
-	if err := savePoliticalDisclosureReportTx(ctx, tx, report, true); err != nil {
+	if err := savePoliticalDisclosureReportTx(ctx, tx, report, politicalDisclosureOperatorReplace); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
 }
 
 func savePoliticalDisclosureReportTx(
-	ctx context.Context, tx pgx.Tx, report PoliticalDisclosureReport, allowCompletedDowngrade bool,
+	ctx context.Context, tx pgx.Tx, report PoliticalDisclosureReport, ownership politicalDisclosureSaveOwnership,
 ) error {
 	if strings.TrimSpace(report.ExternalID) == "" ||
 		strings.TrimSpace(report.FilerName) == "" {
@@ -472,61 +487,51 @@ func savePoliticalDisclosureReportTx(
 			office=EXCLUDED.office, report_type=EXCLUDED.report_type,
 			is_amendment=EXCLUDED.is_amendment,
 			filing_date=EXCLUDED.filing_date, document_url=EXCLUDED.document_url,
-			content_hash=CASE
-				WHEN NOT $18 AND political_disclosure_reports.extraction_status='completed' AND EXCLUDED.extraction_status <> 'completed'
-					THEN political_disclosure_reports.content_hash
-				ELSE EXCLUDED.content_hash END,
-			extraction_status=CASE
-				WHEN NOT $18 AND political_disclosure_reports.extraction_status='completed' AND EXCLUDED.extraction_status <> 'completed'
-					THEN political_disclosure_reports.extraction_status
-				ELSE EXCLUDED.extraction_status END,
-			extraction_error=CASE
-				WHEN NOT $18 AND political_disclosure_reports.extraction_status='completed' AND EXCLUDED.extraction_status <> 'completed'
-					THEN political_disclosure_reports.extraction_error
-				ELSE EXCLUDED.extraction_error END,
+			content_hash=EXCLUDED.content_hash,
+			extraction_status=EXCLUDED.extraction_status,
+			extraction_error=EXCLUDED.extraction_error,
 			retry_attempt_count=CASE
-				WHEN NOT $18 AND political_disclosure_reports.extraction_status='completed' AND EXCLUDED.extraction_status <> 'completed'
-					THEN political_disclosure_reports.retry_attempt_count
-				ELSE CASE
-					WHEN EXCLUDED.extraction_status='failed' AND EXCLUDED.retryable_failure THEN
-						CASE WHEN political_disclosure_reports.extraction_status='failed'
-							THEN political_disclosure_reports.retry_attempt_count + 1 ELSE 1 END
-					ELSE 0 END
-			END,
+				WHEN EXCLUDED.extraction_status='failed' AND EXCLUDED.retryable_failure THEN
+					CASE WHEN political_disclosure_reports.extraction_status='failed'
+						THEN political_disclosure_reports.retry_attempt_count + 1 ELSE 1 END
+				ELSE 0 END,
 			retryable_failure=CASE
-				WHEN NOT $18 AND political_disclosure_reports.extraction_status='completed' AND EXCLUDED.extraction_status <> 'completed'
-					THEN political_disclosure_reports.retryable_failure
-				ELSE CASE
-					WHEN EXCLUDED.extraction_status='failed' AND EXCLUDED.retryable_failure THEN
-						(CASE WHEN political_disclosure_reports.extraction_status='failed'
-							THEN political_disclosure_reports.retry_attempt_count + 1 ELSE 1 END) < $17
-					ELSE FALSE END
-			END,
+				WHEN EXCLUDED.extraction_status='failed' AND EXCLUDED.retryable_failure THEN
+					(CASE WHEN political_disclosure_reports.extraction_status='failed'
+						THEN political_disclosure_reports.retry_attempt_count + 1 ELSE 1 END) < $17
+				ELSE FALSE END,
 			next_retry_at=CASE
-				WHEN NOT $18 AND political_disclosure_reports.extraction_status='completed' AND EXCLUDED.extraction_status <> 'completed'
-					THEN political_disclosure_reports.next_retry_at
-				ELSE CASE
-					WHEN EXCLUDED.extraction_status='failed' AND EXCLUDED.retryable_failure AND
-						(CASE WHEN political_disclosure_reports.extraction_status='failed'
-							THEN political_disclosure_reports.retry_attempt_count + 1 ELSE 1 END) < $17
-					THEN NOW() + CASE
-						WHEN (CASE WHEN political_disclosure_reports.extraction_status='failed'
-							THEN political_disclosure_reports.retry_attempt_count + 1 ELSE 1 END) = 1
-							THEN INTERVAL '1 hour'
-						WHEN (CASE WHEN political_disclosure_reports.extraction_status='failed'
-							THEN political_disclosure_reports.retry_attempt_count + 1 ELSE 1 END) = 2
-							THEN INTERVAL '6 hours'
-						ELSE INTERVAL '24 hours' END
-					ELSE NULL END
-			END,
+				WHEN EXCLUDED.extraction_status='failed' AND EXCLUDED.retryable_failure AND
+					(CASE WHEN political_disclosure_reports.extraction_status='failed'
+						THEN political_disclosure_reports.retry_attempt_count + 1 ELSE 1 END) < $17
+				THEN NOW() + CASE
+					WHEN (CASE WHEN political_disclosure_reports.extraction_status='failed'
+						THEN political_disclosure_reports.retry_attempt_count + 1 ELSE 1 END) = 1
+						THEN INTERVAL '1 hour'
+					WHEN (CASE WHEN political_disclosure_reports.extraction_status='failed'
+						THEN political_disclosure_reports.retry_attempt_count + 1 ELSE 1 END) = 2
+						THEN INTERVAL '6 hours'
+					ELSE INTERVAL '24 hours' END
+				ELSE NULL END,
 			raw_metadata=EXCLUDED.raw_metadata,
 			retry_claim_token=NULL, retry_claimed_at=NULL, retry_lease_until=NULL, updated_at=NOW()
+		WHERE $18::smallint <> $19::smallint
+			OR (political_disclosure_reports.retry_claim_token IS NULL
+				AND (political_disclosure_reports.extraction_status <> 'completed'
+					OR EXCLUDED.extraction_status = 'completed'))
 		RETURNING id, extraction_status`, report.Source, report.ExternalID, report.Chamber,
 		report.FilerName, report.Office, report.ReportType, report.FilingDate,
 		report.DocumentURL, report.ContentHash, report.ExtractionStatus, report.IsAmendment,
 		report.ExtractionError, retryableFailure, retryAttempts, nextRetryAt,
-		report.RawMetadata, MaxPoliticalDisclosureRetryAttempts, allowCompletedDowngrade,
+		report.RawMetadata, MaxPoliticalDisclosureRetryAttempts, ownership,
+		politicalDisclosureFirstPass,
 	).Scan(&reportID, &storedStatus)
+	if errors.Is(err, pgx.ErrNoRows) && ownership == politicalDisclosureFirstPass {
+		// A first-pass worker lost ownership to a retry claim or an already
+		// completed observation. The conflict predicate made this a no-op, so
+		// do not touch child evidence.
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("upsert political disclosure report: %w", err)
 	}
@@ -547,9 +552,6 @@ func savePoliticalDisclosureReportTx(
 		); err != nil {
 			return fmt.Errorf("supersede political disclosure candidates: %w", err)
 		}
-		return nil
-	}
-	if !allowCompletedDowngrade && storedStatus != report.ExtractionStatus {
 		return nil
 	}
 	if _, err := tx.Exec(ctx,
@@ -695,12 +697,16 @@ func ClaimPoliticalDisclosureCandidates(
 				c.promotion_status='processing' AND
 				c.promotion_claimed_at < $2::timestamptz - $3::interval
 			))
-			RETURNING c.*
+			RETURNING c.report_id, c.ticker, c.transaction_count,
+				c.latest_transaction_date, c.evidence, c.promotion_claim_token
 		)
 		SELECT e.report_id, e.external_id, e.ticker, e.source,
 			e.chamber, e.filer_name, COALESCE(e.office,''), e.report_type, e.is_amendment, e.filing_date,
-			e.document_url, e.extraction_status, e.transaction_count,
-			e.latest_transaction_date, e.evidence, COALESCE(c.promotion_claim_token,''),
+		e.document_url, e.extraction_status,
+			CASE WHEN c.report_id IS NOT NULL THEN c.transaction_count ELSE e.transaction_count END,
+			CASE WHEN c.report_id IS NOT NULL THEN c.latest_transaction_date ELSE e.latest_transaction_date END,
+			CASE WHEN c.report_id IS NOT NULL THEN c.evidence ELSE e.evidence END,
+			CASE WHEN c.report_id IS NOT NULL THEN c.promotion_claim_token ELSE '' END,
 			(c.report_id IS NOT NULL)
 		FROM eligible e LEFT JOIN claimed c ON c.report_id=e.report_id AND c.ticker=e.ticker
 		WHERE e.ticker IN (SELECT ticker FROM selected)

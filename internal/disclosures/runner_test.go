@@ -22,6 +22,14 @@ func (runnerTestExtractor) Extract(context.Context, []byte) ([]PageText, error) 
 
 func (runnerTestExtractor) Close() error { return nil }
 
+type staticPagesExtractor struct{ pages []PageText }
+
+func (e staticPagesExtractor) Extract(context.Context, []byte) ([]PageText, error) {
+	return e.pages, nil
+}
+
+func (staticPagesExtractor) Close() error { return nil }
+
 type blockingContextExtractor struct {
 	started chan context.Context
 }
@@ -115,8 +123,9 @@ func TestHouseSyncCancelsInFlightPDFExtraction(t *testing.T) {
 	extractor := blockingContextExtractor{started: make(chan context.Context, 1)}
 	runner := &Runner{
 		House: &HouseClient{BaseURL: server.URL, HTTP: server.Client()}, Extractor: extractor,
-		reportTerminal: func(context.Context, string, string) (bool, error) { return false, nil },
-		persistReport:  func(context.Context, Report) error { t.Fatal("canceled extraction was persisted"); return nil },
+		ExtractionTimeout: time.Hour,
+		reportTerminal:    func(context.Context, string, string) (bool, error) { return false, nil },
+		persistReport:     func(context.Context, Report) error { t.Fatal("canceled extraction was persisted"); return nil },
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -127,8 +136,11 @@ func TestHouseSyncCancelsInFlightPDFExtraction(t *testing.T) {
 	}()
 	select {
 	case extractCtx := <-extractor.started:
-		if extractCtx != ctx {
-			t.Fatal("runner did not pass its sync context to PDF extraction")
+		if extractCtx == ctx {
+			t.Fatal("runner did not derive a bounded PDF extraction context")
+		}
+		if _, ok := extractCtx.Deadline(); !ok {
+			t.Fatal("PDF extraction context has no deadline")
 		}
 	case <-time.After(time.Second):
 		t.Fatal("PDF extraction did not start")
@@ -141,6 +153,62 @@ func TestHouseSyncCancelsInFlightPDFExtraction(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("sync did not return after extraction cancellation")
+	}
+}
+
+func TestHouseSyncPersistsNoTextTerminalAndUnreconstructedTextForRetry(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/financial-pdfs/2026FD.txt":
+			_, _ = w.Write([]byte("Prefix\tLast\tFirst\tSuffix\tFilingType\tStateDst\tYear\tFilingDate\tDocID\nHon.\tMember\tJane\t\tP\tCA01\t2026\t08/10/2026\tdoc"))
+		case "/ptr-pdfs/2026/doc.pdf":
+			_, _ = w.Write([]byte("pdf"))
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	filingDate := time.Date(2026, 8, 10, 0, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name      string
+		pages     []PageText
+		status    string
+		retryable bool
+	}{
+		{
+			name:   "empty PDF text is terminal",
+			pages:  []PageText{{Number: 1, Boxes: []TextBox{{Text: " \n\t "}}}},
+			status: "no_text",
+		},
+		{
+			name:      "unreconstructable extracted text is scheduled for retry",
+			pages:     []PageText{{Number: 1, Boxes: []TextBox{{Text: "table header but no rows"}}}},
+			status:    "failed",
+			retryable: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var persisted []Report
+			runner := &Runner{
+				House:          &HouseClient{BaseURL: server.URL, HTTP: server.Client()},
+				Extractor:      staticPagesExtractor{pages: test.pages},
+				reportTerminal: func(context.Context, string, string) (bool, error) { return false, nil },
+				persistReport: func(_ context.Context, report Report) error {
+					persisted = append(persisted, report)
+					return nil
+				},
+			}
+			processed, err := runner.syncHouse(context.Background(), filingDate.AddDate(0, 0, -1), filingDate.AddDate(0, 0, 1), 1)
+			if err != nil || processed != 1 || len(persisted) != 1 {
+				t.Fatalf("processed=%d persisted=%+v err=%v", processed, persisted, err)
+			}
+			got := persisted[0]
+			if got.ExtractionStatus != test.status || got.RetryableFailure != test.retryable {
+				t.Fatalf("persisted report=%+v, want status=%q retryable=%v", got, test.status, test.retryable)
+			}
+		})
 	}
 }
 
@@ -159,8 +227,9 @@ func TestOGESyncCancelsInFlightPDFExtraction(t *testing.T) {
 	defer server.Close()
 	extractor := blockingContextExtractor{started: make(chan context.Context, 1)}
 	runner := &Runner{
-		OGE:       NewOGEClient(server.URL, time.Second),
-		Extractor: extractor,
+		OGE:               NewOGEClient(server.URL, time.Second),
+		Extractor:         extractor,
+		ExtractionTimeout: time.Hour,
 		reportTerminal: func(context.Context, string, string) (bool, error) {
 			return false, nil
 		},
@@ -178,8 +247,11 @@ func TestOGESyncCancelsInFlightPDFExtraction(t *testing.T) {
 	}()
 	select {
 	case extractCtx := <-extractor.started:
-		if extractCtx != ctx {
-			t.Fatal("runner did not pass its sync context to OGE PDF extraction")
+		if extractCtx == ctx {
+			t.Fatal("runner did not derive a bounded OGE PDF extraction context")
+		}
+		if _, ok := extractCtx.Deadline(); !ok {
+			t.Fatal("OGE PDF extraction context has no deadline")
 		}
 	case <-time.After(time.Second):
 		t.Fatal("OGE PDF extraction did not start")
@@ -201,6 +273,181 @@ func TestPDFiumExtractorRejectsCanceledContextBeforeClaimingWorker(t *testing.T)
 	_, err := (&PDFiumExtractor{}).Extract(ctx, []byte("pdf"))
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Extract error = %v, want context cancellation", err)
+	}
+}
+
+func TestExtractPDFUsesItsOwnDeadlineButPreservesParentCancellation(t *testing.T) {
+	t.Run("deadline", func(t *testing.T) {
+		extractor := blockingContextExtractor{started: make(chan context.Context, 1)}
+		runner := &Runner{Extractor: extractor, ExtractionTimeout: 10 * time.Millisecond}
+		ctx := context.Background()
+		done := make(chan error, 1)
+		go func() {
+			_, err := runner.extractPDF(ctx, []byte("pdf"))
+			done <- err
+		}()
+		select {
+		case extractCtx := <-extractor.started:
+			if extractCtx == ctx {
+				t.Fatal("extraction used the parent context")
+			}
+		case <-time.After(time.Second):
+			t.Fatal("PDF extraction did not start")
+		}
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+				t.Fatalf("error=%v parent=%v, want child deadline only", err, ctx.Err())
+			}
+		case <-time.After(time.Second):
+			t.Fatal("PDF extraction did not time out")
+		}
+	})
+
+	t.Run("parent cancellation", func(t *testing.T) {
+		extractor := blockingContextExtractor{started: make(chan context.Context, 1)}
+		runner := &Runner{Extractor: extractor, ExtractionTimeout: time.Hour}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := make(chan error, 1)
+		go func() {
+			_, err := runner.extractPDF(ctx, []byte("pdf"))
+			done <- err
+		}()
+		select {
+		case <-extractor.started:
+			cancel()
+		case <-time.After(time.Second):
+			t.Fatal("PDF extraction did not start")
+		}
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("error=%v, want parent cancellation", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("PDF extraction did not observe parent cancellation")
+		}
+	})
+}
+
+func TestPDFExtractionDeadlinePersistsRetryableFailureAcrossHouseAndOGEPaths(t *testing.T) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/financial-pdfs/2026FD.txt":
+			_, _ = w.Write([]byte("Prefix\tLast\tFirst\tSuffix\tFilingType\tStateDst\tYear\tFilingDate\tDocID\nHon.\tExample\tJane\t\tP\tCA01\t2026\t08/10/2026\tdoc"))
+		case "/ptr-pdfs/2026/doc.pdf", "/oge.pdf", "/retry-oge.pdf":
+			_, _ = w.Write([]byte("pdf"))
+		case "/":
+			_, _ = w.Write([]byte(`{"recordsTotal":1,"data":[{"type":"<a href='` + server.URL + `/oge.pdf'>PDF</a>","name":"Jane Official","agency":"Office","title":"Role","docDate":"2026-08-10"}]}`))
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	type savedFailure struct {
+		count     int
+		status    string
+		retryable bool
+	}
+	filingDate := time.Date(2026, 8, 10, 0, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name string
+		run  func(*Runner) (int, error)
+		make func(*savedFailure) *Runner
+	}{
+		{
+			name: "House first pass",
+			run: func(r *Runner) (int, error) {
+				return r.syncHouse(context.Background(), filingDate.AddDate(0, 0, -1), filingDate.AddDate(0, 0, 1), 1)
+			},
+			make: func(saved *savedFailure) *Runner {
+				return &Runner{
+					House:             &HouseClient{BaseURL: server.URL, HTTP: server.Client()},
+					Extractor:         blockingContextExtractor{started: make(chan context.Context, 1)},
+					ExtractionTimeout: 10 * time.Millisecond,
+					reportTerminal:    func(context.Context, string, string) (bool, error) { return false, nil },
+					persistReport: func(_ context.Context, report Report) error {
+						saved.count++
+						saved.status, saved.retryable = report.ExtractionStatus, report.RetryableFailure
+						return nil
+					},
+				}
+			},
+		},
+		{
+			name: "OGE first pass",
+			run: func(r *Runner) (int, error) {
+				return r.syncOGE(context.Background(), filingDate.AddDate(0, 0, -1), filingDate.AddDate(0, 0, 1), 1)
+			},
+			make: func(saved *savedFailure) *Runner {
+				return &Runner{
+					OGE:               NewOGEClient(server.URL, time.Second),
+					Extractor:         blockingContextExtractor{started: make(chan context.Context, 1)},
+					ExtractionTimeout: 10 * time.Millisecond,
+					reportTerminal:    func(context.Context, string, string) (bool, error) { return false, nil },
+					persistReport: func(_ context.Context, report Report) error {
+						saved.count++
+						saved.status, saved.retryable = report.ExtractionStatus, report.RetryableFailure
+						return nil
+					},
+				}
+			},
+		},
+		{
+			name: "House retry",
+			run:  func(r *Runner) (int, error) { return r.retryHouse(context.Background(), 1) },
+			make: func(saved *savedFailure) *Runner {
+				return &Runner{
+					House:             &HouseClient{BaseURL: server.URL, HTTP: server.Client()},
+					Extractor:         blockingContextExtractor{started: make(chan context.Context, 1)},
+					ExtractionTimeout: 10 * time.Millisecond,
+					claimDueRetries: func(context.Context, string, time.Time, int, time.Duration) ([]store.PoliticalDisclosureReport, error) {
+						return []store.PoliticalDisclosureReport{{Source: "house", ExternalID: "doc", Chamber: "house", FilerName: "Jane Example", Office: "CA01", ReportType: "periodic_transaction", FilingDate: filingDate, RetryClaimToken: "token", RawMetadata: []byte(`{"First":"Jane","Last":"Example","FilingType":"P","StateDistrict":"CA01","Year":2026,"FilingDate":"2026-08-10T00:00:00Z","DocumentID":"doc"}`)}}, nil
+					},
+					releaseRetryClaims: func(context.Context, string) error { return nil },
+					saveRetryResult: func(_ context.Context, report store.PoliticalDisclosureReport, _ string) error {
+						saved.count++
+						saved.status, saved.retryable = report.ExtractionStatus, report.RetryableFailure
+						return nil
+					},
+				}
+			},
+		},
+		{
+			name: "OGE retry",
+			run:  func(r *Runner) (int, error) { return r.retryOGE(context.Background(), 1) },
+			make: func(saved *savedFailure) *Runner {
+				return &Runner{
+					OGE:               NewOGEClient(server.URL, time.Second),
+					Extractor:         blockingContextExtractor{started: make(chan context.Context, 1)},
+					ExtractionTimeout: 10 * time.Millisecond,
+					claimDueRetries: func(context.Context, string, time.Time, int, time.Duration) ([]store.PoliticalDisclosureReport, error) {
+						return []store.PoliticalDisclosureReport{{Source: "oge", ExternalID: "retry-oge", Chamber: "executive", FilerName: "Jane Official", Office: "Office", ReportType: "periodic_transaction", FilingDate: filingDate, DocumentURL: server.URL + "/retry-oge.pdf", RetryClaimToken: "token"}}, nil
+					},
+					releaseRetryClaims: func(context.Context, string) error { return nil },
+					saveRetryResult: func(_ context.Context, report store.PoliticalDisclosureReport, _ string) error {
+						saved.count++
+						saved.status, saved.retryable = report.ExtractionStatus, report.RetryableFailure
+						return nil
+					},
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			saved := &savedFailure{}
+			processed, err := test.run(test.make(saved))
+			if processed != 1 || !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("processed=%d err=%v, want one deadline failure", processed, err)
+			}
+			if saved.count != 1 || saved.status != "failed" || !saved.retryable {
+				t.Fatalf("saved=%+v, want one retryable failed report", saved)
+			}
+		})
 	}
 }
 
@@ -242,6 +489,7 @@ func TestRetryPDFExtractionReceivesCancellationContext(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			extractor := blockingContextExtractor{started: make(chan context.Context, 1)}
 			runner := test.make(extractor)
+			runner.ExtractionTimeout = time.Hour
 			runner.saveRetryResult = func(context.Context, store.PoliticalDisclosureReport, string) error { return nil }
 			runner.releaseRetryClaims = func(context.Context, string) error { return nil }
 			ctx, cancel := context.WithCancel(context.Background())
@@ -250,8 +498,11 @@ func TestRetryPDFExtractionReceivesCancellationContext(t *testing.T) {
 			go func() { _, err := test.run(runner, ctx); done <- err }()
 			select {
 			case extractCtx := <-extractor.started:
-				if extractCtx != ctx {
-					t.Fatal("retry did not pass its context to PDF extraction")
+				if extractCtx == ctx {
+					t.Fatal("retry did not derive a bounded PDF extraction context")
+				}
+				if _, ok := extractCtx.Deadline(); !ok {
+					t.Fatal("retry PDF extraction context has no deadline")
 				}
 			case <-time.After(time.Second):
 				t.Fatal("retry extraction did not start")
@@ -602,6 +853,21 @@ func TestNewRunnerRejectsInvalidEnabledDisclosureConfigBeforeResources(t *testin
 	cfg.RequestTimeoutSeconds = 0
 	if _, err := NewRunner(cfg); err == nil || !strings.Contains(err.Error(), "request_timeout_seconds") {
 		t.Fatalf("NewRunner error=%v, want disclosure validation", err)
+	}
+}
+
+func TestNewRunnerResolvesPDFExtractionTimeoutFromRequestTimeout(t *testing.T) {
+	cfg := config.Defaults().Disclosures
+	cfg.House.Enabled = false
+	cfg.Senate.Enabled = false
+	cfg.OGE.Enabled = false
+	cfg.RequestTimeoutSeconds = 17
+	runner, err := NewRunner(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runner.ExtractionTimeout != 17*time.Second {
+		t.Fatalf("ExtractionTimeout=%s, want 17s", runner.ExtractionTimeout)
 	}
 }
 
