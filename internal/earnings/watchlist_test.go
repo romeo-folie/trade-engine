@@ -1,15 +1,19 @@
 package earnings
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/engine"
+	"github.com/romeo-folie/trade-engine/internal/logger"
 )
 
 func TestNextSessionReleasesUsesFinnhubCalendarDateWithoutTimezoneShift(t *testing.T) {
@@ -54,6 +58,9 @@ func (f schedulerJob) RunSession(ctx context.Context, s engine.USMarketSession, 
 }
 
 func TestWatchlistSchedulerRetriesTransientFailure(t *testing.T) {
+	var logs bytes.Buffer
+	restore := logger.SetForTesting(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer restore()
 	now, _ := time.Parse(time.RFC3339, "2026-08-21T20:05:00Z")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -76,5 +83,18 @@ func TestWatchlistSchedulerRetriesTransientFailure(t *testing.T) {
 	}
 	if calls != 2 {
 		t.Fatalf("calls=%d, want retry", calls)
+	}
+	for _, want := range []string{
+		"earnings watchlist scheduler initialized",
+		"earnings watchlist feeder failed; retry scheduled",
+		"\"failure_count\":1",
+		"earnings watchlist scheduler waiting",
+		"\"reason\":\"retry\"",
+		"earnings watchlist scheduler woke",
+		"\"lag_seconds\":0",
+	} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("scheduler logs missing %q:\n%s", want, logs.String())
+		}
 	}
 }
