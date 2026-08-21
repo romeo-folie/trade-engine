@@ -77,3 +77,28 @@ func TestPoliticalDisclosureLeaseFingerprintUsesCanonicalReportIdentity(t *testi
 		t.Fatal("new filing did not change political-disclosure fingerprint")
 	}
 }
+
+func TestScannerSourceLeaseFingerprintIgnoresNewsOrdering(t *testing.T) {
+	now := time.Date(2026, time.August, 21, 14, 0, 0, 0, time.UTC)
+	scanner := &MarketScanner{Cfg: config.ScannerConfig{TTLDays: 3}}
+	candidate := SwingCandidate{Ticker: "NEWS", Sources: []string{"mover"}, Price: 12.5, Volume: 100,
+		News: []SwingNewsItem{
+			{Headline: "Later", Sentiment: "POSITIVE", PublishedAt: now.Add(time.Hour)},
+			{Headline: "Earlier", Sentiment: "NEUTRAL", PublishedAt: now},
+		},
+	}
+	firstDiscovery, _, err := buildScannerTradeProfile(candidate, SwingScoreResult{})
+	if err != nil {
+		t.Fatalf("build first profile: %v", err)
+	}
+	first := scanner.scannerSourceLeases(candidate, firstDiscovery, now)
+	candidate.News[0], candidate.News[1] = candidate.News[1], candidate.News[0]
+	secondDiscovery, _, err := buildScannerTradeProfile(candidate, SwingScoreResult{})
+	if err != nil {
+		t.Fatalf("build reordered profile: %v", err)
+	}
+	second := scanner.scannerSourceLeases(candidate, secondDiscovery, now.Add(time.Hour))
+	if first[0].EvidenceFingerprint != second[0].EvidenceFingerprint {
+		t.Fatalf("news ordering changed fingerprint: %q != %q", first[0].EvidenceFingerprint, second[0].EvidenceFingerprint)
+	}
+}

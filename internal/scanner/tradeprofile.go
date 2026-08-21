@@ -129,7 +129,7 @@ func scannerEvidenceBySource(
 		if index == 0 {
 			evidence["market_observation"] = scannerMarketObservation(candidate)
 			if len(candidate.News) > 0 {
-				evidence["recent_news"] = candidate.News
+				evidence["recent_news"] = canonicalScannerNews(candidate.News)
 			}
 		}
 		switch source {

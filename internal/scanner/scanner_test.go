@@ -2,9 +2,11 @@ package scanner
 
 import (
 	"testing"
+	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/analysis"
 	"github.com/romeo-folie/trade-engine/internal/config"
+	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
 func TestCandidateTTLDaysUsesSourcePolicy(t *testing.T) {
@@ -88,5 +90,24 @@ func TestParseSwingResult_FallbackDefaultsToSkip(t *testing.T) {
 	})
 	if got.Action != "skip" {
 		t.Fatalf("fallback should default to skip, got %q", got.Action)
+	}
+}
+
+func TestExpiredScannerResidencyAllowsReadmissionBesideAdditiveContext(t *testing.T) {
+	now := time.Date(2026, time.August, 21, 12, 0, 0, 0, time.UTC)
+	expired := now.Add(-time.Minute)
+	item := store.WatchlistItem{
+		Ticker: "REENTER", ScannerOrigin: true, ExpiresAt: &expired,
+		DiscoveryContexts: []store.WatchlistDiscoveryContext{{Key: "earnings_scheduled:2026-08-24"}},
+	}
+	if !expiredScannerResidency(item, now) {
+		t.Fatal("expired scanner origin with a live additive context was not recognized for readmission")
+	}
+	existing := map[string]struct{}{}
+	if !expiredScannerResidency(item, now) {
+		existing[normalizePromotionKey(item.Ticker)] = struct{}{}
+	}
+	if got := filterActiveCandidates([]SwingCandidate{{Ticker: item.Ticker}}, existing); len(got) != 1 {
+		t.Fatalf("expired scanner origin was still excluded from normal admission: %+v", got)
 	}
 }

@@ -34,6 +34,10 @@ type WatchlistItem struct {
 	Timeframes    []string
 	MinConfidence float64
 	Source        string // "manual" | "config" | "scanner"
+	// ScannerOrigin records the persisted source before an expired scanner
+	// contract is adapted to an independently active additive context.
+	// It is read-only metadata used by the scanner to re-admit fresh evidence.
+	ScannerOrigin bool
 	// GraphContext records WHY a scanner candidate was sourced (graph link or
 	// news-sympathy trigger, migration 038) so the engine's deep-analysis
 	// prompt can carry the origin thesis. Empty for manual/config items and
@@ -241,6 +245,7 @@ func lockScannerWatchlistItem(ctx context.Context, tx pgx.Tx, item WatchlistItem
 
 type watchlistExecer interface {
 	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+	Query(context.Context, string, ...any) (pgx.Rows, error)
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
@@ -396,14 +401,17 @@ func addWatchlistItem(
 	}
 	if tag.RowsAffected() == 0 {
 		if preserveCurrentScanner {
+			var source string
 			var currentlyActive bool
 			err := db.QueryRow(ctx, `
-				SELECT active AND (expires_at IS NULL OR expires_at > NOW())
+				SELECT source, active AND (expires_at IS NULL OR expires_at > NOW())
 				FROM watchlist
 				WHERE ticker=$1 AND platform=$2
-			`, item.Ticker, item.Platform).Scan(&currentlyActive)
+			`, item.Ticker, item.Platform).Scan(&source, &currentlyActive)
 			if err == nil && currentlyActive {
-				if len(item.SourceLeases) > 0 {
+				// A concurrent manual/config admission owns its lifecycle. Scanner
+				// evidence must never attach a finite scanner lease to that row.
+				if source == "scanner" && len(item.SourceLeases) > 0 {
 					if _, err := refreshWatchlistSourceLeases(ctx, db, item); err != nil {
 						return err
 					}
@@ -414,11 +422,36 @@ func addWatchlistItem(
 		return ErrWatchlistRequalificationRequired
 	}
 	if len(item.SourceLeases) > 0 {
-		if _, err := refreshWatchlistSourceLeases(ctx, db, item); err != nil {
+		changed, err := refreshWatchlistSourceLeases(ctx, db, item)
+		if err != nil {
 			return err
+		}
+		// A newly inserted row has a live source lease even if its first
+		// fingerprint matches an already-persisted value. An expired row with
+		// unchanged evidence does not; roll back its provisional reactivation so
+		// callers cannot report a promotion that is immediately ineligible.
+		if !changed {
+			live, err := watchlistHasLiveSourceLease(ctx, db, item.Ticker, item.Platform)
+			if err != nil {
+				return err
+			}
+			if !live {
+				return ErrWatchlistRequalificationRequired
+			}
 		}
 	}
 	return nil
+}
+
+func watchlistHasLiveSourceLease(ctx context.Context, db watchlistExecer, ticker, platform string) (bool, error) {
+	var live bool
+	err := db.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM watchlist w
+			JOIN watchlist_source_leases l ON l.watchlist_id=w.id
+			WHERE w.ticker=$1 AND w.platform=$2 AND l.expires_at > NOW()
+		)`, strings.ToUpper(strings.TrimSpace(ticker)), platform).Scan(&live)
+	return live, err
 }
 
 func validateWatchlistSourceLeases(leases []WatchlistSourceLease) error {
@@ -519,11 +552,23 @@ func mergeRefreshedDiscoveryContext(
 	if err != nil || existing == nil {
 		return tradeprofile.MarshalDiscoveryContext(&fresh)
 	}
+	liveSources, err := activeWatchlistLeaseSources(ctx, db, watchlistID)
+	if err != nil {
+		return nil, err
+	}
 	merged := *existing
 	merged.Sources = append([]string(nil), existing.Sources...)
 	merged.EvidenceBySource = make(map[string]json.RawMessage, len(existing.EvidenceBySource)+len(fresh.EvidenceBySource))
 	for source, evidence := range existing.EvidenceBySource {
-		merged.EvidenceBySource[source] = append(json.RawMessage(nil), evidence...)
+		if liveSources[source] {
+			merged.EvidenceBySource[source] = append(json.RawMessage(nil), evidence...)
+		}
+	}
+	merged.Sources = merged.Sources[:0]
+	for _, source := range existing.Sources {
+		if liveSources[source] {
+			merged.Sources = append(merged.Sources, source)
+		}
 	}
 	for _, source := range fresh.Sources {
 		if _, known := merged.EvidenceBySource[source]; !known {
@@ -535,6 +580,25 @@ func mergeRefreshedDiscoveryContext(
 		merged.Thesis = fresh.Thesis
 	}
 	return tradeprofile.MarshalDiscoveryContext(&merged)
+}
+
+func activeWatchlistLeaseSources(ctx context.Context, db watchlistExecer, watchlistID string) (map[string]bool, error) {
+	rows, err := db.Query(ctx, `
+		SELECT source FROM watchlist_source_leases
+		WHERE watchlist_id=$1 AND expires_at > NOW()`, watchlistID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	live := make(map[string]bool)
+	for rows.Next() {
+		var source string
+		if err := rows.Scan(&source); err != nil {
+			return nil, err
+		}
+		live[source] = true
+	}
+	return live, rows.Err()
 }
 
 // RemoveWatchlistItem soft-deletes a watchlist item by setting active = false.
@@ -599,6 +663,7 @@ func GetWatchlistItems(ctx context.Context, activeOnly bool) ([]WatchlistItem, e
 		if err := decodeWatchlistContracts(&w, discoveryContext, executionProfile); err != nil {
 			return nil, fmt.Errorf("decode watchlist %s/%s contracts: %w", w.Ticker, w.Platform, err)
 		}
+		w.ScannerOrigin = w.Source == "scanner"
 		items = append(items, w)
 	}
 	if err := rows.Err(); err != nil {
@@ -659,6 +724,7 @@ func GetWatchlistItem(ctx context.Context, ticker, platform string) (*WatchlistI
 	if err := decodeWatchlistContracts(&w, discoveryContext, executionProfile); err != nil {
 		return nil, fmt.Errorf("decode watchlist %s/%s contracts: %w", w.Ticker, w.Platform, err)
 	}
+	w.ScannerOrigin = w.Source == "scanner"
 	if err := loadActiveWatchlistDiscoveryContexts(ctx, &w); err != nil {
 		return nil, fmt.Errorf("load watchlist %s/%s discovery contexts: %w", w.Ticker, w.Platform, err)
 	}

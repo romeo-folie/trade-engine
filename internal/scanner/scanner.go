@@ -1154,13 +1154,24 @@ func (s *MarketScanner) filterExistingWatchlist(ctx context.Context, candidates 
 		return nil, err
 	}
 	existing := make(map[string]struct{}, len(items))
+	now := s.now()
 	for _, item := range items {
+		// An additive context can keep an expired scanner row visible for engine
+		// analysis. It is no longer scanner-resident, so fresh scanner evidence
+		// must proceed through ordinary scoring and cap admission.
+		if expiredScannerResidency(item, now) {
+			continue
+		}
 		if key := normalizePromotionKey(item.Ticker); key != "" {
 			existing[key] = struct{}{}
 		}
 	}
 
 	return filterActiveCandidates(candidates, existing), nil
+}
+
+func expiredScannerResidency(item store.WatchlistItem, now time.Time) bool {
+	return item.ScannerOrigin && item.ExpiresAt != nil && !item.ExpiresAt.After(now)
 }
 
 func filterActiveCandidates(

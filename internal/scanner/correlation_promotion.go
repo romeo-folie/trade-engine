@@ -130,6 +130,9 @@ func loadPromotionExposure(ctx context.Context) (promotionExposure, error) {
 		}
 	}
 	for _, item := range items {
+		if expiredScannerResidency(item, time.Now()) {
+			continue
+		}
 		add(exposure.watchlist, item.Ticker)
 	}
 	for _, trade := range trades {

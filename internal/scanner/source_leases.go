@@ -95,6 +95,7 @@ func scannerSourceIdentity(candidate SwingCandidate, source string) map[string]a
 }
 
 func scannerNewsIdentity(news []SwingNewsItem) []map[string]any {
+	news = canonicalScannerNews(news)
 	values := make([]map[string]any, 0, len(news))
 	for _, item := range news {
 		values = append(values, map[string]any{
@@ -103,4 +104,20 @@ func scannerNewsIdentity(news []SwingNewsItem) []map[string]any {
 		})
 	}
 	return values
+}
+
+// canonicalScannerNews makes both persisted evidence and source fingerprints
+// insensitive to upstream news ordering.
+func canonicalScannerNews(news []SwingNewsItem) []SwingNewsItem {
+	canonical := append([]SwingNewsItem(nil), news...)
+	sort.Slice(canonical, func(i, j int) bool {
+		if !canonical[i].PublishedAt.Equal(canonical[j].PublishedAt) {
+			return canonical[i].PublishedAt.Before(canonical[j].PublishedAt)
+		}
+		if canonical[i].Headline != canonical[j].Headline {
+			return canonical[i].Headline < canonical[j].Headline
+		}
+		return canonical[i].Sentiment < canonical[j].Sentiment
+	})
+	return canonical
 }
