@@ -684,11 +684,16 @@ func (r *Runner) syncSenate(
 	processed := 0
 	var failures []error
 	start, pageSize := 0, 100
+	var pagination disclosurePagination
 	for processed < limit {
 		if err := ctx.Err(); err != nil {
 			return processed, err
 		}
 		page, err := r.Senate.ListPTRPage(ctx, since, now, start, pageSize)
+		if err != nil {
+			return processed, senateSourceBlocked(err)
+		}
+		done, err := pagination.advance("Senate eFD search", "recordsFiltered", start, page.RowCount, page.Total)
 		if err != nil {
 			return processed, senateSourceBlocked(err)
 		}
@@ -737,7 +742,7 @@ func (r *Runner) syncSenate(
 			}
 		}
 		start += page.RowCount
-		if page.RowCount == 0 || (page.Total > 0 && start >= page.Total) {
+		if done {
 			break
 		}
 	}
@@ -754,11 +759,16 @@ func (r *Runner) syncOGE(ctx context.Context, since, until time.Time, limit int)
 	processed := 0
 	var failures []error
 	start, pageSize := 0, 100
+	var pagination disclosurePagination
 	for processed < limit {
 		if err := ctx.Err(); err != nil {
 			return processed, err
 		}
 		page, err := r.OGE.ListFilingsPage(ctx, since, until, start, pageSize)
+		if err != nil {
+			return processed, err
+		}
+		done, err := pagination.advance("OGE API", "recordsTotal", start, page.RowCount, page.Total)
 		if err != nil {
 			return processed, err
 		}
@@ -804,7 +814,7 @@ func (r *Runner) syncOGE(ctx context.Context, since, until time.Time, limit int)
 			}
 		}
 		start += page.RowCount
-		if page.RowCount == 0 || start >= page.Total {
+		if done {
 			break
 		}
 	}

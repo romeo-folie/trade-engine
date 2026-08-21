@@ -175,6 +175,35 @@ func TestParseSenateSearchPageRejectsMixedValidAndMalformedRows(t *testing.T) {
 	}
 }
 
+func TestParseSenateSearchPageValidatesRecordsFilteredAtomically(t *testing.T) {
+	valid := `["Jane","Senator","Office","<a href='/search/view/ptr/valid/'>PTR</a>","03/05/2026"]`
+	for _, test := range []struct {
+		name      string
+		body      string
+		wantErr   bool
+		wantRows  int
+		wantTotal int
+	}{
+		{name: "negative total", body: `{"recordsFiltered":-1,"data":[]}`, wantErr: true},
+		{name: "total below returned rows", body: `{"recordsFiltered":1,"data":[` + valid + `,` + valid + `]}`, wantErr: true},
+		{name: "zero empty page", body: `{"recordsFiltered":0,"data":[]}`, wantRows: 0, wantTotal: 0},
+		{name: "consistent positive total", body: `{"recordsFiltered":3,"data":[` + valid + `]}`, wantRows: 1, wantTotal: 3},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			page, err := parseSenateSearchPage("https://efdsearch.senate.gov", []byte(test.body))
+			if test.wantErr {
+				if err == nil || len(page.Filings) != 0 || page.RowCount != 0 || page.Total != 0 {
+					t.Fatalf("page=%+v err=%v, want atomic rejection", page, err)
+				}
+				return
+			}
+			if err != nil || len(page.Filings) != test.wantRows || page.RowCount != test.wantRows || page.Total != test.wantTotal {
+				t.Fatalf("page=%+v err=%v", page, err)
+			}
+		})
+	}
+}
+
 func TestSanitizeSenateTicker(t *testing.T) {
 	if got := sanitizeSenateTicker("-- AMCR"); got != "AMCR" {
 		t.Fatalf("ticker = %q", got)
@@ -243,7 +272,7 @@ func TestSenateClientConsentAndSearchFlow(t *testing.T) {
 			if values.Get("report_types") != "[11]" || req.Header.Get("X-CSRFToken") != "cookie-token" {
 				t.Fatalf("search request form=%v csrf=%q", values, req.Header.Get("X-CSRFToken"))
 			}
-			return response(req, 200, `{"data":[["Jane","Senator","Office","<a href='/search/view/ptr/abc-123/'>PTR</a>","03/05/2026"]]}`, nil), nil
+			return response(req, 200, `{"recordsFiltered":1,"data":[["Jane","Senator","Office","<a href='/search/view/ptr/abc-123/'>PTR</a>","03/05/2026"]]}`, nil), nil
 		default:
 			t.Fatalf("unexpected request %s", req.URL)
 			return nil, nil
@@ -279,7 +308,7 @@ func TestSenateClientImportedBrowserSessionSkipsConsent(t *testing.T) {
 		if err != nil || session.Value != "session-value" {
 			t.Fatalf("session cookie = %+v err=%v", session, err)
 		}
-		return response(req, 200, `{"data":[["Jane","Senator","Office","<a href='/search/view/ptr/imported-123/'>PTR</a>","07/05/2026"]]}`, nil), nil
+		return response(req, 200, `{"recordsFiltered":1,"data":[["Jane","Senator","Office","<a href='/search/view/ptr/imported-123/'>PTR</a>","07/05/2026"]]}`, nil), nil
 	})
 	client, err := NewSenateClient("https://efdsearch.senate.gov", time.Second)
 	if err != nil {
@@ -386,7 +415,7 @@ func TestSenateClientImportedSessionPagePreservesServerTotal(t *testing.T) {
 
 func TestSenateClientUsesBrowserTransport(t *testing.T) {
 	transport := &fixtureSenateTransport{
-		searchBody: []byte(`{"data":[["Jane","Senator","Office","<a href='/search/view/ptr/browser-123/'>PTR</a>","07/05/2026"]]}`),
+		searchBody: []byte(`{"recordsFiltered":1,"data":[["Jane","Senator","Office","<a href='/search/view/ptr/browser-123/'>PTR</a>","07/05/2026"]]}`),
 		fetchBody:  []byte(`<html><table><tr><th>Transaction Date</th><th>Asset Name</th><th>Transaction Type</th><th>Amount</th></tr><tr><td>07/01/2026</td><td>Microsoft (MSFT)</td><td>Purchase</td><td>$1,001 - $15,000</td></tr></table></html>`),
 	}
 	client, err := NewSenateClient("https://efdsearch.senate.gov", time.Second)

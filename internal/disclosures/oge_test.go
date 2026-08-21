@@ -174,6 +174,61 @@ func TestOGEListFilingsRejectsNegativeRecordsTotal(t *testing.T) {
 	}
 }
 
+func TestValidateOGEPageExtent(t *testing.T) {
+	for _, test := range []struct {
+		name                   string
+		total, start, rowCount int
+		wantErr                bool
+	}{
+		{name: "negative total", total: -1, start: 0, rowCount: 0, wantErr: true},
+		{name: "negative start", total: 1, start: -1, rowCount: 0, wantErr: true},
+		{name: "start past total", total: 1, start: 2, rowCount: 0, wantErr: true},
+		{name: "rows overrun remaining extent", total: 3, start: 2, rowCount: 2, wantErr: true},
+		{name: "premature empty page", total: 1, start: 0, rowCount: 0, wantErr: true},
+		{name: "empty result set", total: 0, start: 0, rowCount: 0},
+		{name: "terminal empty page", total: 3, start: 3, rowCount: 0},
+		{name: "partial page", total: 3, start: 1, rowCount: 1},
+		{name: "last row", total: 3, start: 2, rowCount: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateOGEPageExtent(test.total, test.start, test.rowCount)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("validateOGEPageExtent(%d, %d, %d) error = %v, want error %t", test.total, test.start, test.rowCount, err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestOGEListFilingsRejectsChangedTotalOnLaterPage(t *testing.T) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Query().Get("start") {
+		case "0":
+			_, _ = w.Write([]byte(strings.ReplaceAll(`{"recordsTotal":4,"data":[{"type":"<a href='{base}/one.pdf'>278 Transaction</a>","name":"One","docDate":"2026-07-10"},{"type":"<a href='{base}/two.pdf'>278 Transaction</a>","name":"Two","docDate":"2026-07-11"}]}`, "{base}", server.URL)))
+		case "2":
+			// This terminal-looking response used to silently truncate the first
+			// page's four-record result set.
+			_, _ = w.Write([]byte(`{"recordsTotal":2,"data":[]}`))
+		default:
+			t.Fatalf("unexpected page start %q", r.URL.Query().Get("start"))
+		}
+	}))
+	defer server.Close()
+
+	filings, err := NewOGEClient(server.URL, time.Second).ListFilings(
+		context.Background(),
+		time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC), 10,
+	)
+	if err == nil || !strings.Contains(err.Error(), "recordsTotal changed") {
+		t.Fatalf("ListFilings error = %v, want changed-total rejection", err)
+	}
+	if len(filings) != 2 {
+		t.Fatalf("filings before contradictory page = %#v, want first page retained", filings)
+	}
+}
+
 func TestOGEListFilingsContinuesPastMixedOrderOldRows(t *testing.T) {
 	var starts []string
 	var server *httptest.Server
@@ -369,6 +424,66 @@ func TestParseOGEPDFHeaderDateBandDoesNotSplitAssetDates(t *testing.T) {
 	}
 	if report.Transactions[0].AssetName != "Acme 07/02/2026 Fund (ACME)" || report.Transactions[1].AssetName != "Bravo 07/04/2026 Fund (BRAV)" {
 		t.Fatalf("asset dates were split from their rows: %+v", report.Transactions)
+	}
+}
+
+func TestOGEHeaderBandsUseFirstCoherentExactHeaderRow(t *testing.T) {
+	bands := ogeHeaderBands(PageText{Boxes: []TextBox{
+		// The later physical row arrives first to model unsorted extractor output.
+		{Text: "Transaction Date", Left: 1010, Top: 50},
+		{Text: "Transaction Type", Left: 1080, Top: 50},
+		{Text: "Asset", Left: 1140, Top: 50},
+		{Text: "Amount", Left: 1260, Top: 50},
+		{Text: " Transaction\nDate: ", Left: 10, Top: 1},
+		{Text: "Transaction Type", Left: 80, Top: 3},
+		{Text: "Asset Description", Left: 140, Top: 2},
+		{Text: "Value Line.", Left: 260, Top: 1},
+		{Text: "Amount", Left: 900, Top: 1}, // a duplicate must not overwrite Value Line
+	}})
+	if !bands.hasDate || !bands.hasAction || !bands.hasAsset || !bands.hasAmount ||
+		bands.date != 10 || bands.action != 80 || bands.asset != 140 || bands.amount != 260 {
+		t.Fatalf("header bands = %+v", bands)
+	}
+
+	misleading := ogeHeaderBands(PageText{Boxes: []TextBox{
+		{Text: "Transaction Date Notes", Left: 10, Top: 1},
+		{Text: "Action Required", Left: 80, Top: 1},
+		{Text: "Asset Value", Left: 140, Top: 1},
+		{Text: "Amount Remaining", Left: 260, Top: 1},
+	}})
+	if misleading.hasDate || misleading.hasAction || misleading.hasAsset || misleading.hasAmount {
+		t.Fatalf("substring labels became headers: %+v", misleading)
+	}
+	if kind := ogeHeaderKind("Value Line (VALU)"); kind != "" {
+		t.Fatalf("asset value %q classified as %q header", "Value Line (VALU)", kind)
+	}
+}
+
+func TestParseOGEPDFAcceptsValueLineHeaderAndHeaderlessFallback(t *testing.T) {
+	filing := OGEFiling{ExternalID: "oge-header-variants", ReportType: "periodic_transaction", FilingDate: time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)}
+	rows := []TextBox{
+		{Text: "07/01/2026", Left: 10, Top: 10}, {Text: "P", Left: 80, Top: 10}, {Text: "Value Line (VALU)", Left: 140, Top: 10}, {Text: "$1,001 - $15,000", Left: 260, Top: 10},
+		{Text: "07/02/2026", Left: 10, Top: 20}, {Text: "S", Left: 80, Top: 20}, {Text: "Bravo Fund (BRAV)", Left: 140, Top: 20}, {Text: "$15,001 - $50,000", Left: 260, Top: 20},
+	}
+	for name, boxes := range map[string][]TextBox{
+		"Value Line": append([]TextBox{
+			{Text: "Transaction Date", Left: 10, Top: 1}, {Text: "Transaction Type", Left: 80, Top: 1}, {Text: "Asset", Left: 140, Top: 1}, {Text: "Value Line", Left: 260, Top: 1},
+			// A later, malformed duplicate header must not replace the first row's
+			// column positions while rows are being reconstructed.
+			{Text: "Transaction Date", Left: 1010, Top: 50}, {Text: "Transaction Type", Left: 1080, Top: 50}, {Text: "Asset", Left: 1140, Top: 50}, {Text: "Amount", Left: 1260, Top: 50},
+		}, rows...),
+		"misleading labels": append([]TextBox{
+			{Text: "Transaction Date Notes", Left: 10, Top: 1}, {Text: "Action Required", Left: 80, Top: 1}, {Text: "Asset Value", Left: 140, Top: 1}, {Text: "Amount Remaining", Left: 260, Top: 1},
+		}, rows...),
+		"headerless": rows,
+	} {
+		t.Run(name, func(t *testing.T) {
+			report := ParseOGEPDF(filing, []byte("pdf"), []PageText{{Number: 1, Boxes: boxes}})
+			if report.ExtractionStatus != "completed" || len(report.Transactions) != 2 ||
+				report.Transactions[0].Ticker != "VALU" || report.Transactions[1].Ticker != "BRAV" {
+				t.Fatalf("report=%+v", report)
+			}
+		})
 	}
 }
 

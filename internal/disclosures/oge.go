@@ -65,8 +65,13 @@ func (c *OGEClient) ListFilings(ctx context.Context, since, until time.Time, lim
 	}
 	out := make([]OGEFiling, 0)
 	start := 0
+	var pagination disclosurePagination
 	for len(out) < limit {
 		page, err := c.ListFilingsPage(ctx, since, until, start, 100)
+		if err != nil {
+			return out, err
+		}
+		done, err := pagination.advance("OGE API", "recordsTotal", start, page.RowCount, page.Total)
 		if err != nil {
 			return out, err
 		}
@@ -77,7 +82,7 @@ func (c *OGEClient) ListFilings(ctx context.Context, since, until time.Time, lim
 			out = append(out, filing)
 		}
 		start += page.RowCount
-		if page.RowCount == 0 || start >= page.Total {
+		if done {
 			break
 		}
 	}
@@ -123,8 +128,8 @@ func (c *OGEClient) ListFilingsPage(ctx context.Context, since, until time.Time,
 	if err := json.Unmarshal(b, &raw); err != nil {
 		return OGEFilingPage{}, err
 	}
-	if raw.RecordsTotal < 0 || (raw.RecordsTotal > 0 && start > raw.RecordsTotal) {
-		return OGEFilingPage{}, fmt.Errorf("OGE API returned inconsistent recordsTotal %d for start %d", raw.RecordsTotal, start)
+	if err := validateOGEPageExtent(raw.RecordsTotal, start, len(raw.Data)); err != nil {
+		return OGEFilingPage{}, err
 	}
 	out := make([]OGEFiling, 0, len(raw.Data))
 	for index, row := range raw.Data {
@@ -165,6 +170,25 @@ func (c *OGEClient) ListFilingsPage(ctx context.Context, since, until time.Time,
 		out = append(out, OGEFiling{ExternalID: "oge-" + hex.EncodeToString(sum[:8]), FilerName: name, Office: strings.Trim(strings.Join([]string{row.Title, row.Agency}, " — "), " —"), ReportType: normalizeOGEReportType(row.Type, row.Amended), IsAmendment: isAmendment, FilingDate: d, DocumentURL: documentURL, RawMetadata: meta})
 	}
 	return OGEFilingPage{Filings: out, RowCount: len(raw.Data), Total: raw.RecordsTotal}, nil
+}
+
+// validateOGEPageExtent ensures an OGE page can neither skip nor overrun a
+// server-declared result set. It runs before row parsing so malformed metadata
+// cannot be mistaken for a short, successful listing.
+func validateOGEPageExtent(total, start, rowCount int) error {
+	if total < 0 {
+		return fmt.Errorf("OGE API returned negative recordsTotal %d", total)
+	}
+	if start < 0 || start > total {
+		return fmt.Errorf("OGE API returned inconsistent recordsTotal %d for start %d", total, start)
+	}
+	if rowCount > total-start {
+		return fmt.Errorf("OGE API returned %d rows beyond recordsTotal %d at start %d", rowCount, total, start)
+	}
+	if rowCount == 0 && start < total {
+		return fmt.Errorf("OGE API returned an empty page before recordsTotal %d at start %d", total, start)
+	}
+	return nil
 }
 
 func parseOGEFilingDate(value string) (time.Time, bool) {
@@ -496,21 +520,86 @@ func ogeDateRowEvidence(date ogePositionedBox, boxes []ogePositionedBox) bool {
 }
 
 func ogeHeaderBands(p PageText) ogeColumnBands {
-	var bands ogeColumnBands
+	// Only accept a complete, physically coherent header row. Looking for each
+	// label independently across the page lets ordinary transaction text (for
+	// example, an asset named "Value Fund") overwrite a genuine header and
+	// corrupt the row geometry.
+	type headerRow struct {
+		top   float64
+		bands ogeColumnBands
+	}
+	const headerRowTolerance = 4.0
+	rows := make([]headerRow, 0)
 	for _, box := range p.Boxes {
-		text := strings.ToLower(strings.TrimSpace(box.Text))
-		switch {
-		case strings.Contains(text, "transaction date") || text == "date":
-			bands.date, bands.hasDate = box.Left, true
-		case strings.Contains(text, "transaction type") || text == "action":
-			bands.action, bands.hasAction = box.Left, true
-		case strings.Contains(text, "asset") || strings.Contains(text, "description"):
-			bands.asset, bands.hasAsset = box.Left, true
-		case strings.Contains(text, "amount") || strings.Contains(text, "value"):
-			bands.amount, bands.hasAmount = box.Left, true
+		kind := ogeHeaderKind(box.Text)
+		if kind == "" {
+			continue
+		}
+		rowIndex := -1
+		for i := range rows {
+			if math.Abs(rows[i].top-box.Top) <= headerRowTolerance {
+				rowIndex = i
+				break
+			}
+		}
+		if rowIndex == -1 {
+			rows = append(rows, headerRow{top: box.Top})
+			rowIndex = len(rows) - 1
+		}
+		// Keep the first label for each column in a physical header row. Duplicate
+		// words elsewhere in the row must not move a column boundary.
+		bands := &rows[rowIndex].bands
+		switch kind {
+		case "date":
+			if !bands.hasDate {
+				bands.date, bands.hasDate = box.Left, true
+			}
+		case "action":
+			if !bands.hasAction {
+				bands.action, bands.hasAction = box.Left, true
+			}
+		case "asset":
+			if !bands.hasAsset {
+				bands.asset, bands.hasAsset = box.Left, true
+			}
+		case "amount":
+			if !bands.hasAmount {
+				bands.amount, bands.hasAmount = box.Left, true
+			}
 		}
 	}
-	return bands
+	// Text extractors do not promise reading order. A document's first physical
+	// header is the uppermost coherent row, rather than whichever box happened
+	// to be returned first.
+	sort.SliceStable(rows, func(i, j int) bool { return rows[i].top < rows[j].top })
+	for _, row := range rows {
+		bands := row.bands
+		if bands.hasDate && bands.hasAction && bands.hasAsset && bands.hasAmount &&
+			bands.date < bands.action && bands.action < bands.asset && bands.asset < bands.amount {
+			return bands
+		}
+	}
+	return ogeColumnBands{}
+}
+
+// ogeHeaderKind recognizes only complete field labels, after folding ordinary
+// PDF whitespace and punctuation. Substring matches are intentionally avoided:
+// labels in data cells are not table headers.
+func ogeHeaderKind(text string) string {
+	text = strings.ToLower(strings.Join(strings.Fields(text), " "))
+	text = strings.Trim(text, ":;.")
+	switch text {
+	case "transaction date", "date":
+		return "date"
+	case "transaction type", "action":
+		return "action"
+	case "asset", "asset name", "asset description", "description":
+		return "asset"
+	case "amount", "value", "value line":
+		return "amount"
+	default:
+		return ""
+	}
 }
 
 func ogeRowAmountText(row ogeTransactionRow, bands ogeColumnBands) string {

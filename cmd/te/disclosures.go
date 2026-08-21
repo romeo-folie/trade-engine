@@ -61,13 +61,7 @@ persistent Chrome profile created by 'te disclosures senate authorize'.`,
 		if err != nil {
 			return err
 		}
-		disclosureCfg := cfg.Disclosures
-		disclosureCfg.Enabled = true
-		disclosureCfg.AcknowledgeUseRestrictions = true
-		disclosureCfg.House.Enabled = source == "all" || source == "house"
-		disclosureCfg.Senate.Enabled = source == "all" || source == "senate"
-		disclosureCfg.OGE.Enabled = source == "all" || source == "oge"
-		disclosureCfg.Senate.AcknowledgeUseRestrictions = disclosureCfg.Senate.Enabled
+		disclosureCfg := prepareDisclosureSyncConfig(cfg.Disclosures, source, disclosureSyncLimit)
 		if validation := config.ValidateDisclosuresConfig(disclosureCfg); len(validation) > 0 {
 			return fmt.Errorf("invalid disclosure config: %s", strings.Join(validation, "; "))
 		}
@@ -111,6 +105,19 @@ persistent Chrome profile created by 'te disclosures senate authorize'.`,
 			result.HouseProcessed, result.SenateProcessed, result.OGEProcessed)
 		return syncErr
 	},
+}
+
+// prepareDisclosureSyncConfig applies the explicit sync command's source and
+// budget overrides before configuration validation or runner construction.
+func prepareDisclosureSyncConfig(base config.DisclosuresConfig, source string, maxReports int) config.DisclosuresConfig {
+	base.Enabled = true
+	base.AcknowledgeUseRestrictions = true
+	base.MaxReportsPerSync = maxReports
+	base.House.Enabled = source == "all" || source == "house"
+	base.Senate.Enabled = source == "all" || source == "senate"
+	base.OGE.Enabled = source == "all" || source == "oge"
+	base.Senate.AcknowledgeUseRestrictions = base.Senate.Enabled
+	return base
 }
 
 var disclosureListCmd = &cobra.Command{

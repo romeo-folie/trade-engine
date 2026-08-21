@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
@@ -49,5 +50,35 @@ func TestValidDisclosureStatus(t *testing.T) {
 	}
 	if validDisclosureStatus("processing") {
 		t.Fatal("invalid report status accepted")
+	}
+}
+
+func TestPrepareDisclosureSyncConfigAppliesBudgetBeforeValidation(t *testing.T) {
+	for _, test := range []struct {
+		name             string
+		source           string
+		limit            int
+		wantHouse        bool
+		wantSenate       bool
+		wantOGE          bool
+		wantValidationOK bool
+	}{
+		{name: "all sources", source: "all", limit: 3, wantHouse: true, wantSenate: true, wantOGE: true, wantValidationOK: true},
+		{name: "all sources insufficient", source: "all", limit: 2, wantHouse: true, wantSenate: true, wantOGE: true},
+		{name: "only OGE", source: "oge", limit: 1, wantOGE: true, wantValidationOK: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := prepareDisclosureSyncConfig(config.Defaults().Disclosures, test.source, test.limit)
+			if cfg.MaxReportsPerSync != test.limit || cfg.House.Enabled != test.wantHouse ||
+				cfg.Senate.Enabled != test.wantSenate || cfg.OGE.Enabled != test.wantOGE ||
+				!cfg.Enabled || !cfg.AcknowledgeUseRestrictions ||
+				cfg.Senate.AcknowledgeUseRestrictions != test.wantSenate {
+				t.Fatalf("prepared config = %+v", cfg)
+			}
+			valid := len(config.ValidateDisclosuresConfig(cfg)) == 0
+			if valid != test.wantValidationOK {
+				t.Fatalf("validation=%v, want valid=%v", config.ValidateDisclosuresConfig(cfg), test.wantValidationOK)
+			}
+		})
 	}
 }

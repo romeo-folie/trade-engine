@@ -65,6 +65,30 @@ func (t *countingSenateTransport) FetchPTR(context.Context, string) ([]byte, err
 
 func (*countingSenateTransport) Close() error { return nil }
 
+type sequentialSenateTransport struct {
+	searchBodies [][]byte
+	searchCalls  int
+	fetchCalls   int
+}
+
+func (t *sequentialSenateTransport) SearchPTRs(
+	context.Context, time.Time, time.Time, int, int,
+) ([]byte, error) {
+	if t.searchCalls >= len(t.searchBodies) {
+		return nil, errors.New("unexpected Senate search")
+	}
+	body := t.searchBodies[t.searchCalls]
+	t.searchCalls++
+	return body, nil
+}
+
+func (t *sequentialSenateTransport) FetchPTR(context.Context, string) ([]byte, error) {
+	t.fetchCalls++
+	return nil, errors.New("unexpected Senate report fetch")
+}
+
+func (*sequentialSenateTransport) Close() error { return nil }
+
 func TestDistributeSyncBudgetReservesCapacityForEnabledSources(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -675,6 +699,85 @@ func TestSenateSyncRejectsMixedMalformedPageWithoutFetchingOrPersisting(t *testi
 	processed, err := runner.syncSenate(context.Background(), time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 8, 12, 0, 0, 0, 0, time.UTC), 2)
 	if err == nil || processed != 0 || persisted != 0 {
 		t.Fatalf("processed=%d persisted=%d err=%v", processed, persisted, err)
+	}
+}
+
+func TestSenateSyncRejectsInconsistentTerminalPageAfterOneSearch(t *testing.T) {
+	client, err := NewSenateClient("https://efdsearch.senate.gov", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport := &countingSenateTransport{searchBody: []byte(`{"recordsFiltered":0,"data":[["Terminal","Member","Office","<a href='/search/view/ptr/terminal/'>PTR</a>","08/10/2026"]]}`)}
+	client.Transport = transport
+	terminalChecks, persisted := 0, 0
+	runner := &Runner{
+		Senate: client,
+		reportTerminal: func(context.Context, string, string) (bool, error) {
+			terminalChecks++
+			return true, nil
+		},
+		persistReport: func(context.Context, Report) error { persisted++; return nil },
+	}
+	processed, err := runner.syncSenate(context.Background(), time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 8, 12, 0, 0, 0, 0, time.UTC), 1)
+	if err == nil || processed != 0 || transport.searchCalls != 1 || terminalChecks != 0 || persisted != 0 {
+		t.Fatalf("processed=%d searches=%d terminalChecks=%d persisted=%d err=%v", processed, transport.searchCalls, terminalChecks, persisted, err)
+	}
+}
+
+func TestSenateSyncRejectsShrunkenTerminalPageBeforeFetchingOrPersisting(t *testing.T) {
+	client, err := NewSenateClient("https://efdsearch.senate.gov", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport := &sequentialSenateTransport{searchBodies: [][]byte{
+		[]byte(`{"recordsFiltered":2,"data":[["Terminal","Member","Office","<a href='/search/view/ptr/terminal/'>PTR</a>","08/10/2026"]]}`),
+		[]byte(`{"recordsFiltered":1,"data":[]}`),
+	}}
+	client.Transport = transport
+	persisted := 0
+	runner := &Runner{
+		Senate: client,
+		reportTerminal: func(context.Context, string, string) (bool, error) {
+			return true, nil
+		},
+		persistReport: func(context.Context, Report) error { persisted++; return nil },
+	}
+	processed, err := runner.syncSenate(context.Background(),
+		time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 8, 12, 0, 0, 0, 0, time.UTC), 1)
+	if err == nil || !strings.Contains(err.Error(), "recordsFiltered changed") || processed != 0 || transport.searchCalls != 2 || transport.fetchCalls != 0 || persisted != 0 {
+		t.Fatalf("processed=%d searches=%d fetches=%d persisted=%d err=%v", processed, transport.searchCalls, transport.fetchCalls, persisted, err)
+	}
+}
+
+func TestOGESyncRejectsShrunkenPageAfterFilteredRawRowBeforeFetchingOrPersisting(t *testing.T) {
+	var indexCalls, pdfCalls, persisted int
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch request.URL.Query().Get("start") {
+		case "0":
+			indexCalls++
+			_, _ = w.Write([]byte(strings.ReplaceAll(`{"recordsTotal":2,"data":[{"type":"<a href='{base}/old.pdf'>278 Transaction</a>","name":"Old","docDate":"2026-07-31"}]}`, "{base}", server.URL)))
+		case "1":
+			indexCalls++
+			_, _ = w.Write([]byte(`{"recordsTotal":1,"data":[]}`))
+		default:
+			pdfCalls++
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	runner := &Runner{
+		OGE:           NewOGEClient(server.URL, time.Second),
+		persistReport: func(context.Context, Report) error { persisted++; return nil },
+	}
+	processed, err := runner.syncOGE(context.Background(),
+		time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 8, 12, 0, 0, 0, 0, time.UTC), 1)
+	if err == nil || !strings.Contains(err.Error(), "recordsTotal changed") || processed != 0 || indexCalls != 2 || pdfCalls != 0 || persisted != 0 {
+		t.Fatalf("processed=%d indexCalls=%d pdfCalls=%d persisted=%d err=%v", processed, indexCalls, pdfCalls, persisted, err)
 	}
 }
 

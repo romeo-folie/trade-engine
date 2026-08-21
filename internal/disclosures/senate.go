@@ -169,6 +169,12 @@ func parseSenateSearchPage(baseURL string, body []byte) (SenateFilingPage, error
 	if err := json.Unmarshal(body, &response); err != nil {
 		return SenateFilingPage{}, fmt.Errorf("decode Senate eFD search response: %w", err)
 	}
+	if response.RecordsFiltered < 0 || response.RecordsFiltered < len(response.Data) {
+		return SenateFilingPage{}, fmt.Errorf(
+			"Senate eFD search response has inconsistent recordsFiltered %d for %d rows",
+			response.RecordsFiltered, len(response.Data),
+		)
+	}
 	filings := make([]SenateFiling, 0, len(response.Data))
 	if len(response.Data) > 0 {
 		for index, row := range response.Data {
