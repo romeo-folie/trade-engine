@@ -1278,12 +1278,12 @@ type ScannerConfig struct {
 	ScanIntervalHours int `yaml:"scan_interval_hours"`
 
 	// CandidateCap is the maximum number of scanner-sourced tickers that may be
-	// active on the watchlist at any one time. Lowest-conviction items are evicted
-	// when the cap is reached. Default: 10.
+	// active on the watchlist at any one time. New promotions are suppressed when
+	// the cap is reached; lease refreshes never consume an additional slot.
 	CandidateCap int `yaml:"candidate_cap"`
 
-	// TTLDays is how many calendar days a scanner-added ticker stays on the watchlist
-	// before being auto-expired (deactivated) if no signal fires. Default: 3.
+	// TTLDays is the default source-lease duration for ordinary scanner sources.
+	// A scanner ticker is expired only after every source lease has elapsed.
 	TTLDays int `yaml:"ttl_days"`
 
 	// MinConviction is the minimum LLM conviction score (0–1) required for a
@@ -1358,7 +1358,34 @@ type PoliticalDisclosureScannerConfig struct {
 	PromoteCandidates   bool `yaml:"promote_candidates"`
 	MaxCandidatesPerRun int  `yaml:"max_candidates_per_run"`
 	ClaimLeaseMinutes   int  `yaml:"claim_lease_minutes"`
-	TTLDays             int  `yaml:"ttl_days"`
+	// TTLDays is the legacy all-in-one window. It remains accepted as the
+	// fallback for every new timing control so deployed configs are safe to
+	// upgrade without an operator edit.
+	TTLDays                    int `yaml:"ttl_days"`
+	TriggerLookbackDays        int `yaml:"trigger_lookback_days"`
+	AnalystEvidenceHorizonDays int `yaml:"analyst_evidence_horizon_days"`
+	WatchlistLeaseDays         int `yaml:"watchlist_lease_days"`
+}
+
+func (c PoliticalDisclosureScannerConfig) TriggerWindowDays() int {
+	if c.TriggerLookbackDays > 0 {
+		return c.TriggerLookbackDays
+	}
+	return c.TTLDays
+}
+
+func (c PoliticalDisclosureScannerConfig) EvidenceHorizonDays() int {
+	if c.AnalystEvidenceHorizonDays > 0 {
+		return c.AnalystEvidenceHorizonDays
+	}
+	return c.TTLDays
+}
+
+func (c PoliticalDisclosureScannerConfig) WatchlistLeaseWindowDays() int {
+	if c.WatchlistLeaseDays > 0 {
+		return c.WatchlistLeaseDays
+	}
+	return c.TTLDays
 }
 
 // WeeklyLeaderConfig controls the point-in-time weekly-leadership lens. The
@@ -2006,7 +2033,7 @@ func ConfigPath() string {
 //  2. peek cost.profile    — extract profile key only from YAML
 //  3. ApplyProfile()       — overlay profile-specific defaults
 //  4. yaml.Unmarshal()     — user's explicit values overwrite profile defaults
-//  5. migrateModelsConfig  — legacy field migration
+//  5. migrateModelsConfig / migratePoliticalDisclosureTimingConfig — legacy field migration
 //  6. resolveEnvVars       — substitute environment variables
 func Load() (*Config, error) {
 	mu.Lock()
@@ -2046,6 +2073,7 @@ func Load() (*Config, error) {
 		if err := yaml.Unmarshal(data, cfg); err != nil {
 			return nil, fmt.Errorf("parse config: %w", err)
 		}
+		migratePoliticalDisclosureTimingConfig(cfg, data)
 	}
 
 	migrateModelsConfig(cfg)
@@ -2062,6 +2090,38 @@ func migrateModelsConfig(cfg *Config) {
 	}
 	if m.Primary.Provider != "" {
 		m.Analysts = append([]ModelConfig{m.Primary}, m.Secondary...)
+	}
+}
+
+// migratePoliticalDisclosureTimingConfig keeps legacy ttl_days-only operator
+// configs behaviorally stable after the three disclosure timing controls were
+// separated. Explicit new values always win; the migration runs only when a
+// political_disclosures block supplied ttl_days but omitted a new field.
+func migratePoliticalDisclosureTimingConfig(cfg *Config, raw []byte) {
+	var doc struct {
+		Scanner struct {
+			PoliticalDisclosures map[string]any `yaml:"political_disclosures"`
+		} `yaml:"scanner"`
+	}
+	if yaml.Unmarshal(raw, &doc) != nil {
+		return
+	}
+	values := doc.Scanner.PoliticalDisclosures
+	if len(values) == 0 {
+		return
+	}
+	if _, hasLegacy := values["ttl_days"]; !hasLegacy {
+		return
+	}
+	political := &cfg.Scanner.PoliticalDisclosures
+	if _, explicit := values["trigger_lookback_days"]; !explicit {
+		political.TriggerLookbackDays = political.TTLDays
+	}
+	if _, explicit := values["analyst_evidence_horizon_days"]; !explicit {
+		political.AnalystEvidenceHorizonDays = political.TTLDays
+	}
+	if _, explicit := values["watchlist_lease_days"]; !explicit {
+		political.WatchlistLeaseDays = political.TTLDays
 	}
 }
 
@@ -2861,8 +2921,23 @@ func Validate(cfg *Config) []string {
 			!durationConfigFits(political.ClaimLeaseMinutes, time.Minute) {
 			errs = append(errs, prefix+".claim_lease_minutes must be a safe positive duration")
 		}
-		if political.TTLDays <= 0 {
-			errs = append(errs, prefix+".ttl_days must be > 0")
+		for field, value := range map[string]int{
+			"trigger_lookback_days":         political.TriggerLookbackDays,
+			"analyst_evidence_horizon_days": political.AnalystEvidenceHorizonDays,
+			"watchlist_lease_days":          political.WatchlistLeaseDays,
+		} {
+			if value < 0 {
+				errs = append(errs, prefix+"."+field+" must be > 0 when set")
+			}
+		}
+		if political.TriggerWindowDays() <= 0 {
+			errs = append(errs, prefix+".trigger_lookback_days (or legacy ttl_days) must be > 0")
+		}
+		if political.EvidenceHorizonDays() <= 0 {
+			errs = append(errs, prefix+".analyst_evidence_horizon_days (or legacy ttl_days) must be > 0")
+		}
+		if political.WatchlistLeaseWindowDays() <= 0 {
+			errs = append(errs, prefix+".watchlist_lease_days (or legacy ttl_days) must be > 0")
 		}
 	}
 

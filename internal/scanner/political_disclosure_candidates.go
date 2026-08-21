@@ -32,8 +32,9 @@ func (s *MarketScanner) politicalDisclosureCandidates(
 		return nil, err
 	}
 	now := s.now()
-	rows, err := store.ClaimPoliticalDisclosureCandidates(
-		ctx, now.AddDate(0, 0, -s.Cfg.PoliticalDisclosures.TTLDays), now,
+	rows, err := store.ClaimPoliticalDisclosureCandidatesWithEvidence(
+		ctx, now.AddDate(0, 0, -cfg.TriggerWindowDays()),
+		now.AddDate(0, 0, -cfg.EvidenceHorizonDays()), now,
 		time.Duration(cfg.ClaimLeaseMinutes)*time.Minute,
 		cfg.MaxCandidatesPerRun, token,
 	)

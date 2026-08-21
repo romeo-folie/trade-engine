@@ -59,6 +59,34 @@ func TestValidateDisclosureBudgetCoversEnabledSources(t *testing.T) {
 	}
 }
 
+func TestPoliticalDisclosureTimingSplitFallsBackForLegacyConfigAndValidatesExplicitValues(t *testing.T) {
+	legacy := PoliticalDisclosureScannerConfig{TTLDays: 7}
+	if legacy.TriggerWindowDays() != 7 || legacy.EvidenceHorizonDays() != 7 || legacy.WatchlistLeaseWindowDays() != 7 {
+		t.Fatalf("legacy timing fallback = %+v", legacy)
+	}
+	loaded := Defaults()
+	loaded.Scanner.PoliticalDisclosures.TTLDays = 9
+	migratePoliticalDisclosureTimingConfig(loaded, []byte("scanner:\n  political_disclosures:\n    ttl_days: 9\n"))
+	if got := loaded.Scanner.PoliticalDisclosures; got.TriggerLookbackDays != 9 ||
+		got.AnalystEvidenceHorizonDays != 9 || got.WatchlistLeaseDays != 9 {
+		t.Fatalf("legacy config migration = %+v, want all timing values 9", got)
+	}
+	cfg := Defaults()
+	cfg.Scanner.Enabled = true
+	cfg.Disclosures.Enabled = true
+	cfg.Disclosures.AcknowledgeUseRestrictions = true
+	cfg.Scanner.PoliticalDisclosures.Enabled = true
+	cfg.Scanner.PoliticalDisclosures.TriggerLookbackDays = -1
+	cfg.Scanner.PoliticalDisclosures.AnalystEvidenceHorizonDays = -1
+	cfg.Scanner.PoliticalDisclosures.WatchlistLeaseDays = -1
+	errs := Validate(cfg)
+	for _, field := range []string{"trigger_lookback_days", "analyst_evidence_horizon_days", "watchlist_lease_days"} {
+		if !containsConfigError(errs, field) {
+			t.Fatalf("validation errors %v did not include %s", errs, field)
+		}
+	}
+}
+
 func TestValidateDisclosuresConfigReportsInvalidEnabledSettingsDeterministically(t *testing.T) {
 	cfg := Defaults().Disclosures
 	cfg.Enabled = true
