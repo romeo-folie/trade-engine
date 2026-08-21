@@ -39,7 +39,7 @@ func (f *WatchlistFeeder) RunSession(ctx context.Context, completed engine.USMar
 	attemptID := ""
 	stage := "validate_dependencies"
 	defer func() {
-		if err == nil {
+		if err == nil || ctx.Err() != nil {
 			return
 		}
 		args := []any{
@@ -77,6 +77,7 @@ func (f *WatchlistFeeder) RunSession(ctx context.Context, completed engine.USMar
 	if err := store.ExpireWatchlistDiscoveryContexts(ctx); err != nil {
 		return fmt.Errorf("expire discovery contexts: %w", err)
 	}
+	now = f.now()
 	if !now.Before(target.Open) {
 		// Startup during the target session must not pre-publish tomorrow with
 		// yesterday's ranking data. The ordinary after-close run will use the
