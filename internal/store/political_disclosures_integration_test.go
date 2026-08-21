@@ -932,8 +932,8 @@ func TestClaimPoliticalDisclosureCandidatesSeparatesTriggerFromEvidenceHorizon(t
 	for _, row := range rows {
 		byExternalID[row.ExternalID] = row
 	}
-	if byExternalID[history.ExternalID].Claimed || byExternalID[history.ExternalID].PromotionClaimToken != "" {
-		t.Fatalf("historical context was claimed: %+v", byExternalID[history.ExternalID])
+	if !byExternalID[history.ExternalID].Claimed || byExternalID[history.ExternalID].PromotionClaimToken != "horizon-token" {
+		t.Fatalf("historical context was not aggregate-fenced: %+v", byExternalID[history.ExternalID])
 	}
 	if !byExternalID[trigger.ExternalID].Claimed || byExternalID[trigger.ExternalID].PromotionClaimToken != "horizon-token" {
 		t.Fatalf("fresh trigger was not claimed: %+v", byExternalID[trigger.ExternalID])

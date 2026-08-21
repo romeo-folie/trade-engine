@@ -82,7 +82,9 @@ func (s *MarketScanner) newsSympathyCandidates(ctx context.Context, existing []S
 	covered := make(map[string]struct{}, len(items)+len(existing))
 	var seeds []string
 	for _, it := range items {
-		covered[strings.ToUpper(it.Ticker)] = struct{}{}
+		if !it.ScannerOrigin {
+			covered[strings.ToUpper(it.Ticker)] = struct{}{}
+		}
 		if it.Source != "scanner" && it.Source != "earnings_watchlist" {
 			seeds = append(seeds, it.Ticker)
 		}

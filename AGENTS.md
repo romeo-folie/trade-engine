@@ -28,6 +28,13 @@ suite, vet, build, applicable race tests, diff checks, and a final review-thread
 check. GitHub Codex review is a secondary safety net, not a substitute for this
 local gate.
 
+## Mandatory PR watcher persistence
+
+Once a PR watcher is started, keep actively monitoring and handling its review
+and CI events without shutting it down until the PR is merged or closed. Do not
+claim a detached watcher can take action on its own: keep the Codex turn active
+while remediation is expected, and restart the watcher if its heartbeat stops.
+
 ## Mandatory post-merge database and engine handling
 
 After merging a PR, the agent must:

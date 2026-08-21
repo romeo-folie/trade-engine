@@ -377,7 +377,7 @@ func promoteScannerSourcesToWatchlist(
 				OR (NOT EXISTS (SELECT 1 FROM watchlist_source_leases l WHERE l.watchlist_id=watchlist.id)
 					AND (expires_at IS NULL OR expires_at > NOW()))
 			)
-			FROM watchlist WHERE ticker=$1 AND platform=$2 FOR UPDATE`,
+			FROM watchlist WHERE ticker=$1 AND platform=$2 AND source='scanner' FOR UPDATE`,
 			strings.ToUpper(strings.TrimSpace(item.Ticker)), item.Platform,
 		).Scan(&active)
 		if isNoRows(err) || !active {

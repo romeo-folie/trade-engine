@@ -1049,27 +1049,24 @@ func ClaimPoliticalDisclosureCandidatesWithEvidence(
 			  -- A ticker's historical evidence is an aggregate ownership unit.
 			  -- Do not publish a partial aggregate while another scanner owns a
 			  -- still-fresh fence on any of its evidence rows.
-			  AND NOT BOOL_OR(
-				c.promotion_claim_token IS NOT NULL AND
-				c.promotion_claimed_at IS NOT NULL AND
-				c.promotion_claimed_at >= $2::timestamptz - $3::interval AND
-				c.promotion_claim_token <> $5
-			  )
+			AND NOT EXISTS (SELECT 1 FROM evidence e WHERE e.ticker=c.ticker
+				AND e.promotion_claim_token IS NOT NULL AND e.promotion_claimed_at IS NOT NULL
+				AND e.promotion_claimed_at >= $2::timestamptz - $3::interval AND e.promotion_claim_token <> $5)
 			ORDER BY MAX(c.filing_date) DESC, c.ticker
 		LIMIT $4
 		), claimed AS (
 			UPDATE political_disclosure_candidates c
 			SET promotion_status=CASE
-					WHEN c.promotion_status='pending' OR (
-						c.promotion_status='processing' AND
-						(c.promotion_claimed_at IS NULL OR c.promotion_claimed_at < $2::timestamptz - $3::interval)
-					) THEN 'processing'
+				WHEN EXISTS (SELECT 1 FROM trigger_eligible t WHERE t.report_id=c.report_id AND t.ticker=c.ticker) AND (c.promotion_status='pending' OR (
+					c.promotion_status='processing' AND
+					(c.promotion_claimed_at IS NULL OR c.promotion_claimed_at < $2::timestamptz - $3::interval)
+				)) THEN 'processing'
 					ELSE c.promotion_status
 				END,
 				promotion_claim_token=$5, promotion_claimed_at=$2::timestamptz
 			FROM selected s
 			WHERE c.ticker=s.ticker
-			  AND EXISTS (SELECT 1 FROM trigger_eligible e WHERE e.report_id=c.report_id AND e.ticker=c.ticker)
+			  AND EXISTS (SELECT 1 FROM evidence e WHERE e.report_id=c.report_id AND e.ticker=c.ticker)
 			RETURNING c.report_id, c.ticker, c.transaction_count,
 				c.latest_transaction_date, c.evidence, c.promotion_claim_token
 		)

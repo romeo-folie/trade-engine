@@ -40,6 +40,7 @@ WITH legacy_sources AS (
              THEN w.discovery_context->'sources' ELSE '[]'::jsonb END
     ) AS source(value)
     WHERE w.source = 'scanner' AND w.expires_at IS NOT NULL
+      AND btrim(source.value) <> ''
 ), unattributed AS (
     SELECT w.id AS watchlist_id,
            'legacy_scanner'::text AS source,

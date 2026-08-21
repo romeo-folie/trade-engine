@@ -631,7 +631,8 @@ func GetWatchlistItems(ctx context.Context, activeOnly bool) ([]WatchlistItem, e
 		SELECT id, ticker, platform, strategies, timeframes,
 		       COALESCE(min_confidence, 0), source, COALESCE(graph_context, ''),
 		       discovery_context, execution_profile, COALESCE(scanner_run_id::text, ''), active, expires_at,
-		       pullback_requalification_required, created_at, updated_at
+		       pullback_requalification_required, created_at, updated_at,
+		       (source='scanner' OR (source='earnings_watchlist' AND EXISTS (SELECT 1 FROM watchlist_source_leases l WHERE l.watchlist_id=watchlist.id)))
 		FROM watchlist
 	`
 	if activeOnly {
@@ -666,14 +667,13 @@ func GetWatchlistItems(ctx context.Context, activeOnly bool) ([]WatchlistItem, e
 			&w.MinConfidence, &w.Source, &w.GraphContext, &discoveryContext, &executionProfile,
 			&w.ScannerRunID,
 			&w.Active, &w.ExpiresAt,
-			&w.PullbackRequalificationRequired, &w.CreatedAt, &w.UpdatedAt,
+			&w.PullbackRequalificationRequired, &w.CreatedAt, &w.UpdatedAt, &w.ScannerOrigin,
 		); err != nil {
 			return nil, err
 		}
 		if err := decodeWatchlistContracts(&w, discoveryContext, executionProfile); err != nil {
 			return nil, fmt.Errorf("decode watchlist %s/%s contracts: %w", w.Ticker, w.Platform, err)
 		}
-		w.ScannerOrigin = w.Source == "scanner"
 		items = append(items, w)
 	}
 	if err := rows.Err(); err != nil {
@@ -715,7 +715,8 @@ func GetWatchlistItem(ctx context.Context, ticker, platform string) (*WatchlistI
 		SELECT id, ticker, platform, strategies, timeframes,
 		       COALESCE(min_confidence, 0), source, COALESCE(graph_context, ''),
 		       discovery_context, execution_profile, COALESCE(scanner_run_id::text, ''), active, expires_at,
-		       pullback_requalification_required, created_at, updated_at
+		       pullback_requalification_required, created_at, updated_at,
+		       (source='scanner' OR (source='earnings_watchlist' AND EXISTS (SELECT 1 FROM watchlist_source_leases l WHERE l.watchlist_id=watchlist.id)))
 		FROM watchlist
 		WHERE ticker = $1 AND platform = $2
 	`, ticker, platform)
@@ -726,7 +727,7 @@ func GetWatchlistItem(ctx context.Context, ticker, platform string) (*WatchlistI
 		&w.ID, &w.Ticker, &w.Platform, &w.Strategies, &w.Timeframes,
 		&w.MinConfidence, &w.Source, &w.GraphContext, &discoveryContext, &executionProfile, &w.ScannerRunID,
 		&w.Active, &w.ExpiresAt,
-		&w.PullbackRequalificationRequired, &w.CreatedAt, &w.UpdatedAt,
+		&w.PullbackRequalificationRequired, &w.CreatedAt, &w.UpdatedAt, &w.ScannerOrigin,
 	)
 	if err != nil {
 		if isNoRows(err) {
@@ -737,7 +738,6 @@ func GetWatchlistItem(ctx context.Context, ticker, platform string) (*WatchlistI
 	if err := decodeWatchlistContracts(&w, discoveryContext, executionProfile); err != nil {
 		return nil, fmt.Errorf("decode watchlist %s/%s contracts: %w", w.Ticker, w.Platform, err)
 	}
-	w.ScannerOrigin = w.Source == "scanner"
 	if err := loadActiveWatchlistDiscoveryContexts(ctx, &w); err != nil {
 		return nil, fmt.Errorf("load watchlist %s/%s discovery contexts: %w", w.Ticker, w.Platform, err)
 	}
