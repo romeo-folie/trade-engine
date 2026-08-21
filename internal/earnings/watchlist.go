@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -33,46 +34,110 @@ type rankedRelease struct {
 	dollar  float64
 }
 
-func (f *WatchlistFeeder) RunSession(ctx context.Context, completed engine.USMarketSession, _ time.Time) (err error) {
+func (f *WatchlistFeeder) RunSession(ctx context.Context, completed engine.USMarketSession, decisionAt time.Time) (err error) {
+	target := engine.NextMarketSession(completed.Date)
+	attemptID := ""
+	stage := "validate_dependencies"
+	defer func() {
+		if err == nil || ctx.Err() != nil {
+			return
+		}
+		args := []any{
+			"completed_session_date", completed.Date.Format("2006-01-02"),
+			"target_session_date", target.Date.Format("2006-01-02"),
+			"stage", stage,
+			"err", err,
+		}
+		if attemptID != "" {
+			args = append(args, "attempt_id", attemptID)
+		}
+		slog.Error("earnings watchlist run failed", args...)
+		if attemptID != "" {
+			if statusErr := store.FailEarningsWatchlistRun(ctx, target.Date, attemptID, err); statusErr != nil {
+				slog.Warn("earnings watchlist failed to persist durable failure status",
+					"target_session_date", target.Date.Format("2006-01-02"),
+					"attempt_id", attemptID,
+					"err", statusErr,
+				)
+			}
+		}
+	}()
 	if f.Calendar == nil || f.Bars == nil {
 		return fmt.Errorf("earnings watchlist requires calendar and daily-bars providers")
 	}
+	now := f.now()
+	slog.Info("earnings watchlist run targeting session",
+		"completed_session_date", completed.Date.Format("2006-01-02"),
+		"target_session_date", target.Date.Format("2006-01-02"),
+		"target_open", target.Open,
+		"decision_at", decisionAt,
+		"now", now,
+	)
+	stage = "expire_contexts"
 	if err := store.ExpireWatchlistDiscoveryContexts(ctx); err != nil {
 		return fmt.Errorf("expire discovery contexts: %w", err)
 	}
-	target := engine.NextMarketSession(completed.Date)
-	if !f.now().Before(target.Open) {
+	now = f.now()
+	if !now.Before(target.Open) {
 		// Startup during the target session must not pre-publish tomorrow with
 		// yesterday's ranking data. The ordinary after-close run will use the
 		// completed session that actually precedes tomorrow.
+		slog.Info("earnings watchlist run skipped",
+			"reason", "target_session_started",
+			"completed_session_date", completed.Date.Format("2006-01-02"),
+			"target_session_date", target.Date.Format("2006-01-02"),
+		)
 		return nil
 	}
-	attemptID, claimed, err := store.ClaimEarningsWatchlistRun(ctx, target.Date, f.now())
+	stage = "claim"
+	attemptID, claimed, err := store.ClaimEarningsWatchlistRun(ctx, target.Date, now)
 	if err != nil {
 		return err
 	}
 	if !claimed {
-		leaseHeld, availabilityErr := store.EarningsWatchlistRunLeaseHeld(ctx, target.Date, f.now())
+		stage = "lease"
+		leaseHeld, availabilityErr := store.EarningsWatchlistRunLeaseHeld(ctx, target.Date, now)
 		if availabilityErr != nil {
 			return availabilityErr
 		}
 		if leaseHeld {
+			slog.Info("earnings watchlist run skipped",
+				"reason", "another_worker",
+				"target_session_date", target.Date.Format("2006-01-02"),
+			)
 			return store.ErrEarningsWatchlistRunLeased
 		}
+		slog.Info("earnings watchlist run reused durable result",
+			"target_session_date", target.Date.Format("2006-01-02"),
+		)
 		return nil
 	}
-	defer func() {
-		if err != nil {
-			_ = store.FailEarningsWatchlistRun(ctx, target.Date, attemptID, err)
-		}
-	}()
+	slog.Info("earnings watchlist run claimed",
+		"target_session_date", target.Date.Format("2006-01-02"),
+		"attempt_id", attemptID,
+	)
+	stage = "calendar"
 	releases, err := f.Calendar.FetchMarketEarningsCalendar(ctx, target.Date, target.Date)
 	if err != nil {
 		return fmt.Errorf("fetch market earnings calendar for %s: %w", target.Date.Format("2006-01-02"), err)
 	}
 	unique := nextSessionReleases(releases, target.Date)
+	slog.Info("earnings watchlist calendar loaded",
+		"target_session_date", target.Date.Format("2006-01-02"),
+		"release_count", len(releases),
+		"eligible_unique_count", len(unique),
+	)
 	if len(unique) == 0 {
-		return store.CompleteEarningsWatchlistRun(ctx, target.Date, attemptID)
+		stage = "complete_empty"
+		if err := store.CompleteEarningsWatchlistRun(ctx, target.Date, attemptID); err != nil {
+			return err
+		}
+		slog.Info("earnings watchlist run published",
+			"target_session_date", target.Date.Format("2006-01-02"),
+			"attempt_id", attemptID,
+			"selected_count", 0,
+		)
+		return nil
 	}
 	symbols := make([]string, 0, len(unique))
 	for _, release := range unique {
@@ -80,6 +145,7 @@ func (f *WatchlistFeeder) RunSession(ctx context.Context, completed engine.USMar
 	}
 	from := completed.Date.AddDate(0, 0, -35)
 	to := completed.Date.AddDate(0, 0, 1)
+	stage = "bars"
 	barResult, err := f.Bars.FetchDailyBars(ctx, symbols, from, to, f.Cfg.BarBatchSize)
 	if err != nil {
 		return fmt.Errorf("fetch ranking daily bars: %w", err)
@@ -89,6 +155,15 @@ func (f *WatchlistFeeder) RunSession(ctx context.Context, completed engine.USMar
 	if cap > len(ranked) {
 		cap = len(ranked)
 	}
+	slog.Info("earnings watchlist candidates ranked",
+		"target_session_date", target.Date.Format("2006-01-02"),
+		"eligible_unique_count", len(unique),
+		"bar_symbol_count", len(barResult.Bars),
+		"bar_failure_count", len(barResult.Failures),
+		"ranked_count", len(ranked),
+		"selected_count", cap,
+		"candidate_cap", f.Cfg.CandidateCap,
+	)
 	expires := engine.MarketSessionOffset(target.Date, f.Cfg.WatchlistSessions-1).Close
 	candidates := make([]store.EarningsWatchlistCandidate, 0, cap)
 	for index, candidate := range ranked[:cap] {
@@ -98,7 +173,17 @@ func (f *WatchlistFeeder) RunSession(ctx context.Context, completed engine.USMar
 			LiquidityRank: index + 1, MedianDollarVolume: candidate.dollar,
 		})
 	}
-	return store.PublishEarningsWatchlistRun(ctx, target.Date, attemptID, candidates)
+	stage = "publish"
+	if err := store.PublishEarningsWatchlistRun(ctx, target.Date, attemptID, candidates); err != nil {
+		return err
+	}
+	slog.Info("earnings watchlist run published",
+		"target_session_date", target.Date.Format("2006-01-02"),
+		"attempt_id", attemptID,
+		"selected_count", len(candidates),
+		"expires_at", expires,
+	)
+	return nil
 }
 
 func nextSessionReleases(releases []data.EarningsRelease, target time.Time) []data.EarningsRelease {
