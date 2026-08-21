@@ -97,18 +97,65 @@ func scannerSourceIdentity(candidate SwingCandidate, source string) map[string]a
 		identity["report_ids"] = reportIDs
 		identity["facts"] = json.RawMessage(candidate.PoliticalDisclosureFacts)
 	case "graph_neighbor":
-		identity["relationship"] = candidate.GraphContext
+		identity["relationship"] = sourceGraphContext(candidate, source)
 	case "news_sympathy":
 		identity["seed"] = candidate.SympathySeed
 		identity["relationship"] = candidate.SympathyRelationship
+		if len(candidate.News) > 0 {
+			// Sympathy candidates place their immutable seed trigger first; any
+			// subsequent entries are optional neighbor enrichment and must not
+			// renew the source lease.
+			identity["trigger"] = scannerNewsIdentity(candidate.News[:1])
+		}
+	case "mover", "active":
+		// Preserve the source's raw screener observation. Weekly/industry and
+		// premarket merges legitimately replace fields on the shared candidate
+		// for scoring, but they must not renew an independent mover/activity
+		// lease without new mover/activity evidence.
+		identity["market"] = ordinarySourceMarketObservation(candidate, source)
 		identity["news"] = scannerNewsIdentity(candidate.News)
 	default:
-		// Movers/actives have no immutable upstream ID. Use the bounded market
+		// Other sources without an immutable upstream ID use the bounded market
 		// observation, excluding wall-clock scan time so exact retries are inert.
 		identity["market"] = scannerMarketObservation(candidate)
 		identity["news"] = scannerNewsIdentity(candidate.News)
 	}
 	return identity
+}
+
+func sourceGraphContext(candidate SwingCandidate, source string) string {
+	if candidate.sourceGraphContexts != nil && candidate.sourceGraphContexts[source] != "" {
+		return candidate.sourceGraphContexts[source]
+	}
+	return candidate.GraphContext
+}
+
+func moverMarketObservation(price, changePct float64, volume int64) map[string]any {
+	return map[string]any{
+		"price": price, "change_pct": changePct, "premarket_volume": volume,
+	}
+}
+
+func activeMarketObservation(price float64, volume, tradeCount int64) map[string]any {
+	return map[string]any{
+		"price": price, "volume": volume, "trade_count": tradeCount,
+	}
+}
+
+func ordinarySourceMarketObservation(candidate SwingCandidate, source string) map[string]any {
+	if observation := candidate.sourceMarketObservations[source]; observation != nil {
+		copy := make(map[string]any, len(observation))
+		for key, value := range observation {
+			copy[key] = value
+		}
+		return copy
+	}
+	// Candidates reconstructed by a legacy caller still receive a bounded,
+	// source-specific identity rather than fields supplied by another source.
+	if source == "mover" {
+		return moverMarketObservation(candidate.Price, candidate.ChangePct, candidate.Volume)
+	}
+	return activeMarketObservation(candidate.Price, candidate.Volume, candidate.TradeCount)
 }
 
 func scannerNewsIdentity(news []SwingNewsItem) []map[string]any {

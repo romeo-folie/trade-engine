@@ -981,10 +981,20 @@ func ClaimPoliticalDisclosureCandidatesWithEvidence(
 		WITH trigger_eligible AS (
 			SELECT c.ticker, c.promotion_status, c.promotion_claim_token,
 				c.promotion_claimed_at, r.filing_date
-			FROM political_disclosure_candidates c
-			JOIN political_disclosure_reports r ON r.id=c.report_id
-			WHERE r.filing_date >= $1::date AND r.filing_date <= $2::date
-			  AND r.extraction_status='completed' AND c.promotion_status <> 'superseded'
+				FROM political_disclosure_candidates c
+				JOIN political_disclosure_reports r ON r.id=c.report_id
+				WHERE r.filing_date >= $1::date AND r.filing_date <= $2::date
+				  AND r.extraction_status='completed' AND c.promotion_status <> 'superseded'
+				  AND NOT EXISTS (
+					SELECT 1
+					FROM political_disclosure_candidates claimed
+					JOIN political_disclosure_reports claim_report ON claim_report.id=claimed.report_id
+					WHERE claimed.ticker=c.ticker
+					  AND claim_report.filing_date >= $6::date AND claim_report.filing_date <= $2::date
+					  AND claimed.promotion_claim_token IS NOT NULL AND claimed.promotion_claimed_at IS NOT NULL
+					  AND claimed.promotion_claimed_at >= $2::timestamptz - $3::interval
+					  AND claimed.promotion_claim_token <> $5
+				  )
 		)
 		SELECT ticker
 		FROM trigger_eligible
@@ -997,8 +1007,8 @@ func ClaimPoliticalDisclosureCandidatesWithEvidence(
 			promotion_claim_token IS NOT NULL AND promotion_claimed_at IS NOT NULL AND
 			promotion_claimed_at >= $2::timestamptz - $3::interval AND promotion_claim_token <> $5
 		)
-		ORDER BY MAX(filing_date) DESC, ticker
-		LIMIT $4`, triggerSince, now, lease.String(), maxTickers, token)
+			ORDER BY MAX(filing_date) DESC, ticker
+			LIMIT $4`, triggerSince, now, lease.String(), maxTickers, token, evidenceSince)
 	if err != nil {
 		return nil, err
 	}

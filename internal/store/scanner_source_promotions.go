@@ -373,17 +373,14 @@ func promoteScannerSourcesToWatchlist(
 		var active bool
 		err := tx.QueryRow(ctx, `
 			SELECT active AND (
-				EXISTS (SELECT 1 FROM watchlist_source_leases l WHERE l.watchlist_id=watchlist.id AND l.expires_at > NOW())
-				OR (NOT EXISTS (SELECT 1 FROM watchlist_source_leases l WHERE l.watchlist_id=watchlist.id)
-					AND (expires_at IS NULL OR expires_at > NOW()))
+					EXISTS (SELECT 1 FROM watchlist_source_leases l WHERE l.watchlist_id=watchlist.id AND l.expires_at > clock_timestamp())
+					OR (NOT EXISTS (SELECT 1 FROM watchlist_source_leases l WHERE l.watchlist_id=watchlist.id)
+						AND (expires_at IS NULL OR expires_at > clock_timestamp()))
 			)
 			FROM watchlist WHERE ticker=$1 AND platform=$2 AND source='scanner' FOR UPDATE`,
 			strings.ToUpper(strings.TrimSpace(item.Ticker)), item.Platform,
 		).Scan(&active)
-		if isNoRows(err) || !active {
-			return ErrWatchlistRefreshNotActive
-		}
-		if err != nil {
+		if err := refreshActivityResult(active, err); err != nil {
 			return err
 		}
 		if _, err := refreshWatchlistSourceLeases(ctx, tx, item); err != nil {
@@ -416,6 +413,19 @@ func promoteScannerSourcesToWatchlist(
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+func refreshActivityResult(active bool, err error) error {
+	if err != nil {
+		if isNoRows(err) {
+			return ErrWatchlistRefreshNotActive
+		}
+		return err
+	}
+	if !active {
+		return ErrWatchlistRefreshNotActive
+	}
+	return nil
 }
 
 func completeScannerSourcePromotionClaims(

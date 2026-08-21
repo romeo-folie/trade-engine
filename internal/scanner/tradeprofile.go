@@ -126,7 +126,15 @@ func scannerEvidenceBySource(
 		if score, ok := candidate.SourceScores[source]; ok {
 			evidence["source_score"] = score
 		}
-		if index == 0 {
+		if source == "mover" || source == "active" {
+			// Movers and most-actives are independent screener observations.
+			// Do not attach fields later supplied by weekly/industry/premarket
+			// merges, otherwise that other source can renew this lease.
+			evidence["market_observation"] = ordinarySourceMarketObservation(candidate, source)
+			if len(candidate.News) > 0 {
+				evidence["recent_news"] = canonicalScannerNews(candidate.News)
+			}
+		} else if index == 0 {
 			evidence["market_observation"] = scannerMarketObservation(candidate)
 			if len(candidate.News) > 0 {
 				evidence["recent_news"] = canonicalScannerNews(candidate.News)
@@ -134,8 +142,8 @@ func scannerEvidenceBySource(
 		}
 		switch source {
 		case "graph_neighbor", "news_sympathy":
-			if candidate.GraphContext != "" {
-				evidence["relationship_thesis"] = candidate.GraphContext
+			if context := sourceGraphContext(candidate, source); context != "" {
+				evidence["relationship_thesis"] = context
 			}
 		case "weekly_leader":
 			if candidate.WeeklyLeaderEvidence != "" {
@@ -186,6 +194,9 @@ func scannerEvidenceBySource(
 				}
 			}
 		}
+		if thesis := scannerSourceThesis(candidate, source); thesis != "" {
+			evidence["source_thesis"] = thesis
+		}
 		encoded, err := json.Marshal(evidence)
 		if err != nil {
 			// All values above are scanner-owned primitives. Retain a valid
@@ -217,28 +228,37 @@ func scannerMarketObservation(candidate SwingCandidate) map[string]any {
 
 func scannerDiscoveryThesis(candidate SwingCandidate, sources []string) string {
 	for _, source := range sources {
-		var evidence string
-		switch source {
-		case "weekly_leader":
-			evidence = candidate.WeeklyLeaderEvidence
-		case "potent_industry":
-			evidence = candidate.PotentIndustryEvidence
-		case "premarket_episodic":
-			evidence = candidate.PremarketEpisodicEvidence
-		case "political_disclosure":
-			evidence = politicalDisclosureThesis(candidate)
-		case "graph_neighbor", "news_sympathy":
-			evidence = candidate.GraphContext
+		if thesis := scannerSourceThesis(candidate, source); thesis != "" {
+			return thesis
 		}
-		if strings.TrimSpace(evidence) != "" {
-			return compactScannerText(fmt.Sprintf("%s: %s", source, evidence), 280)
-		}
-	}
-	if len(candidate.News) > 0 && strings.TrimSpace(candidate.News[0].Headline) != "" {
-		return compactScannerText(fmt.Sprintf("%s surfaced by %s with recent news: %s",
-			candidate.Ticker, strings.Join(sources, ", "), candidate.News[0].Headline), 280)
 	}
 	return compactScannerText(fmt.Sprintf("%s surfaced by %s", candidate.Ticker, strings.Join(sources, ", ")), 280)
+}
+
+func scannerSourceThesis(candidate SwingCandidate, source string) string {
+	var evidence string
+	switch source {
+	case "weekly_leader":
+		evidence = candidate.WeeklyLeaderEvidence
+	case "potent_industry":
+		evidence = candidate.PotentIndustryEvidence
+	case "premarket_episodic":
+		evidence = candidate.PremarketEpisodicEvidence
+	case "political_disclosure":
+		evidence = politicalDisclosureThesis(candidate)
+	case "graph_neighbor", "news_sympathy":
+		evidence = sourceGraphContext(candidate, source)
+	}
+	if strings.TrimSpace(evidence) != "" {
+		return compactScannerText(fmt.Sprintf("%s: %s", source, evidence), 280)
+	}
+	news := canonicalScannerNews(candidate.News)
+	if len(news) > 0 && strings.TrimSpace(news[0].Headline) != "" {
+		latest := news[len(news)-1]
+		return compactScannerText(fmt.Sprintf("%s surfaced by %s with recent news: %s",
+			candidate.Ticker, source, latest.Headline), 280)
+	}
+	return compactScannerText(fmt.Sprintf("%s surfaced by %s", candidate.Ticker, source), 280)
 }
 
 func politicalDisclosureEvidenceObject(raw json.RawMessage) bool {

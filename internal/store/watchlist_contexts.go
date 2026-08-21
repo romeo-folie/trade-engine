@@ -186,6 +186,12 @@ func pruneExpiredSourceLeaseEvidenceBatch(ctx context.Context, items []Watchlist
 				// The original thesis/graph wording may describe an expired source.
 				// Preserve only source-scoped facts that remain live.
 				items[index].GraphContext = ""
+				// Discovery and execution are a durable pair. Once the final
+				// lease-backed source is gone, do not expose execution routing with
+				// no discovery contract to justify it.
+				if filtered == nil {
+					items[index].ExecutionProfile = nil
+				}
 			}
 		}
 	}
@@ -214,7 +220,10 @@ func filterDiscoveryContextSources(value *tradeprofile.DiscoveryContext, live ma
 		if len(filtered.Sources) == 0 {
 			return nil, true
 		}
-		filtered.Thesis = "Active source evidence: " + strings.Join(filtered.Sources, ", ")
+		filtered.Thesis = mergedDiscoveryThesis("", "", filtered.Sources, filtered.EvidenceBySource)
+		if filtered.Thesis == "" {
+			filtered.Thesis = "Active source evidence: " + strings.Join(filtered.Sources, ", ")
+		}
 	}
 	return &filtered, pruned
 }

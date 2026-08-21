@@ -102,9 +102,9 @@ func RefreshActiveScannerWatchlistItem(
 	err = tx.QueryRow(ctx, `
 		SELECT id::text FROM watchlist w
 		WHERE ticker=$1 AND platform=$2 AND source='scanner' AND active
-		  AND (EXISTS (SELECT 1 FROM watchlist_source_leases l WHERE l.watchlist_id=w.id AND l.expires_at > NOW())
+		  AND (EXISTS (SELECT 1 FROM watchlist_source_leases l WHERE l.watchlist_id=w.id AND l.expires_at > clock_timestamp())
 		       OR (NOT EXISTS (SELECT 1 FROM watchlist_source_leases l WHERE l.watchlist_id=w.id)
-		           AND (expires_at IS NULL OR expires_at > NOW())))
+		           AND (expires_at IS NULL OR expires_at > clock_timestamp())))
 		FOR UPDATE`, strings.ToUpper(strings.TrimSpace(item.Ticker)), item.Platform,
 	).Scan(&id)
 	if isNoRows(err) {
@@ -399,6 +399,23 @@ func addWatchlistItem(
 			$13
 			AND watchlist.active
 			AND (watchlist.expires_at IS NULL OR watchlist.expires_at > NOW())
+			-- An earnings context may temporarily take over a scanner row after
+			-- its final scanner lease expired. Its retained, expired lease history
+			-- identifies that re-admission path; fresh scanner evidence must be
+			-- able to restore scanner residency without waiting for the earnings
+			-- context to expire. A normal earnings-only row still owns its active
+			-- lifecycle and remains protected by this conflict guard.
+			AND NOT (
+				watchlist.source = 'earnings_watchlist'
+				AND EXISTS (
+					SELECT 1 FROM watchlist_source_leases l
+					WHERE l.watchlist_id=watchlist.id
+				)
+				AND NOT EXISTS (
+					SELECT 1 FROM watchlist_source_leases l
+					WHERE l.watchlist_id=watchlist.id AND l.expires_at > NOW()
+				)
+			)
 		)
 	`,
 		item.Ticker, item.Platform, item.Strategies, item.Timeframes,
@@ -529,12 +546,39 @@ func refreshWatchlistSourceLeases(
 		if err != nil {
 			return false, err
 		}
+		executionProfile, err := tradeprofile.MarshalExecutionProfile(item.ExecutionProfile)
+		if err != nil {
+			return false, fmt.Errorf("marshal refreshed execution profile: %w", err)
+		}
+		var persistedDiscovery, persistedProfile []byte
+		if err := db.QueryRow(ctx, `SELECT discovery_context, execution_profile FROM watchlist WHERE id=$1`, watchlistID).
+			Scan(&persistedDiscovery, &persistedProfile); err != nil {
+			return false, err
+		}
+		storedDiscovery, discoveryErr := tradeprofile.DecodeDiscoveryContext(persistedDiscovery)
+		storedProfile, profileErr := tradeprofile.DecodeExecutionProfile(persistedProfile)
+		repairExecutionProfile := discoveryErr != nil || profileErr != nil ||
+			(storedDiscovery == nil) != (storedProfile == nil) ||
+			// A legacy scanner row has neither side of the contract. Once a
+			// refreshed lease introduces discovery context, install its paired
+			// execution profile in the same write to satisfy the DB invariant.
+			(storedDiscovery == nil && discoveryContext != nil)
 		if _, err := db.Exec(ctx, `
 			UPDATE watchlist w
 			SET expires_at=(SELECT MAX(l.expires_at) FROM watchlist_source_leases l WHERE l.watchlist_id=w.id),
 				discovery_context=COALESCE($2, discovery_context),
+					execution_profile=CASE WHEN $4 THEN $3 ELSE w.execution_profile END,
+				graph_context=CASE
+					WHEN $5 <> '' THEN $5
+					WHEN EXISTS (
+						SELECT 1 FROM watchlist_source_leases l
+						WHERE l.watchlist_id=w.id AND l.expires_at > NOW()
+						  AND l.source IN ('graph_neighbor', 'news_sympathy')
+					) THEN w.graph_context
+					ELSE NULL
+				END,
 				last_rediscovered_at=NOW(), updated_at=NOW()
-			WHERE w.id=$1`, watchlistID, discoveryContext); err != nil {
+			WHERE w.id=$1`, watchlistID, discoveryContext, executionProfile, repairExecutionProfile, strings.TrimSpace(item.GraphContext)); err != nil {
 			return false, fmt.Errorf("project watchlist source lease expiry: %w", err)
 		}
 	}
@@ -586,10 +630,80 @@ func mergeRefreshedDiscoveryContext(
 		}
 		merged.EvidenceBySource[source] = append(json.RawMessage(nil), fresh.EvidenceBySource[source]...)
 	}
-	if strings.TrimSpace(fresh.Thesis) != "" && fresh.Thesis != merged.Thesis {
-		merged.Thesis = fresh.Thesis
+	legacyThesis := existing.Thesis
+	for _, source := range existing.Sources {
+		if !liveSources[source] {
+			// Older contexts have only a row-wide thesis. Once one of their
+			// sources expires, we cannot safely attribute that prose to the
+			// remaining evidence, so retain only current source-scoped thesis.
+			legacyThesis = ""
+			break
+		}
 	}
+	merged.Thesis = mergedDiscoveryThesis(legacyThesis, fresh.Thesis, merged.Sources, merged.EvidenceBySource)
 	return tradeprofile.MarshalDiscoveryContext(&merged)
+}
+
+// mergedDiscoveryThesis keeps the analyst-facing provenance in step with the
+// live per-source evidence. New scanner contexts persist source_thesis inside
+// each evidence object, allowing a deterministic composite. Older rows do not
+// have that field, so retain their prior row-wide thesis when a refresh adds a
+// different source instead of letting that source erase unrelated provenance.
+func mergedDiscoveryThesis(existing, fresh string, sources []string, evidence map[string]json.RawMessage) string {
+	parts := make([]string, 0, len(sources))
+	complete := len(sources) > 0
+	for _, source := range sources {
+		thesis := discoveryEvidenceThesis(evidence[source])
+		if thesis == "" {
+			complete = false
+			continue
+		}
+		if !containsThesis(parts, thesis) {
+			parts = append(parts, thesis)
+		}
+	}
+	if complete && len(parts) > 0 {
+		return strings.Join(parts, " | ")
+	}
+	existing = strings.TrimSpace(existing)
+	fresh = strings.TrimSpace(fresh)
+	if fresh == "" || fresh == existing || containsThesis(thesisComponents(existing), fresh) {
+		return existing
+	}
+	if existing == "" {
+		return fresh
+	}
+	return existing + " | " + fresh
+}
+
+func thesisComponents(value string) []string {
+	parts := strings.Split(value, " | ")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part = strings.TrimSpace(part); part != "" && !containsThesis(out, part) {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+func discoveryEvidenceThesis(raw json.RawMessage) string {
+	var value struct {
+		SourceThesis string `json:"source_thesis"`
+	}
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(value.SourceThesis)
+}
+
+func containsThesis(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 func activeWatchlistLeaseSources(ctx context.Context, db watchlistExecer, watchlistID string) (map[string]bool, error) {

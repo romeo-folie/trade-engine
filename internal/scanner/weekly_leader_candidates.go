@@ -173,6 +173,22 @@ func cloneSwingCandidate(candidate SwingCandidate) SwingCandidate {
 			clone.SourceScores[source] = score
 		}
 	}
+	if candidate.sourceMarketObservations != nil {
+		clone.sourceMarketObservations = make(map[string]map[string]any, len(candidate.sourceMarketObservations))
+		for source, observation := range candidate.sourceMarketObservations {
+			copy := make(map[string]any, len(observation))
+			for key, value := range observation {
+				copy[key] = value
+			}
+			clone.sourceMarketObservations[source] = copy
+		}
+	}
+	if candidate.sourceGraphContexts != nil {
+		clone.sourceGraphContexts = make(map[string]string, len(candidate.sourceGraphContexts))
+		for source, context := range candidate.sourceGraphContexts {
+			clone.sourceGraphContexts[source] = context
+		}
+	}
 	if candidate.UniverseMember != nil {
 		member := *candidate.UniverseMember
 		clone.UniverseMember = &member

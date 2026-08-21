@@ -1365,6 +1365,11 @@ type PoliticalDisclosureScannerConfig struct {
 	TriggerLookbackDays        int `yaml:"trigger_lookback_days"`
 	AnalystEvidenceHorizonDays int `yaml:"analyst_evidence_horizon_days"`
 	WatchlistLeaseDays         int `yaml:"watchlist_lease_days"`
+	// These loader-only flags retain whether zero was explicitly written in
+	// YAML, distinct from a legacy config that omitted the newly split window.
+	explicitTriggerLookbackDays        bool
+	explicitAnalystEvidenceHorizonDays bool
+	explicitWatchlistLeaseDays         bool
 }
 
 func (c PoliticalDisclosureScannerConfig) TriggerWindowDays() int {
@@ -2107,13 +2112,16 @@ func migratePoliticalDisclosureTimingConfig(cfg *Config, raw []byte) {
 		return
 	}
 	values := doc.Scanner.PoliticalDisclosures
+	political := &cfg.Scanner.PoliticalDisclosures
+	_, political.explicitTriggerLookbackDays = values["trigger_lookback_days"]
+	_, political.explicitAnalystEvidenceHorizonDays = values["analyst_evidence_horizon_days"]
+	_, political.explicitWatchlistLeaseDays = values["watchlist_lease_days"]
 	if len(values) == 0 {
 		return
 	}
 	if _, hasLegacy := values["ttl_days"]; !hasLegacy {
 		return
 	}
-	political := &cfg.Scanner.PoliticalDisclosures
 	if _, explicit := values["trigger_lookback_days"]; !explicit {
 		political.TriggerLookbackDays = political.TTLDays
 	}
@@ -2921,13 +2929,17 @@ func Validate(cfg *Config) []string {
 			!durationConfigFits(political.ClaimLeaseMinutes, time.Minute) {
 			errs = append(errs, prefix+".claim_lease_minutes must be a safe positive duration")
 		}
-		for field, value := range map[string]int{
-			"trigger_lookback_days":         political.TriggerLookbackDays,
-			"analyst_evidence_horizon_days": political.AnalystEvidenceHorizonDays,
-			"watchlist_lease_days":          political.WatchlistLeaseDays,
+		for _, field := range []struct {
+			name     string
+			value    int
+			explicit bool
+		}{
+			{"trigger_lookback_days", political.TriggerLookbackDays, political.explicitTriggerLookbackDays},
+			{"analyst_evidence_horizon_days", political.AnalystEvidenceHorizonDays, political.explicitAnalystEvidenceHorizonDays},
+			{"watchlist_lease_days", political.WatchlistLeaseDays, political.explicitWatchlistLeaseDays},
 		} {
-			if value < 0 {
-				errs = append(errs, prefix+"."+field+" must be > 0 when set")
+			if field.value < 0 || (field.explicit && field.value == 0) {
+				errs = append(errs, prefix+"."+field.name+" must be > 0 when set")
 			}
 		}
 		if political.TriggerWindowDays() <= 0 {

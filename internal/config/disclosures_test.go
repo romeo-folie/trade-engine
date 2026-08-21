@@ -85,6 +85,21 @@ func TestPoliticalDisclosureTimingSplitFallsBackForLegacyConfigAndValidatesExpli
 			t.Fatalf("validation errors %v did not include %s", errs, field)
 		}
 	}
+	explicitZero := Defaults()
+	explicitZero.Scanner.Enabled = true
+	explicitZero.Disclosures.Enabled = true
+	explicitZero.Disclosures.AcknowledgeUseRestrictions = true
+	explicitZero.Scanner.PoliticalDisclosures.Enabled = true
+	explicitZero.Scanner.PoliticalDisclosures.TTLDays = 7
+	explicitZero.Scanner.PoliticalDisclosures.TriggerLookbackDays = 0
+	explicitZero.Scanner.PoliticalDisclosures.AnalystEvidenceHorizonDays = 0
+	explicitZero.Scanner.PoliticalDisclosures.WatchlistLeaseDays = 0
+	migratePoliticalDisclosureTimingConfig(explicitZero, []byte("scanner:\n  political_disclosures:\n    ttl_days: 7\n    trigger_lookback_days: 0\n    analyst_evidence_horizon_days: 0\n    watchlist_lease_days: 0\n"))
+	for _, field := range []string{"trigger_lookback_days", "analyst_evidence_horizon_days", "watchlist_lease_days"} {
+		if !containsConfigError(Validate(explicitZero), field) {
+			t.Fatalf("explicit zero validation errors %v did not include %s", Validate(explicitZero), field)
+		}
+	}
 }
 
 func TestValidateDisclosuresConfigReportsInvalidEnabledSettingsDeterministically(t *testing.T) {

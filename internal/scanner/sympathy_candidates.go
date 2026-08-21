@@ -196,7 +196,7 @@ func (s *MarketScanner) newsSympathyCandidates(ctx context.Context, existing []S
 			Sources:      []string{"news_sympathy"},
 			GraphContext: sympathyPhrase(p.trigger, p.neighbor),
 			SympathySeed: p.trigger.Seed, SympathyRelationship: graphLinkPhrase(p.neighbor),
-			News: []SwingNewsItem{{Headline: p.trigger.Headline, Sentiment: fmt.Sprintf("%.6f", p.trigger.Sentiment), PublishedAt: p.trigger.PublishedAt}},
+			News: []SwingNewsItem{{Headline: p.trigger.Headline, Sentiment: scannerNewsSentiment(p.trigger.Sentiment), PublishedAt: p.trigger.PublishedAt}},
 		})
 		if !refreshable[strings.ToUpper(p.neighbor.Ticker)] {
 			admissions++

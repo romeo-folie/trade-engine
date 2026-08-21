@@ -74,6 +74,44 @@ func TestWatchlistSourceLeaseRefreshIsEvidenceGatedAndPreservesAdmission(t *test
 	}
 }
 
+func TestLegacyScannerLeaseRefreshInstallsCompleteTradeProfile(t *testing.T) {
+	ctx := context.Background()
+	const ticker = "LEASE_LEGACY_PROFILE_RT"
+	t.Cleanup(func() { _, _ = store.GetDB().Exec(ctx, "DELETE FROM watchlist WHERE ticker=$1", ticker) })
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	expiresAt := now.Add(24 * time.Hour)
+	legacy := store.WatchlistItem{
+		Ticker: ticker, Platform: "stock", Source: "scanner", Strategies: []string{"momentum"},
+		Timeframes: []string{"1D"}, ExpiresAt: &expiresAt,
+		SourceLeases: []store.WatchlistSourceLease{{
+			Source: "mover", EvidenceFingerprint: "legacy", QualifiedAt: now, ObservedAt: now,
+			EffectiveAt: now, ExpiresAt: expiresAt, Evidence: json.RawMessage(`{"price":10}`),
+		}},
+	}
+	if err := store.AddWatchlistItem(ctx, legacy); err != nil {
+		t.Fatalf("add legacy scanner item: %v", err)
+	}
+	refresh := legacy
+	refresh.DiscoveryContext = &tradeprofile.DiscoveryContext{
+		Version: tradeprofile.DiscoveryContextVersion, Sources: []string{"mover"}, Thesis: "Fresh mover evidence",
+		EvidenceBySource: map[string]json.RawMessage{"mover": json.RawMessage(`{"price":11}`)},
+	}
+	refresh.ExecutionProfile = &tradeprofile.ExecutionProfile{
+		Version: tradeprofile.ExecutionProfileVersion, RecommendedLens: "momentum",
+		AdmissibleLenses: []string{"momentum"}, PrimaryTimeframe: "1D", ScorerRationale: "Fresh scanner refresh.",
+	}
+	refresh.SourceLeases = append([]store.WatchlistSourceLease(nil), legacy.SourceLeases...)
+	refresh.SourceLeases[0].EvidenceFingerprint = "fresh"
+	refresh.SourceLeases[0].Evidence = json.RawMessage(`{"price":11}`)
+	if changed, err := store.RefreshActiveScannerWatchlistItem(ctx, refresh, nil); err != nil || !changed {
+		t.Fatalf("refresh legacy scanner item = changed=%v err=%v, want true/nil", changed, err)
+	}
+	stored, err := store.GetWatchlistItem(ctx, ticker, "stock")
+	if err != nil || stored == nil || stored.DiscoveryContext == nil || stored.ExecutionProfile == nil {
+		t.Fatalf("legacy refresh did not install complete trade profile: %+v, %v", stored, err)
+	}
+}
+
 func TestWatchlistRemainsLiveUntilItsFinalSourceLeaseExpires(t *testing.T) {
 	ctx := context.Background()
 	const ticker = "LEASE_MULTI_RT"
@@ -138,7 +176,7 @@ func TestRefreshDropsEvidenceWhoseSourceLeaseExpired(t *testing.T) {
 		AdmissibleLenses: []string{"momentum"}, PrimaryTimeframe: "1D", ScorerRationale: "Test evidence expiry.",
 	}
 	item := store.WatchlistItem{
-		Ticker: ticker, Platform: "stock", Source: "scanner", ScannerRunID: runID, Strategies: []string{"momentum"}, Timeframes: []string{"1D"}, ExpiresAt: &liveExpiry,
+		Ticker: ticker, Platform: "stock", Source: "scanner", ScannerRunID: runID, Strategies: []string{"momentum"}, Timeframes: []string{"1D"}, GraphContext: "stale admission thesis", ExpiresAt: &liveExpiry,
 		DiscoveryContext: &tradeprofile.DiscoveryContext{
 			Version: tradeprofile.DiscoveryContextVersion, Sources: []string{"mover", "political_disclosure"}, Thesis: "Initial provenance",
 			EvidenceBySource: map[string]json.RawMessage{"mover": json.RawMessage(`{"price":10}`), "political_disclosure": json.RawMessage(`{"report_count":2}`)},
@@ -163,6 +201,7 @@ func TestRefreshDropsEvidenceWhoseSourceLeaseExpired(t *testing.T) {
 		t.Fatalf("live source context lost its usable thesis: %+v", beforeRefresh.EffectiveDiscoveryContext())
 	}
 	refresh := item
+	refresh.GraphContext = "fresh refreshed thesis"
 	refresh.DiscoveryContext = &tradeprofile.DiscoveryContext{
 		Version: tradeprofile.DiscoveryContextVersion, Sources: []string{"mover"}, Thesis: "Fresh mover provenance",
 		EvidenceBySource: map[string]json.RawMessage{"mover": json.RawMessage(`{"price":11}`)},
@@ -182,6 +221,21 @@ func TestRefreshDropsEvidenceWhoseSourceLeaseExpired(t *testing.T) {
 	}
 	if _, found := stored.DiscoveryContext.EvidenceBySource["mover"]; !found {
 		t.Fatalf("fresh mover evidence missing: %+v", stored.DiscoveryContext)
+	}
+	if stored.GraphContext != "fresh refreshed thesis" {
+		t.Fatalf("refreshed graph context = %q, want current provenance", stored.GraphContext)
+	}
+	if _, err := store.GetDB().Exec(ctx, `
+		UPDATE watchlist_source_leases SET expires_at=NOW()-INTERVAL '1 second'
+		WHERE watchlist_id=(SELECT id FROM watchlist WHERE ticker=$1)`, ticker); err != nil {
+		t.Fatalf("expire final source lease: %v", err)
+	}
+	expiredItem, err := store.GetWatchlistItem(ctx, ticker, "stock")
+	if err != nil || expiredItem == nil {
+		t.Fatalf("read item after final source expiry: %+v, %v", expiredItem, err)
+	}
+	if expiredItem.DiscoveryContext != nil || expiredItem.ExecutionProfile != nil {
+		t.Fatalf("expired final source returned half contract: %+v", expiredItem)
 	}
 }
 
@@ -235,6 +289,45 @@ func TestScannerFallbackDoesNotAttachLeaseToActiveManualItem(t *testing.T) {
 	var leaseCount int
 	if err := store.GetDB().QueryRow(ctx, `SELECT count(*) FROM watchlist_source_leases l JOIN watchlist w ON w.id=l.watchlist_id WHERE w.ticker=$1`, ticker).Scan(&leaseCount); err != nil || leaseCount != 0 {
 		t.Fatalf("manual item lease count = %d, %v; want 0", leaseCount, err)
+	}
+}
+
+func TestScannerReadmissionReplacesExpiredScannerLeaseTakenOverByEarnings(t *testing.T) {
+	ctx := context.Background()
+	const ticker = "LEASE_EARNINGS_READMISSION_RT"
+	t.Cleanup(func() { _, _ = store.GetDB().Exec(ctx, "DELETE FROM watchlist WHERE ticker=$1", ticker) })
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	expired := now.Add(-time.Hour)
+	if err := store.AddWatchlistItem(ctx, store.WatchlistItem{
+		Ticker: ticker, Platform: "stock", Source: "scanner", Strategies: []string{"momentum"}, Timeframes: []string{"1D"}, ExpiresAt: &expired,
+		SourceLeases: []store.WatchlistSourceLease{{
+			Source: "mover", EvidenceFingerprint: "expired-mover", QualifiedAt: now.Add(-48 * time.Hour), ObservedAt: now.Add(-48 * time.Hour), EffectiveAt: now.Add(-48 * time.Hour), ExpiresAt: expired, Evidence: json.RawMessage(`{"price":10}`),
+		}},
+	}); err != nil {
+		t.Fatalf("add expired scanner row: %v", err)
+	}
+	// Earnings publication preserves this row and its historical scanner lease
+	// while making its own additive context the active lifecycle owner.
+	if err := store.AddWatchlistItem(ctx, store.WatchlistItem{
+		Ticker: ticker, Platform: "stock", Source: "earnings_watchlist",
+		Strategies: []string{"trend_following", "momentum", "news_sentiment"}, Timeframes: []string{"1D", "4H", "1H"},
+		GraphContext: "Scheduled earnings watchlist candidate.",
+	}); err != nil {
+		t.Fatalf("take over expired scanner row for earnings: %v", err)
+	}
+	newExpiry := now.Add(24 * time.Hour)
+	err := store.AddWatchlistItemUnlessActive(ctx, store.WatchlistItem{
+		Ticker: ticker, Platform: "stock", Source: "scanner", Strategies: []string{"momentum"}, Timeframes: []string{"4H"}, ExpiresAt: &newExpiry,
+		SourceLeases: []store.WatchlistSourceLease{{
+			Source: "mover", EvidenceFingerprint: "fresh-mover", QualifiedAt: now, ObservedAt: now, EffectiveAt: now, ExpiresAt: newExpiry, Evidence: json.RawMessage(`{"price":11}`),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("readmit fresh scanner evidence over earnings takeover: %v", err)
+	}
+	item, err := store.GetWatchlistItem(ctx, ticker, "stock")
+	if err != nil || item == nil || item.Source != "scanner" || item.ExpiresAt == nil || !item.ExpiresAt.Equal(newExpiry) {
+		t.Fatalf("scanner readmission = %+v, %v", item, err)
 	}
 }
 
