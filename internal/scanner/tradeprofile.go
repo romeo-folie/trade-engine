@@ -134,6 +134,10 @@ func scannerEvidenceBySource(
 			if len(candidate.News) > 0 {
 				evidence["recent_news"] = canonicalScannerNews(candidate.News)
 			}
+		} else if source == "news_sympathy" {
+			if candidate.SympathyTrigger != nil {
+				evidence["sympathy_trigger"] = *candidate.SympathyTrigger
+			}
 		} else if index == 0 {
 			evidence["market_observation"] = scannerMarketObservation(candidate)
 			if len(candidate.News) > 0 {

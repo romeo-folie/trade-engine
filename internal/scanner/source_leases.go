@@ -101,10 +101,12 @@ func scannerSourceIdentity(candidate SwingCandidate, source string) map[string]a
 	case "news_sympathy":
 		identity["seed"] = candidate.SympathySeed
 		identity["relationship"] = candidate.SympathyRelationship
-		if len(candidate.News) > 0 {
-			// Sympathy candidates place their immutable seed trigger first; any
-			// subsequent entries are optional neighbor enrichment and must not
-			// renew the source lease.
+		if candidate.SympathyTrigger != nil {
+			identity["trigger"] = scannerNewsIdentity([]SwingNewsItem{*candidate.SympathyTrigger})
+		} else if len(candidate.News) > 0 {
+			// Backwards compatibility for candidates constructed before the
+			// trigger became source-owned. Fresh candidates always use the
+			// dedicated field above.
 			identity["trigger"] = scannerNewsIdentity(candidate.News[:1])
 		}
 	case "mover", "active":

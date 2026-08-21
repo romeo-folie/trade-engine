@@ -160,6 +160,10 @@ func cloneSwingCandidate(candidate SwingCandidate) SwingCandidate {
 	clone := candidate
 	clone.Sources = append([]string(nil), candidate.Sources...)
 	clone.News = append([]SwingNewsItem(nil), candidate.News...)
+	if candidate.SympathyTrigger != nil {
+		trigger := *candidate.SympathyTrigger
+		clone.SympathyTrigger = &trigger
+	}
 	clone.PoliticalDisclosureClaimReportIDs = append(
 		[]string(nil), candidate.PoliticalDisclosureClaimReportIDs...,
 	)

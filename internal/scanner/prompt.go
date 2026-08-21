@@ -95,6 +95,10 @@ type SwingCandidate struct {
 	GraphContext         string
 	SympathySeed         string
 	SympathyRelationship string
+	// SympathyTrigger is the immutable seed article that belongs only to the
+	// news-sympathy source. Candidate News always describes this ticker, so an
+	// overlapping mover/activity source cannot inherit the seed's evidence.
+	SympathyTrigger *SwingNewsItem
 }
 
 // SwingNewsItem is a lightweight news record for prompt injection.

@@ -835,7 +835,15 @@ func deduplicateScannerCandidates(candidates []SwingCandidate) []SwingCandidate 
 				// those fields even when an ordinary/graph candidate was first.
 				merged.SympathySeed = candidate.SympathySeed
 				merged.SympathyRelationship = candidate.SympathyRelationship
-				merged.News = append(append([]SwingNewsItem(nil), candidate.News...), merged.News...)
+				if candidate.SympathyTrigger != nil {
+					trigger := *candidate.SympathyTrigger
+					merged.SympathyTrigger = &trigger
+				} else {
+					// Compatibility for an old in-memory candidate that predates the
+					// source-owned trigger. Fresh sympathy candidates never place the
+					// seed article in the shared ticker-news slice.
+					merged.News = append(append([]SwingNewsItem(nil), candidate.News...), merged.News...)
+				}
 			} else if len(merged.News) == 0 {
 				merged.News = append([]SwingNewsItem(nil), candidate.News...)
 			}
@@ -969,12 +977,6 @@ func (s *MarketScanner) enrichActiveRefreshCandidates(
 		return candidates, nil
 	}
 	for index := range refresh {
-		// The sympathy source owns the seed article used as its immutable event
-		// identity. Neighbor-ticker enrichment is optional and must not replace
-		// that trigger or make its lease fingerprint depend on unrelated news.
-		if hasSource(refresh[index].Sources, "news_sympathy") && len(refresh[index].News) > 0 {
-			continue
-		}
 		if s.News == nil {
 			restoreActiveRefreshNews(&refresh[index], active[normalizePromotionKey(refresh[index].Ticker)])
 			continue
@@ -985,8 +987,9 @@ func (s *MarketScanner) enrichActiveRefreshCandidates(
 			// A transient provider failure is not fresh "no news" evidence. Keep
 			// the persisted source view so it cannot alter a lease fingerprint or
 			// erase analyst provenance.
-			// Sympathy owns its seed-trigger news independently of optional
-			// neighbor enrichment, so never overwrite a newly observed trigger.
+			// The immutable sympathy trigger is held separately. Preserve the
+			// persisted ticker-specific news on transient provider failures so
+			// ordinary leases cannot churn because enrichment was unavailable.
 			restoreActiveRefreshNews(&refresh[index], active[normalizePromotionKey(refresh[index].Ticker)])
 			continue
 		}
@@ -1014,9 +1017,7 @@ func (s *MarketScanner) enrichActiveRefreshCandidates(
 }
 
 func restoreActiveRefreshNews(candidate *SwingCandidate, item store.WatchlistItem) {
-	if !hasSource(candidate.Sources, "news_sympathy") || len(candidate.News) == 0 {
-		candidate.News = scannerDiscoveryNews(item.DiscoveryContext)
-	}
+	candidate.News = scannerDiscoveryNews(item.DiscoveryContext)
 }
 
 func scannerDiscoveryNews(discovery *tradeprofile.DiscoveryContext) []SwingNewsItem {
@@ -1024,6 +1025,9 @@ func scannerDiscoveryNews(discovery *tradeprofile.DiscoveryContext) []SwingNewsI
 		return nil
 	}
 	for _, source := range discovery.Sources {
+		if source == "news_sympathy" {
+			continue
+		}
 		var evidence struct {
 			RecentNews []SwingNewsItem `json:"recent_news"`
 		}

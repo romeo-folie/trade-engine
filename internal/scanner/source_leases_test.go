@@ -153,16 +153,59 @@ func TestScannerSourceLeaseFingerprintIgnoresNewsOrdering(t *testing.T) {
 	}
 }
 
+func TestSympathyTriggerDoesNotRenewOrdinarySourceLease(t *testing.T) {
+	now := time.Date(2026, time.August, 21, 14, 0, 0, 0, time.UTC)
+	scanner := &MarketScanner{Cfg: config.ScannerConfig{TTLDays: 3}}
+	candidate := SwingCandidate{
+		Ticker: "OVERLAP", Sources: []string{"mover", "news_sympathy"}, Price: 12.5, ChangePct: 3, Volume: 100,
+		News:         []SwingNewsItem{{Headline: "OVERLAP reports stronger demand", Sentiment: "POSITIVE", PublishedAt: now}},
+		SympathySeed: "SEED", SympathyRelationship: "customer_of",
+		SympathyTrigger: &SwingNewsItem{Headline: "SEED signs a major contract", Sentiment: "POSITIVE", PublishedAt: now},
+	}
+	firstDiscovery, _, err := buildScannerTradeProfile(candidate, SwingScoreResult{})
+	if err != nil {
+		t.Fatalf("build first profile: %v", err)
+	}
+	first := scanner.scannerSourceLeases(candidate, firstDiscovery, now)
+
+	candidate.SympathyTrigger = &SwingNewsItem{Headline: "SEED announces a second contract", Sentiment: "POSITIVE", PublishedAt: now.Add(time.Hour)}
+	secondDiscovery, _, err := buildScannerTradeProfile(candidate, SwingScoreResult{})
+	if err != nil {
+		t.Fatalf("build second profile: %v", err)
+	}
+	second := scanner.scannerSourceLeases(candidate, secondDiscovery, now.Add(time.Hour))
+
+	firstBySource := make(map[string]store.WatchlistSourceLease, len(first))
+	secondBySource := make(map[string]store.WatchlistSourceLease, len(second))
+	for _, lease := range first {
+		firstBySource[lease.Source] = lease
+	}
+	for _, lease := range second {
+		secondBySource[lease.Source] = lease
+	}
+	if firstBySource["mover"].EvidenceFingerprint != secondBySource["mover"].EvidenceFingerprint {
+		t.Fatal("changed sympathy trigger renewed unchanged mover lease")
+	}
+	if firstBySource["news_sympathy"].EvidenceFingerprint == secondBySource["news_sympathy"].EvidenceFingerprint {
+		t.Fatal("changed sympathy trigger did not renew sympathy lease")
+	}
+	if got := scannerSourceIdentity(candidate, "mover")["news"]; len(got.([]map[string]any)) != 1 || got.([]map[string]any)[0]["headline"] != "OVERLAP reports stronger demand" {
+		t.Fatalf("mover news identity inherited seed trigger: %#v", got)
+	}
+}
+
 func TestDeduplicateScannerCandidatesPreservesSourceOwnedGraphAndSympathyIdentity(t *testing.T) {
 	now := time.Date(2026, time.August, 21, 14, 0, 0, 0, time.UTC)
 	trigger := SwingNewsItem{Headline: "Seed announces new fab", Sentiment: "POSITIVE", PublishedAt: now}
 	merged := deduplicateScannerCandidates([]SwingCandidate{
-		{Ticker: "OVERLAP", Sources: []string{"mover"}, Price: 12, Volume: 100},
+		{Ticker: "OVERLAP", Sources: []string{"mover"}, Price: 12, Volume: 100,
+			News: []SwingNewsItem{{Headline: "OVERLAP reports demand", Sentiment: "POSITIVE", PublishedAt: now}}},
 		{Ticker: "overlap", Sources: []string{"graph_neighbor"}, GraphContext: "Seed supplies_to OVERLAP"},
 		{
 			Ticker: "Overlap", Sources: []string{"news_sympathy"},
 			GraphContext: "Seed news sympathy through customer_of OVERLAP",
 			SympathySeed: "SEED", SympathyRelationship: "customer_of", News: []SwingNewsItem{trigger},
+			SympathyTrigger: &trigger,
 		},
 	})
 	if len(merged) != 1 {
@@ -178,8 +221,11 @@ func TestDeduplicateScannerCandidatesPreservesSourceOwnedGraphAndSympathyIdentit
 	if candidate.SympathySeed != "SEED" || candidate.SympathyRelationship != "customer_of" {
 		t.Fatalf("sympathy identity = %q/%q", candidate.SympathySeed, candidate.SympathyRelationship)
 	}
-	if len(candidate.News) == 0 || candidate.News[0] != trigger {
-		t.Fatalf("sympathy trigger was not retained first: %#v", candidate.News)
+	if candidate.SympathyTrigger == nil || *candidate.SympathyTrigger != trigger {
+		t.Fatalf("sympathy trigger = %#v", candidate.SympathyTrigger)
+	}
+	if len(candidate.News) != 1 || candidate.News[0].Headline != "OVERLAP reports demand" {
+		t.Fatalf("ordinary news was replaced by sympathy seed: %#v", candidate.News)
 	}
 	graphIdentity := scannerSourceIdentity(candidate, "graph_neighbor")
 	if graphIdentity["relationship"] != "Seed supplies_to OVERLAP" {
