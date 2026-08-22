@@ -40,16 +40,20 @@ while remediation is expected, and restart the watcher if its heartbeat stops.
 After merging a PR, the agent must:
 
 1. Sync the local `main` branch to the merged remote state.
-2. Compare merged configuration schema, example, and default changes with the
+2. Rebuild the frontend from `web/frontend` with `npm run build`, then rebuild
+   `te` from the repository root (for example, `make build-go-only`) so those
+   assets are embedded in the executable used by `te run`. If either build
+   fails, do not restart the engine—report and diagnose it first.
+3. Compare merged configuration schema, example, and default changes with the
    ignored operator `config.yaml`; apply required live changes without
    committing `config.yaml`, then run `./te config validate`. If validation
    fails, do not migrate or restart; report the failure and diagnose it.
-3. Run `./te migrate` from the repository root. `te run` does **not** apply
+4. Run `./te migrate` from the repository root. `te run` does **not** apply
    migrations automatically; this command applies every pending migration,
    including any introduced by the merged PR.
-4. Verify that migration succeeds before continuing. If it fails, do not start
+5. Verify that migration succeeds before continuing. If it fails, do not start
    or restart the engine; report the failure and diagnose it.
-5. After successful validation and migration, ask the user whether the engine
+6. After successful frontend build, validation, and migration, ask the user whether the engine
    should be restarted. Do not restart it without that confirmation.
 
 When a restart is approved, first verify whether an existing engine process is
