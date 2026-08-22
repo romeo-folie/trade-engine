@@ -44,6 +44,7 @@ const DEFAULTS = {
   notifyTrade: true,
   notifyError: true,
   notifyDailySummary: false,
+  notifyScanner: true,
   batchEnabled: true,
   batchWindow: 60,
   minConfidenceAlert: 0.65,
@@ -111,6 +112,9 @@ export default function ConfigScreen() {
         const res = await fetch('/api/system/config');
         if (!res.ok) throw new Error('Failed to fetch config');
         const data = await res.json();
+        const telegramNotifyOn: string[] = data.notifications?.telegram?.notify_on ?? [];
+        const scannerNotificationsConfigured = data.notifications?.telegram?.scanner_notifications_configured;
+        const legacyScannerDefault = scannerNotificationsConfigured == null;
         
         const mapped: Config = {
           ...DEFAULTS,
@@ -143,10 +147,11 @@ export default function ConfigScreen() {
           weeklyTokenBudget: data.cost?.weekly_token_budget || DEFAULTS.weeklyTokenBudget,
           autoDegradeBudget: data.cost?.auto_degrade_on_budget_hit ?? DEFAULTS.autoDegradeBudget,
           telegram: data.notifications?.telegram?.enabled ?? DEFAULTS.telegram,
-          notifySignal: (data.notifications?.telegram?.notify_on?.includes('signal_generated') || data.notifications?.telegram?.notify_on?.includes('signal')) ?? DEFAULTS.notifySignal,
-          notifyTrade: (data.notifications?.telegram?.notify_on?.includes('trade_executed') || data.notifications?.telegram?.notify_on?.includes('trade')) ?? DEFAULTS.notifyTrade,
-          notifyError: (data.notifications?.telegram?.notify_on?.includes('error_occurred') || data.notifications?.telegram?.notify_on?.includes('error')) ?? DEFAULTS.notifyError,
-          notifyDailySummary: data.notifications?.telegram?.notify_on?.includes('daily_summary') ?? DEFAULTS.notifyDailySummary,
+          notifySignal: (telegramNotifyOn.includes('signal_generated') || telegramNotifyOn.includes('signal')) ?? DEFAULTS.notifySignal,
+          notifyTrade: (telegramNotifyOn.includes('trade_executed') || telegramNotifyOn.includes('trade')) ?? DEFAULTS.notifyTrade,
+          notifyError: (telegramNotifyOn.includes('error_occurred') || telegramNotifyOn.includes('error')) ?? DEFAULTS.notifyError,
+          notifyDailySummary: telegramNotifyOn.includes('daily_summary') ?? DEFAULTS.notifyDailySummary,
+          notifyScanner: telegramNotifyOn.includes('scanner') || legacyScannerDefault,
           batchEnabled: data.notifications?.telegram?.batch_enabled ?? DEFAULTS.batchEnabled,
           batchWindow: data.notifications?.telegram?.batch_window_sec ?? DEFAULTS.batchWindow,
           minConfidenceAlert: data.notifications?.telegram?.min_confidence_for_alert || DEFAULTS.minConfidenceAlert,
@@ -169,6 +174,7 @@ export default function ConfigScreen() {
     if (config.notifyTrade) notifyOn.push('trade');
     if (config.notifyError) notifyOn.push('error');
     if (config.notifyDailySummary) notifyOn.push('daily_summary');
+    if (config.notifyScanner) notifyOn.push('scanner');
 
     const payload = {
       mode: config.mode,
@@ -189,6 +195,7 @@ export default function ConfigScreen() {
       auto_degrade_budget: config.autoDegradeBudget,
       telegram_enabled: config.telegram,
       'notifications.telegram.notify_on': notifyOn,
+      'notifications.telegram.scanner_notifications_configured': true,
       'notifications.telegram.batch_enabled': config.batchEnabled,
       'notifications.telegram.batch_window_sec': config.batchWindow,
       'notifications.telegram.min_confidence_for_alert': config.minConfidenceAlert,
@@ -488,6 +495,10 @@ export default function ConfigScreen() {
                 <label className={styles.checkboxLabel}>
                   <input type="checkbox" className={styles.checkbox} checked={config.notifyDailySummary} onChange={(e) => set('notifyDailySummary', e.target.checked)} />
                   Daily Summary
+                </label>
+                <label className={styles.checkboxLabel}>
+                  <input type="checkbox" className={styles.checkbox} checked={config.notifyScanner} onChange={(e) => set('notifyScanner', e.target.checked)} />
+                  Scanner Watchlist
                 </label>
               </div>
             </div>

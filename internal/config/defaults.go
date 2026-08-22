@@ -209,7 +209,7 @@ func Defaults() *Config {
 				Enabled:               false,
 				BotTokenEnv:           "TELEGRAM_BOT_TOKEN",
 				ChatID:                "",
-				NotifyOn:              []string{"signal", "trade", "error", "daily_summary"},
+				NotifyOn:              []string{"signal", "trade", "error", "daily_summary", "scanner"},
 				BatchEnabled:          true,
 				BatchWindowSec:        60,
 				MaxItemsPerBatch:      25,

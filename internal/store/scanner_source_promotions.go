@@ -70,7 +70,7 @@ func PromoteScannerSourcesToWatchlist(
 	reason string,
 	at time.Time,
 ) error {
-	return promoteScannerSourcesToWatchlist(ctx, item, claims, reason, at, false, false, nil)
+	return promoteScannerSourcesToWatchlist(ctx, item, claims, reason, at, false, false, nil, nil)
 }
 
 // PromoteScannerSourcesToWatchlistWithScannerLease fences source-claim
@@ -83,7 +83,7 @@ func PromoteScannerSourcesToWatchlistWithScannerLease(
 	at time.Time,
 	lease ScannerCycleLease,
 ) error {
-	return promoteScannerSourcesToWatchlist(ctx, item, claims, reason, at, false, false, &lease)
+	return promoteScannerSourcesToWatchlist(ctx, item, claims, reason, at, false, false, &lease, nil)
 }
 
 // PromoteScannerSourcesToWatchlistUnlessActive consumes all still-current
@@ -96,7 +96,7 @@ func PromoteScannerSourcesToWatchlistUnlessActive(
 	reason string,
 	at time.Time,
 ) error {
-	return promoteScannerSourcesToWatchlist(ctx, item, claims, reason, at, true, false, nil)
+	return promoteScannerSourcesToWatchlist(ctx, item, claims, reason, at, true, false, nil, nil)
 }
 
 // PromoteScannerSourcesToWatchlistUnlessActiveWithScannerLease is the fenced
@@ -109,7 +109,7 @@ func PromoteScannerSourcesToWatchlistUnlessActiveWithScannerLease(
 	at time.Time,
 	lease ScannerCycleLease,
 ) error {
-	return promoteScannerSourcesToWatchlist(ctx, item, claims, reason, at, true, false, &lease)
+	return promoteScannerSourcesToWatchlist(ctx, item, claims, reason, at, true, false, &lease, nil)
 }
 
 // RefreshScannerSourcesOnActiveWatchlist consumes current source claims and
@@ -119,7 +119,20 @@ func RefreshScannerSourcesOnActiveWatchlist(
 	ctx context.Context, item WatchlistItem, claims ScannerSourcePromotionClaims,
 	reason string, at time.Time, lease *ScannerCycleLease,
 ) error {
-	return promoteScannerSourcesToWatchlist(ctx, item, claims, reason, at, true, true, lease)
+	_, err := RefreshScannerSourcesOnActiveWatchlistWithChangedLeases(ctx, item, claims, reason, at, lease)
+	return err
+}
+
+// RefreshScannerSourcesOnActiveWatchlistWithChangedLeases refreshes an active
+// scanner item and returns only source leases whose meaningful evidence was
+// persisted by the committed transaction.
+func RefreshScannerSourcesOnActiveWatchlistWithChangedLeases(
+	ctx context.Context, item WatchlistItem, claims ScannerSourcePromotionClaims,
+	reason string, at time.Time, lease *ScannerCycleLease,
+) ([]WatchlistSourceLease, error) {
+	var changedLeases []WatchlistSourceLease
+	err := promoteScannerSourcesToWatchlist(ctx, item, claims, reason, at, true, true, lease, &changedLeases)
+	return changedLeases, err
 }
 
 func promoteScannerSourcesToWatchlist(
@@ -131,6 +144,7 @@ func promoteScannerSourcesToWatchlist(
 	preserveActive bool,
 	refreshOnly bool,
 	lease *ScannerCycleLease,
+	changedLeasesOut *[]WatchlistSourceLease,
 ) error {
 	if strings.TrimSpace(item.Ticker) == "" ||
 		(claims.WeeklyLeader == nil && claims.PotentIndustry == nil &&
@@ -383,14 +397,21 @@ func promoteScannerSourcesToWatchlist(
 		if err := refreshActivityResult(active, err); err != nil {
 			return err
 		}
-		if _, err := refreshWatchlistSourceLeases(ctx, tx, item); err != nil {
+		changedLeases, err := refreshWatchlistSourceLeases(ctx, tx, item)
+		if err != nil {
 			return err
 		}
 		if err := completeScannerSourcePromotionClaims(ctx, tx, item, claims,
 			"active_watchlist", reason, at); err != nil {
 			return err
 		}
-		return tx.Commit(ctx)
+		if err := tx.Commit(ctx); err != nil {
+			return err
+		}
+		if changedLeasesOut != nil {
+			*changedLeasesOut = changedLeases
+		}
+		return nil
 	}
 	if err := addWatchlistItem(ctx, tx, item, preserveActive); err != nil {
 		if !errors.Is(err, ErrWatchlistActiveItemExists) {

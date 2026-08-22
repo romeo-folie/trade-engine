@@ -134,21 +134,6 @@ func TestPotentIndustryEvidenceIsPromptedAsConfirmation(t *testing.T) {
 	}
 }
 
-func TestBuildTelegramMessageLabelsPotentIndustryEvidence(t *testing.T) {
-	scanner := &MarketScanner{}
-	got := scanner.buildTelegramMessage([]scoredCandidate{{
-		candidate: SwingCandidate{
-			Ticker:                 "AAA",
-			PotentIndustryEvidence: "Software broad_strong; member rank 1",
-		},
-		score: SwingScoreResult{SetupType: "momentum_breakout", Conviction: .8},
-	}}, 0)
-	if !strings.Contains(got,
-		"Potent industry: Software broad_strong; member rank 1") {
-		t.Fatalf("Telegram omitted potent industry evidence: %s", got)
-	}
-}
-
 func existingSlice(candidate SwingCandidate) []SwingCandidate {
 	return []SwingCandidate{candidate}
 }

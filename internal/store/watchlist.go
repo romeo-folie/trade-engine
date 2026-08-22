@@ -79,23 +79,34 @@ type WatchlistItem struct {
 func RefreshActiveScannerWatchlistItem(
 	ctx context.Context, item WatchlistItem, lease *ScannerCycleLease,
 ) (bool, error) {
+	changedLeases, err := RefreshActiveScannerWatchlistItemWithChangedLeases(ctx, item, lease)
+	return len(changedLeases) > 0, err
+}
+
+// RefreshActiveScannerWatchlistItemWithChangedLeases refreshes only a live
+// scanner row and returns the exact source leases whose fingerprints changed.
+// Its result is returned only after the transaction commits, making it safe for
+// downstream rediscovery events.
+func RefreshActiveScannerWatchlistItemWithChangedLeases(
+	ctx context.Context, item WatchlistItem, lease *ScannerCycleLease,
+) ([]WatchlistSourceLease, error) {
 	if item.Source != "scanner" || len(item.SourceLeases) == 0 {
-		return false, errors.New("scanner source leases are required for refresh")
+		return nil, errors.New("scanner source leases are required for refresh")
 	}
 	if err := validateWatchlistSourceLeases(item.SourceLeases); err != nil {
-		return false, err
+		return nil, err
 	}
 	tx, err := GetDB().Begin(ctx)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 	if err := lockScannerWatchlistItem(ctx, tx, item); err != nil {
-		return false, err
+		return nil, err
 	}
 	if lease != nil {
 		if err := renewScannerCycleTx(ctx, tx, *lease); err != nil {
-			return false, err
+			return nil, err
 		}
 	}
 	var id string
@@ -108,19 +119,19 @@ func RefreshActiveScannerWatchlistItem(
 		FOR UPDATE`, strings.ToUpper(strings.TrimSpace(item.Ticker)), item.Platform,
 	).Scan(&id)
 	if isNoRows(err) {
-		return false, ErrWatchlistRefreshNotActive
+		return nil, ErrWatchlistRefreshNotActive
 	}
 	if err != nil {
-		return false, err
+		return nil, err
 	}
-	changed, err := refreshWatchlistSourceLeases(ctx, tx, item)
+	changedLeases, err := refreshWatchlistSourceLeases(ctx, tx, item)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return false, err
+		return nil, err
 	}
-	return changed, nil
+	return changedLeases, nil
 }
 
 // WatchlistSourceLease is a scanner source's current qualifying observation.
@@ -449,7 +460,7 @@ func addWatchlistItem(
 		return ErrWatchlistRequalificationRequired
 	}
 	if len(item.SourceLeases) > 0 {
-		changed, err := refreshWatchlistSourceLeases(ctx, db, item)
+		changedLeases, err := refreshWatchlistSourceLeases(ctx, db, item)
 		if err != nil {
 			return err
 		}
@@ -457,7 +468,7 @@ func addWatchlistItem(
 		// fingerprint matches an already-persisted value. An expired row with
 		// unchanged evidence does not; roll back its provisional reactivation so
 		// callers cannot report a promotion that is immediately ineligible.
-		if !changed {
+		if len(changedLeases) == 0 {
 			live, err := watchlistHasLiveSourceLease(ctx, db, item.Ticker, item.Platform)
 			if err != nil {
 				return err
@@ -510,15 +521,15 @@ func jsonObject(value json.RawMessage) bool {
 // transaction and ticker lock as the admission/claim write.
 func refreshWatchlistSourceLeases(
 	ctx context.Context, db watchlistExecer, item WatchlistItem,
-) (bool, error) {
+) ([]WatchlistSourceLease, error) {
 	var watchlistID string
 	if err := db.QueryRow(ctx, `
 		SELECT id::text FROM watchlist WHERE ticker=$1 AND platform=$2`,
 		strings.ToUpper(strings.TrimSpace(item.Ticker)), item.Platform,
 	).Scan(&watchlistID); err != nil {
-		return false, err
+		return nil, err
 	}
-	changed := false
+	changedLeases := make([]WatchlistSourceLease, 0, len(item.SourceLeases))
 	for _, lease := range item.SourceLeases {
 		tag, err := db.Exec(ctx, `
 			INSERT INTO watchlist_source_leases (
@@ -537,23 +548,26 @@ func refreshWatchlistSourceLeases(
 			lease.EffectiveAt, lease.ExpiresAt, lease.Evidence,
 		)
 		if err != nil {
-			return false, fmt.Errorf("upsert watchlist source lease: %w", err)
+			return nil, fmt.Errorf("upsert watchlist source lease: %w", err)
 		}
-		changed = changed || tag.RowsAffected() > 0
+		if tag.RowsAffected() > 0 {
+			lease.Source = strings.ToLower(strings.TrimSpace(lease.Source))
+			changedLeases = append(changedLeases, lease)
+		}
 	}
-	if changed {
+	if len(changedLeases) > 0 {
 		discoveryContext, err := mergeRefreshedDiscoveryContext(ctx, db, watchlistID, item)
 		if err != nil {
-			return false, err
+			return nil, err
 		}
 		executionProfile, err := tradeprofile.MarshalExecutionProfile(item.ExecutionProfile)
 		if err != nil {
-			return false, fmt.Errorf("marshal refreshed execution profile: %w", err)
+			return nil, fmt.Errorf("marshal refreshed execution profile: %w", err)
 		}
 		var persistedDiscovery, persistedProfile []byte
 		if err := db.QueryRow(ctx, `SELECT discovery_context, execution_profile FROM watchlist WHERE id=$1`, watchlistID).
 			Scan(&persistedDiscovery, &persistedProfile); err != nil {
-			return false, err
+			return nil, err
 		}
 		storedDiscovery, discoveryErr := tradeprofile.DecodeDiscoveryContext(persistedDiscovery)
 		storedProfile, profileErr := tradeprofile.DecodeExecutionProfile(persistedProfile)
@@ -579,10 +593,10 @@ func refreshWatchlistSourceLeases(
 				END,
 				last_rediscovered_at=NOW(), updated_at=NOW()
 			WHERE w.id=$1`, watchlistID, discoveryContext, executionProfile, repairExecutionProfile, strings.TrimSpace(item.GraphContext)); err != nil {
-			return false, fmt.Errorf("project watchlist source lease expiry: %w", err)
+			return nil, fmt.Errorf("project watchlist source lease expiry: %w", err)
 		}
 	}
-	return changed, nil
+	return changedLeases, nil
 }
 
 // mergeRefreshedDiscoveryContext updates only the source evidence that was

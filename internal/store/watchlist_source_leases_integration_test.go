@@ -39,9 +39,9 @@ func TestWatchlistSourceLeaseRefreshIsEvidenceGatedAndPreservesAdmission(t *test
 	retry := item
 	retry.SourceLeases = append([]store.WatchlistSourceLease(nil), item.SourceLeases...)
 	retry.SourceLeases[0].ExpiresAt = firstExpiry.Add(24 * time.Hour)
-	changed, err := store.RefreshActiveScannerWatchlistItem(ctx, retry, nil)
-	if err != nil || changed {
-		t.Fatalf("identical refresh = changed=%v err=%v, want false/nil", changed, err)
+	changedLeases, err := store.RefreshActiveScannerWatchlistItemWithChangedLeases(ctx, retry, nil)
+	if err != nil || len(changedLeases) != 0 {
+		t.Fatalf("identical refresh = changed=%#v err=%v, want no changes/nil", changedLeases, err)
 	}
 	afterRetry, err := store.GetWatchlistItem(ctx, ticker, "stock")
 	if err != nil || afterRetry == nil || afterRetry.ExpiresAt == nil || !afterRetry.ExpiresAt.Equal(firstExpiry) {
@@ -52,9 +52,10 @@ func TestWatchlistSourceLeaseRefreshIsEvidenceGatedAndPreservesAdmission(t *test
 	updated.SourceLeases[0].EvidenceFingerprint = "second"
 	updated.SourceLeases[0].Evidence = json.RawMessage(`{"price":11}`)
 	updated.SourceLeases[0].ExpiresAt = firstExpiry.Add(48 * time.Hour)
-	changed, err = store.RefreshActiveScannerWatchlistItem(ctx, updated, nil)
-	if err != nil || !changed {
-		t.Fatalf("meaningful refresh = changed=%v err=%v, want true/nil", changed, err)
+	changedLeases, err = store.RefreshActiveScannerWatchlistItemWithChangedLeases(ctx, updated, nil)
+	if err != nil || len(changedLeases) != 1 || changedLeases[0].Source != "mover" ||
+		changedLeases[0].EvidenceFingerprint != "second" {
+		t.Fatalf("meaningful refresh = changed=%#v err=%v, want changed mover/nil", changedLeases, err)
 	}
 	after, err := store.GetWatchlistItem(ctx, ticker, "stock")
 	if err != nil || after == nil {

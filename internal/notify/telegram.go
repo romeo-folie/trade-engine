@@ -21,6 +21,9 @@ import (
 
 const (
 	telegramAPIBase = "https://api.telegram.org/bot"
+	// Telegram limits messages to 4096 characters. Keep scanner batches within
+	// that boundary so one verbose cycle does not reject its entire update.
+	telegramMessageMaxLength = 4096
 	// pollTimeout is the long-poll timeout for getUpdates (seconds).
 	pollTimeout = 30
 	// maxRetries for transient send failures.
@@ -159,6 +162,289 @@ func (b *TelegramBot) subscribeEvents(ctx context.Context) {
 			}
 		}(sub, handler)
 	}
+	b.subscribeScannerEvents(ctx)
+}
+
+// scannerCycleNotifications is deliberately separate from TickBatcher. Scanner
+// events form a lifecycle with ScanCompleted as their flush fence; an engine
+// tick boundary can occur before a long scanner cycle has finished.
+type scannerCycleNotifications struct {
+	added        []events.ScannerItemAddedPayload
+	rediscovered []events.ScannerItemRediscoveredPayload
+}
+
+// subscribeScannerEvents consumes all scanner lifecycle events through one
+// wildcard subscription. A single channel preserves publish order across
+// started, item, and completed events; separate event subscriptions could let
+// completion flush before an earlier admission handler has run.
+func (b *TelegramBot) subscribeScannerEvents(ctx context.Context) {
+	if b.bus == nil || !scannerNotificationsEnabled(b.cfg, b.notifyOn) {
+		return
+	}
+	sub := b.bus.SubscribeAll()
+	b.subs = append(b.subs, sub)
+	delivery := make(chan string)
+	b.wg.Add(2)
+	go func() {
+		defer b.wg.Done()
+		for message := range delivery {
+			b.sendScannerNotification(message)
+		}
+	}()
+	go func() {
+		defer b.wg.Done()
+		defer close(delivery)
+		cycles := make(map[string]*scannerCycleNotifications)
+		var pendingMessages []string
+		for {
+			var nextDelivery chan<- string
+			var nextMessage string
+			if len(pendingMessages) > 0 {
+				nextDelivery = delivery
+				nextMessage = pendingMessages[0]
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case nextDelivery <- nextMessage:
+				pendingMessages = pendingMessages[1:]
+			case ev, ok := <-sub.C:
+				if !ok {
+					return
+				}
+				switch ev.Type {
+				case events.ScanStarted:
+					payload, ok := ev.Payload.(events.ScanStartedPayload)
+					if b.cfg.BatchEnabled && ok && payload.ScanID != "" {
+						cycles[payload.ScanID] = &scannerCycleNotifications{}
+					}
+				case events.ScannerItemAdded:
+					payload, ok := ev.Payload.(events.ScannerItemAddedPayload)
+					if !ok {
+						continue
+					}
+					if b.cfg.BatchEnabled {
+						state := cycles[payload.ScanID]
+						if state == nil {
+							state = &scannerCycleNotifications{}
+							cycles[payload.ScanID] = state
+						}
+						state.added = append(state.added, payload)
+					} else {
+						pendingMessages = append(pendingMessages, formatScannerAdmission(payload))
+					}
+				case events.ScannerItemRediscovered:
+					payload, ok := ev.Payload.(events.ScannerItemRediscoveredPayload)
+					if !ok || len(payload.ChangedSources) == 0 {
+						continue
+					}
+					if b.cfg.BatchEnabled {
+						state := cycles[payload.ScanID]
+						if state == nil {
+							state = &scannerCycleNotifications{}
+							cycles[payload.ScanID] = state
+						}
+						state.rediscovered = append(state.rediscovered, payload)
+					} else {
+						pendingMessages = append(pendingMessages, formatScannerRediscovery(payload))
+					}
+				case events.ScanCompleted:
+					payload, ok := ev.Payload.(events.ScanCompletedPayload)
+					if !ok || !b.cfg.BatchEnabled {
+						continue
+					}
+					state := cycles[payload.ScanID]
+					delete(cycles, payload.ScanID)
+					if state != nil && (len(state.added) > 0 || len(state.rediscovered) > 0) {
+						pendingMessages = append(pendingMessages,
+							formatScannerCycleBatches(state, b.cfg.MaxItemsPerBatch)...)
+					}
+				}
+			}
+		}
+	}()
+}
+
+// scannerNotificationsEnabled keeps the former direct scanner summary alive
+// for every unmarked pre-category configuration. The current UI persists the
+// marker, making a later removal of scanner an explicit opt-out.
+func scannerNotificationsEnabled(cfg config.TelegramConfig, notifyOn map[string]bool) bool {
+	if notifyOn["scanner"] {
+		return true
+	}
+	return cfg.ScannerNotificationsConfigured == nil
+}
+
+func (b *TelegramBot) sendScannerNotification(message string) {
+	if err := b.sendMessage(message, nil); err != nil {
+		logger.Warn("telegram: send scanner notification failed", "error", err)
+	}
+}
+
+func formatScannerCycle(state *scannerCycleNotifications) string {
+	var sb strings.Builder
+	sb.WriteString("🔍 *Scanner watchlist updates*\n")
+	if len(state.added) > 0 {
+		sb.WriteString(fmt.Sprintf("\n*Added (%d)*\n", len(state.added)))
+		for _, payload := range state.added {
+			sb.WriteString(scannerAdmissionLine(payload))
+		}
+	}
+	if len(state.rediscovered) > 0 {
+		sb.WriteString(fmt.Sprintf("\n*Rediscovered (%d)*\n", len(state.rediscovered)))
+		for _, payload := range state.rediscovered {
+			sb.WriteString(scannerRediscoveryLine(payload))
+		}
+	}
+	return sb.String()
+}
+
+// formatScannerCycleBatches splits a completed scanner cycle into compact
+// delivery messages. It preserves source order, respects the configured item
+// cap, and keeps every message within Telegram's character limit.
+func formatScannerCycleBatches(state *scannerCycleNotifications, maxItems int) []string {
+	if state == nil {
+		return nil
+	}
+	if maxItems <= 0 {
+		maxItems = 20
+	}
+	var batches []string
+	current := &scannerCycleNotifications{}
+	flush := func() {
+		if len(current.added) == 0 && len(current.rediscovered) == 0 {
+			return
+		}
+		batches = append(batches, formatScannerCycle(current))
+		current = &scannerCycleNotifications{}
+	}
+	appendAdmission := func(payload events.ScannerItemAddedPayload) {
+		prospective := &scannerCycleNotifications{
+			added:        append(append([]events.ScannerItemAddedPayload(nil), current.added...), payload),
+			rediscovered: current.rediscovered,
+		}
+		if scannerCycleItemCount(current) >= maxItems ||
+			(scannerCycleItemCount(current) > 0 && len(formatScannerCycle(prospective)) > telegramMessageMaxLength) {
+			flush()
+		}
+		current.added = append(current.added, payload)
+	}
+	appendRediscovery := func(payload events.ScannerItemRediscoveredPayload) {
+		prospective := &scannerCycleNotifications{
+			added:        current.added,
+			rediscovered: append(append([]events.ScannerItemRediscoveredPayload(nil), current.rediscovered...), payload),
+		}
+		if scannerCycleItemCount(current) >= maxItems ||
+			(scannerCycleItemCount(current) > 0 && len(formatScannerCycle(prospective)) > telegramMessageMaxLength) {
+			flush()
+		}
+		current.rediscovered = append(current.rediscovered, payload)
+	}
+	for _, payload := range state.added {
+		appendAdmission(payload)
+	}
+	for _, payload := range state.rediscovered {
+		appendRediscovery(payload)
+	}
+	flush()
+	return batches
+}
+
+func scannerCycleItemCount(state *scannerCycleNotifications) int {
+	return len(state.added) + len(state.rediscovered)
+}
+
+func formatScannerAdmission(payload events.ScannerItemAddedPayload) string {
+	return "🔍 *Scanner watchlist admission*\n" + scannerAdmissionLine(payload)
+}
+
+func scannerAdmissionLine(payload events.ScannerItemAddedPayload) string {
+	line := fmt.Sprintf("• *%s* — %s",
+		truncateScannerNotification(payload.Ticker, 32),
+		truncateScannerNotification(scannerSourceSummary(payload.Sources), 256),
+	)
+	if payload.SetupType != "" {
+		line += fmt.Sprintf(" · %s", truncateScannerNotification(payload.SetupType, 128))
+	}
+	if payload.Conviction > 0 {
+		line += fmt.Sprintf(" · %.0f%%", payload.Conviction*100)
+	}
+	if detail := scannerAdmissionDetail(payload); detail != "" {
+		line += "\n  _" + detail + "_"
+	}
+	return line + "\n"
+}
+
+func formatScannerRediscovery(payload events.ScannerItemRediscoveredPayload) string {
+	return "🔄 *Scanner rediscovery*\n" + scannerRediscoveryLine(payload)
+}
+
+func scannerRediscoveryLine(payload events.ScannerItemRediscoveredPayload) string {
+	sources := make([]string, 0, len(payload.ChangedSources))
+	for _, source := range payload.ChangedSources {
+		sources = append(sources, scannerSourceLabel(source.Source))
+	}
+	return fmt.Sprintf("• *%s* — %s\n",
+		truncateScannerNotification(payload.Ticker, 32),
+		truncateScannerNotification(strings.Join(sources, ", "), 256),
+	)
+}
+
+func scannerSourceSummary(sources []string) string {
+	labels := make([]string, 0, len(sources))
+	for _, source := range sources {
+		labels = append(labels, scannerSourceLabel(source))
+	}
+	if len(labels) == 0 {
+		return "Scanner"
+	}
+	return strings.Join(labels, ", ")
+}
+
+func scannerSourceLabel(source string) string {
+	switch source {
+	case "mover":
+		return "Mover"
+	case "active":
+		return "Most active"
+	case "weekly_leader":
+		return "Weekly leader"
+	case "potent_industry":
+		return "Potent industry"
+	case "premarket_episodic":
+		return "Premarket"
+	case "graph_neighbor":
+		return "Graph neighbor"
+	case "news_sympathy":
+		return "News sympathy"
+	case "political_disclosure":
+		return "Political disclosure"
+	default:
+		return strings.ReplaceAll(source, "_", " ")
+	}
+}
+
+func scannerAdmissionDetail(payload events.ScannerItemAddedPayload) string {
+	for _, value := range []string{
+		payload.PoliticalDisclosureEvidence,
+		payload.PremarketEpisodicEvidence,
+		payload.WeeklyLeaderEvidence,
+		payload.PotentIndustryEvidence,
+		payload.GraphContext,
+		payload.Reasoning,
+	} {
+		if value = strings.TrimSpace(value); value != "" {
+			return truncateScannerNotification(value, 180)
+		}
+	}
+	return ""
+}
+
+func truncateScannerNotification(value string, limit int) string {
+	if len(value) <= limit {
+		return value
+	}
+	return value[:limit-1] + "…"
 }
 
 // ── Event handlers ────────────────────────────────────────────────────────────

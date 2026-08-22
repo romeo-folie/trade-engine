@@ -1974,6 +1974,9 @@ type TelegramConfig struct {
 	BotToken    string   `yaml:"-" json:"-"`
 	ChatID      string   `yaml:"chat_id"`
 	NotifyOn    []string `yaml:"notify_on"`
+	// ScannerNotificationsConfigured distinguishes an older notify_on list from
+	// an explicit scanner-category choice made in the current configuration UI.
+	ScannerNotificationsConfigured *bool `yaml:"scanner_notifications_configured,omitempty"`
 
 	// Batching config (Epic 1 cost reduction).
 	BatchEnabled          bool    `yaml:"batch_enabled"`
