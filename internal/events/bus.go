@@ -198,9 +198,11 @@ func (b *Bus) Publish(evType Type, payload any) {
 func (b *Bus) SubscriberCount() int {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	count := 0
+	unique := make(map[*Subscription]struct{})
 	for _, subs := range b.subs {
-		count += len(subs)
+		for _, sub := range subs {
+			unique[sub] = struct{}{}
+		}
 	}
-	return count
+	return len(unique)
 }

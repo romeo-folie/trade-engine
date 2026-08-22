@@ -86,6 +86,18 @@ func TestSubscribeLosslessRetainsLifecycleBurst(t *testing.T) {
 	}
 }
 
+func TestSubscriberCountCountsMultiTypeSubscriptionOnce(t *testing.T) {
+	bus := New()
+	scanner := bus.SubscribeLossless(ScanStarted, ScannerItemAdded, ScanCompleted)
+	regular := bus.Subscribe(SignalGenerated)
+	defer bus.Unsubscribe(scanner)
+	defer bus.Unsubscribe(regular)
+
+	if got := bus.SubscriberCount(); got != 2 {
+		t.Fatalf("subscriber count = %d, want 2 handles", got)
+	}
+}
+
 func TestUnsubscribeStopsDelivery(t *testing.T) {
 	bus := New()
 	sub := bus.Subscribe(DataFetched)
