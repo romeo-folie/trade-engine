@@ -632,7 +632,7 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 		if err := s.renewScannerCycleBeforePromotion(ctx, cycleKey, cycleOwner, interval); err != nil {
 			return err
 		}
-		addErr := s.promoteDiscoveryCandidate(ctx, item, sc.candidate, cycleLease)
+		changedLeases, addErr := s.promoteDiscoveryCandidate(ctx, item, sc.candidate, cycleLease)
 		skipCandidate := false
 		for errors.Is(addErr, store.ErrScannerSourcePromotionClaimLost) {
 			var claimErr *store.ScannerSourcePromotionClaimError
@@ -644,6 +644,7 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			if !ok {
 				break
 			}
+			scanCandidatesEvaluated++
 			fallbackScore, scoreErr := s.scoreCandidate(ctx, fallback)
 			recorder.fallbackScored(
 				fallback, fallbackScore, scoreErr, s.Cfg.MinConviction,
@@ -726,7 +727,7 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			if err := s.renewScannerCycleBeforePromotion(ctx, cycleKey, cycleOwner, interval); err != nil {
 				return err
 			}
-			addErr = s.promoteDiscoveryFallback(ctx, item, fallback, cycleLease)
+			changedLeases, addErr = s.promoteDiscoveryFallback(ctx, item, fallback, cycleLease)
 		}
 		if skipCandidate {
 			continue
@@ -735,6 +736,11 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			return addErr
 		}
 		if errors.Is(addErr, store.ErrWatchlistActiveItemExists) {
+			if len(changedLeases) > 0 && s.Bus != nil {
+				s.Bus.Publish(events.ScannerItemRediscovered, scannerRediscoveryPayload(
+					scanID, sc.candidate.Ticker, changedLeases,
+				))
+			}
 			promotionActive[index] = false
 			recorder.watchlistResult(sc.candidate, sc.score, strategies, addErr)
 			slog.Info(

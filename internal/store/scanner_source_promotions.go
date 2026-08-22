@@ -70,7 +70,22 @@ func PromoteScannerSourcesToWatchlist(
 	reason string,
 	at time.Time,
 ) error {
-	return promoteScannerSourcesToWatchlist(ctx, item, claims, reason, at, false, false, nil, nil)
+	_, err := PromoteScannerSourcesToWatchlistWithChangedLeases(ctx, item, claims, reason, at)
+	return err
+}
+
+// PromoteScannerSourcesToWatchlistWithChangedLeases returns source leases
+// committed when a concurrent active scanner row wins the promotion race.
+func PromoteScannerSourcesToWatchlistWithChangedLeases(
+	ctx context.Context,
+	item WatchlistItem,
+	claims ScannerSourcePromotionClaims,
+	reason string,
+	at time.Time,
+) ([]WatchlistSourceLease, error) {
+	var changedLeases []WatchlistSourceLease
+	err := promoteScannerSourcesToWatchlist(ctx, item, claims, reason, at, false, false, nil, &changedLeases)
+	return changedLeases, err
 }
 
 // PromoteScannerSourcesToWatchlistWithScannerLease fences source-claim
@@ -83,7 +98,25 @@ func PromoteScannerSourcesToWatchlistWithScannerLease(
 	at time.Time,
 	lease ScannerCycleLease,
 ) error {
-	return promoteScannerSourcesToWatchlist(ctx, item, claims, reason, at, false, false, &lease, nil)
+	_, err := PromoteScannerSourcesToWatchlistWithScannerLeaseWithChangedLeases(
+		ctx, item, claims, reason, at, lease,
+	)
+	return err
+}
+
+// PromoteScannerSourcesToWatchlistWithScannerLeaseWithChangedLeases fences a
+// promotion while returning source leases committed on an active-row race.
+func PromoteScannerSourcesToWatchlistWithScannerLeaseWithChangedLeases(
+	ctx context.Context,
+	item WatchlistItem,
+	claims ScannerSourcePromotionClaims,
+	reason string,
+	at time.Time,
+	lease ScannerCycleLease,
+) ([]WatchlistSourceLease, error) {
+	var changedLeases []WatchlistSourceLease
+	err := promoteScannerSourcesToWatchlist(ctx, item, claims, reason, at, false, false, &lease, &changedLeases)
+	return changedLeases, err
 }
 
 // PromoteScannerSourcesToWatchlistUnlessActive consumes all still-current
@@ -96,7 +129,24 @@ func PromoteScannerSourcesToWatchlistUnlessActive(
 	reason string,
 	at time.Time,
 ) error {
-	return promoteScannerSourcesToWatchlist(ctx, item, claims, reason, at, true, false, nil, nil)
+	_, err := PromoteScannerSourcesToWatchlistUnlessActiveWithChangedLeases(
+		ctx, item, claims, reason, at,
+	)
+	return err
+}
+
+// PromoteScannerSourcesToWatchlistUnlessActiveWithChangedLeases preserves an
+// active winner while returning source leases committed as rediscovery evidence.
+func PromoteScannerSourcesToWatchlistUnlessActiveWithChangedLeases(
+	ctx context.Context,
+	item WatchlistItem,
+	claims ScannerSourcePromotionClaims,
+	reason string,
+	at time.Time,
+) ([]WatchlistSourceLease, error) {
+	var changedLeases []WatchlistSourceLease
+	err := promoteScannerSourcesToWatchlist(ctx, item, claims, reason, at, true, false, nil, &changedLeases)
+	return changedLeases, err
 }
 
 // PromoteScannerSourcesToWatchlistUnlessActiveWithScannerLease is the fenced
@@ -109,7 +159,25 @@ func PromoteScannerSourcesToWatchlistUnlessActiveWithScannerLease(
 	at time.Time,
 	lease ScannerCycleLease,
 ) error {
-	return promoteScannerSourcesToWatchlist(ctx, item, claims, reason, at, true, false, &lease, nil)
+	_, err := PromoteScannerSourcesToWatchlistUnlessActiveWithScannerLeaseWithChangedLeases(
+		ctx, item, claims, reason, at, lease,
+	)
+	return err
+}
+
+// PromoteScannerSourcesToWatchlistUnlessActiveWithScannerLeaseWithChangedLeases
+// is the fenced fallback variant that returns committed rediscovery leases.
+func PromoteScannerSourcesToWatchlistUnlessActiveWithScannerLeaseWithChangedLeases(
+	ctx context.Context,
+	item WatchlistItem,
+	claims ScannerSourcePromotionClaims,
+	reason string,
+	at time.Time,
+	lease ScannerCycleLease,
+) ([]WatchlistSourceLease, error) {
+	var changedLeases []WatchlistSourceLease
+	err := promoteScannerSourcesToWatchlist(ctx, item, claims, reason, at, true, false, &lease, &changedLeases)
+	return changedLeases, err
 }
 
 // RefreshScannerSourcesOnActiveWatchlist consumes current source claims and
@@ -413,7 +481,8 @@ func promoteScannerSourcesToWatchlist(
 		}
 		return nil
 	}
-	if err := addWatchlistItem(ctx, tx, item, preserveActive); err != nil {
+	var changedLeases []WatchlistSourceLease
+	if err := addWatchlistItem(ctx, tx, item, preserveActive, &changedLeases); err != nil {
 		if !errors.Is(err, ErrWatchlistActiveItemExists) {
 			return err
 		}
@@ -425,6 +494,9 @@ func promoteScannerSourcesToWatchlist(
 		}
 		if commitErr := tx.Commit(ctx); commitErr != nil {
 			return commitErr
+		}
+		if changedLeasesOut != nil {
+			*changedLeasesOut = changedLeases
 		}
 		return ErrWatchlistActiveItemExists
 	}

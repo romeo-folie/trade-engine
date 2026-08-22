@@ -17,6 +17,34 @@ func TestDefaultsEngineMode(t *testing.T) {
 	}
 }
 
+func TestDefaultsMarkScannerNotificationCategoryConfigured(t *testing.T) {
+	cfg := Defaults()
+	if cfg.Notifications.Telegram.ScannerNotificationsConfigured == nil ||
+		!*cfg.Notifications.Telegram.ScannerNotificationsConfigured {
+		t.Fatal("new default configs must persist scanner notification category awareness")
+	}
+}
+
+func TestLoadLegacyTelegramConfigLeavesScannerCategoryUnmarked(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	path := ConfigPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("notifications:\n  telegram:\n    notify_on:\n      - signal\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Notifications.Telegram.ScannerNotificationsConfigured != nil {
+		t.Fatalf("legacy config marker = %v, want nil", *cfg.Notifications.Telegram.ScannerNotificationsConfigured)
+	}
+}
+
 func TestDefaultsTickInterval(t *testing.T) {
 	cfg := Defaults()
 	if cfg.Engine.TickIntervalSec != 3600 {

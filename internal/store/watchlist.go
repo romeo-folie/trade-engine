@@ -162,10 +162,20 @@ func (item WatchlistItem) EffectiveDiscoveryContext() *tradeprofile.DiscoveryCon
 // If the ticker+platform pair already exists and was disabled, it is re-enabled.
 // For scanner-sourced items, ExpiresAt is written and updated on re-activation.
 func AddWatchlistItem(ctx context.Context, item WatchlistItem) error {
+	_, err := AddWatchlistItemWithChangedLeases(ctx, item)
+	return err
+}
+
+// AddWatchlistItemWithChangedLeases returns source leases committed when a
+// concurrent scanner row wins the insertion race. They are rediscovery
+// evidence, rather than a new watchlist admission.
+func AddWatchlistItemWithChangedLeases(
+	ctx context.Context, item WatchlistItem,
+) ([]WatchlistSourceLease, error) {
 	if len(item.SourceLeases) > 0 {
-		return addWatchlistItemInTransaction(ctx, item, false)
+		return addWatchlistItemInTransactionWithChangedLeases(ctx, item, false)
 	}
-	return addWatchlistItem(ctx, GetDB(), item, false)
+	return nil, addWatchlistItem(ctx, GetDB(), item, false, nil)
 }
 
 // AddWatchlistItemWithScannerLease fences a scanner promotion and its lease
@@ -173,7 +183,16 @@ func AddWatchlistItem(ctx context.Context, item WatchlistItem) error {
 func AddWatchlistItemWithScannerLease(
 	ctx context.Context, item WatchlistItem, lease ScannerCycleLease,
 ) error {
-	return addWatchlistItemWithScannerLease(ctx, item, lease, false)
+	_, err := AddWatchlistItemWithScannerLeaseWithChangedLeases(ctx, item, lease)
+	return err
+}
+
+// AddWatchlistItemWithScannerLeaseWithChangedLeases fences an admission while
+// returning source leases committed if an active scanner row won the race.
+func AddWatchlistItemWithScannerLeaseWithChangedLeases(
+	ctx context.Context, item WatchlistItem, lease ScannerCycleLease,
+) ([]WatchlistSourceLease, error) {
+	return addWatchlistItemWithScannerLeaseWithChangedLeases(ctx, item, lease, false)
 }
 
 // AddWatchlistItemUnlessActive inserts a watchlist item, or reactivates an
@@ -181,60 +200,102 @@ func AddWatchlistItemWithScannerLease(
 // after a weekly-leader claim loss, where another worker may have promoted the
 // same ticker between the failed fenced promotion and the ordinary fallback.
 func AddWatchlistItemUnlessActive(ctx context.Context, item WatchlistItem) error {
+	_, err := AddWatchlistItemUnlessActiveWithChangedLeases(ctx, item)
+	return err
+}
+
+// AddWatchlistItemUnlessActiveWithChangedLeases returns source leases committed
+// when a live scanner row wins the fallback race. They represent rediscovery
+// evidence, not a new watchlist admission.
+func AddWatchlistItemUnlessActiveWithChangedLeases(
+	ctx context.Context, item WatchlistItem,
+) ([]WatchlistSourceLease, error) {
 	if len(item.SourceLeases) > 0 {
-		return addWatchlistItemInTransaction(ctx, item, true)
+		return addWatchlistItemInTransactionWithChangedLeases(ctx, item, true)
 	}
-	return addWatchlistItem(ctx, GetDB(), item, true)
+	return nil, addWatchlistItem(ctx, GetDB(), item, true, nil)
 }
 
 func addWatchlistItemInTransaction(ctx context.Context, item WatchlistItem, preserveActive bool) error {
+	_, err := addWatchlistItemInTransactionWithChangedLeases(ctx, item, preserveActive)
+	return err
+}
+
+func addWatchlistItemInTransactionWithChangedLeases(
+	ctx context.Context, item WatchlistItem, preserveActive bool,
+) ([]WatchlistSourceLease, error) {
 	tx, err := GetDB().Begin(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
-	if err := addWatchlistItem(ctx, tx, item, preserveActive); err != nil {
+	var changedLeases []WatchlistSourceLease
+	if err := addWatchlistItem(ctx, tx, item, preserveActive, &changedLeases); err != nil {
 		if errors.Is(err, ErrWatchlistActiveItemExists) {
 			if commitErr := tx.Commit(ctx); commitErr != nil {
-				return commitErr
+				return nil, commitErr
 			}
 		}
-		return err
+		return changedLeases, err
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return changedLeases, nil
 }
 
 // AddWatchlistItemUnlessActiveWithScannerLease is the fenced fallback variant.
 func AddWatchlistItemUnlessActiveWithScannerLease(
 	ctx context.Context, item WatchlistItem, lease ScannerCycleLease,
 ) error {
-	return addWatchlistItemWithScannerLease(ctx, item, lease, true)
+	_, err := AddWatchlistItemUnlessActiveWithScannerLeaseWithChangedLeases(ctx, item, lease)
+	return err
+}
+
+// AddWatchlistItemUnlessActiveWithScannerLeaseWithChangedLeases preserves the
+// cycle fence while returning leases committed on a winning active scanner row.
+func AddWatchlistItemUnlessActiveWithScannerLeaseWithChangedLeases(
+	ctx context.Context, item WatchlistItem, lease ScannerCycleLease,
+) ([]WatchlistSourceLease, error) {
+	return addWatchlistItemWithScannerLeaseWithChangedLeases(ctx, item, lease, true)
 }
 
 func addWatchlistItemWithScannerLease(
 	ctx context.Context, item WatchlistItem, lease ScannerCycleLease,
 	preserveActive bool,
 ) error {
+	_, err := addWatchlistItemWithScannerLeaseWithChangedLeases(ctx, item, lease, preserveActive)
+	return err
+}
+
+func addWatchlistItemWithScannerLeaseWithChangedLeases(
+	ctx context.Context, item WatchlistItem, lease ScannerCycleLease,
+	preserveActive bool,
+) ([]WatchlistSourceLease, error) {
 	tx, err := GetDB().Begin(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 	if err := lockScannerWatchlistItem(ctx, tx, item); err != nil {
-		return err
+		return nil, err
 	}
 	if err := renewScannerCycleTx(ctx, tx, lease); err != nil {
-		return err
+		return nil, err
 	}
-	if err := addWatchlistItem(ctx, tx, item, preserveActive); err != nil {
+	var changedLeases []WatchlistSourceLease
+	if err := addWatchlistItem(ctx, tx, item, preserveActive, &changedLeases); err != nil {
 		if errors.Is(err, ErrWatchlistActiveItemExists) {
 			if commitErr := tx.Commit(ctx); commitErr != nil {
-				return commitErr
+				return nil, commitErr
 			}
 		}
-		return err
+		return changedLeases, err
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return changedLeases, nil
 }
 
 // lockScannerWatchlistItem serializes scanner writes for one ticker and waits
@@ -272,7 +333,7 @@ type watchlistExecer interface {
 
 func addWatchlistItem(
 	ctx context.Context, db watchlistExecer, item WatchlistItem,
-	preserveActive bool,
+	preserveActive bool, changedLeasesOut *[]WatchlistSourceLease,
 ) error {
 	if (item.DiscoveryContext == nil) != (item.ExecutionProfile == nil) {
 		return errors.New("watchlist discovery context and execution profile must be supplied together")
@@ -450,8 +511,12 @@ func addWatchlistItem(
 				// A concurrent manual/config admission owns its lifecycle. Scanner
 				// evidence must never attach a finite scanner lease to that row.
 				if source == "scanner" && len(item.SourceLeases) > 0 {
-					if _, err := refreshWatchlistSourceLeases(ctx, db, item); err != nil {
+					changedLeases, err := refreshWatchlistSourceLeases(ctx, db, item)
+					if err != nil {
 						return err
+					}
+					if changedLeasesOut != nil {
+						*changedLeasesOut = changedLeases
 					}
 				}
 				return ErrWatchlistActiveItemExists

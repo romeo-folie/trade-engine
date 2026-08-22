@@ -2078,6 +2078,11 @@ func Load() (*Config, error) {
 
 		ApplyProfile(cfg)
 
+		// Defaults marks freshly generated configurations as scanner-category
+		// aware. Existing files that predate that marker must remain unmarked
+		// when they omit it, so their legacy scanner summaries stay enabled.
+		// yaml.Unmarshal does not clear a non-nil pointer for an omitted field.
+		cfg.Notifications.Telegram.ScannerNotificationsConfigured = nil
 		if err := yaml.Unmarshal(data, cfg); err != nil {
 			return nil, fmt.Errorf("parse config: %w", err)
 		}

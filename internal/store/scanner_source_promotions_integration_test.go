@@ -222,11 +222,23 @@ func TestScannerSourcePromotionIsAtomicAcrossWeeklyAndIndustryClaims(t *testing.
 	}
 	claims.WeeklyLeader.Token = "weekly-fallback"
 	claims.PotentIndustry.Token = "industry-fallback"
-	err = store.PromoteScannerSourcesToWatchlistUnlessActive(
+	item.SourceLeases = []store.WatchlistSourceLease{{
+		Source:              "weekly_leader",
+		EvidenceFingerprint: "fallback-rediscovery",
+		QualifiedAt:         base.Add(26 * time.Minute),
+		ObservedAt:          base.Add(26 * time.Minute),
+		EffectiveAt:         base.Add(26 * time.Minute),
+		ExpiresAt:           base.Add(7 * 24 * time.Hour),
+		Evidence:            json.RawMessage(`{"run":"fallback"}`),
+	}}
+	changedLeases, err := store.PromoteScannerSourcesToWatchlistWithChangedLeases(
 		ctx, item, claims, "fallback must preserve active row", base.Add(26*time.Minute),
 	)
 	if !errors.Is(err, store.ErrWatchlistActiveItemExists) {
 		t.Fatalf("active-row fallback race = %v", err)
+	}
+	if len(changedLeases) != 1 || changedLeases[0].Source != "weekly_leader" {
+		t.Fatalf("changed leases = %+v, want committed weekly-leader lease", changedLeases)
 	}
 	var strategies []string
 	var confidence float64

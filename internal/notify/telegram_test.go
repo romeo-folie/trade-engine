@@ -503,6 +503,21 @@ func TestScannerNotificationsBoundIndividualMessages(t *testing.T) {
 	}
 }
 
+func TestScannerNotificationFieldsEscapeMarkdownAndPreserveRunes(t *testing.T) {
+	message := formatScannerAdmission(events.ScannerItemAddedPayload{
+		Ticker: "A_B", Sources: []string{"mover"},
+		SetupType: "[breakout]", Reasoning: "café *momentum*",
+	})
+	for _, want := range []string{"A\\_B", "\\[breakout\\]", "café \\*momentum\\*"} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("escaped scanner message missing %q: %s", want, message)
+		}
+	}
+	if got := truncateScannerNotification("ééé", 2); got != "é…" {
+		t.Fatalf("rune-safe truncation = %q, want %q", got, "é…")
+	}
+}
+
 func TestScannerSourceLabelsCoverEveryDiscoverySource(t *testing.T) {
 	want := map[string]string{
 		"mover":                "Mover",

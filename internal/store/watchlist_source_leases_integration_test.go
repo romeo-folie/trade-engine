@@ -254,8 +254,12 @@ func TestActiveScannerRaceCommitsRefreshedLease(t *testing.T) {
 	}
 	race := initial
 	race.SourceLeases = []store.WatchlistSourceLease{{Source: "graph_neighbor", EvidenceFingerprint: "graph", QualifiedAt: now, ObservedAt: now, EffectiveAt: now, ExpiresAt: expiresAt, Evidence: json.RawMessage(`{"relationship":"supplies"}`)}}
-	if err := store.AddWatchlistItemUnlessActive(ctx, race); !errors.Is(err, store.ErrWatchlistActiveItemExists) {
+	changedLeases, err := store.AddWatchlistItemWithChangedLeases(ctx, race)
+	if !errors.Is(err, store.ErrWatchlistActiveItemExists) {
 		t.Fatalf("race error = %v, want ErrWatchlistActiveItemExists", err)
+	}
+	if len(changedLeases) != 1 || changedLeases[0].Source != "graph_neighbor" {
+		t.Fatalf("changed leases = %+v, want committed graph-neighbor lease", changedLeases)
 	}
 	var count int
 	if err := store.GetDB().QueryRow(ctx, `SELECT count(*) FROM watchlist_source_leases l JOIN watchlist w ON w.id=l.watchlist_id WHERE w.ticker=$1 AND l.source='graph_neighbor'`, ticker).Scan(&count); err != nil || count != 1 {

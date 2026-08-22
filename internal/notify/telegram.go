@@ -173,15 +173,17 @@ type scannerCycleNotifications struct {
 	rediscovered []events.ScannerItemRediscoveredPayload
 }
 
-// subscribeScannerEvents consumes all scanner lifecycle events through one
-// wildcard subscription. A single channel preserves publish order across
-// started, item, and completed events; separate event subscriptions could let
-// completion flush before an earlier admission handler has run.
+// subscribeScannerEvents consumes scanner lifecycle events through one ordered,
+// lossless subscription. A terminal completion must never be dropped: it is the
+// flush fence for every earlier admission in that cycle.
 func (b *TelegramBot) subscribeScannerEvents(ctx context.Context) {
 	if b.bus == nil || !scannerNotificationsEnabled(b.cfg, b.notifyOn) {
 		return
 	}
-	sub := b.bus.SubscribeAll()
+	sub := b.bus.SubscribeLossless(
+		events.ScanStarted, events.ScannerItemAdded,
+		events.ScannerItemRediscovered, events.ScanCompleted,
+	)
 	b.subs = append(b.subs, sub)
 	delivery := make(chan string)
 	b.wg.Add(2)
@@ -360,11 +362,11 @@ func formatScannerAdmission(payload events.ScannerItemAddedPayload) string {
 
 func scannerAdmissionLine(payload events.ScannerItemAddedPayload) string {
 	line := fmt.Sprintf("• *%s* — %s",
-		truncateScannerNotification(payload.Ticker, 32),
-		truncateScannerNotification(scannerSourceSummary(payload.Sources), 256),
+		scannerNotificationField(payload.Ticker, 32),
+		scannerNotificationField(scannerSourceSummary(payload.Sources), 256),
 	)
 	if payload.SetupType != "" {
-		line += fmt.Sprintf(" · %s", truncateScannerNotification(payload.SetupType, 128))
+		line += fmt.Sprintf(" · %s", scannerNotificationField(payload.SetupType, 128))
 	}
 	if payload.Conviction > 0 {
 		line += fmt.Sprintf(" · %.0f%%", payload.Conviction*100)
@@ -385,8 +387,8 @@ func scannerRediscoveryLine(payload events.ScannerItemRediscoveredPayload) strin
 		sources = append(sources, scannerSourceLabel(source.Source))
 	}
 	return fmt.Sprintf("• *%s* — %s\n",
-		truncateScannerNotification(payload.Ticker, 32),
-		truncateScannerNotification(strings.Join(sources, ", "), 256),
+		scannerNotificationField(payload.Ticker, 32),
+		scannerNotificationField(strings.Join(sources, ", "), 256),
 	)
 }
 
@@ -434,17 +436,29 @@ func scannerAdmissionDetail(payload events.ScannerItemAddedPayload) string {
 		payload.Reasoning,
 	} {
 		if value = strings.TrimSpace(value); value != "" {
-			return truncateScannerNotification(value, 180)
+			return scannerNotificationField(value, 180)
 		}
 	}
 	return ""
 }
 
 func truncateScannerNotification(value string, limit int) string {
-	if len(value) <= limit {
+	runes := []rune(value)
+	if len(runes) <= limit {
 		return value
 	}
-	return value[:limit-1] + "…"
+	return string(runes[:limit-1]) + "…"
+}
+
+func scannerNotificationField(value string, limit int) string {
+	return escapeTelegramMarkdown(truncateScannerNotification(value, limit))
+}
+
+func escapeTelegramMarkdown(value string) string {
+	replacer := strings.NewReplacer(
+		"\\", "\\\\", "_", "\\_", "*", "\\*", "[", "\\[", "]", "\\]", "(", "\\(", ")", "\\)",
+	)
+	return replacer.Replace(value)
 }
 
 // ── Event handlers ────────────────────────────────────────────────────────────
