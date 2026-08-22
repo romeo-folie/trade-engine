@@ -456,7 +456,7 @@ func scannerNotificationField(value string, limit int) string {
 
 func escapeTelegramMarkdown(value string) string {
 	replacer := strings.NewReplacer(
-		"\\", "\\\\", "_", "\\_", "*", "\\*", "[", "\\[", "]", "\\]", "(", "\\(", ")", "\\)",
+		"\\", "\\\\", "_", "\\_", "*", "\\*", "`", "\\`", "[", "\\[", "]", "\\]", "(", "\\(", ")", "\\)",
 	)
 	return replacer.Replace(value)
 }
