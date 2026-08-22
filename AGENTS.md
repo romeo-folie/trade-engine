@@ -40,10 +40,11 @@ while remediation is expected, and restart the watcher if its heartbeat stops.
 After merging a PR, the agent must:
 
 1. Sync the local `main` branch to the merged remote state.
-2. Rebuild the frontend from `web/frontend` with `npm run build`, then rebuild
-   `te` from the repository root (for example, `make build-go-only`) so those
-   assets are embedded in the executable used by `te run`. If either build
-   fails, do not restart the engine—report and diagnose it first.
+2. From the repository root, run `make build`. It rebuilds the frontend and
+   then `te`, embedding the current web assets in the executable used by
+   `te run`. `make install-dev` only installs the development launcher, whose
+   per-invocation build is Go-only; it is not a substitute for this step. If
+   the build fails, do not restart the engine—report and diagnose it first.
 3. Compare merged configuration schema, example, and default changes with the
    ignored operator `config.yaml`; apply required live changes without
    committing `config.yaml`, then run `./te config validate`. If validation
