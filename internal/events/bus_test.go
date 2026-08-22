@@ -65,6 +65,39 @@ func TestSubscribeAll(t *testing.T) {
 	}
 }
 
+func TestSubscribeLosslessRetainsLifecycleBurst(t *testing.T) {
+	bus := New()
+	sub := bus.SubscribeLossless(ScanStarted, ScannerItemAdded, ScanCompleted)
+	defer bus.Unsubscribe(sub)
+
+	const count = DefaultBufferSize + 64
+	for i := 0; i < count; i++ {
+		bus.Publish(ScannerItemAdded, ScannerItemAddedPayload{Ticker: "BURST"})
+	}
+	for i := 0; i < count; i++ {
+		select {
+		case ev := <-sub.C:
+			if ev.Type != ScannerItemAdded {
+				t.Fatalf("event %d = %s, want scanner item", i, ev.Type)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out after receiving %d of %d events", i, count)
+		}
+	}
+}
+
+func TestSubscriberCountCountsMultiTypeSubscriptionOnce(t *testing.T) {
+	bus := New()
+	scanner := bus.SubscribeLossless(ScanStarted, ScannerItemAdded, ScanCompleted)
+	regular := bus.Subscribe(SignalGenerated)
+	defer bus.Unsubscribe(scanner)
+	defer bus.Unsubscribe(regular)
+
+	if got := bus.SubscriberCount(); got != 2 {
+		t.Fatalf("subscriber count = %d, want 2 handles", got)
+	}
+}
+
 func TestUnsubscribeStopsDelivery(t *testing.T) {
 	bus := New()
 	sub := bus.Subscribe(DataFetched)

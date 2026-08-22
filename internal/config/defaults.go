@@ -1,5 +1,7 @@
 package config
 
+func boolPointer(value bool) *bool { return &value }
+
 // Defaults returns a Config pre-filled with sensible defaults.
 // These are overridden by YAML, DB overrides, and CLI flags.
 func Defaults() *Config {
@@ -206,15 +208,16 @@ func Defaults() *Config {
 		},
 		Notifications: NotificationsConfig{
 			Telegram: TelegramConfig{
-				Enabled:               false,
-				BotTokenEnv:           "TELEGRAM_BOT_TOKEN",
-				ChatID:                "",
-				NotifyOn:              []string{"signal", "trade", "error", "daily_summary"},
-				BatchEnabled:          true,
-				BatchWindowSec:        60,
-				MaxItemsPerBatch:      25,
-				IncludeHolds:          false,
-				MinConfidenceForAlert: 0.65,
+				Enabled:                        false,
+				BotTokenEnv:                    "TELEGRAM_BOT_TOKEN",
+				ChatID:                         "",
+				NotifyOn:                       []string{"signal", "trade", "error", "daily_summary", "scanner"},
+				ScannerNotificationsConfigured: boolPointer(true),
+				BatchEnabled:                   true,
+				BatchWindowSec:                 60,
+				MaxItemsPerBatch:               25,
+				IncludeHolds:                   false,
+				MinConfidenceForAlert:          0.65,
 			},
 		},
 		Logging: LoggingConfig{
@@ -562,8 +565,8 @@ func Defaults() *Config {
 				Transport:                  "browser",
 			},
 			OGE: DisclosureSourceConfig{
-				Enabled: true,
-				BaseURL: "https://extapps2.oge.gov/201/Presiden.nsf/API.xsp/v2/rest",
+				Enabled:                  true,
+				BaseURL:                  "https://extapps2.oge.gov/201/Presiden.nsf/API.xsp/v2/rest",
 				RequestDelayMilliseconds: 250,
 			},
 		},

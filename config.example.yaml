@@ -429,6 +429,11 @@ notifications:
       - trade
       - error
       - daily_summary
+      - scanner                # Scanner watchlist admissions and meaningful source rediscoveries
+    # Marks scanner's presence/absence as an explicit choice. Keep this when
+    # disabling scanner notifications; unmarked pre-category configs preserve
+    # their legacy scanner admission summary on upgrade.
+    scanner_notifications_configured: true
     # Batching (Epic 1): accumulate events per tick and flush a single summary.
     # Error events always bypass the batcher and are sent immediately.
     batch_enabled: true

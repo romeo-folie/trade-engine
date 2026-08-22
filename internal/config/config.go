@@ -1974,6 +1974,9 @@ type TelegramConfig struct {
 	BotToken    string   `yaml:"-" json:"-"`
 	ChatID      string   `yaml:"chat_id"`
 	NotifyOn    []string `yaml:"notify_on"`
+	// ScannerNotificationsConfigured distinguishes an older notify_on list from
+	// an explicit scanner-category choice made in the current configuration UI.
+	ScannerNotificationsConfigured *bool `yaml:"scanner_notifications_configured,omitempty"`
 
 	// Batching config (Epic 1 cost reduction).
 	BatchEnabled          bool    `yaml:"batch_enabled"`
@@ -2075,6 +2078,11 @@ func Load() (*Config, error) {
 
 		ApplyProfile(cfg)
 
+		// Defaults marks freshly generated configurations as scanner-category
+		// aware. Existing files that predate that marker must remain unmarked
+		// when they omit it, so their legacy scanner summaries stay enabled.
+		// yaml.Unmarshal does not clear a non-nil pointer for an omitted field.
+		cfg.Notifications.Telegram.ScannerNotificationsConfigured = nil
 		if err := yaml.Unmarshal(data, cfg); err != nil {
 			return nil, fmt.Errorf("parse config: %w", err)
 		}

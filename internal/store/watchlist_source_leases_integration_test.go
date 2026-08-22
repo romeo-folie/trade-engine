@@ -39,9 +39,9 @@ func TestWatchlistSourceLeaseRefreshIsEvidenceGatedAndPreservesAdmission(t *test
 	retry := item
 	retry.SourceLeases = append([]store.WatchlistSourceLease(nil), item.SourceLeases...)
 	retry.SourceLeases[0].ExpiresAt = firstExpiry.Add(24 * time.Hour)
-	changed, err := store.RefreshActiveScannerWatchlistItem(ctx, retry, nil)
-	if err != nil || changed {
-		t.Fatalf("identical refresh = changed=%v err=%v, want false/nil", changed, err)
+	changedLeases, err := store.RefreshActiveScannerWatchlistItemWithChangedLeases(ctx, retry, nil)
+	if err != nil || len(changedLeases) != 0 {
+		t.Fatalf("identical refresh = changed=%#v err=%v, want no changes/nil", changedLeases, err)
 	}
 	afterRetry, err := store.GetWatchlistItem(ctx, ticker, "stock")
 	if err != nil || afterRetry == nil || afterRetry.ExpiresAt == nil || !afterRetry.ExpiresAt.Equal(firstExpiry) {
@@ -52,9 +52,10 @@ func TestWatchlistSourceLeaseRefreshIsEvidenceGatedAndPreservesAdmission(t *test
 	updated.SourceLeases[0].EvidenceFingerprint = "second"
 	updated.SourceLeases[0].Evidence = json.RawMessage(`{"price":11}`)
 	updated.SourceLeases[0].ExpiresAt = firstExpiry.Add(48 * time.Hour)
-	changed, err = store.RefreshActiveScannerWatchlistItem(ctx, updated, nil)
-	if err != nil || !changed {
-		t.Fatalf("meaningful refresh = changed=%v err=%v, want true/nil", changed, err)
+	changedLeases, err = store.RefreshActiveScannerWatchlistItemWithChangedLeases(ctx, updated, nil)
+	if err != nil || len(changedLeases) != 1 || changedLeases[0].Source != "mover" ||
+		changedLeases[0].EvidenceFingerprint != "second" {
+		t.Fatalf("meaningful refresh = changed=%#v err=%v, want changed mover/nil", changedLeases, err)
 	}
 	after, err := store.GetWatchlistItem(ctx, ticker, "stock")
 	if err != nil || after == nil {
@@ -253,8 +254,12 @@ func TestActiveScannerRaceCommitsRefreshedLease(t *testing.T) {
 	}
 	race := initial
 	race.SourceLeases = []store.WatchlistSourceLease{{Source: "graph_neighbor", EvidenceFingerprint: "graph", QualifiedAt: now, ObservedAt: now, EffectiveAt: now, ExpiresAt: expiresAt, Evidence: json.RawMessage(`{"relationship":"supplies"}`)}}
-	if err := store.AddWatchlistItemUnlessActive(ctx, race); !errors.Is(err, store.ErrWatchlistActiveItemExists) {
+	changedLeases, err := store.AddWatchlistItemWithChangedLeases(ctx, race)
+	if !errors.Is(err, store.ErrWatchlistActiveItemExists) {
 		t.Fatalf("race error = %v, want ErrWatchlistActiveItemExists", err)
+	}
+	if len(changedLeases) != 1 || changedLeases[0].Source != "graph_neighbor" {
+		t.Fatalf("changed leases = %+v, want committed graph-neighbor lease", changedLeases)
 	}
 	var count int
 	if err := store.GetDB().QueryRow(ctx, `SELECT count(*) FROM watchlist_source_leases l JOIN watchlist w ON w.id=l.watchlist_id WHERE w.ticker=$1 AND l.source='graph_neighbor'`, ticker).Scan(&count); err != nil || count != 1 {

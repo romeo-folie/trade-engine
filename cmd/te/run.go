@@ -967,9 +967,6 @@ Modes:
 				if fh, ok := newsProvider.(*data.FinnhubClient); ok {
 					mscanner.Fundamentals = fh
 				}
-				if tgBot != nil {
-					mscanner.Notifier = tgBot
-				}
 				var afterCloseJobs []swinguniverse.ApprovedUniverseJob
 				if cfg.Scanner.WeeklyLeader.Enabled && store.IsConnected() {
 					leaderRunner := &scanner.WeeklyLeaderRunner{

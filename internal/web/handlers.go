@@ -1616,12 +1616,13 @@ type systemConfigDTO struct {
 	} `json:"cost"`
 	Notifications struct {
 		Telegram struct {
-			Enabled               bool     `json:"enabled"`
-			NotifyOn              []string `json:"notify_on"`
-			BatchEnabled          bool     `json:"batch_enabled"`
-			BatchWindowSec        int      `json:"batch_window_sec"`
-			MinConfidenceForAlert float64  `json:"min_confidence_for_alert"`
-			IncludeHolds          bool     `json:"include_holds"`
+			Enabled                        bool     `json:"enabled"`
+			NotifyOn                       []string `json:"notify_on"`
+			ScannerNotificationsConfigured *bool    `json:"scanner_notifications_configured,omitempty"`
+			BatchEnabled                   bool     `json:"batch_enabled"`
+			BatchWindowSec                 int      `json:"batch_window_sec"`
+			MinConfidenceForAlert          float64  `json:"min_confidence_for_alert"`
+			IncludeHolds                   bool     `json:"include_holds"`
 		} `json:"telegram"`
 	} `json:"notifications"`
 }
@@ -1659,6 +1660,7 @@ func newSystemConfigDTO(cfg *config.Config) systemConfigDTO {
 	tg := cfg.Notifications.Telegram
 	dto.Notifications.Telegram.Enabled = tg.Enabled
 	dto.Notifications.Telegram.NotifyOn = tg.NotifyOn
+	dto.Notifications.Telegram.ScannerNotificationsConfigured = tg.ScannerNotificationsConfigured
 	dto.Notifications.Telegram.BatchEnabled = tg.BatchEnabled
 	dto.Notifications.Telegram.BatchWindowSec = tg.BatchWindowSec
 	dto.Notifications.Telegram.MinConfidenceForAlert = tg.MinConfidenceForAlert

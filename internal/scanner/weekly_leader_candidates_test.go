@@ -244,20 +244,3 @@ func TestOrdinaryFallbackRestoresIndependentEvidence(t *testing.T) {
 		t.Fatal("weekly-only candidate received an ordinary fallback")
 	}
 }
-
-func TestBuildTelegramMessageLabelsWeeklyLeaderEvidence(t *testing.T) {
-	scanner := &MarketScanner{}
-	message := scanner.buildTelegramMessage([]scoredCandidate{{
-		candidate: SwingCandidate{
-			Ticker:               "NVDA",
-			WeeklyLeaderEvidence: "rank 4, composite score 0.910 across the full eligible universe",
-		},
-		score: SwingScoreResult{SetupType: "momentum_breakout", Conviction: 0.82},
-	}}, 0)
-	if !strings.Contains(message, "Weekly leader: rank 4") {
-		t.Fatalf("Telegram message omitted leader evidence:\n%s", message)
-	}
-	if strings.Contains(message, "🔗") {
-		t.Fatalf("Telegram message rendered leader evidence as a graph link:\n%s", message)
-	}
-}

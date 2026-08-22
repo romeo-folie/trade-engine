@@ -3,6 +3,7 @@ package notify
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -260,6 +261,278 @@ func TestTradeClosedNotification(t *testing.T) {
 	}
 	if !strings.Contains(text, "take-profit hit") {
 		t.Errorf("canonical reason was not rendered for operators: %q", text)
+	}
+}
+
+func TestScannerCycleNotificationBatchesAdmissionsAndRediscoveries(t *testing.T) {
+	srv, msgs := captureServer(t)
+	defer srv.Close()
+
+	bus := events.New()
+	bot := NewTelegramBot(config.TelegramConfig{
+		Enabled: true, BotToken: "test-token", ChatID: "123",
+		NotifyOn: []string{"scanner"}, BatchEnabled: true,
+	}, bus)
+	bot.apiBase = srv.URL + "/bot"
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := bot.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer bot.Stop()
+	time.Sleep(100 * time.Millisecond)
+	startCount := msgs.Len()
+
+	bus.Publish(events.ScanStarted, events.ScanStartedPayload{ScanID: "scan-1"})
+	bus.Publish(events.ScannerItemAdded, events.ScannerItemAddedPayload{
+		ScanID: "scan-1", Ticker: "NVDA", Conviction: 0.82, SetupType: "momentum",
+		Sources: []string{"mover", "news_sympathy"}, GraphContext: "Supplier sympathy",
+	})
+	bus.Publish(events.ScannerItemRediscovered, events.ScannerItemRediscoveredPayload{
+		ScanID: "scan-1", Ticker: "AMD", ChangedSources: []events.ScannerSourceLeaseChangePayload{
+			{Source: "political_disclosure"}, {Source: "weekly_leader"},
+		},
+	})
+	bus.Publish(events.ScanCompleted, events.ScanCompletedPayload{ScanID: "scan-1"})
+
+	time.Sleep(200 * time.Millisecond)
+	if got := msgs.Len(); got != startCount+1 {
+		t.Fatalf("scanner messages = %d, want %d", got-startCount, 1)
+	}
+	text := msgs.At(startCount)["text"].(string)
+	for _, want := range []string{"Added (1)", "NVDA", "Mover, News sympathy", "Rediscovered (1)", "AMD", "Political disclosure, Weekly leader"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("scanner batch missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestScannerCycleBatchesHonorItemAndTelegramMessageLimits(t *testing.T) {
+	state := &scannerCycleNotifications{}
+	for _, ticker := range []string{"AAA", "BBB", "CCC"} {
+		state.added = append(state.added, events.ScannerItemAddedPayload{
+			Ticker: ticker, Sources: []string{"mover"}, Reasoning: strings.Repeat("evidence ", 30),
+		})
+	}
+	state.rediscovered = append(state.rediscovered, events.ScannerItemRediscoveredPayload{
+		Ticker: "DDD", ChangedSources: []events.ScannerSourceLeaseChangePayload{{Source: "weekly_leader"}},
+	})
+	batches := formatScannerCycleBatches(state, 2)
+	if len(batches) != 2 {
+		t.Fatalf("batches = %d, want 2", len(batches))
+	}
+	combined := strings.Join(batches, "\n")
+	for _, ticker := range []string{"AAA", "BBB", "CCC", "DDD"} {
+		if count := strings.Count(combined, ticker); count != 1 {
+			t.Errorf("ticker %s appeared %d times across batches", ticker, count)
+		}
+	}
+	for _, batch := range batches {
+		if len(batch) > telegramMessageMaxLength {
+			t.Fatalf("scanner batch is %d bytes, exceeds Telegram limit", len(batch))
+		}
+	}
+
+	longState := &scannerCycleNotifications{}
+	for i := 0; i < 25; i++ {
+		longState.added = append(longState.added, events.ScannerItemAddedPayload{
+			Ticker: fmt.Sprintf("T%02d", i), Sources: []string{"mover"}, Reasoning: strings.Repeat("evidence ", 30),
+		})
+	}
+	longBatches := formatScannerCycleBatches(longState, 25)
+	if len(longBatches) < 2 {
+		t.Fatal("verbose scanner cycle was not split for Telegram's message limit")
+	}
+	for _, batch := range longBatches {
+		if len(batch) > telegramMessageMaxLength {
+			t.Fatalf("verbose scanner batch is %d bytes, exceeds Telegram limit", len(batch))
+		}
+	}
+}
+
+func TestScannerNotificationsRespectCategory(t *testing.T) {
+	srv, msgs := captureServer(t)
+	defer srv.Close()
+
+	bot, bus := testBot(t, srv, []string{"trade"})
+	configured := true
+	bot.cfg.ScannerNotificationsConfigured = &configured
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := bot.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer bot.Stop()
+	time.Sleep(100 * time.Millisecond)
+	startCount := msgs.Len()
+
+	bus.Publish(events.ScanStarted, events.ScanStartedPayload{ScanID: "scan-1"})
+	bus.Publish(events.ScannerItemAdded, events.ScannerItemAddedPayload{ScanID: "scan-1", Ticker: "NVDA", Sources: []string{"mover"}})
+	bus.Publish(events.ScanCompleted, events.ScanCompletedPayload{ScanID: "scan-1"})
+	time.Sleep(150 * time.Millisecond)
+	if got := msgs.Len(); got != startCount {
+		t.Fatalf("disabled scanner category sent %d message(s)", got-startCount)
+	}
+}
+
+func TestLegacyTelegramNotifyOnKeepsScannerAdmissions(t *testing.T) {
+	srv, msgs := captureServer(t)
+	defer srv.Close()
+
+	bot, bus := testBot(t, srv, []string{"signal", "trade", "error", "daily_summary"})
+	bot.cfg.BatchEnabled = false
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := bot.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer bot.Stop()
+	time.Sleep(100 * time.Millisecond)
+	startCount := msgs.Len()
+
+	bus.Publish(events.ScannerItemAdded, events.ScannerItemAddedPayload{
+		Ticker: "NVDA", Sources: []string{"mover"},
+	})
+	time.Sleep(200 * time.Millisecond)
+	if got := msgs.Len(); got != startCount+1 {
+		t.Fatalf("legacy notify_on sent %d scanner messages, want 1", got-startCount)
+	}
+}
+
+func TestLegacyCustomizedNotifyOnKeepsScannerAdmissions(t *testing.T) {
+	srv, msgs := captureServer(t)
+	defer srv.Close()
+
+	bot, bus := testBot(t, srv, []string{"trade"})
+	bot.cfg.BatchEnabled = false
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := bot.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer bot.Stop()
+	time.Sleep(100 * time.Millisecond)
+	startCount := msgs.Len()
+
+	bus.Publish(events.ScannerItemAdded, events.ScannerItemAddedPayload{
+		Ticker: "NVDA", Sources: []string{"mover"},
+	})
+	time.Sleep(200 * time.Millisecond)
+	if got := msgs.Len(); got != startCount+1 {
+		t.Fatalf("custom legacy notify_on sent %d scanner messages, want 1", got-startCount)
+	}
+}
+
+func TestScannerCategoryExplicitOptOutOverridesLegacyCompatibility(t *testing.T) {
+	srv, msgs := captureServer(t)
+	defer srv.Close()
+
+	configured := true
+	bus := events.New()
+	bot := NewTelegramBot(config.TelegramConfig{
+		Enabled: true, BotToken: "test-token", ChatID: "123", BatchEnabled: false,
+		NotifyOn:                       []string{"signal", "trade", "error", "daily_summary"},
+		ScannerNotificationsConfigured: &configured,
+	}, bus)
+	bot.apiBase = srv.URL + "/bot"
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := bot.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer bot.Stop()
+	time.Sleep(100 * time.Millisecond)
+	startCount := msgs.Len()
+
+	bus.Publish(events.ScannerItemAdded, events.ScannerItemAddedPayload{
+		Ticker: "NVDA", Sources: []string{"mover"},
+	})
+	time.Sleep(150 * time.Millisecond)
+	if got := msgs.Len(); got != startCount {
+		t.Fatalf("explicit scanner opt-out sent %d message(s)", got-startCount)
+	}
+}
+
+func TestScannerNotificationsSendEachEventWhenBatchingDisabled(t *testing.T) {
+	srv, msgs := captureServer(t)
+	defer srv.Close()
+
+	bus := events.New()
+	bot := NewTelegramBot(config.TelegramConfig{
+		Enabled: true, BotToken: "test-token", ChatID: "123",
+		NotifyOn: []string{"scanner"}, BatchEnabled: false,
+	}, bus)
+	bot.apiBase = srv.URL + "/bot"
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := bot.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer bot.Stop()
+	time.Sleep(100 * time.Millisecond)
+	startCount := msgs.Len()
+
+	bus.Publish(events.ScannerItemAdded, events.ScannerItemAddedPayload{Ticker: "NVDA", Sources: []string{"mover"}})
+	bus.Publish(events.ScannerItemRediscovered, events.ScannerItemRediscoveredPayload{
+		Ticker: "AMD", ChangedSources: []events.ScannerSourceLeaseChangePayload{{Source: "graph_neighbor"}},
+	})
+	time.Sleep(200 * time.Millisecond)
+	if got := msgs.Len(); got != startCount+2 {
+		t.Fatalf("unbatched scanner messages = %d, want 2", got-startCount)
+	}
+}
+
+func TestScannerNotificationsBoundIndividualMessages(t *testing.T) {
+	admission := formatScannerAdmission(events.ScannerItemAddedPayload{
+		Ticker:    strings.Repeat("T", 100),
+		Sources:   []string{strings.Repeat("source_", 100)},
+		SetupType: strings.Repeat("setup_", 1000),
+		Reasoning: strings.Repeat("evidence ", 1000),
+	})
+	if len(admission) > telegramMessageMaxLength {
+		t.Fatalf("admission is %d bytes, exceeds Telegram limit", len(admission))
+	}
+	rediscovery := formatScannerRediscovery(events.ScannerItemRediscoveredPayload{
+		Ticker: strings.Repeat("T", 100),
+		ChangedSources: []events.ScannerSourceLeaseChangePayload{
+			{Source: strings.Repeat("source_", 100)},
+		},
+	})
+	if len(rediscovery) > telegramMessageMaxLength {
+		t.Fatalf("rediscovery is %d bytes, exceeds Telegram limit", len(rediscovery))
+	}
+}
+
+func TestScannerNotificationFieldsEscapeMarkdownAndPreserveRunes(t *testing.T) {
+	message := formatScannerAdmission(events.ScannerItemAddedPayload{
+		Ticker: "A_B", Sources: []string{"mover"},
+		SetupType: "[breakout]", Reasoning: "café *momentum* `validated`",
+	})
+	for _, want := range []string{"A\\_B", "\\[breakout\\]", "café \\*momentum\\* \\`validated\\`"} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("escaped scanner message missing %q: %s", want, message)
+		}
+	}
+	if got := truncateScannerNotification("ééé", 2); got != "é…" {
+		t.Fatalf("rune-safe truncation = %q, want %q", got, "é…")
+	}
+}
+
+func TestScannerSourceLabelsCoverEveryDiscoverySource(t *testing.T) {
+	want := map[string]string{
+		"mover":                "Mover",
+		"active":               "Most active",
+		"weekly_leader":        "Weekly leader",
+		"potent_industry":      "Potent industry",
+		"premarket_episodic":   "Premarket",
+		"graph_neighbor":       "Graph neighbor",
+		"news_sympathy":        "News sympathy",
+		"political_disclosure": "Political disclosure",
+	}
+	for source, label := range want {
+		if got := scannerSourceLabel(source); got != label {
+			t.Errorf("scannerSourceLabel(%q) = %q, want %q", source, got, label)
+		}
 	}
 }
 

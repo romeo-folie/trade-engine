@@ -10,7 +10,7 @@
 //  4. Adds high-conviction candidates to the watchlist (source="scanner") with
 //     an expiry timestamp.
 //  5. Expires stale scanner-added items that have passed their TTL.
-//  6. Sends a Telegram summary of what was added.
+//  6. Publishes committed watchlist admission and rediscovery events.
 package scanner
 
 import (
@@ -53,11 +53,6 @@ type CompanyFundamentalsProvider interface {
 	FetchCompanyFundamentals(ctx context.Context, ticker string) (data.CompanyFundamentals, error)
 }
 
-// Notifier is satisfied by notify.TelegramBot (and any test double).
-type Notifier interface {
-	SendImmediate(ctx context.Context, message string) error
-}
-
 // MarketScanner discovers swing-trade candidates and manages a time-bounded
 // watchlist of scanner-sourced tickers.
 type MarketScanner struct {
@@ -68,7 +63,6 @@ type MarketScanner struct {
 	News            data.NewsProvider
 	Fundamentals    CompanyFundamentalsProvider
 	DailyBars       data.BulkDailyBarsProvider // optional; required only for correlation-aware promotion
-	Notifier        Notifier                   // optional — nil disables Telegram notifications
 	Bus             bus
 	Cfg             config.ScannerConfig
 	Now             func() time.Time // injectable for tests; defaults to time.Now
@@ -131,6 +125,7 @@ func (s *MarketScanner) Run(ctx context.Context) error {
 // runScan executes one full scan cycle.
 func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 	start := s.now()
+	var scanCandidatesEvaluated, scanItemsAdded, scanItemsExpired int
 	if s.Cfg.PromotionCorrelationEnabled {
 		if s.DailyBars == nil {
 			return fmt.Errorf("promotion correlation enabled but daily-bars provider is unavailable")
@@ -253,9 +248,20 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 	}
 	recorder.begin(ctx)
 	defer func() { recorder.finish(scanErr) }()
+	scanID := recorder.run.ID
 
 	if s.Bus != nil {
-		s.Bus.Publish(events.ScanStarted, events.ScanStartedPayload{})
+		s.Bus.Publish(events.ScanStarted, events.ScanStartedPayload{ScanID: scanID})
+		defer func() {
+			s.Bus.Publish(events.ScanCompleted, events.ScanCompletedPayload{
+				ScanID:              scanID,
+				CandidatesEvaluated: scanCandidatesEvaluated,
+				ItemsAdded:          scanItemsAdded,
+				ItemsExpired:        scanItemsExpired,
+				DurationMs:          time.Since(start).Milliseconds(),
+				Failed:              scanErr != nil,
+			})
+		}()
 	}
 
 	slog.Info("scanner: scan started")
@@ -266,6 +272,7 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 		slog.Warn("scanner: expire stale items", "err", err)
 	}
 	recorder.run.ExpiredItemCount = len(expired)
+	scanItemsExpired = len(expired)
 
 	// 2. Fetch candidates from both screeners.
 	candidates, err := s.fetchCandidates(ctx)
@@ -465,12 +472,15 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 	candidates = s.enrichWithNews(ctx, candidates, since)
 	recorder.setEligible(candidates)
 
-	// 6. LLM-score each candidate.
+	// 6. LLM-score each candidate. The completion metric is incremented per
+	// attempted score, so a cancelled cycle never reports skipped candidates as
+	// evaluated.
 	var scored []scoredCandidate
 	for _, c := range candidates {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		scanCandidatesEvaluated++
 		result, err := s.scoreCandidate(ctx, c)
 		recorder.scored(c, result, err, s.Cfg.MinConviction)
 		if err != nil {
@@ -552,7 +562,6 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 	recorder.selected(scored)
 
 	// 8. Add to watchlist and notify.
-	var added []scoredCandidate
 	promotionState := append([]scoredCandidate(nil), scored...)
 	promotionActive := make([]bool, len(scored))
 	for index := range scored {
@@ -623,7 +632,7 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 		if err := s.renewScannerCycleBeforePromotion(ctx, cycleKey, cycleOwner, interval); err != nil {
 			return err
 		}
-		addErr := s.promoteDiscoveryCandidate(ctx, item, sc.candidate, cycleLease)
+		changedLeases, addErr := s.promoteDiscoveryCandidate(ctx, item, sc.candidate, cycleLease)
 		skipCandidate := false
 		for errors.Is(addErr, store.ErrScannerSourcePromotionClaimLost) {
 			var claimErr *store.ScannerSourcePromotionClaimError
@@ -635,6 +644,7 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			if !ok {
 				break
 			}
+			scanCandidatesEvaluated++
 			fallbackScore, scoreErr := s.scoreCandidate(ctx, fallback)
 			recorder.fallbackScored(
 				fallback, fallbackScore, scoreErr, s.Cfg.MinConviction,
@@ -717,7 +727,7 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			if err := s.renewScannerCycleBeforePromotion(ctx, cycleKey, cycleOwner, interval); err != nil {
 				return err
 			}
-			addErr = s.promoteDiscoveryFallback(ctx, item, fallback, cycleLease)
+			changedLeases, addErr = s.promoteDiscoveryFallback(ctx, item, fallback, cycleLease)
 		}
 		if skipCandidate {
 			continue
@@ -726,6 +736,11 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			return addErr
 		}
 		if errors.Is(addErr, store.ErrWatchlistActiveItemExists) {
+			if len(changedLeases) > 0 && s.Bus != nil {
+				s.Bus.Publish(events.ScannerItemRediscovered, scannerRediscoveryPayload(
+					scanID, sc.candidate.Ticker, changedLeases,
+				))
+			}
 			promotionActive[index] = false
 			recorder.watchlistResult(sc.candidate, sc.score, strategies, addErr)
 			slog.Info(
@@ -758,10 +773,11 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 		promotionActive[index] = true
 		recorder.watchlistResult(sc.candidate, sc.score, strategies, nil)
 		slog.Info("scanner: added to watchlist", "ticker", sc.candidate.Ticker, "conviction", sc.score.Conviction, "setup", sc.score.SetupType, "strategy", sc.score.Strategy)
-		added = append(added, sc)
+		scanItemsAdded++
 
 		if s.Bus != nil {
 			s.Bus.Publish(events.ScannerItemAdded, events.ScannerItemAddedPayload{
+				ScanID:                      scanID,
 				Ticker:                      sc.candidate.Ticker,
 				Conviction:                  sc.score.Conviction,
 				SetupType:                   sc.score.SetupType,
@@ -783,24 +799,10 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 
 	slog.Info("scanner: scan completed",
 		"candidates_evaluated", len(candidates),
-		"items_added", len(added),
+		"items_added", scanItemsAdded,
 		"items_expired", len(expired),
 		"duration_ms", durationMs,
 	)
-
-	if s.Bus != nil {
-		s.Bus.Publish(events.ScanCompleted, events.ScanCompletedPayload{
-			CandidatesEvaluated: len(candidates),
-			ItemsAdded:          len(added),
-			ItemsExpired:        len(expired),
-			DurationMs:          durationMs,
-		})
-	}
-
-	// 9. Send Telegram summary if anything was added.
-	if len(added) > 0 && s.Notifier != nil {
-		s.Notifier.SendImmediate(ctx, s.buildTelegramMessage(added, len(expired), promotionRejections)) //nolint:errcheck
-	}
 
 	return nil
 }
@@ -912,13 +914,14 @@ func (s *MarketScanner) refreshActiveSourceLeases(
 				PullbackRequalificationComplete: refreshCandidate.PullbackQualificationKnown,
 			}
 			claims := scannerSourcePromotionClaims(refreshCandidate)
+			var changedLeases []store.WatchlistSourceLease
 			if claims.WeeklyLeader != nil || claims.PotentIndustry != nil ||
 				claims.PremarketEpisodic != nil || claims.PoliticalDisclosure != nil {
-				err = store.RefreshScannerSourcesOnActiveWatchlist(
+				changedLeases, err = store.RefreshScannerSourcesOnActiveWatchlistWithChangedLeases(
 					ctx, item, claims, "meaningful scanner evidence refreshed an active watchlist lease", now, cycleLease,
 				)
 			} else {
-				_, err = store.RefreshActiveScannerWatchlistItem(ctx, item, cycleLease)
+				changedLeases, err = store.RefreshActiveScannerWatchlistItemWithChangedLeases(ctx, item, cycleLease)
 			}
 			if errors.Is(err, store.ErrWatchlistRefreshNotActive) {
 				// It will be handled by normal scoring if it is not active by the
@@ -942,11 +945,35 @@ func (s *MarketScanner) refreshActiveSourceLeases(
 			if err != nil {
 				return nil, fmt.Errorf("refresh %s: %w", refreshCandidate.Ticker, err)
 			}
+			if len(changedLeases) > 0 && s.Bus != nil {
+				s.Bus.Publish(events.ScannerItemRediscovered, scannerRediscoveryPayload(
+					scannerRunID, refreshCandidate.Ticker, changedLeases,
+				))
+			}
 			handled[normalizePromotionKey(candidate.Ticker)] = true
 			break
 		}
 	}
 	return handled, nil
+}
+
+func scannerRediscoveryPayload(
+	scanID, ticker string, leases []store.WatchlistSourceLease,
+) events.ScannerItemRediscoveredPayload {
+	changed := make([]events.ScannerSourceLeaseChangePayload, 0, len(leases))
+	for _, lease := range leases {
+		changed = append(changed, events.ScannerSourceLeaseChangePayload{
+			Source:      lease.Source,
+			QualifiedAt: lease.QualifiedAt.UTC().Format(time.RFC3339),
+			ObservedAt:  lease.ObservedAt.UTC().Format(time.RFC3339),
+			EffectiveAt: lease.EffectiveAt.UTC().Format(time.RFC3339),
+			ExpiresAt:   lease.ExpiresAt.UTC().Format(time.RFC3339),
+			Evidence:    append([]byte(nil), lease.Evidence...),
+		})
+	}
+	return events.ScannerItemRediscoveredPayload{
+		ScanID: scanID, Ticker: ticker, ChangedSources: changed,
+	}
 }
 
 func (s *MarketScanner) enrichActiveRefreshCandidates(
@@ -1702,54 +1729,6 @@ func parseSwingResult(rawResponse string, fallback analysis.AnalysisResponse) Sw
 		Conviction: fallback.Confidence,
 		Reasoning:  fallback.Reasoning,
 	}
-}
-
-// buildTelegramMessage constructs the Telegram notification for a scan cycle.
-func (s *MarketScanner) buildTelegramMessage(added []scoredCandidate, expired int, rejectionSets ...[]PromotionRejection) string {
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("🔍 *Scanner added %d ticker(s) to watchlist*\n\n", len(added)))
-	for _, sc := range added {
-		sb.WriteString(fmt.Sprintf("• *%s* — %s (conviction: %.0f%%)\n",
-			sc.candidate.Ticker, sc.score.SetupType, sc.score.Conviction*100))
-		if sc.candidate.GraphContext != "" {
-			sb.WriteString(fmt.Sprintf("  🔗 _%s_\n", sc.candidate.GraphContext))
-		}
-		if sc.candidate.WeeklyLeaderEvidence != "" {
-			sb.WriteString(fmt.Sprintf(
-				"  📈 _Weekly leader: %s_\n", sc.candidate.WeeklyLeaderEvidence,
-			))
-		}
-		if sc.candidate.PotentIndustryEvidence != "" {
-			sb.WriteString(fmt.Sprintf(
-				"  🧭 _Potent industry: %s_\n",
-				sc.candidate.PotentIndustryEvidence,
-			))
-		}
-		if sc.candidate.PremarketEpisodicEvidence != "" {
-			sb.WriteString(fmt.Sprintf(
-				"  🌅 _Premarket episodic: %s_\n",
-				sc.candidate.PremarketEpisodicEvidence,
-			))
-		}
-		if sc.score.Reasoning != "" {
-			sb.WriteString(fmt.Sprintf("  _%s_\n", sc.score.Reasoning))
-		}
-	}
-	if expired > 0 {
-		sb.WriteString(fmt.Sprintf("\n_Expired %d stale scanner item(s) from watchlist._", expired))
-	}
-	if len(rejectionSets) > 0 && len(rejectionSets[0]) > 0 {
-		correlationRejections := 0
-		for _, rejection := range rejectionSets[0] {
-			if rejection.Reason == "correlation_cap" || rejection.Reason == "exposure_correlation_cap" {
-				correlationRejections++
-			}
-		}
-		if correlationRejections > 0 {
-			sb.WriteString(fmt.Sprintf("\n_Correlation/exposure filter retained %d rejected alternative(s) for audit._", correlationRejections))
-		}
-	}
-	return sb.String()
 }
 
 func (s *MarketScanner) now() time.Time {

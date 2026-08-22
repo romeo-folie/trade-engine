@@ -53,6 +53,34 @@ func TestScannerSourceLeasesAreSourceSpecificAndRetryStable(t *testing.T) {
 	}
 }
 
+func TestScannerRediscoveryPayloadIncludesOnlyCommittedLeaseChanges(t *testing.T) {
+	qualifiedAt := time.Date(2026, time.August, 22, 10, 0, 0, 0, time.FixedZone("EDT", -4*60*60))
+	lease := store.WatchlistSourceLease{
+		Source:      "weekly_leader",
+		QualifiedAt: qualifiedAt,
+		ObservedAt:  qualifiedAt.Add(time.Hour),
+		EffectiveAt: qualifiedAt.Add(2 * time.Hour),
+		ExpiresAt:   qualifiedAt.Add(10 * 24 * time.Hour),
+		Evidence:    json.RawMessage(`{"rank":1}`),
+	}
+	payload := scannerRediscoveryPayload("scan-7", "NVDA", []store.WatchlistSourceLease{lease})
+	if payload.ScanID != "scan-7" || payload.Ticker != "NVDA" || len(payload.ChangedSources) != 1 {
+		t.Fatalf("payload = %#v", payload)
+	}
+	got := payload.ChangedSources[0]
+	if got.Source != "weekly_leader" || got.QualifiedAt != "2026-08-22T14:00:00Z" ||
+		got.ExpiresAt != "2026-09-01T14:00:00Z" {
+		t.Fatalf("lease payload = %#v", got)
+	}
+	if string(got.Evidence) != `{"rank":1}` {
+		t.Fatalf("evidence = %s", got.Evidence)
+	}
+	lease.Evidence[0] = '['
+	if string(payload.ChangedSources[0].Evidence) != `{"rank":1}` {
+		t.Fatal("payload retained caller-owned evidence bytes")
+	}
+}
+
 func TestOrdinaryLeaseFingerprintsIgnoreMergedSourceFields(t *testing.T) {
 	now := time.Date(2026, time.August, 21, 14, 0, 0, 0, time.UTC)
 	scanner := &MarketScanner{Cfg: config.ScannerConfig{TTLDays: 3}}

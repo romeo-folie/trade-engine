@@ -468,21 +468,21 @@ func scannerSourcePromotionClaims(
 func (s *MarketScanner) promoteDiscoveryCandidate(
 	ctx context.Context, item store.WatchlistItem, candidate SwingCandidate,
 	lease *store.ScannerCycleLease,
-) error {
+) ([]store.WatchlistSourceLease, error) {
 	claims := scannerSourcePromotionClaims(candidate)
 	if claims.WeeklyLeader == nil && claims.PotentIndustry == nil &&
 		claims.PremarketEpisodic == nil && claims.PoliticalDisclosure == nil {
 		if lease != nil {
-			return store.AddWatchlistItemWithScannerLease(ctx, item, *lease)
+			return store.AddWatchlistItemWithScannerLeaseWithChangedLeases(ctx, item, *lease)
 		}
-		return store.AddWatchlistItem(ctx, item)
+		return store.AddWatchlistItemWithChangedLeases(ctx, item)
 	}
 	if lease != nil {
-		return store.PromoteScannerSourcesToWatchlistWithScannerLease(
+		return store.PromoteScannerSourcesToWatchlistWithScannerLeaseWithChangedLeases(
 			ctx, item, claims, "passed conviction and was added to the watchlist", s.now(), *lease,
 		)
 	}
-	return store.PromoteScannerSourcesToWatchlist(
+	return store.PromoteScannerSourcesToWatchlistWithChangedLeases(
 		ctx, item, claims, "passed conviction and was added to the watchlist", s.now(),
 	)
 }
@@ -490,23 +490,23 @@ func (s *MarketScanner) promoteDiscoveryCandidate(
 func (s *MarketScanner) promoteDiscoveryFallback(
 	ctx context.Context, item store.WatchlistItem, candidate SwingCandidate,
 	lease *store.ScannerCycleLease,
-) error {
+) ([]store.WatchlistSourceLease, error) {
 	claims := scannerSourcePromotionClaims(candidate)
 	if claims.WeeklyLeader == nil && claims.PotentIndustry == nil &&
 		claims.PremarketEpisodic == nil && claims.PoliticalDisclosure == nil {
 		if lease != nil {
-			return store.AddWatchlistItemUnlessActiveWithScannerLease(ctx, item, *lease)
+			return store.AddWatchlistItemUnlessActiveWithScannerLeaseWithChangedLeases(ctx, item, *lease)
 		}
-		return store.AddWatchlistItemUnlessActive(ctx, item)
+		return store.AddWatchlistItemUnlessActiveWithChangedLeases(ctx, item)
 	}
 	if lease != nil {
-		return store.PromoteScannerSourcesToWatchlistUnlessActiveWithScannerLease(
+		return store.PromoteScannerSourcesToWatchlistUnlessActiveWithScannerLeaseWithChangedLeases(
 			ctx, item, claims,
 			"remaining source passed conviction after another source claim was lost",
 			s.now(), *lease,
 		)
 	}
-	return store.PromoteScannerSourcesToWatchlistUnlessActive(
+	return store.PromoteScannerSourcesToWatchlistUnlessActiveWithChangedLeases(
 		ctx, item, claims,
 		"remaining source passed conviction after another source claim was lost",
 		s.now(),

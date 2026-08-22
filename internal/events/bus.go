@@ -14,10 +14,21 @@ const (
 // Subscription is a handle returned by Subscribe. Call Unsubscribe to stop
 // receiving events and release the channel.
 type Subscription struct {
-	C      <-chan Event // read-only channel for the subscriber
-	ch     chan Event   // internal writeable reference
-	evType Type
-	bus    *Bus
+	C       <-chan Event // read-only channel for the subscriber
+	ch      chan Event   // internal writeable reference
+	evType  Type
+	evTypes []Type
+	bus     *Bus
+
+	// A lossless subscription queues publishes under a short mutex, then a
+	// dedicated dispatcher forwards them to C. It is used for lifecycle fences
+	// where dropping a terminal event would strand earlier work indefinitely.
+	lossless       bool
+	pendingMu      sync.Mutex
+	pending        []Event
+	wake           chan struct{}
+	done           chan struct{}
+	dispatcherDone chan struct{}
 }
 
 // Bus is a fan-out publish-subscribe event bus. Thread-safe.
@@ -47,15 +58,73 @@ func (b *Bus) Subscribe(evType Type) *Subscription {
 func (b *Bus) SubscribeBuffered(evType Type, bufferSize int) *Subscription {
 	ch := make(chan Event, bufferSize)
 	sub := &Subscription{
-		C:      ch,
-		ch:     ch,
-		evType: evType,
-		bus:    b,
+		C:       ch,
+		ch:      ch,
+		evType:  evType,
+		evTypes: []Type{evType},
+		bus:     b,
 	}
 	b.mu.Lock()
 	b.subs[evType] = append(b.subs[evType], sub)
 	b.mu.Unlock()
 	return sub
+}
+
+// SubscribeLossless registers one subscription for the supplied event types.
+// It keeps publisher calls non-blocking while retaining lifecycle events in an
+// unbounded in-memory queue until the consumer accepts them. Callers should
+// use it only for small, correctness-sensitive streams.
+func (b *Bus) SubscribeLossless(evTypes ...Type) *Subscription {
+	ch := make(chan Event, DefaultBufferSize)
+	sub := &Subscription{
+		C: ch, ch: ch, bus: b, evTypes: append([]Type(nil), evTypes...),
+		lossless: true, wake: make(chan struct{}, 1), done: make(chan struct{}),
+		dispatcherDone: make(chan struct{}),
+	}
+	b.mu.Lock()
+	for _, evType := range sub.evTypes {
+		b.subs[evType] = append(b.subs[evType], sub)
+	}
+	b.mu.Unlock()
+	go sub.dispatchLossless()
+	return sub
+}
+
+func (s *Subscription) dispatchLossless() {
+	defer close(s.dispatcherDone)
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-s.wake:
+		}
+		for {
+			s.pendingMu.Lock()
+			if len(s.pending) == 0 {
+				s.pendingMu.Unlock()
+				break
+			}
+			ev := s.pending[0]
+			s.pending[0] = Event{}
+			s.pending = s.pending[1:]
+			s.pendingMu.Unlock()
+			select {
+			case <-s.done:
+				return
+			case s.ch <- ev:
+			}
+		}
+	}
+}
+
+func (s *Subscription) enqueueLossless(ev Event) {
+	s.pendingMu.Lock()
+	s.pending = append(s.pending, ev)
+	s.pendingMu.Unlock()
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
 }
 
 // SubscribeAll registers a subscriber that receives ALL event types.
@@ -69,14 +138,20 @@ func (b *Bus) Unsubscribe(sub *Subscription) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	subs := b.subs[sub.evType]
-	for i, s := range subs {
-		if s == sub {
-			b.subs[sub.evType] = append(subs[:i], subs[i+1:]...)
-			close(sub.ch)
-			return
+	for _, evType := range sub.evTypes {
+		subs := b.subs[evType]
+		for i, s := range subs {
+			if s == sub {
+				b.subs[evType] = append(subs[:i], subs[i+1:]...)
+				break
+			}
 		}
 	}
+	if sub.lossless {
+		close(sub.done)
+		<-sub.dispatcherDone
+	}
+	close(sub.ch)
 }
 
 // Publish sends an event to all subscribers of its type and all wildcard subscribers.
@@ -93,6 +168,10 @@ func (b *Bus) Publish(evType Type, payload any) {
 
 	// Deliver to type-specific subscribers.
 	for _, sub := range b.subs[evType] {
+		if sub.lossless {
+			sub.enqueueLossless(ev)
+			continue
+		}
 		select {
 		case sub.ch <- ev:
 		default:
@@ -103,6 +182,10 @@ func (b *Bus) Publish(evType Type, payload any) {
 	// Deliver to wildcard subscribers.
 	if evType != "*" {
 		for _, sub := range b.subs["*"] {
+			if sub.lossless {
+				sub.enqueueLossless(ev)
+				continue
+			}
 			select {
 			case sub.ch <- ev:
 			default:
@@ -115,9 +198,11 @@ func (b *Bus) Publish(evType Type, payload any) {
 func (b *Bus) SubscriberCount() int {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	count := 0
+	unique := make(map[*Subscription]struct{})
 	for _, subs := range b.subs {
-		count += len(subs)
+		for _, sub := range subs {
+			unique[sub] = struct{}{}
+		}
 	}
-	return count
+	return len(unique)
 }

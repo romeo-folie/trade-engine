@@ -41,6 +41,10 @@ const (
 	ScanStarted      Type = "scanner.started"
 	ScanCompleted    Type = "scanner.completed"
 	ScannerItemAdded Type = "scanner.item_added"
+	// ScannerItemRediscovered is emitted only after a committed scanner source
+	// lease receives materially new evidence. Retried or duplicate evidence does
+	// not emit this event.
+	ScannerItemRediscovered Type = "scanner.item_rediscovered"
 )
 
 // Event is the envelope delivered to subscribers.
@@ -305,18 +309,25 @@ type ORBTradeUpdatePayload struct {
 }
 
 // ScanStartedPayload is emitted when the market scanner begins a scan cycle.
-type ScanStartedPayload struct{}
+// ScanID links the terminal event and any scanner watchlist events in the same
+// cycle, allowing consumers to form a compact, ordered summary.
+type ScanStartedPayload struct {
+	ScanID string `json:"scan_id"`
+}
 
 // ScanCompletedPayload is emitted when a scan cycle finishes.
 type ScanCompletedPayload struct {
-	CandidatesEvaluated int   `json:"candidates_evaluated"`
-	ItemsAdded          int   `json:"items_added"`
-	ItemsExpired        int   `json:"items_expired"`
-	DurationMs          int64 `json:"duration_ms"`
+	ScanID              string `json:"scan_id"`
+	CandidatesEvaluated int    `json:"candidates_evaluated"`
+	ItemsAdded          int    `json:"items_added"`
+	ItemsExpired        int    `json:"items_expired"`
+	DurationMs          int64  `json:"duration_ms"`
+	Failed              bool   `json:"failed"`
 }
 
 // ScannerItemAddedPayload is emitted when a scanner candidate is added to the watchlist.
 type ScannerItemAddedPayload struct {
+	ScanID                      string   `json:"scan_id"`
 	Ticker                      string   `json:"ticker"`
 	Conviction                  float64  `json:"conviction"`
 	SetupType                   string   `json:"setup_type"`
@@ -330,4 +341,25 @@ type ScannerItemAddedPayload struct {
 	PotentIndustryEvidence      string   `json:"potent_industry_evidence,omitempty"`
 	PremarketEpisodicEvidence   string   `json:"premarket_episodic_evidence,omitempty"`
 	PoliticalDisclosureEvidence string   `json:"political_disclosure_evidence,omitempty"`
+}
+
+// ScannerSourceLeaseChangePayload identifies one source whose committed lease
+// was renewed by genuinely new evidence. The timestamps and evidence are
+// source-owned, so a multi-source ticker can report only the source that
+// actually changed.
+type ScannerSourceLeaseChangePayload struct {
+	Source      string          `json:"source"`
+	QualifiedAt string          `json:"qualified_at"`
+	ObservedAt  string          `json:"observed_at"`
+	EffectiveAt string          `json:"effective_at"`
+	ExpiresAt   string          `json:"expires_at"`
+	Evidence    json.RawMessage `json:"evidence,omitempty"`
+}
+
+// ScannerItemRediscoveredPayload is emitted after a committed active-watchlist
+// source-lease refresh. ChangedSources never includes unchanged/retried leases.
+type ScannerItemRediscoveredPayload struct {
+	ScanID         string                            `json:"scan_id"`
+	Ticker         string                            `json:"ticker"`
+	ChangedSources []ScannerSourceLeaseChangePayload `json:"changed_sources"`
 }

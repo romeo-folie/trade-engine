@@ -33,7 +33,7 @@ func TestMergePremarketEpisodicRetainsMultiSourceAttribution(t *testing.T) {
 	}
 }
 
-func TestPremarketEpisodicEvidenceReachesPromptAndTelegram(t *testing.T) {
+func TestPremarketEpisodicEvidenceReachesPrompt(t *testing.T) {
 	candidate := SwingCandidate{
 		Ticker: "AAPL", Price: 105,
 		Sources:                   []string{"premarket_episodic"},
@@ -42,15 +42,6 @@ func TestPremarketEpisodicEvidenceReachesPromptAndTelegram(t *testing.T) {
 	_, prompt := BuildSwingPrompt(candidate, .65)
 	if !strings.Contains(prompt, "Premarket episodic evidence: gap +5%") {
 		t.Fatalf("prompt omitted evidence:\n%s", prompt)
-	}
-	message := (&MarketScanner{}).buildTelegramMessage([]scoredCandidate{{
-		candidate: candidate,
-		score: SwingScoreResult{
-			SetupType: "news_catalyst", Conviction: .8,
-		},
-	}}, 0)
-	if !strings.Contains(message, "Premarket episodic: gap +5%") {
-		t.Fatalf("Telegram omitted evidence:\n%s", message)
 	}
 }
 
