@@ -3043,7 +3043,9 @@ func Validate(cfg *Config) []string {
 			errs = append(errs, "risk.entry_gates.anti_chase.enabled requires at least one enabled rule")
 		}
 		if anti.StaleCatalystRunupEnabled {
-			validate("stale_after_hours", anti.StaleAfterHours, 24*30)
+			if anti.StaleAfterHours <= 0 || anti.StaleAfterHours >= 24*30 || math.IsNaN(anti.StaleAfterHours) || math.IsInf(anti.StaleAfterHours, 0) {
+				errs = append(errs, fmt.Sprintf("risk.entry_gates.anti_chase.stale_after_hours must be within (0,720), got %.4f", anti.StaleAfterHours))
+			}
 			validate("min_return_3_session_pct", anti.MinReturn3SessionPct, 200)
 			validate("stale_ema_extension_atr", anti.StaleEMAExtensionATR, 20)
 		}

@@ -36,18 +36,33 @@ func antiChaseDailyCandles(count int, now time.Time) []data.Candle {
 }
 
 func TestBuildAntiChaseSnapshotUsesCompletedDailyHistory(t *testing.T) {
-	now := time.Date(2026, time.August, 24, 18, 0, 0, 0, time.UTC)
-	candles := antiChaseDailyCandles(253, now)
+	now := time.Date(2026, time.August, 24, 22, 0, 0, 0, time.UTC)
+	candles := antiChaseDailyCandles(254, now)
+	// The first of 253 prior sessions must be included, while the latest close
+	// (the reference mark) must be excluded from its own prior-high window.
+	candles[0].High = 200
+	candles[len(candles)-1].High = 300
 	mark := candles[len(candles)-1].Close
 	snapshot := buildAntiChaseSnapshot("TEST", candles, mark, "test", nil, now)
 	if snapshot.EvidenceStatus != "available" {
 		t.Fatalf("snapshot evidence = %q (%s)", snapshot.EvidenceStatus, snapshot.EvidenceReason)
 	}
-	if snapshot.HistoryScope != "true_52w" || snapshot.CompletedSessions != 253 {
-		t.Fatalf("history scope=%q sessions=%d, want true_52w/253", snapshot.HistoryScope, snapshot.CompletedSessions)
+	if snapshot.HistoryScope != "true_52w" || snapshot.CompletedSessions != 254 {
+		t.Fatalf("history scope=%q sessions=%d, want true_52w/254", snapshot.HistoryScope, snapshot.CompletedSessions)
 	}
-	if snapshot.PriorHigh52Week <= 0 || snapshot.PriorHighProximity <= 0 {
-		t.Fatalf("prior high evidence missing: %+v", snapshot)
+	if snapshot.PriorHigh52Week != 200 || snapshot.PriorHighProximity <= 0 {
+		t.Fatalf("prior high evidence = %.2f/%.3f, want 200.00 from the 253 prior sessions", snapshot.PriorHigh52Week, snapshot.PriorHighProximity)
+	}
+}
+
+func TestBuildAntiChaseSnapshotAfterCloseRequires253PriorSessions(t *testing.T) {
+	now := time.Date(2026, time.August, 24, 22, 0, 0, 0, time.UTC)
+	candles := antiChaseDailyCandles(253, now)
+	// The newest candle is the close being evaluated, leaving only 252 earlier
+	// observations. It must not be presented as a full prior-52-week scope.
+	snapshot := buildAntiChaseSnapshot("TEST", candles, candles[len(candles)-1].Close, "test", nil, now)
+	if snapshot.HistoryScope != "limited_history" || snapshot.PriorHigh52Week != 0 || snapshot.PriorHighProximity != 0 {
+		t.Fatalf("after-close 253-bar history = %+v, want limited prior-high evidence", snapshot)
 	}
 }
 
@@ -152,6 +167,21 @@ func TestBuildAnalysisAntiChaseSnapshotFailsClosedOnlyForEnabledCatalystRule(t *
 	empty := buildAnalysisAntiChaseSnapshot("TEST", candles, 100, "test", nil, nil, true, now)
 	if empty.EvidenceStatus != "available" {
 		t.Fatalf("empty successful news read should remain valid: %+v", empty)
+	}
+}
+
+func TestAnalysisAntiChaseMarkRequiresCurrentCandleDuringLiveSession(t *testing.T) {
+	now := time.Date(2026, time.August, 24, 15, 0, 0, 0, nyLoc)
+	yesterday := MostRecentCompletedMarketSession(now, 0).Close
+	if mark, source := analysisAntiChaseMark([]data.Candle{{Close: 100, Timestamp: yesterday}}, now); mark != 0 || source != "analysis_current_mark_unavailable" {
+		t.Fatalf("completed-only live mark = %.2f/%s, want unavailable", mark, source)
+	}
+	if mark, source := analysisAntiChaseMark([]data.Candle{{Close: 101, Timestamp: now.Add(-time.Minute)}}, now); mark != 101 || source != "analysis_current_candle" {
+		t.Fatalf("current-session mark = %.2f/%s, want current candle", mark, source)
+	}
+	afterClose := time.Date(2026, time.August, 24, 17, 0, 0, 0, nyLoc)
+	if mark, source := analysisAntiChaseMark([]data.Candle{{Close: 100, Timestamp: yesterday}}, afterClose); mark != 100 || source != "analysis_latest_close" {
+		t.Fatalf("post-close mark = %.2f/%s, want completed close", mark, source)
 	}
 }
 

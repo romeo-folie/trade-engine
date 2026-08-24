@@ -364,12 +364,30 @@ func TestRepricePreparedStockEntryRequestUsesFinalAdmissionValues(t *testing.T) 
 		Quantity: 5, ReferencePrice: 100, IntentKey: "entry:prepared", ClientOrderID: "te-stock-prepared",
 		OrderClass: "bracket", StopLossPrice: 95, TakeProfitPrice: 110,
 	}
-	got := repricePreparedStockEntryRequest(original, 4, 125)
+	got, err := repricePreparedStockEntryRequest(original, 4, 125)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if got.Quantity != 4 || got.ReferencePrice != 125 {
 		t.Fatalf("repriced request = %+v, want quantity 4 at 125", got)
 	}
 	if got.ClientOrderID != original.ClientOrderID || got.OrderClass != original.OrderClass || got.StopLossPrice != original.StopLossPrice {
 		t.Fatalf("repricing changed durable order identity or policy: %+v", got)
+	}
+}
+
+func TestRepricePreparedStockEntryRequestPreservesProtectedWholeShareSizing(t *testing.T) {
+	protected := execution.OrderRequest{RequireBrokerProtection: true}
+	got, err := repricePreparedStockEntryRequest(protected, 4.8, 125)
+	if err != nil || got.Quantity != 4 {
+		t.Fatalf("protected replay = %+v, err=%v; want 4 whole shares", got, err)
+	}
+	if _, err := repricePreparedStockEntryRequest(execution.OrderRequest{UncappedTakeProfit: true}, .8, 125); err == nil {
+		t.Fatal("sub-share uncapped replay was accepted")
+	}
+	fractional, err := repricePreparedStockEntryRequest(execution.OrderRequest{}, .8, 125)
+	if err != nil || fractional.Quantity != .8 {
+		t.Fatalf("ordinary fractional replay = %+v, err=%v", fractional, err)
 	}
 }
 

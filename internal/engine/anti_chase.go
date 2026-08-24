@@ -123,17 +123,21 @@ func buildAntiChaseSnapshot(
 	s.RSI14, s.StochK, s.BBUpper = set.RSI, set.StochK, set.BBUpper
 	s.VolumeRatio = float64(completed[n-1].Volume) / (priorVolume / 20)
 	s.Return3SessionPct = (mark - returnRef) / returnRef * 100
-	if n >= antichase.TrueHighSessions {
+	// The close itself is the reference mark after the market closes, so it
+	// cannot also be part of its own prior-high comparison. Keep 253 earlier
+	// sessions in that case; an intraday mark can compare against all 253
+	// completed sessions already present.
+	highEnd := n
+	if !IsMarketOpen(now) {
+		highEnd = n - 1
+	}
+	if highEnd >= antichase.TrueHighSessions {
 		s.HistoryScope = "true_52w"
 		// At the close the reference mark is the latest completed close, so omit
 		// that bar to preserve breakout-extension evidence. During a live
 		// session the mark is intraday and the latest completed bar is yesterday,
 		// which must remain part of the prior-high history.
-		highEnd := n - 1
-		if IsMarketOpen(now) {
-			highEnd = n
-		}
-		for _, candle := range completed[n-antichase.TrueHighSessions : highEnd] {
+		for _, candle := range completed[highEnd-antichase.TrueHighSessions : highEnd] {
 			if candle.High > s.PriorHigh52Week {
 				s.PriorHigh52Week = candle.High
 			}
@@ -170,6 +174,24 @@ func antiChaseDailyHistoryFresh(completed []data.Candle, now time.Time) bool {
 	}
 	expected := MostRecentCompletedMarketSession(now, 0)
 	return sameDate(latest, expected.Date)
+}
+
+// analysisAntiChaseMark uses the already-fetched analysis candle as the mark.
+// During a live session a completed daily bar is yesterday's close, not a
+// current price; without a current-session candle the prompt-time gate must
+// record unavailable evidence and defer to the final broker-ask recheck.
+func analysisAntiChaseMark(candles []data.Candle, now time.Time) (float64, string) {
+	if len(candles) == 0 {
+		return 0, "analysis_current_mark_unavailable"
+	}
+	latest := candles[len(candles)-1]
+	if !IsMarketOpen(now) {
+		return latest.Close, "analysis_latest_close"
+	}
+	if latest.Timestamp.IsZero() || latest.Timestamp.After(now) || !sameDate(latest.Timestamp, now) {
+		return 0, "analysis_current_mark_unavailable"
+	}
+	return latest.Close, "analysis_current_candle"
 }
 
 // buildAnalysisAntiChaseSnapshot keeps a failed catalyst read distinct from a

@@ -1157,12 +1157,9 @@ func (e *Engine) runAnalysisWithProfile(
 				timingDaily = nil
 			}
 		}
-		mark := 0.0
-		if len(candles) > 0 {
-			mark = candles[len(candles)-1].Close
-		}
+		mark, markSource := analysisAntiChaseMark(candles, timingNow)
 		timingSnapshot = buildAnalysisAntiChaseSnapshot(
-			ticker, timingDaily, mark, "analysis_latest_close", timingNews, recentNewsErr,
+			ticker, timingDaily, mark, markSource, timingNews, recentNewsErr,
 			e.cfg.Risk.EntryGates.AntiChase.StaleCatalystRunupEnabled, timingNow,
 		)
 	}
@@ -2943,7 +2940,14 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		orderReq = *existingRequest
 		hydrateStockEntryReplayPolicy(&sig, orderReq)
 		if !admission.BrokerHeldReplay {
-			orderReq = repricePreparedStockEntryRequest(orderReq, qty, sig.SignalPrice)
+			var repriceErr error
+			orderReq, repriceErr = repricePreparedStockEntryRequest(orderReq, qty, sig.SignalPrice)
+			if repriceErr != nil {
+				reason := "unable to preserve whole-share protected entry replay"
+				_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+				logger.Warn("signal execution blocked", "ticker", sig.Ticker, "reason", reason, "err", repriceErr)
+				return
+			}
 		}
 	}
 

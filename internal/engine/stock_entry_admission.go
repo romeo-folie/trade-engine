@@ -569,10 +569,27 @@ func recalculateStockEntryQuantity(admission stockEntryAdmission, sizePct, ask, 
 // match the final ask and quantity evaluated by release risk. It is used only
 // for a durable intent proven not to be broker-held; persistence happens at
 // the final release boundary before PlaceOrder.
-func repricePreparedStockEntryRequest(req execution.OrderRequest, quantity, referencePrice float64) execution.OrderRequest {
+func repricePreparedStockEntryRequest(req execution.OrderRequest, quantity, referencePrice float64) (execution.OrderRequest, error) {
+	quantity, err := preparedReplayQuantity(req, quantity)
+	if err != nil {
+		return execution.OrderRequest{}, err
+	}
 	req.Quantity = quantity
 	req.ReferencePrice = referencePrice
-	return req
+	return req, nil
+}
+
+// preparedReplayQuantity preserves the persisted broker-protection contract.
+// Bracket and uncapped entries require a whole-share parent so their broker
+// protective stop can be submitted for the same quantity.
+func preparedReplayQuantity(req execution.OrderRequest, quantity float64) (float64, error) {
+	if req.RequireBrokerProtection || req.UncappedTakeProfit {
+		quantity = math.Floor(quantity)
+		if quantity < 1 {
+			return 0, errorsForAdmission("protected prepared replay requires at least one whole share")
+		}
+	}
+	return quantity, nil
 }
 
 func minimumWholeShareAllowed(quantity float64, fractionable bool, sizePct, ask, equity, capacity, maxPositionPct float64) bool {

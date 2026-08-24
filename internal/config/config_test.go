@@ -478,6 +478,15 @@ func TestValidateAntiChaseConfig(t *testing.T) {
 	if !containsStr(Validate(cfg), "risk.entry_gates.anti_chase.weak_volume_ratio_max") {
 		t.Fatalf("non-finite anti-chase threshold accepted: %v", Validate(cfg))
 	}
+	cfg.Risk.EntryGates.AntiChase.WeakVolumeRatioMax = .75
+	cfg.Risk.EntryGates.AntiChase.StaleAfterHours = 720
+	if !containsStr(Validate(cfg), "risk.entry_gates.anti_chase.stale_after_hours") {
+		t.Fatalf("unobservable catalyst threshold accepted: %v", Validate(cfg))
+	}
+	cfg.Risk.EntryGates.AntiChase.StaleAfterHours = 719.999
+	if errs := Validate(cfg); containsStr(errs, "risk.entry_gates.anti_chase.stale_after_hours") {
+		t.Fatalf("observable catalyst threshold rejected: %v", errs)
+	}
 	// Operators can enable only one combination without supplying thresholds
 	// that disabled combinations never consult.
 	cfg.Risk.EntryGates.AntiChase = AntiChaseConfig{
