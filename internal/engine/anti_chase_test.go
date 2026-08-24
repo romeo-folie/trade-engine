@@ -80,6 +80,33 @@ func TestBuildAntiChaseSnapshotLiveSessionUsesThreeSessionReferenceWithoutPartia
 	}
 }
 
+func TestBuildAntiChaseSnapshotLiveSessionIncludesYesterdayInPriorHigh(t *testing.T) {
+	now := time.Date(2026, time.August, 24, 15, 0, 0, 0, nyLoc)
+	candles := antiChaseDailyCandles(253, now)
+	// Today's mark is intraday, so yesterday remains a valid prior session even
+	// when it set a higher wick than its close.
+	candles[len(candles)-1].High = 150
+	snapshot := buildAntiChaseSnapshot("TEST", candles, 145, "test", nil, now)
+	if snapshot.PriorHigh52Week != 150 {
+		t.Fatalf("live-session prior high = %.2f, want yesterday's 150.00", snapshot.PriorHigh52Week)
+	}
+}
+
+func TestBuildAntiChaseSnapshotIncludesEarlyCloseBarAfterClose(t *testing.T) {
+	now := time.Date(2024, time.November, 29, 14, 0, 0, 0, nyLoc) // Black Friday, 13:00 close.
+	candles := antiChaseDailyCandles(253, now)
+	candles[len(candles)-1].Timestamp = now
+	mark := candles[len(candles)-1].Close
+	snapshot := buildAntiChaseSnapshot("TEST", candles, mark, "test", nil, now)
+	if snapshot.CompletedSessions != len(candles) {
+		t.Fatalf("early-close completed sessions = %d, want %d", snapshot.CompletedSessions, len(candles))
+	}
+	want := (mark - candles[249].Close) / candles[249].Close * 100
+	if math.Abs(snapshot.Return3SessionPct-want) > 1e-9 {
+		t.Fatalf("early-close three-session return = %.12f, want %.12f", snapshot.Return3SessionPct, want)
+	}
+}
+
 func TestFreshAntiChaseAskRejectsStaleQuote(t *testing.T) {
 	now := time.Now().UTC()
 	engine := &Engine{marketData: &pullbackEvidenceMarket{

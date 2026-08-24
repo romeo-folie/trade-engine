@@ -115,6 +115,16 @@ func Evaluate(snapshot Snapshot, policy Policy) Decision {
 		decision.Status = "disabled"
 		return decision
 	}
+	if !policy.StaleCatalystRunupEnabled && !policy.PriorHighExtensionEnabled && !policy.MomentumExhaustionEnabled {
+		decision.Status = "not_applicable"
+		decision.Reason = "anti-chase: no rule combinations are enabled"
+		decision.Rules = []RuleDecision{
+			{ID: "stale_catalyst_runup", Reason: "disabled"},
+			{ID: "prior_high_extension", Reason: "disabled"},
+			{ID: "momentum_exhaustion", Reason: "disabled"},
+		}
+		return decision
+	}
 	if snapshot.EvidenceStatus != "available" || !hasMinimumEvidence(snapshot) {
 		decision.Status = "unavailable_block"
 		if snapshot.EvidenceReason != "" {

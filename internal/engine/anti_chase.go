@@ -35,9 +35,10 @@ func antiChasePolicy(cfg config.AntiChaseConfig) antichase.Policy {
 }
 
 // buildAntiChaseSnapshot turns full daily history into compact, immutable prompt
-// evidence. It deliberately excludes a current partial session from indicators,
-// volumes, and 52-week history; the current mark is separately supplied by the
-// analysis candle or validated broker ask.
+// evidence. It deliberately excludes a current partial session from indicators
+// and volumes; the current mark is separately supplied by the analysis candle
+// or validated broker ask. During a live session, yesterday is a completed,
+// legitimate prior-high observation and remains in the 52-week history.
 func buildAntiChaseSnapshot(
 	ticker string,
 	daily []data.Candle,
@@ -97,9 +98,15 @@ func buildAntiChaseSnapshot(
 	s.Return3SessionPct = (mark - returnRef) / returnRef * 100
 	if n >= antichase.TrueHighSessions {
 		s.HistoryScope = "true_52w"
-		// The prior high intentionally excludes the latest completed session so
-		// a freshly completed breakout cannot erase its own extension evidence.
-		for _, candle := range completed[n-antichase.TrueHighSessions : n-1] {
+		// At the close the reference mark is the latest completed close, so omit
+		// that bar to preserve breakout-extension evidence. During a live
+		// session the mark is intraday and the latest completed bar is yesterday,
+		// which must remain part of the prior-high history.
+		highEnd := n - 1
+		if IsMarketOpen(now) {
+			highEnd = n
+		}
+		for _, candle := range completed[n-antichase.TrueHighSessions : highEnd] {
 			if candle.High > s.PriorHigh52Week {
 				s.PriorHigh52Week = candle.High
 			}
@@ -140,25 +147,16 @@ func (e *Engine) historyCandleLimit(tf data.Timeframe) int {
 	return historyCandles
 }
 
-// executionAntiChaseSnapshot refreshes the same daily evidence used during
-// analysis immediately before an order is released. A missing refresh is a
-// deliberate fail-closed condition for BUYs: an old analysis snapshot cannot
-// prove that an entry is still timely.
-func (e *Engine) executionAntiChaseSnapshot(ctx context.Context, ticker string, mark float64, source string, now time.Time) *antichase.Snapshot {
+// executionAntiChaseEvidence refreshes daily evidence before the final quote
+// is fetched. The final ask must be validated after this potentially slow work
+// so the timing decision and submitted market order share the same mark.
+func (e *Engine) executionAntiChaseEvidence(ctx context.Context, ticker string, now time.Time) ([]data.Candle, []analysis.NewsSnippet, string) {
 	if _, err := e.fetchAndStoreCandlesObserved(ctx, ticker, data.Timeframe1Day); err != nil {
-		return &antichase.Snapshot{
-			SchemaVersion: antichase.PolicyVersion, Ticker: ticker, ObservedAt: now.UTC(),
-			ReferencePrice: mark, ReferenceSource: source, EvidenceStatus: "unavailable",
-			HistoryScope: "limited_history", EvidenceReason: "anti-chase: unable to refresh daily evidence",
-		}
+		return nil, nil, "anti-chase: unable to refresh daily evidence"
 	}
 	daily, err := store.GetCandles(ctx, ticker, data.Timeframe1Day, now.AddDate(-2, 0, 0), now)
 	if err != nil {
-		return &antichase.Snapshot{
-			SchemaVersion: antichase.PolicyVersion, Ticker: ticker, ObservedAt: now.UTC(),
-			ReferencePrice: mark, ReferenceSource: source, EvidenceStatus: "unavailable",
-			HistoryScope: "limited_history", EvidenceReason: "anti-chase: unable to load refreshed daily evidence",
-		}
+		return nil, nil, "anti-chase: unable to load refreshed daily evidence"
 	}
 	items, err := store.GetRecentNews(ctx, ticker, now.AddDate(0, 0, -30))
 	if err != nil {
@@ -171,20 +169,25 @@ func (e *Engine) executionAntiChaseSnapshot(ctx context.Context, ticker string, 
 			Sentiment: sentimentLabel(item.SentimentScore),
 		})
 	}
-	return buildAntiChaseSnapshot(ticker, daily, mark, source, news, now)
+	return daily, news, ""
 }
 
-func (e *Engine) freshAntiChaseAsk(ctx context.Context, ticker string) float64 {
+func (e *Engine) freshAntiChaseQuote(ctx context.Context, ticker string, now time.Time) (*data.Quote, float64) {
 	if e.marketData == nil {
-		return 0
+		return nil, 0
 	}
 	quote, err := e.marketData.FetchQuote(ctx, ticker)
 	if err != nil || quote == nil || quote.Bid <= 0 {
-		return 0
+		return nil, 0
 	}
-	ask, err := validateStockAsk(quote, ticker, time.Now().UTC())
+	ask, err := validateStockAsk(quote, ticker, now)
 	if err != nil {
-		return 0
+		return nil, 0
 	}
+	return quote, ask
+}
+
+func (e *Engine) freshAntiChaseAsk(ctx context.Context, ticker string) float64 {
+	_, ask := e.freshAntiChaseQuote(ctx, ticker, time.Now().UTC())
 	return ask
 }

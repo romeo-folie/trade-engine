@@ -3034,11 +3034,14 @@ func Validate(cfg *Config) []string {
 	}
 	if anti := entryGates.AntiChase; anti.Enabled {
 		validate := func(name string, value, max float64) {
-			if value <= 0 || value > max {
+			if value <= 0 || value > max || math.IsNaN(value) || math.IsInf(value, 0) {
 				errs = append(errs, fmt.Sprintf("risk.entry_gates.anti_chase.%s must be within (0,%.0f], got %.4f", name, max, value))
 			}
 		}
 		needsWeakVolume := anti.StaleCatalystRunupEnabled || anti.PriorHighExtensionEnabled || anti.MomentumExhaustionEnabled
+		if !needsWeakVolume {
+			errs = append(errs, "risk.entry_gates.anti_chase.enabled requires at least one enabled rule")
+		}
 		if anti.StaleCatalystRunupEnabled {
 			validate("stale_after_hours", anti.StaleAfterHours, 24*30)
 			validate("min_return_3_session_pct", anti.MinReturn3SessionPct, 200)

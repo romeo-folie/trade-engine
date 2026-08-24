@@ -2800,42 +2800,57 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 
 	pState := e.portfolio.CurrentState()
 	qty := admission.Quantity
-	freshAntiChaseAskAvailable := admission.BrokerAuthoritative
 	if admission.BrokerAuthoritative {
 		sig.SignalPrice = admission.Ask
 		if err := store.UpdateSignalPrice(ctx, sigID, sig.SignalPrice); err != nil {
 			logger.Warn("update signal with fresh broker ask", "id", sigID, "err", err)
 		}
-	} else {
-		// Paper and non-broker executors still need a fresh two-sided ask for
-		// the universal timing release check; a stored signal close is not a
-		// substitute for current entry evidence.
-		if e.cfg.Risk.EntryGates.AntiChase.Enabled && !admission.BrokerHeldReplay {
-			if ask := e.freshAntiChaseAsk(ctx, sig.Ticker); ask > 0 {
-				freshAntiChaseAskAvailable = true
-				sig.SignalPrice = ask
-				if err := store.UpdateSignalPrice(ctx, sigID, sig.SignalPrice); err != nil {
-					logger.Warn("update signal with fresh anti-chase ask", "id", sigID, "err", err)
-				}
-			}
-		}
-		positionValue := pState.Cash * (sig.SizePct / 100)
-		qty = positionValue / sig.SignalPrice
 	}
 	if e.cfg.Risk.EntryGates.AntiChase.Enabled && !admission.BrokerHeldReplay {
 		source := "broker_validated_ask"
 		if !admission.BrokerAuthoritative {
 			source = "fresh_market_ask"
 		}
+		now := time.Now().UTC()
+		daily, news, evidenceReason := e.executionAntiChaseEvidence(ctx, sig.Ticker, now)
+		quote, finalAsk := e.freshAntiChaseQuote(ctx, sig.Ticker, time.Now().UTC())
 		var snapshot *antichase.Snapshot
-		if !freshAntiChaseAskAvailable {
+		if evidenceReason != "" {
+			snapshot = &antichase.Snapshot{
+				SchemaVersion: antichase.PolicyVersion, Ticker: sig.Ticker, ObservedAt: now,
+				ReferencePrice: sig.SignalPrice, ReferenceSource: source, EvidenceStatus: "unavailable",
+				HistoryScope: "limited_history", EvidenceReason: evidenceReason,
+			}
+		} else if finalAsk <= 0 {
 			snapshot = &antichase.Snapshot{
 				SchemaVersion: antichase.PolicyVersion, Ticker: sig.Ticker, ObservedAt: time.Now().UTC(),
 				ReferencePrice: sig.SignalPrice, ReferenceSource: source, EvidenceStatus: "unavailable",
 				HistoryScope: "limited_history", EvidenceReason: "anti-chase: fresh two-sided ask is unavailable",
 			}
 		} else {
-			snapshot = e.executionAntiChaseSnapshot(ctx, sig.Ticker, sig.SignalPrice, source, time.Now())
+			// Daily evidence may take seconds to refresh. Fetch this quote only
+			// afterward, so both the anti-chase decision and submitted market
+			// order use the final validated ask.
+			sig.SignalPrice = finalAsk
+			if admission.BrokerAuthoritative {
+				admission.Ask, admission.QuoteAt = finalAsk, quote.Timestamp
+				if existingRequest == nil {
+					resized, err := recalculateStockEntryQuantity(
+						admission, sig.SizePct, finalAsk, e.cfg.Risk.MaxPositionPct,
+					)
+					if err != nil {
+						reason := "unable to size entry from final anti-chase ask"
+						_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+						logger.Warn("signal execution blocked", "ticker", sig.Ticker, "reason", reason, "err", err)
+						return
+					}
+					qty, admission.Quantity = resized, resized
+				}
+			}
+			if err := store.UpdateSignalPrice(ctx, sigID, sig.SignalPrice); err != nil {
+				logger.Warn("update signal with final anti-chase ask", "id", sigID, "err", err)
+			}
+			snapshot = buildAntiChaseSnapshot(sig.Ticker, daily, sig.SignalPrice, source, news, time.Now())
 		}
 		reason, decision := antiChaseEntryGate(snapshot, antiChasePolicy(e.cfg.Risk.EntryGates.AntiChase))
 		details, _ := json.Marshal(struct {
@@ -2866,6 +2881,10 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 			logger.Warn("signal execution blocked — final anti-chase audit failed", "ticker", sig.Ticker, "err", err)
 			return
 		}
+	}
+	if !admission.BrokerAuthoritative {
+		positionValue := pState.Cash * (sig.SizePct / 100)
+		qty = positionValue / sig.SignalPrice
 	}
 	if qty <= 0 {
 		reason := fmt.Sprintf("zero quantity (size_pct=%.2f signal_price=%.4f)", sig.SizePct, sig.SignalPrice)

@@ -343,6 +343,21 @@ func TestValidateStockAskRequiresFreshPositiveAsk(t *testing.T) {
 	}
 }
 
+func TestRecalculateStockEntryQuantityUsesFinalAsk(t *testing.T) {
+	admission := stockEntryAdmission{
+		Account:           execution.BrokerAccount{Equity: 1_000},
+		Asset:             execution.StockAsset{Fractionable: true},
+		RemainingCapacity: 500,
+	}
+	got, err := recalculateStockEntryQuantity(admission, 10, 125, 50)
+	if err != nil {
+		t.Fatalf("recalculate quantity: %v", err)
+	}
+	if got != 0.8 {
+		t.Fatalf("final-ask quantity = %.6f, want 0.8", got)
+	}
+}
+
 func TestApplyStockEntryReservations(t *testing.T) {
 	now := time.Now().UTC()
 	prepared := store.ActiveStockEntryReservation{

@@ -65,3 +65,14 @@ func TestEvaluateFailsClosedForMissingCoreEvidence(t *testing.T) {
 		t.Fatalf("decision = %+v, want unavailable_block", got)
 	}
 }
+
+func TestEvaluateNoEnabledRulesDoesNotRequireEvidence(t *testing.T) {
+	policy := DefaultPolicy()
+	policy.StaleCatalystRunupEnabled = false
+	policy.PriorHighExtensionEnabled = false
+	policy.MomentumExhaustionEnabled = false
+	got := Evaluate(Snapshot{}, policy)
+	if got.Status != "not_applicable" {
+		t.Fatalf("no-rule policy = %+v, want not_applicable", got)
+	}
+}

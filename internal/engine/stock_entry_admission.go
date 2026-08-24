@@ -543,6 +543,28 @@ func sizeStockEntry(equity, sizePct, capacity, ask float64, fractionable bool) (
 	return floorStockQuantity(math.Min(desiredNotional, capacity)/ask, fractionable), nil
 }
 
+// recalculateStockEntryQuantity applies the same allocation and whole-share
+// admission rules to a later validated ask. It is used when a final execution
+// gate deliberately refreshes price evidence after the initial admission.
+func recalculateStockEntryQuantity(admission stockEntryAdmission, sizePct, ask, maxPositionPct float64) (float64, error) {
+	quantity, err := sizeStockEntry(
+		admission.Account.Equity, sizePct, admission.RemainingCapacity, ask, admission.Asset.Fractionable,
+	)
+	if err != nil {
+		return 0, err
+	}
+	if minimumWholeShareAllowed(
+		quantity, admission.Asset.Fractionable, sizePct, ask, admission.Account.Equity,
+		admission.RemainingCapacity, maxPositionPct,
+	) {
+		quantity = 1
+	}
+	if !finitePositive(quantity) {
+		return 0, errorsForAdmission("available buying power produces zero quantity")
+	}
+	return quantity, nil
+}
+
 func minimumWholeShareAllowed(quantity float64, fractionable bool, sizePct, ask, equity, capacity, maxPositionPct float64) bool {
 	return quantity <= 0 && !fractionable && sizePct > 0 && ask > 0 &&
 		maxPositionPct > 0 && ask <= equity*maxPositionPct/100+1e-9 && ask <= capacity+1e-9
