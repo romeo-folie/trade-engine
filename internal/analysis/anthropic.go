@@ -404,6 +404,7 @@ func toPromptIndicators(s IndicatorSnapshot) prompts.Indicators {
 		ADX: s.ADX, ATR: s.ATR, OBV: s.OBV,
 		StochK: s.StochK, StochD: s.StochD,
 		VWAP: s.VWAP, VolSMA20: s.VolSMA20, VolRatio: s.VolRatio,
+		TimingSnapshot: s.TimingSnapshot,
 	}
 }
 

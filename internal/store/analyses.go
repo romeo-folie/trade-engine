@@ -67,6 +67,8 @@ type AnalysisAudit struct {
 	Regime            string
 	SelectionStatus   analysis.LensSelectionStatus
 	TimeframeWorkflow *TimeframeWorkflowAudit
+	TimingSnapshot    any
+	DecisionPolicy    *analysis.DecisionPolicyAudit
 }
 
 type TimeframePassAudit struct {
@@ -97,7 +99,7 @@ func InsertAnalysisWithScannerRunAudit(
 	scannerRunID string,
 	audit AnalysisAudit,
 ) (string, error) {
-	selectedLens, rejectedLenses, regime, status, workflow, err := analysisAuditValues(audit)
+	selectedLens, rejectedLenses, regime, status, workflow, timingSnapshot, decisionPolicy, err := analysisAuditValues(audit)
 	if err != nil {
 		return "", err
 	}
@@ -109,7 +111,8 @@ func InsertAnalysisWithScannerRunAudit(
 			model_provider, model_name,
 			token_count_input, token_count_output, latency_ms,
 			indicators, scanner_run_id,
-			selected_lens, rejected_lenses, regime, lens_selection_status, timeframe_workflow
+			selected_lens, rejected_lenses, regime, lens_selection_status, timeframe_workflow,
+			timing_snapshot, decision_policy
 		) VALUES (
 			$1, $2, $3, $4, $5,
 			$6, $7, $8,
@@ -117,7 +120,8 @@ func InsertAnalysisWithScannerRunAudit(
 			$12, $13,
 			$14, $15, $16,
 			$17, $18,
-			$19, $20, $21, $22, $23
+			$19, $20, $21, $22, $23,
+			$24, $25
 		) RETURNING id`
 	var id string
 	err = GetDB().QueryRow(ctx, q,
@@ -127,7 +131,7 @@ func InsertAnalysisWithScannerRunAudit(
 		meta.Provider, meta.Model,
 		meta.InputTokens, meta.OutputTokens, meta.LatencyMs,
 		meta.IndicatorJSON, nullableString(scannerRunID),
-		selectedLens, rejectedLenses, regime, status, workflow,
+		selectedLens, rejectedLenses, regime, status, workflow, timingSnapshot, decisionPolicy,
 	).Scan(&id)
 	return id, err
 }
@@ -144,7 +148,7 @@ type EnsembleRecord struct {
 
 // InsertEnsembleAnalysis persists an ensemble analysis record (Phase 12).
 func InsertEnsembleAnalysis(ctx context.Context, ticker, strategy string, resp analysis.AnalysisResponse, meta analysis.ModelCallMeta, ensemble EnsembleRecord) (string, error) {
-	selectedLens, rejectedLenses, regime, status, workflow, err := analysisAuditValues(ensemble.Audit)
+	selectedLens, rejectedLenses, regime, status, workflow, timingSnapshot, decisionPolicy, err := analysisAuditValues(ensemble.Audit)
 	if err != nil {
 		return "", err
 	}
@@ -158,7 +162,8 @@ func InsertEnsembleAnalysis(ctx context.Context, ticker, strategy string, resp a
 			indicators,
 			ensemble_results, arbiter_response, fast_pathed, dissent_summary,
 			scanner_run_id,
-			selected_lens, rejected_lenses, regime, lens_selection_status, timeframe_workflow
+			selected_lens, rejected_lenses, regime, lens_selection_status, timeframe_workflow,
+			timing_snapshot, decision_policy
 		) VALUES (
 			$1, $2, $3, $4, $5,
 			$6, $7, $8,
@@ -167,7 +172,8 @@ func InsertEnsembleAnalysis(ctx context.Context, ticker, strategy string, resp a
 			$14, $15, $16,
 			$17,
 			$18, $19, $20, $21, $22,
-			$23, $24, $25, $26, $27
+			$23, $24, $25, $26, $27,
+			$28, $29
 		) RETURNING id`
 	var id string
 	err = GetDB().QueryRow(ctx, q,
@@ -179,28 +185,40 @@ func InsertEnsembleAnalysis(ctx context.Context, ticker, strategy string, resp a
 		meta.IndicatorJSON,
 		ensemble.EnsembleResults, ensemble.ArbiterResponse, ensemble.FastPathed,
 		nullableString(ensemble.DissentSummary), nullableString(ensemble.ScannerRunID),
-		selectedLens, rejectedLenses, regime, status, workflow,
+		selectedLens, rejectedLenses, regime, status, workflow, timingSnapshot, decisionPolicy,
 	).Scan(&id)
 	return id, err
 }
 
-func analysisAuditValues(audit AnalysisAudit) (selectedLens, rejectedLenses, regime, status, workflow any, err error) {
+func analysisAuditValues(audit AnalysisAudit) (selectedLens, rejectedLenses, regime, status, workflow, timingSnapshot, decisionPolicy any, err error) {
 	if audit.SelectionStatus == "" {
 		audit.SelectionStatus = analysis.LensSelectionAbsent
 	}
 	if len(audit.RejectedLenses) > 0 {
 		rejectedLenses, err = json.Marshal(audit.RejectedLenses)
 		if err != nil {
-			return nil, nil, nil, nil, nil, fmt.Errorf("marshal rejected lenses: %w", err)
+			return nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("marshal rejected lenses: %w", err)
 		}
 	}
 	if audit.TimeframeWorkflow != nil {
 		workflow, err = json.Marshal(audit.TimeframeWorkflow)
 		if err != nil {
-			return nil, nil, nil, nil, nil, fmt.Errorf("marshal timeframe workflow: %w", err)
+			return nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("marshal timeframe workflow: %w", err)
 		}
 	}
-	return nullableString(audit.SelectedLens), rejectedLenses, nullableString(audit.Regime), string(audit.SelectionStatus), workflow, nil
+	if audit.TimingSnapshot != nil {
+		timingSnapshot, err = json.Marshal(audit.TimingSnapshot)
+		if err != nil {
+			return nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("marshal timing snapshot: %w", err)
+		}
+	}
+	if audit.DecisionPolicy != nil {
+		decisionPolicy, err = json.Marshal(audit.DecisionPolicy)
+		if err != nil {
+			return nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("marshal decision policy: %w", err)
+		}
+	}
+	return nullableString(audit.SelectedLens), rejectedLenses, nullableString(audit.Regime), string(audit.SelectionStatus), workflow, timingSnapshot, decisionPolicy, nil
 }
 
 // ModelPerformanceRow is a row from the model_performance_detail view.
@@ -734,6 +752,8 @@ type AnalysisSummary struct {
 	Regime                   string `json:"-"`
 	LensSelectionStatus      string `json:"-"`
 	TimeframeWorkflowRaw     []byte `json:"-"`
+	TimingSnapshotRaw        []byte `json:"-"`
+	DecisionPolicyRaw        []byte `json:"-"`
 	RelatedSignalAction      string `json:"-"`
 	RelatedSignalStatus      string `json:"-"`
 	RelatedSignalBlockReason string `json:"-"`
@@ -807,6 +827,7 @@ func GetAnalysisDetail(ctx context.Context, id string) (*AnalysisSummary, error)
 		       COALESCE(a.indicators, '{}'::jsonb), COALESCE(a.selected_lens, ''),
 		       COALESCE(a.rejected_lenses, '{}'::jsonb), COALESCE(a.regime, ''),
 		       COALESCE(a.lens_selection_status, ''), COALESCE(a.timeframe_workflow, '{}'::jsonb),
+		       COALESCE(a.timing_snapshot, '{}'::jsonb), COALESCE(a.decision_policy, '{}'::jsonb),
 		       COALESCE(sig.action::text, ''), COALESCE(sig.status::text, ''), COALESCE(sig.block_reason, ''),
 		       COALESCE(sig.entry_setup, ''), COALESCE(sig.entry_setup_evidence, ''),
 		       COALESCE(sig.entry_gate_decisions, '[]'::jsonb)
@@ -836,6 +857,7 @@ func GetAnalysisDetail(ctx context.Context, id string) (*AnalysisSummary, error)
 		&a.FastPathed, &a.DissentSummaryRaw,
 		&a.IndicatorsRaw, &a.SelectedLens, &a.RejectedLensesRaw, &a.Regime,
 		&a.LensSelectionStatus, &a.TimeframeWorkflowRaw,
+		&a.TimingSnapshotRaw, &a.DecisionPolicyRaw,
 		&a.RelatedSignalAction, &a.RelatedSignalStatus, &a.RelatedSignalBlockReason,
 		&a.EntrySetup, &a.EntrySetupEvidence, &a.EntryGateDecisionsRaw,
 	)

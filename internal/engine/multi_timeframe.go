@@ -271,9 +271,10 @@ func (e *Engine) runSecondTimeframePass(ctx context.Context, primaryReq analysis
 		BBLower:       set.BBLower,
 		ADX:           set.ADX, ATR: set.ATR, OBV: set.OBV,
 		StochK: set.StochK, StochD: set.StochD,
-		VWAP:     set.VWAP,
-		VolSMA20: set.VolumeSMA20,
-		VolRatio: volRatio(candles, set.VolumeSMA20),
+		VWAP:           set.VWAP,
+		VolSMA20:       set.VolumeSMA20,
+		VolRatio:       volRatio(candles, set.VolumeSMA20),
+		TimingSnapshot: primaryReq.Indicators.TimingSnapshot,
 	}
 
 	// Reuse the primary pass's impact score so the alt fan-out runs at the
@@ -346,6 +347,7 @@ func (e *Engine) runProfileConfirmation(ctx context.Context, primaryReq analysis
 		BBLower: set.BBLower, ADX: set.ADX, ATR: set.ATR, OBV: set.OBV,
 		StochK: set.StochK, StochD: set.StochD, VWAP: set.VWAP,
 		VolSMA20: set.VolumeSMA20, VolRatio: volRatio(candles, set.VolumeSMA20),
+		TimingSnapshot: primaryReq.Indicators.TimingSnapshot,
 	}
 	var result analysis.AnalyzeResult
 	if e.cfg.Analysis.SpecialistModeEnabled {

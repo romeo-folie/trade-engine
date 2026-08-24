@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/analysis/prompts"
+	"github.com/romeo-folie/trade-engine/internal/strategy/antichase"
 	"github.com/romeo-folie/trade-engine/internal/strategy/pullback"
 	"github.com/romeo-folie/trade-engine/internal/tradeprofile"
 )
@@ -245,6 +246,9 @@ type IndicatorSnapshot struct {
 	VWAP     float64
 	VolSMA20 float64
 	VolRatio float64 // current volume / VolSMA20 — computed by engine at callsite
+	// TimingSnapshot is a deterministic, daily entry-quality context. It is
+	// deliberately distinct from the short prompt candle window.
+	TimingSnapshot *antichase.Snapshot
 }
 
 // NewsSnippet is a compressed news item for prompt inclusion.
@@ -305,4 +309,21 @@ type AnalyzeResult struct {
 	AnalystResults []AnalystResult
 	Arbiter        *ArbiterResult // nil when fast-pathed or single-model
 	FastPathed     bool
+	DecisionPolicy *DecisionPolicyAudit
+}
+
+// DecisionPolicyAudit records deterministic topology constraints applied after
+// a model response. In specialist mode it prevents the risk reviewer from
+// originating a new BUY without support from the directional electorate.
+type DecisionPolicyAudit struct {
+	Version          int               `json:"version"`
+	Mode             string            `json:"mode"`
+	DirectionalVotes map[string]Action `json:"directional_votes"`
+	RiskAction       Action            `json:"risk_action"`
+	BuyVotes         int               `json:"buy_votes"`
+	RequiredBuyVotes int               `json:"required_buy_votes"`
+	OriginalAction   Action            `json:"original_action"`
+	ResolvedAction   Action            `json:"resolved_action"`
+	Applied          bool              `json:"applied"`
+	Reason           string            `json:"reason,omitempty"`
 }

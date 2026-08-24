@@ -245,6 +245,48 @@ func TestAnalyzeSpecialist_RiskReviewerReceivesFindingsAndOwnsFinalOutcome(t *te
 	}
 }
 
+func TestResolveSpecialistRiskDecision_BuyRequiresTwoDirectionalBuys(t *testing.T) {
+	tests := []struct {
+		name       string
+		votes      []Action
+		wantAction Action
+		applied    bool
+	}{
+		{"one buy and wait becomes wait", []Action{ActionBuy, ActionWait, ActionHold}, ActionWait, true},
+		{"one buy and holds becomes hold", []Action{ActionBuy, ActionHold, ActionHold}, ActionHold, true},
+		{"two directional buys permit risk buy", []Action{ActionBuy, ActionBuy, ActionWait}, ActionBuy, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			roles := []string{"fundamental", "technical", "sentiment"}
+			results := make([]specialistResult, 0, 3)
+			for i, action := range tt.votes {
+				results = append(results, specialistResult{Role: roles[i], Response: AnalysisResponse{Action: action}})
+			}
+			risk := AnalysisResponse{Action: ActionBuy, Confidence: .8, SizePct: 3, StopLoss: 90, TakeProfit: 120}
+			got, audit := resolveSpecialistRiskDecision(results, risk)
+			if got.Action != tt.wantAction || audit.Applied != tt.applied {
+				t.Fatalf("resolved = %s applied=%t; want %s applied=%t", got.Action, audit.Applied, tt.wantAction, tt.applied)
+			}
+			if tt.applied && (got.SizePct != 0 || got.StopLoss != 0 || got.TakeProfit != 0) {
+				t.Fatalf("downgraded response retained BUY order fields: %+v", got)
+			}
+		})
+	}
+}
+
+func TestResolveSpecialistRiskDecision_RiskSellIsUnrestricted(t *testing.T) {
+	results := []specialistResult{
+		{Role: "fundamental", Response: AnalysisResponse{Action: ActionHold}},
+		{Role: "technical", Response: AnalysisResponse{Action: ActionWait}},
+		{Role: "sentiment", Response: AnalysisResponse{Action: ActionHold}},
+	}
+	got, audit := resolveSpecialistRiskDecision(results, AnalysisResponse{Action: ActionSell})
+	if got.Action != ActionSell || audit.Applied {
+		t.Fatalf("risk SELL must be preserved, got %s audit=%+v", got.Action, audit)
+	}
+}
+
 // TestModelTimeoutForRegistry_RegistryWins is the regression guard for the
 // Copilot-flagged real bug: specialist roles map to registry keys that aren't
 // in models.roles.analysts, so modelTimeout() silently returned the hardcoded

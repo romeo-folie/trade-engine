@@ -30,6 +30,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/portfolio"
 	"github.com/romeo-folie/trade-engine/internal/risk"
 	"github.com/romeo-folie/trade-engine/internal/store"
+	"github.com/romeo-folie/trade-engine/internal/strategy/antichase"
 	"github.com/romeo-folie/trade-engine/internal/strategy/pullback"
 	"github.com/romeo-folie/trade-engine/internal/tradeprofile"
 )
@@ -40,8 +41,9 @@ const (
 	// wrap to a negative duration.
 	maxTickIntervalSec = math.MaxInt64 / int64(time.Second)
 
-	// historyCandles is the number of candles fetched per watchlist item per tick.
-	// 200 daily bars covers ~10 months; enough for EMA200 and ADX warmup.
+	// historyCandles is the standard number of candles fetched per watchlist item
+	// per tick. The anti-chase policy requests a larger daily-only history through
+	// historyCandleLimit so it can establish a true prior 52-week high.
 	historyCandles = 200
 
 	// newsFetchInterval is the minimum time between news fetches for the same ticker.
@@ -657,7 +659,7 @@ func (e *Engine) processStockWithProfile(
 		hasEntryStrategy(strategies, store.EntrySetupPullbackStrength)
 	pullbackPromptCandidate := pullbackLensAdmissible(strategies, executionProfile)
 	needsDailyEvidence := pullbackCandidate || pullbackPromptCandidate ||
-		entryGates.TrendAlignmentEnabled
+		entryGates.TrendAlignmentEnabled || entryGates.AntiChase.Enabled
 	fetchTimeframes := workflow.FetchTimeframes
 	if workflow.ProfileOwned {
 		// Entry-timing evidence is fetched only if the primary decision is
@@ -1071,7 +1073,9 @@ func (e *Engine) runAnalysisWithProfile(
 	// Load recent news from the store for prompt inclusion.
 	// Note: newsItems also fetched by processStock for the material-change gate;
 	// this second query is a lightweight store read (no API call).
-	recentNews, _ := store.GetRecentNews(ctx, ticker, time.Now().Add(-48*time.Hour))
+	// Keep a longer timestamped source window for the deterministic timing
+	// snapshot. The prompt still receives only its configured newest subset.
+	recentNews, _ := store.GetRecentNews(ctx, ticker, time.Now().AddDate(0, 0, -30))
 	// Cap news articles to MaxNewsArticlesPerPrompt — newest first, excess dropped.
 	newsCap := e.cfg.Analysis.MaxNewsArticlesPerPrompt
 	if newsCap <= 0 {
@@ -1138,6 +1142,28 @@ func (e *Engine) runAnalysisWithProfile(
 		}
 	}
 
+	// Build the deterministic timing snapshot from full daily history. The
+	// prompt remains capped to its short strategy window; this separate block is
+	// the only source of long-history/high-proximity facts available to models.
+	var timingSnapshot *antichase.Snapshot
+	if e.cfg.Risk.EntryGates.AntiChase.Enabled {
+		timingDaily := candles
+		if data.Timeframe(timeframe) != data.Timeframe1Day {
+			var dailyErr error
+			timingDaily, dailyErr = store.GetCandles(ctx, ticker, data.Timeframe1Day,
+				time.Now().AddDate(-2, 0, 0), time.Now())
+			if dailyErr != nil {
+				logger.Warn("anti-chase: load daily timing evidence", "ticker", ticker, "err", dailyErr)
+				timingDaily = nil
+			}
+		}
+		mark := 0.0
+		if len(candles) > 0 {
+			mark = candles[len(candles)-1].Close
+		}
+		timingSnapshot = buildAntiChaseSnapshot(ticker, timingDaily, mark, "analysis_latest_close", snippets, time.Now())
+	}
+
 	req := analysis.AnalysisRequest{
 		Ticker:             ticker,
 		Strategy:           strategy,
@@ -1163,9 +1189,10 @@ func (e *Engine) runAnalysisWithProfile(
 			BBLower:       set.BBLower,
 			ADX:           set.ADX, ATR: set.ATR, OBV: set.OBV,
 			StochK: set.StochK, StochD: set.StochD,
-			VWAP:     set.VWAP,
-			VolSMA20: set.VolumeSMA20,
-			VolRatio: volRatio(candles, set.VolumeSMA20),
+			VWAP:           set.VWAP,
+			VolSMA20:       set.VolumeSMA20,
+			VolRatio:       volRatio(candles, set.VolumeSMA20),
+			TimingSnapshot: timingSnapshot,
 		},
 		News:      snippets,
 		Portfolio: e.portfolioContextForPrompt(ctx),
@@ -1448,6 +1475,8 @@ func (e *Engine) runAnalysisWithProfile(
 				Regime:            lensAudit.Regime,
 				SelectionStatus:   lensAudit.SelectionStatus,
 				TimeframeWorkflow: &workflowAudit,
+				TimingSnapshot:    timingSnapshot,
+				DecisionPolicy:    result.DecisionPolicy,
 			},
 		})
 	} else {
@@ -1458,6 +1487,8 @@ func (e *Engine) runAnalysisWithProfile(
 				Regime:            lensAudit.Regime,
 				SelectionStatus:   lensAudit.SelectionStatus,
 				TimeframeWorkflow: &workflowAudit,
+				TimingSnapshot:    timingSnapshot,
+				DecisionPolicy:    result.DecisionPolicy,
 			},
 		)
 	}
@@ -1476,7 +1507,7 @@ func (e *Engine) runAnalysisWithProfile(
 	// prefetch unset, and generateSignal then re-fetches on-demand and applies
 	// its degraded-mode handling.
 	e.generateSignal(
-		ctx, ticker, signalTimeframe, strategy, strategies, signalCandles, resp, analysisID,
+		ctx, ticker, signalTimeframe, strategy, strategies, signalCandles, resp, timingSnapshot, analysisID,
 		prefetchedOpenTrades, e.analysisSourceNode(result), scannerRunID,
 		pullbackCandidate, req.LensSet(),
 	)
@@ -1807,7 +1838,7 @@ func (e *Engine) fetchAndStoreCandlesObserved(
 	if e.marketData == nil {
 		return time.Time{}, fmt.Errorf("market data unavailable")
 	}
-	candles, err := e.marketData.FetchHistory(ctx, ticker, tf, historyCandles)
+	candles, err := e.marketData.FetchHistory(ctx, ticker, tf, e.historyCandleLimit(tf))
 	if err != nil {
 		logger.Warn("fetch candles", "ticker", ticker, "tf", string(tf), "err", err.Error())
 		return time.Time{}, err
@@ -2017,6 +2048,7 @@ func (e *Engine) generateSignal(
 	strategies []string,
 	candles []data.Candle,
 	resp analysis.AnalysisResponse,
+	timingSnapshot *antichase.Snapshot,
 	analysisID string,
 	prefetchedOpenTrades []store.Trade,
 	analysisSourceNode string,
@@ -2076,7 +2108,7 @@ func (e *Engine) generateSignal(
 		AnalysisIDs:       analysisIDs,
 		CreatedAt:         createdAt,
 	}
-	gateDecisions := make([]store.EntryGateDecision, 0, 4)
+	gateDecisions := make([]store.EntryGateDecision, 0, 5)
 
 	// Entry-quality gates (entry_gates.go): daily trend alignment, news
 	// tape-confirmation, and momentum anti-chase. Checked before the generic
@@ -2108,7 +2140,7 @@ func (e *Engine) generateSignal(
 		pullbackConfirmed := false
 		pullbackFailureReason := ""
 		needsDailyEvidence := pullbackEvaluationRequired ||
-			eg.TrendAlignmentEnabled
+			eg.TrendAlignmentEnabled || eg.AntiChase.Enabled
 		if pullbackEvaluationRequired {
 			// The analyst may take long enough for the session low to change.
 			// Refresh the partial daily bar at qualification time, then scan
@@ -2134,6 +2166,29 @@ func (e *Engine) generateSignal(
 					"ticker", ticker, "err", err)
 				entryDailyCandles = nil
 			}
+		}
+		if eg.AntiChase.Enabled {
+			policy := antiChasePolicy(eg.AntiChase)
+			reason := "anti-chase: deterministic timing evidence was not recorded"
+			decision := antichase.Decision{Status: "unavailable_block", Reason: reason}
+			if timingSnapshot != nil {
+				reason, decision = antiChaseEntryGate(timingSnapshot, policy)
+			}
+			details, _ := json.Marshal(struct {
+				Snapshot *antichase.Snapshot `json:"snapshot,omitempty"`
+				Decision antichase.Decision  `json:"decision"`
+			}{timingSnapshot, decision})
+			status := "passed"
+			if reason != "" {
+				status = "blocked"
+				entryGateReason = reason
+				entryGateFailedCheck = "universal_anti_chase"
+			}
+			gateDecisions = append(gateDecisions, store.EntryGateDecision{
+				Name: "universal_anti_chase", Status: status, Reason: reason, Details: details,
+			})
+		} else {
+			gateDecisions = append(gateDecisions, store.EntryGateDecision{Name: "universal_anti_chase", Status: "disabled"})
 		}
 		if pullbackEvaluationRequired && !pullbackObservedAt.IsZero() {
 			// Use the refreshed daily snapshot's close for reclaim, stop width,
@@ -2742,14 +2797,71 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 
 	pState := e.portfolio.CurrentState()
 	qty := admission.Quantity
+	freshAntiChaseAskAvailable := admission.BrokerAuthoritative
 	if admission.BrokerAuthoritative {
 		sig.SignalPrice = admission.Ask
 		if err := store.UpdateSignalPrice(ctx, sigID, sig.SignalPrice); err != nil {
 			logger.Warn("update signal with fresh broker ask", "id", sigID, "err", err)
 		}
 	} else {
+		// Paper and non-broker executors still need a fresh two-sided ask for
+		// the universal timing release check; a stored signal close is not a
+		// substitute for current entry evidence.
+		if e.cfg.Risk.EntryGates.AntiChase.Enabled && !admission.BrokerHeldReplay {
+			if ask := e.freshAntiChaseAsk(ctx, sig.Ticker); ask > 0 {
+				freshAntiChaseAskAvailable = true
+				sig.SignalPrice = ask
+				if err := store.UpdateSignalPrice(ctx, sigID, sig.SignalPrice); err != nil {
+					logger.Warn("update signal with fresh anti-chase ask", "id", sigID, "err", err)
+				}
+			}
+		}
 		positionValue := pState.Cash * (sig.SizePct / 100)
 		qty = positionValue / sig.SignalPrice
+	}
+	if e.cfg.Risk.EntryGates.AntiChase.Enabled && !admission.BrokerHeldReplay {
+		source := "broker_validated_ask"
+		if !admission.BrokerAuthoritative {
+			source = "fresh_market_ask"
+		}
+		var snapshot *antichase.Snapshot
+		if !freshAntiChaseAskAvailable {
+			snapshot = &antichase.Snapshot{
+				SchemaVersion: antichase.PolicyVersion, Ticker: sig.Ticker, ObservedAt: time.Now().UTC(),
+				ReferencePrice: sig.SignalPrice, ReferenceSource: source, EvidenceStatus: "unavailable",
+				HistoryScope: "limited_history", EvidenceReason: "anti-chase: fresh two-sided ask is unavailable",
+			}
+		} else {
+			snapshot = e.executionAntiChaseSnapshot(ctx, sig.Ticker, sig.SignalPrice, source, time.Now())
+		}
+		reason, decision := antiChaseEntryGate(snapshot, antiChasePolicy(e.cfg.Risk.EntryGates.AntiChase))
+		details, _ := json.Marshal(struct {
+			Snapshot *antichase.Snapshot `json:"snapshot"`
+			Decision antichase.Decision  `json:"decision"`
+		}{snapshot, decision})
+		gate := store.EntryGateDecision{
+			Name: "universal_anti_chase_release", Status: "passed",
+			Details: details, ObservedAt: time.Now().UTC(),
+		}
+		if reason != "" {
+			gate.Status, gate.Reason = "blocked", reason
+			if err := store.BlockSignalWithEntryGateDecision(ctx, sigID, reason, gate); err != nil {
+				logger.Warn("persist anti-chase execution block", "id", sigID, "err", err)
+			}
+			logger.Warn("signal execution blocked by universal anti-chase gate",
+				"ticker", sig.Ticker, "reason", reason)
+			e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+				Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
+				BlockReason: reason, FailedCheck: "universal_anti_chase_release",
+			})
+			return
+		}
+		if err := store.AppendSignalEntryGateDecision(ctx, sigID, gate); err != nil {
+			reason := "anti-chase: unable to persist final timing release audit"
+			_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+			logger.Warn("signal execution blocked — final anti-chase audit failed", "ticker", sig.Ticker, "err", err)
+			return
+		}
 	}
 	if qty <= 0 {
 		reason := fmt.Sprintf("zero quantity (size_pct=%.2f signal_price=%.4f)", sig.SizePct, sig.SignalPrice)

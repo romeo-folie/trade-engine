@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -13,9 +14,11 @@ const (
 )
 
 type EntryGateDecision struct {
-	Name   string `json:"name"`
-	Status string `json:"status"`
-	Reason string `json:"reason,omitempty"`
+	Name       string          `json:"name"`
+	Status     string          `json:"status"`
+	Reason     string          `json:"reason,omitempty"`
+	Details    json.RawMessage `json:"details,omitempty"`
+	ObservedAt time.Time       `json:"observed_at,omitempty"`
 }
 
 // Signal mirrors a row from the signals table.
@@ -95,6 +98,37 @@ func UpdateSignalStatus(ctx context.Context, id, status, blockReason string) err
 	_, err := GetDB().Exec(ctx, `
 		UPDATE signals SET status=$1, block_reason=$2, updated_at=NOW() WHERE id=$3`,
 		status, nullableString(blockReason), id)
+	return err
+}
+
+// AppendSignalEntryGateDecision records a release-time gate without replacing
+// the analysis-time audit trail.
+func AppendSignalEntryGateDecision(ctx context.Context, id string, decision EntryGateDecision) error {
+	payload, err := json.Marshal(decision)
+	if err != nil {
+		return err
+	}
+	_, err = GetDB().Exec(ctx, `
+		UPDATE signals
+		SET entry_gate_decisions = COALESCE(entry_gate_decisions, '[]'::jsonb) || $1::jsonb,
+		    updated_at=NOW()
+		WHERE id=$2::uuid`, payload, id)
+	return err
+}
+
+// BlockSignalWithEntryGateDecision atomically records the final failed gate
+// and prevents further automated execution of the signal.
+func BlockSignalWithEntryGateDecision(ctx context.Context, id, reason string, decision EntryGateDecision) error {
+	payload, err := json.Marshal(decision)
+	if err != nil {
+		return err
+	}
+	_, err = GetDB().Exec(ctx, `
+		UPDATE signals
+		SET status='blocked', block_reason=$1,
+		    entry_gate_decisions = COALESCE(entry_gate_decisions, '[]'::jsonb) || $2::jsonb,
+		    updated_at=NOW()
+		WHERE id=$3::uuid`, nullableString(reason), payload, id)
 	return err
 }
 

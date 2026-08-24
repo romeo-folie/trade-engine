@@ -327,6 +327,22 @@ risk:
     momentum_max_runup_pct: 0  # momentum BUY blocked when already > this % above prior close (anti-chase); 0 disables. Recommended 2.0
     first_tick_defer: false    # Hold first-session-tick BUYs pending; execute next tick only if price held (breaks the overnight-headline burst)
     first_tick_hold_tolerance_pct: 1.0  # How far below signal price still counts as "held"
+    # Universal deterministic BUY timing policy. This applies regardless of
+    # the selected analysis lens and is rechecked at the fresh broker ask.
+    anti_chase:
+      enabled: true
+      stale_catalyst_runup_enabled: true
+      stale_after_hours: 24
+      min_return_3_session_pct: 8
+      weak_volume_ratio_max: 0.75
+      stale_ema_extension_atr: 1.75
+      prior_high_extension_enabled: true
+      near_prior_high_pct: 5
+      high_ema_extension_atr: 2
+      momentum_exhaustion_enabled: true
+      rsi_min: 70
+      stoch_k_min: 80
+      exhaustion_return_3_session_pct: 5
 
 # ── Analysis gate (cost-reduction Epics 1 & 2) ───────────────────────────────
 # Controls the pre-LLM material-change gate (zero token cost) and the optional
