@@ -75,9 +75,10 @@ type Engine struct {
 	enricher     *knowledge.Enricher // nil if no LLM configured
 	embedder     embeddings.Embedder // nil if embeddings disabled
 
-	// newsLastFetched tracks when news was last fetched per ticker, to avoid
-	// hammering the news API on every 5-min tick.
-	newsLastFetched map[string]time.Time
+	// newsLastFetched tracks each durable refresh's timestamp and source window.
+	// A short prompt-news refresh is not sufficient evidence for the 30-day
+	// stale-catalyst timing rule.
+	newsLastFetched map[string]newsRefresh
 	newsMu          sync.Mutex
 
 	// tickerState holds the last-seen indicator snapshot per ticker.
@@ -153,6 +154,11 @@ type Engine struct {
 	// recoveredEntryEffects keeps asynchronous polling and coordinator startup
 	// recovery from publishing the same in-process entry event twice.
 	recoveredEntryEffects sync.Map
+}
+
+type newsRefresh struct {
+	at       time.Time
+	lookback time.Duration
 }
 
 // BatchFlusher is implemented by notify.TelegramBot when batch mode is enabled.
@@ -243,7 +249,7 @@ func New(cfg *config.Config, market data.MarketDataProvider, news data.NewsProvi
 		bus:               bus, // use the same bus as az
 		enricher:          knowledge.NewEnricher(cfg, callFn),
 		embedder:          emb,
-		newsLastFetched:   make(map[string]time.Time),
+		newsLastFetched:   make(map[string]newsRefresh),
 		tickerState:       make(map[string]*TickerState),
 		mode:              mode,
 		costTracker:       tracker,
@@ -728,8 +734,10 @@ func (e *Engine) processStockWithProfile(
 		Ticker: ticker, RSI: set.RSI, EMA20: set.EMA20, MACD: set.MACDLine, ADX: set.ADX,
 	})
 
-	// Fetch news (rate-limited to newsFetchInterval cadence).
-	e.fetchAndStoreNews(ctx, ticker)
+	// Fetch news (rate-limited to newsFetchInterval cadence). The returned
+	// result is timing evidence: a stale-catalyst BUY rule cannot treat an
+	// empty database window as complete after its provider refresh failed.
+	newsRefreshErr := e.fetchAndStoreNews(ctx, ticker)
 
 	// Material-change gate: skip LLM analysis when nothing has changed.
 	// Only query news when news_novelty_enabled — avoids a per-ticker DB round-trip
@@ -830,7 +838,7 @@ func (e *Engine) processStockWithProfile(
 	e.runAnalysisWithProfile(
 		ctx, ticker, string(primaryTF), primaryStrategy, strategies, candles, set,
 		newsHash, source, graphContext, scannerRunID, pullbackCandidate,
-		discoveryContext, executionProfile, pullbackContext,
+		discoveryContext, executionProfile, pullbackContext, newsRefreshErr,
 	)
 }
 
@@ -935,7 +943,7 @@ func (e *Engine) runAnalysis(
 	e.runAnalysisWithProfile(
 		ctx, ticker, timeframe, strategy, strategies, candles, set,
 		newsHash, source, graphContext, scannerRunID, pullbackCandidate, nil, nil,
-		nil,
+		nil, nil,
 	)
 }
 
@@ -953,6 +961,7 @@ func (e *Engine) runAnalysisWithProfile(
 	discoveryContext *tradeprofile.DiscoveryContext,
 	executionProfile *tradeprofile.ExecutionProfile,
 	pullbackContext *pullback.PromptContext,
+	newsRefreshErr error,
 ) {
 	if set == nil {
 		e.recordScannerEngineOutcome(ctx, scannerRunID, ticker, "indicators_missing", "", "")
@@ -1077,6 +1086,9 @@ func (e *Engine) runAnalysisWithProfile(
 	// snapshot. The prompt still receives only its configured newest subset.
 	timingNow := time.Now()
 	recentNews, recentNewsErr := store.GetRecentNews(ctx, ticker, timingNow.Add(-antiChaseNewsLookback))
+	if recentNewsErr == nil && newsRefreshErr != nil {
+		recentNewsErr = newsRefreshErr
+	}
 	// Cap news articles to MaxNewsArticlesPerPrompt — newest first, excess dropped.
 	newsCap := e.cfg.Analysis.MaxNewsArticlesPerPrompt
 	if newsCap <= 0 {
@@ -1885,44 +1897,52 @@ func (e *Engine) fetchAndStoreCandlesObserved(
 	return observedAt, nil
 }
 
-// fetchAndStoreNews fetches recent news for a ticker (respecting the cadence limit)
-// and upserts articles into the database.
-func (e *Engine) fetchAndStoreNews(ctx context.Context, ticker string) {
+// fetchAndStoreNews fetches recent news for a ticker (respecting the cadence
+// limit) and upserts articles into the database. A nil result means the
+// requested window was either durably refreshed or a prior successful refresh
+// is still within cadence; callers may safely use an empty result as evidence.
+func (e *Engine) fetchAndStoreNews(ctx context.Context, ticker string) error {
 	if e.newsProvider == nil {
-		return
+		if e.cfg.Risk.EntryGates.AntiChase.Enabled && e.cfg.Risk.EntryGates.AntiChase.StaleCatalystRunupEnabled {
+			return errors.New("anti-chase: timestamped catalyst provider is unavailable")
+		}
+		return nil
 	}
-
-	e.newsMu.Lock()
-	last := e.newsLastFetched[ticker]
-	if time.Since(last) < newsFetchInterval {
-		e.newsMu.Unlock()
-		return
-	}
-	e.newsLastFetched[ticker] = time.Now()
-	e.newsMu.Unlock()
 
 	now := time.Now()
-	since := now.Add(-newsLookback(
+	lookback := newsLookback(
 		e.cfg.Risk.EntryGates.AntiChase.Enabled,
 		e.cfg.Risk.EntryGates.AntiChase.StaleCatalystRunupEnabled,
-	))
+	)
+	e.newsMu.Lock()
+	last := e.newsLastFetched[ticker]
+	if newsRefreshCovers(last, now, lookback) {
+		e.newsMu.Unlock()
+		return nil
+	}
+	e.newsMu.Unlock()
+
+	since := now.Add(-lookback)
 	items, err := e.newsProvider.FetchNews(ctx, ticker, since)
 	if err != nil {
 		logger.Warn("fetch news", "ticker", ticker, "err", err.Error())
-		return
+		return fmt.Errorf("fetch timestamped news: %w", err)
 	}
 	newsIDs, err := store.UpsertNewsItems(ctx, items)
 	if err != nil {
 		logger.Warn("upsert news", "ticker", ticker, "err", err.Error())
-		return
+		return fmt.Errorf("persist timestamped news: %w", err)
 	}
+	e.newsMu.Lock()
+	e.newsLastFetched[ticker] = newsRefresh{at: time.Now(), lookback: lookback}
+	e.newsMu.Unlock()
 	logger.Info("news fetched", "ticker", ticker, "count", len(items))
 	e.bus.Publish(events.NewsFetched, events.NewsFetchedPayload{
 		Ticker: ticker, Count: len(items),
 	})
 
 	if e.enricher == nil || !e.cfg.Markets.News.ExtractionEnabled {
-		return
+		return nil
 	}
 	maxItems := e.cfg.Markets.News.ExtractionMaxArticlesPerTick
 	if maxItems <= 0 || maxItems > len(items) {
@@ -1940,6 +1960,11 @@ func (e *Engine) fetchAndStoreNews(ctx context.Context, ticker string) {
 		// recording, matching prior behavior for those rows.
 		e.enricher.EnrichNewsItem(ctx, newsIDs[item.ExternalID], item.Headline, item.Summary)
 	}
+	return nil
+}
+
+func newsRefreshCovers(last newsRefresh, now time.Time, requiredLookback time.Duration) bool {
+	return !last.at.IsZero() && now.Sub(last.at) < newsFetchInterval && last.lookback >= requiredLookback
 }
 
 // BackfillHistory fetches and stores 2 years of daily + 30 days of hourly candles

@@ -583,7 +583,7 @@ func repricePreparedStockEntryRequest(req execution.OrderRequest, quantity, refe
 // Bracket and uncapped entries require a whole-share parent so their broker
 // protective stop can be submitted for the same quantity.
 func preparedReplayQuantity(req execution.OrderRequest, quantity float64) (float64, error) {
-	if req.RequireBrokerProtection || req.UncappedTakeProfit {
+	if req.RequireBrokerProtection || req.UncappedTakeProfit || req.OrderClass == "bracket" {
 		quantity = math.Floor(quantity)
 		if quantity < 1 {
 			return 0, errorsForAdmission("protected prepared replay requires at least one whole share")

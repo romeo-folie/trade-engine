@@ -2,13 +2,22 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"math"
 	"testing"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/analysis"
+	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
 )
+
+type failingNewsProvider struct{ calls int }
+
+func (p *failingNewsProvider) FetchNews(context.Context, string, time.Time) ([]data.NewsItem, error) {
+	p.calls++
+	return nil, errors.New("provider unavailable")
+}
 
 func antiChaseDailyCandles(count int, now time.Time) []data.Candle {
 	candles := make([]data.Candle, count)
@@ -251,6 +260,38 @@ func TestNewsLookbackCoversEnabledStaleCatalystPolicy(t *testing.T) {
 	}
 	if got := newsLookback(true, true); got != antiChaseNewsLookback {
 		t.Fatalf("enabled stale catalyst lookback = %s, want %s", got, antiChaseNewsLookback)
+	}
+}
+
+func TestNewsRefreshCoversOnlyItsSuccessfulEvidenceWindow(t *testing.T) {
+	now := time.Now()
+	short := newsRefresh{at: now.Add(-time.Minute), lookback: defaultNewsLookback}
+	if newsRefreshCovers(short, now, antiChaseNewsLookback) {
+		t.Fatal("48-hour refresh was accepted as 30-day catalyst evidence")
+	}
+	long := newsRefresh{at: now.Add(-time.Minute), lookback: antiChaseNewsLookback}
+	if !newsRefreshCovers(long, now, defaultNewsLookback) || !newsRefreshCovers(long, now, antiChaseNewsLookback) {
+		t.Fatal("30-day successful refresh did not cover shorter and equal windows")
+	}
+	if newsRefreshCovers(newsRefresh{at: now.Add(-newsFetchInterval)}, now, defaultNewsLookback) {
+		t.Fatal("expired refresh remained within cadence")
+	}
+}
+
+func TestFetchAndStoreNewsRetriesFailedStaleCatalystRefresh(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Risk.EntryGates.AntiChase.Enabled = true
+	cfg.Risk.EntryGates.AntiChase.StaleCatalystRunupEnabled = true
+	provider := &failingNewsProvider{}
+	engine := &Engine{cfg: cfg, newsProvider: provider, newsLastFetched: make(map[string]newsRefresh)}
+	if err := engine.fetchAndStoreNews(context.Background(), "TEST"); err == nil {
+		t.Fatal("failed catalyst refresh was accepted")
+	}
+	if !engine.newsLastFetched["TEST"].at.IsZero() {
+		t.Fatal("failed catalyst refresh advanced cadence state")
+	}
+	if err := engine.fetchAndStoreNews(context.Background(), "TEST"); err == nil || provider.calls != 2 {
+		t.Fatalf("failed catalyst refresh was cadence-suppressed: calls=%d err=%v", provider.calls, err)
 	}
 }
 

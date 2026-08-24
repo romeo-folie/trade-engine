@@ -385,6 +385,13 @@ func TestRepricePreparedStockEntryRequestPreservesProtectedWholeShareSizing(t *t
 	if _, err := repricePreparedStockEntryRequest(execution.OrderRequest{UncappedTakeProfit: true}, .8, 125); err == nil {
 		t.Fatal("sub-share uncapped replay was accepted")
 	}
+	legacyBracket, err := repricePreparedStockEntryRequest(execution.OrderRequest{OrderClass: "bracket"}, 4.8, 125)
+	if err != nil || legacyBracket.Quantity != 4 {
+		t.Fatalf("legacy bracket replay = %+v, err=%v; want 4 whole shares", legacyBracket, err)
+	}
+	if _, err := repricePreparedStockEntryRequest(execution.OrderRequest{OrderClass: "bracket"}, .8, 125); err == nil {
+		t.Fatal("sub-share legacy bracket replay was accepted")
+	}
 	fractional, err := repricePreparedStockEntryRequest(execution.OrderRequest{}, .8, 125)
 	if err != nil || fractional.Quantity != .8 {
 		t.Fatalf("ordinary fractional replay = %+v, err=%v", fractional, err)

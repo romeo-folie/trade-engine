@@ -10,6 +10,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/indicators"
+	"github.com/romeo-folie/trade-engine/internal/logger"
 	"github.com/romeo-folie/trade-engine/internal/store"
 	"github.com/romeo-folie/trade-engine/internal/strategy/antichase"
 )
@@ -246,6 +247,12 @@ func (e *Engine) historyCandleLimit(tf data.Timeframe) int {
 func (e *Engine) executionAntiChaseEvidence(ctx context.Context, ticker string, now time.Time, staleCatalystEnabled bool) ([]data.Candle, []analysis.NewsSnippet, string) {
 	if _, err := e.fetchAndStoreCandlesObserved(ctx, ticker, data.Timeframe1Day); err != nil {
 		return nil, nil, "anti-chase: unable to refresh daily evidence"
+	}
+	if err := e.fetchAndStoreNews(ctx, ticker); err != nil {
+		if staleCatalystEnabled {
+			return nil, nil, "anti-chase: unable to refresh timestamped catalyst evidence"
+		}
+		logger.Warn("anti-chase: refresh timestamped catalyst evidence", "ticker", ticker, "err", err)
 	}
 	daily, err := store.GetCandles(ctx, ticker, data.Timeframe1Day, now.AddDate(-2, 0, 0), now)
 	if err != nil {
