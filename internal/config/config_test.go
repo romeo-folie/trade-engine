@@ -474,6 +474,15 @@ func TestValidateAntiChaseConfig(t *testing.T) {
 	if !containsStr(Validate(cfg), "risk.entry_gates.anti_chase.weak_volume_ratio_max") {
 		t.Fatalf("missing anti-chase validation error: %v", Validate(cfg))
 	}
+	// Operators can enable only one combination without supplying thresholds
+	// that disabled combinations never consult.
+	cfg.Risk.EntryGates.AntiChase = AntiChaseConfig{
+		Enabled: true, MomentumExhaustionEnabled: true, WeakVolumeRatioMax: .75,
+		RSIMin: 70, StochKMin: 80, ExhaustionReturn3Pct: 5,
+	}
+	if errs := Validate(cfg); containsStr(errs, "risk.entry_gates.anti_chase") {
+		t.Fatalf("single enabled anti-chase rule rejected: %v", errs)
+	}
 }
 
 func TestSaveAndReload(t *testing.T) {

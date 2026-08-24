@@ -18,7 +18,7 @@ type EntryGateDecision struct {
 	Status     string          `json:"status"`
 	Reason     string          `json:"reason,omitempty"`
 	Details    json.RawMessage `json:"details,omitempty"`
-	ObservedAt time.Time       `json:"observed_at,omitempty"`
+	ObservedAt *time.Time      `json:"observed_at,omitempty"`
 }
 
 // Signal mirrors a row from the signals table.

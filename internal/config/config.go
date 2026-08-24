@@ -3033,24 +3033,28 @@ func Validate(cfg *Config) []string {
 		errs = append(errs, fmt.Sprintf("risk.entry_gates.pullback_max_stop_width_pct must be within [0,20], got %.4f", v))
 	}
 	if anti := entryGates.AntiChase; anti.Enabled {
-		for _, field := range []struct {
-			name       string
-			value, min float64
-			max        float64
-		}{
-			{"stale_after_hours", anti.StaleAfterHours, 0, 24 * 30},
-			{"min_return_3_session_pct", anti.MinReturn3SessionPct, 0, 200},
-			{"weak_volume_ratio_max", anti.WeakVolumeRatioMax, 0, 10},
-			{"stale_ema_extension_atr", anti.StaleEMAExtensionATR, 0, 20},
-			{"near_prior_high_pct", anti.NearPriorHighPct, 0, 100},
-			{"high_ema_extension_atr", anti.HighEMAExtensionATR, 0, 20},
-			{"rsi_min", anti.RSIMin, 0, 100},
-			{"stoch_k_min", anti.StochKMin, 0, 100},
-			{"exhaustion_return_3_session_pct", anti.ExhaustionReturn3Pct, 0, 200},
-		} {
-			if field.value <= field.min || field.value > field.max {
-				errs = append(errs, fmt.Sprintf("risk.entry_gates.anti_chase.%s must be within (%.0f,%.0f], got %.4f", field.name, field.min, field.max, field.value))
+		validate := func(name string, value, max float64) {
+			if value <= 0 || value > max {
+				errs = append(errs, fmt.Sprintf("risk.entry_gates.anti_chase.%s must be within (0,%.0f], got %.4f", name, max, value))
 			}
+		}
+		needsWeakVolume := anti.StaleCatalystRunupEnabled || anti.PriorHighExtensionEnabled || anti.MomentumExhaustionEnabled
+		if anti.StaleCatalystRunupEnabled {
+			validate("stale_after_hours", anti.StaleAfterHours, 24*30)
+			validate("min_return_3_session_pct", anti.MinReturn3SessionPct, 200)
+			validate("stale_ema_extension_atr", anti.StaleEMAExtensionATR, 20)
+		}
+		if anti.PriorHighExtensionEnabled {
+			validate("near_prior_high_pct", anti.NearPriorHighPct, 100)
+			validate("high_ema_extension_atr", anti.HighEMAExtensionATR, 20)
+		}
+		if anti.MomentumExhaustionEnabled {
+			validate("rsi_min", anti.RSIMin, 100)
+			validate("stoch_k_min", anti.StochKMin, 100)
+			validate("exhaustion_return_3_session_pct", anti.ExhaustionReturn3Pct, 200)
+		}
+		if needsWeakVolume {
+			validate("weak_volume_ratio_max", anti.WeakVolumeRatioMax, 10)
 		}
 	}
 

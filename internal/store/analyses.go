@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/romeo-folie/trade-engine/internal/analysis"
+	"github.com/romeo-folie/trade-engine/internal/strategy/antichase"
 )
 
 // StoredAnalysis is a row from the analyses table.
@@ -67,7 +68,7 @@ type AnalysisAudit struct {
 	Regime            string
 	SelectionStatus   analysis.LensSelectionStatus
 	TimeframeWorkflow *TimeframeWorkflowAudit
-	TimingSnapshot    any
+	TimingSnapshot    *antichase.Snapshot
 	DecisionPolicy    *analysis.DecisionPolicyAudit
 }
 

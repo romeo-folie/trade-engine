@@ -1082,16 +1082,18 @@ func (e *Engine) runAnalysisWithProfile(
 		newsCap = 5
 	}
 	snippets := make([]analysis.NewsSnippet, 0, newsCap)
+	timingNews := make([]analysis.NewsSnippet, 0, len(recentNews))
 	for i, n := range recentNews {
-		if i >= newsCap {
-			break
-		}
-		snippets = append(snippets, analysis.NewsSnippet{
+		item := analysis.NewsSnippet{
 			Headline:    n.Headline,
 			Source:      n.Source,
 			PublishedAt: n.PublishedAt,
 			Sentiment:   sentimentLabel(n.SentimentScore),
-		})
+		}
+		timingNews = append(timingNews, item)
+		if i < newsCap {
+			snippets = append(snippets, item)
+		}
 	}
 	e.bus.Publish(events.NewsEnriched, events.NewsEnrichedPayload{
 		Ticker: ticker,
@@ -1161,7 +1163,7 @@ func (e *Engine) runAnalysisWithProfile(
 		if len(candles) > 0 {
 			mark = candles[len(candles)-1].Close
 		}
-		timingSnapshot = buildAntiChaseSnapshot(ticker, timingDaily, mark, "analysis_latest_close", snippets, time.Now())
+		timingSnapshot = buildAntiChaseSnapshot(ticker, timingDaily, mark, "analysis_latest_close", timingNews, time.Now())
 	}
 
 	req := analysis.AnalysisRequest{
@@ -2839,9 +2841,10 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 			Snapshot *antichase.Snapshot `json:"snapshot"`
 			Decision antichase.Decision  `json:"decision"`
 		}{snapshot, decision})
+		observedAt := time.Now().UTC()
 		gate := store.EntryGateDecision{
 			Name: "universal_anti_chase_release", Status: "passed",
-			Details: details, ObservedAt: time.Now().UTC(),
+			Details: details, ObservedAt: &observedAt,
 		}
 		if reason != "" {
 			gate.Status, gate.Reason = "blocked", reason

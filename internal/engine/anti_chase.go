@@ -75,7 +75,15 @@ func buildAntiChaseSnapshot(
 		s.EvidenceReason = "anti-chase: completed-session volume evidence is unavailable"
 		return s
 	}
-	returnRef := completed[n-4].Close
+	// A partial current session is excluded from completed, while mark remains
+	// current. In that case the third prior completed session is the correct
+	// three-session reference; after the close the latest completed bar itself
+	// is the mark, so it is four array positions back.
+	returnIndex := n - 4
+	if len(completed) < len(daily) {
+		returnIndex = n - 3
+	}
+	returnRef := completed[returnIndex].Close
 	if returnRef <= 0 {
 		s.EvidenceReason = "anti-chase: three-session reference close is unavailable"
 		return s
@@ -170,8 +178,12 @@ func (e *Engine) freshAntiChaseAsk(ctx context.Context, ticker string) float64 {
 		return 0
 	}
 	quote, err := e.marketData.FetchQuote(ctx, ticker)
-	if err != nil || quote == nil || quote.Bid <= 0 || quote.Ask <= 0 {
+	if err != nil || quote == nil || quote.Bid <= 0 {
 		return 0
 	}
-	return quote.Ask
+	ask, err := validateStockAsk(quote, ticker, time.Now().UTC())
+	if err != nil {
+		return 0
+	}
+	return ask
 }
