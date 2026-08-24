@@ -122,3 +122,12 @@ func TestFreshAntiChaseAskRejectsStaleQuote(t *testing.T) {
 		t.Fatalf("fresh quote ask = %.2f, want 100", got)
 	}
 }
+
+func TestAntiChaseNewsEvidenceFailsClosedOnlyForEnabledCatalystRule(t *testing.T) {
+	if _, reason := antiChaseNewsEvidence(nil, context.DeadlineExceeded, true); reason == "" {
+		t.Fatal("missing catalyst evidence passed with stale-catalyst rule enabled")
+	}
+	if news, reason := antiChaseNewsEvidence(nil, context.DeadlineExceeded, false); reason != "" || len(news) != 0 {
+		t.Fatalf("disabled catalyst rule should tolerate missing news: news=%v reason=%q", news, reason)
+	}
+}

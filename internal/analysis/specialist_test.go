@@ -245,6 +245,39 @@ func TestAnalyzeSpecialist_RiskReviewerReceivesFindingsAndOwnsFinalOutcome(t *te
 	}
 }
 
+func TestAnalyzeSpecialistKeepsRiskReviewerRejectionsWithRiskSelectedLens(t *testing.T) {
+	riskRejections := map[string]string{"trend_following": "late extension", "pullback": "no reclaim"}
+	risk := &captureRiskProvider{response: AnalysisResponse{
+		Action: ActionBuy, Confidence: .8, SizePct: 1, StopLoss: 90, TakeProfit: 110,
+		SelectedStrategy: "momentum", Regime: "trending", RejectedStrategies: riskRejections,
+	}}
+	withSpecialistBuildProvider(t, func(c config.ModelConfig) ModelProvider {
+		if c.Model == "risk-model" {
+			return risk
+		}
+		return &fakeRoleProvider{provider: c.Provider, model: c.Model}
+	})
+	registry := config.ModelRegistry{
+		"fund": {ModelConfig: config.ModelConfig{Provider: "p1", Model: "fund-model"}},
+		"tech": {ModelConfig: config.ModelConfig{Provider: "p2", Model: "tech-model"}},
+		"sent": {ModelConfig: config.ModelConfig{Provider: "p3", Model: "sent-model"}},
+		"risk": {ModelConfig: config.ModelConfig{Provider: "risk-provider", Model: "risk-model"}},
+	}
+	a := &Analyzer{cfg: config.ModelsConfig{Registry: registry}, specialist: &config.AnalysisConfig{SpecialistRoles: map[string]string{
+		"fundamental": "fund", "technical": "tech", "sentiment": "sent", "risk_manager": "risk",
+	}}}
+	result, err := a.AnalyzeSpecialist(context.Background(), AnalysisRequest{
+		Ticker: "AAPL", Strategies: []string{"momentum", "trend_following", "pullback"},
+	}, depth.ImpactScore{})
+	if err != nil {
+		t.Fatalf("AnalyzeSpecialist returned error: %v", err)
+	}
+	if result.Response.SelectedStrategy != "momentum" || len(result.Response.RejectedStrategies) != len(riskRejections) ||
+		result.Response.RejectedStrategies["trend_following"] != "late extension" {
+		t.Fatalf("risk-selected response lost its rejections: %+v", result.Response)
+	}
+}
+
 func TestResolveSpecialistRiskDecision_BuyRequiresTwoDirectionalBuys(t *testing.T) {
 	tests := []struct {
 		name       string

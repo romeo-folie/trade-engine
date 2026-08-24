@@ -107,6 +107,15 @@ func TestDecisionPolicyAfterConfirmationPrefersConfirmationAudit(t *testing.T) {
 	}
 }
 
+func TestDecisionPolicyAllowsReArbitration(t *testing.T) {
+	if !decisionPolicyAllowsReArbitration(nil) || !decisionPolicyAllowsReArbitration(&analysis.DecisionPolicyAudit{}) {
+		t.Fatal("unapplied policy should allow re-arbitration")
+	}
+	if decisionPolicyAllowsReArbitration(&analysis.DecisionPolicyAudit{Applied: true}) {
+		t.Fatal("applied specialist authority policy must prevent re-arbitration")
+	}
+}
+
 func TestQualifiedWaitRequiresCompleteRejections(t *testing.T) {
 	audit := analysis.LensSelectionAudit{SelectedLens: "momentum", SelectionStatus: analysis.LensSelectionSelected}
 	wait := analysis.AnalysisResponse{Action: analysis.ActionWait, Confidence: .75, SelectedStrategy: "momentum", RejectedStrategies: map[string]string{"trend_following": "range not established"}}

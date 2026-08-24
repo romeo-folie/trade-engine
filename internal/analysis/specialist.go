@@ -241,7 +241,8 @@ func (a *Analyzer) AnalyzeSpecialist(ctx context.Context, req AnalysisRequest, _
 	// A risk BUY can retain an admissible selected lens. Any deterministic
 	// downgrade must instead use consensus evidence for its non-directional
 	// outcome; retaining a BUY lens on WAIT/HOLD would misstate the audit.
-	if final.Action != ActionBuy || !validSpecialistRiskLens(riskResp.SelectedStrategy, req.LensSet()) {
+	riskSelectedLens := final.Action == ActionBuy && validSpecialistRiskLens(riskResp.SelectedStrategy, req.LensSet())
+	if !riskSelectedLens {
 		final.SelectedStrategy, final.Regime = specialistConsensusLens(results, final.Action)
 	} else {
 		final.SelectedStrategy, final.Regime = riskResp.SelectedStrategy, riskResp.Regime
@@ -252,7 +253,11 @@ func (a *Analyzer) AnalyzeSpecialist(ctx context.Context, req AnalysisRequest, _
 	// rejected one. Inert today (only len() is read, and the field is not
 	// persisted), but the two fields must describe the same decision before
 	// anything is ever wired to them.
-	final.RejectedStrategies = specialistConsensusRejections(results, final.Action, final.SelectedStrategy)
+	if riskSelectedLens {
+		final.RejectedStrategies = riskResp.RejectedStrategies
+	} else {
+		final.RejectedStrategies = specialistConsensusRejections(results, final.Action, final.SelectedStrategy)
+	}
 	logger.Info("specialist risk review complete",
 		"ticker", req.Ticker,
 		"action", string(final.Action),

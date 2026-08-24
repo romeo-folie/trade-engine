@@ -149,6 +149,13 @@ func decisionPolicyAfterConfirmation(primary, confirmation *analysis.DecisionPol
 	return primary
 }
 
+// decisionPolicyAllowsReArbitration prevents a deterministic specialist BUY
+// authority downgrade from being replaced by a later arbiter pass that still
+// sees the risk reviewer's original unsupported BUY.
+func decisionPolicyAllowsReArbitration(policy *analysis.DecisionPolicyAudit) bool {
+	return policy == nil || !policy.Applied
+}
+
 func profileConfirmationConfirmed(confirmation analysis.AnalysisResponse, primaryAudit, confirmationAudit analysis.LensSelectionAudit, available bool) bool {
 	return available && confirmation.Action == analysis.ActionBuy &&
 		confirmationAudit.SelectionStatus == analysis.LensSelectionSelected &&

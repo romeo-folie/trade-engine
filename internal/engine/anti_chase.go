@@ -150,7 +150,7 @@ func (e *Engine) historyCandleLimit(tf data.Timeframe) int {
 // executionAntiChaseEvidence refreshes daily evidence before the final quote
 // is fetched. The final ask must be validated after this potentially slow work
 // so the timing decision and submitted market order share the same mark.
-func (e *Engine) executionAntiChaseEvidence(ctx context.Context, ticker string, now time.Time) ([]data.Candle, []analysis.NewsSnippet, string) {
+func (e *Engine) executionAntiChaseEvidence(ctx context.Context, ticker string, now time.Time, staleCatalystEnabled bool) ([]data.Candle, []analysis.NewsSnippet, string) {
 	if _, err := e.fetchAndStoreCandlesObserved(ctx, ticker, data.Timeframe1Day); err != nil {
 		return nil, nil, "anti-chase: unable to refresh daily evidence"
 	}
@@ -159,8 +159,22 @@ func (e *Engine) executionAntiChaseEvidence(ctx context.Context, ticker string, 
 		return nil, nil, "anti-chase: unable to load refreshed daily evidence"
 	}
 	items, err := store.GetRecentNews(ctx, ticker, now.AddDate(0, 0, -30))
+	news, reason := antiChaseNewsEvidence(items, err, staleCatalystEnabled)
+	if reason != "" {
+		return nil, nil, reason
+	}
+	return daily, news, ""
+}
+
+// antiChaseNewsEvidence treats a read failure differently from a confirmed
+// empty result. A stale-catalyst rule cannot be evaluated safely when its
+// timestamped evidence was unavailable, so the execution gate must fail closed.
+func antiChaseNewsEvidence(items []data.NewsItem, err error, staleCatalystEnabled bool) ([]analysis.NewsSnippet, string) {
 	if err != nil {
-		items = nil // price/technical evidence remains valid; catalyst rule is simply absent.
+		if staleCatalystEnabled {
+			return nil, "anti-chase: unable to load timestamped catalyst evidence"
+		}
+		items = nil
 	}
 	news := make([]analysis.NewsSnippet, 0, len(items))
 	for _, item := range items {
@@ -169,7 +183,7 @@ func (e *Engine) executionAntiChaseEvidence(ctx context.Context, ticker string, 
 			Sentiment: sentimentLabel(item.SentimentScore),
 		})
 	}
-	return daily, news, ""
+	return news, ""
 }
 
 func (e *Engine) freshAntiChaseQuote(ctx context.Context, ticker string, now time.Time) (*data.Quote, float64) {

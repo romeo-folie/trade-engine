@@ -1312,7 +1312,7 @@ func (e *Engine) runAnalysisWithProfile(
 		}
 	}
 
-	if err == nil && !workflow.ProfileOwned {
+	if err == nil && !workflow.ProfileOwned && decisionPolicyAllowsReArbitration(result.DecisionPolicy) {
 		if altTF, run := shouldRunSecondPass(e.cfg.Analysis, result.Response, timeframe, false); run {
 			logger.Info("multi-tf: borderline WAIT — running alt-timeframe pass",
 				"ticker", ticker, "primary_tf", timeframe, "alt_tf", altTF,
@@ -2807,12 +2807,13 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		}
 	}
 	if e.cfg.Risk.EntryGates.AntiChase.Enabled && !admission.BrokerHeldReplay {
+		antiPolicy := antiChasePolicy(e.cfg.Risk.EntryGates.AntiChase)
 		source := "broker_validated_ask"
 		if !admission.BrokerAuthoritative {
 			source = "fresh_market_ask"
 		}
 		now := time.Now().UTC()
-		daily, news, evidenceReason := e.executionAntiChaseEvidence(ctx, sig.Ticker, now)
+		daily, news, evidenceReason := e.executionAntiChaseEvidence(ctx, sig.Ticker, now, antiPolicy.StaleCatalystRunupEnabled)
 		quote, finalAsk := e.freshAntiChaseQuote(ctx, sig.Ticker, time.Now().UTC())
 		var snapshot *antichase.Snapshot
 		if evidenceReason != "" {
@@ -2852,7 +2853,7 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 			}
 			snapshot = buildAntiChaseSnapshot(sig.Ticker, daily, sig.SignalPrice, source, news, time.Now())
 		}
-		reason, decision := antiChaseEntryGate(snapshot, antiChasePolicy(e.cfg.Risk.EntryGates.AntiChase))
+		reason, decision := antiChaseEntryGate(snapshot, antiPolicy)
 		details, _ := json.Marshal(struct {
 			Snapshot *antichase.Snapshot `json:"snapshot"`
 			Decision antichase.Decision  `json:"decision"`
@@ -3144,6 +3145,16 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 			})
 			return
 		}
+	}
+	if !admission.BrokerHeldReplay && !IsMarketOpen(time.Now()) {
+		reason := "market closed before order release — order would not fill this session"
+		_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+		logger.Warn("signal execution blocked before broker release", "ticker", sig.Ticker, "reason", reason)
+		e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+			Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
+			BlockReason: reason, FailedCheck: "market_hours",
+		})
+		return
 	}
 	result, err := e.executor.PlaceOrder(ctx, orderReq)
 	if err != nil {
