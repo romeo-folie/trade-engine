@@ -66,6 +66,20 @@ func TestBuildAntiChaseSnapshotPartialSessionUsesThreeSessionReference(t *testin
 	}
 }
 
+func TestBuildAntiChaseSnapshotLiveSessionUsesThreeSessionReferenceWithoutPartialBar(t *testing.T) {
+	now := time.Date(2026, time.August, 24, 15, 0, 0, 0, nyLoc)
+	candles := antiChaseDailyCandles(253, now)
+	mark := 100.0
+	snapshot := buildAntiChaseSnapshot("TEST", candles, mark, "test", nil, now)
+	if snapshot.EvidenceStatus != "available" || snapshot.CompletedSessions != len(candles) {
+		t.Fatalf("completed-bar live-session snapshot = %+v", snapshot)
+	}
+	want := (mark - candles[250].Close) / candles[250].Close * 100
+	if math.Abs(snapshot.Return3SessionPct-want) > 1e-9 {
+		t.Fatalf("three-session return = %.12f, want %.12f", snapshot.Return3SessionPct, want)
+	}
+}
+
 func TestFreshAntiChaseAskRejectsStaleQuote(t *testing.T) {
 	now := time.Now().UTC()
 	engine := &Engine{marketData: &pullbackEvidenceMarket{

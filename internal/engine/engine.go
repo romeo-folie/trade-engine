@@ -1303,6 +1303,7 @@ func (e *Engine) runAnalysisWithProfile(
 			}
 			workflowAudit.Confirmation = confirmationPass
 			result.Response = mergeProfileConfirmation(primaryResp, confirmationResp, primaryAudit, confirmationAudit, req.LensSet(), available)
+			result.DecisionPolicy = decisionPolicyAfterConfirmation(result.DecisionPolicy, confirmation.DecisionPolicy)
 			signalCandles, signalTimeframe = signalEvidenceAfterConfirmation(
 				candles, timeframe, confirmationCandles, entryTF, confirmationPass.Status, result.Response.Action,
 			)

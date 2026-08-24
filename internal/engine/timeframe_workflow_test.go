@@ -96,6 +96,17 @@ func TestMergeProfileConfirmation(t *testing.T) {
 	}
 }
 
+func TestDecisionPolicyAfterConfirmationPrefersConfirmationAudit(t *testing.T) {
+	primary := &analysis.DecisionPolicyAudit{Mode: "primary", Applied: false}
+	confirmation := &analysis.DecisionPolicyAudit{Mode: "confirmation", Applied: true}
+	if got := decisionPolicyAfterConfirmation(primary, confirmation); got != confirmation {
+		t.Fatalf("final policy = %+v, want confirmation %+v", got, confirmation)
+	}
+	if got := decisionPolicyAfterConfirmation(primary, nil); got != primary {
+		t.Fatalf("missing confirmation policy = %+v, want primary %+v", got, primary)
+	}
+}
+
 func TestQualifiedWaitRequiresCompleteRejections(t *testing.T) {
 	audit := analysis.LensSelectionAudit{SelectedLens: "momentum", SelectionStatus: analysis.LensSelectionSelected}
 	wait := analysis.AnalysisResponse{Action: analysis.ActionWait, Confidence: .75, SelectedStrategy: "momentum", RejectedStrategies: map[string]string{"trend_following": "range not established"}}

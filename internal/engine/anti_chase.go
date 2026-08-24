@@ -75,12 +75,13 @@ func buildAntiChaseSnapshot(
 		s.EvidenceReason = "anti-chase: completed-session volume evidence is unavailable"
 		return s
 	}
-	// A partial current session is excluded from completed, while mark remains
-	// current. In that case the third prior completed session is the correct
-	// three-session reference; after the close the latest completed bar itself
-	// is the mark, so it is four array positions back.
+	// During a live equity session the reference mark is intraday even when a
+	// provider returns completed daily bars only, so compare it to the third
+	// prior completed session. Once the session is closed, the latest completed
+	// daily close itself is the mark and the three-session reference is four
+	// array positions back.
 	returnIndex := n - 4
-	if len(completed) < len(daily) {
+	if IsMarketOpen(now) {
 		returnIndex = n - 3
 	}
 	returnRef := completed[returnIndex].Close

@@ -138,6 +138,17 @@ func mergeProfileConfirmation(primary, confirmation analysis.AnalysisResponse, p
 	return primary
 }
 
+// decisionPolicyAfterConfirmation keeps the policy audit belonging to the
+// decision that determined the final entry outcome. A profile confirmation can
+// independently downgrade an otherwise valid primary BUY, so its deterministic
+// authority audit is more relevant than the primary pass's audit.
+func decisionPolicyAfterConfirmation(primary, confirmation *analysis.DecisionPolicyAudit) *analysis.DecisionPolicyAudit {
+	if confirmation != nil {
+		return confirmation
+	}
+	return primary
+}
+
 func profileConfirmationConfirmed(confirmation analysis.AnalysisResponse, primaryAudit, confirmationAudit analysis.LensSelectionAudit, available bool) bool {
 	return available && confirmation.Action == analysis.ActionBuy &&
 		confirmationAudit.SelectionStatus == analysis.LensSelectionSelected &&

@@ -714,11 +714,10 @@ func buildUserWithTimeframeContext(
 // deterministic view of entry extension. It is evidence, not a model-created
 // strategy: knowledge-graph prose and reasoning never establish freshness.
 func writeTimingSnapshot(b *strings.Builder, s *antichase.Snapshot) {
-	b.WriteString("### DETERMINISTIC BUY TIMING SNAPSHOT\n")
 	if s == nil {
-		b.WriteString("Unavailable — a BUY cannot rely on unstated timing evidence.\n\n")
 		return
 	}
+	b.WriteString("### DETERMINISTIC BUY TIMING SNAPSHOT\n")
 	b.WriteString(fmt.Sprintf("Observed: %s | reference price: %.2f (%s) | evidence: %s | completed daily sessions: %d | history: %s\n",
 		s.ObservedAt.UTC().Format(time.RFC3339), s.ReferencePrice, valueOrUnknown(s.ReferenceSource),
 		s.EvidenceStatus, s.CompletedSessions, s.HistoryScope))

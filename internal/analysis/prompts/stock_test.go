@@ -57,6 +57,15 @@ func TestBuildStockPrompt_IncludesRequiredSections(t *testing.T) {
 	}
 }
 
+func TestBuildStockPromptOmitsTimingSectionWhenPolicyIsDisabled(t *testing.T) {
+	_, user := BuildStockPrompt(
+		"AAPL", []string{"trend_following"}, "1d", nil, Indicators{}, nil, Portfolio{}, "", nil, "", false,
+	)
+	if strings.Contains(user, "DETERMINISTIC BUY TIMING SNAPSHOT") {
+		t.Fatalf("disabled timing policy leaked a prompt section: %q", user)
+	}
+}
+
 // TestBuildStockPrompt_RRSelfFilter asserts both the standard swing prompt and
 // the momentum prompt instruct the model to downgrade BUY → WAIT when the
 // proposed R:R is below 1.5. The phrasing is the contract — gate calibration
