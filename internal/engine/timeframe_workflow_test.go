@@ -116,6 +116,23 @@ func TestDecisionPolicyAllowsReArbitration(t *testing.T) {
 	}
 }
 
+func TestProfileConfirmationAllowedRespectsAppliedDecisionPolicy(t *testing.T) {
+	resp := analysis.AnalysisResponse{
+		Action:             analysis.ActionWait,
+		Confidence:         profileConfirmationWaitMinConfidence,
+		SelectedStrategy:   "momentum",
+		RejectedStrategies: map[string]string{"trend_following": "wait for confirmation"},
+	}
+	audit := analysis.LensSelectionAudit{SelectionStatus: analysis.LensSelectionSelected, SelectedLens: "momentum"}
+	lenses := []string{"momentum", "trend_following"}
+	if profileConfirmationAllowed(resp, audit, lenses, &analysis.DecisionPolicyAudit{Applied: true}) {
+		t.Fatal("applied primary authority downgrade was eligible for confirmation")
+	}
+	if !profileConfirmationAllowed(resp, audit, lenses, &analysis.DecisionPolicyAudit{}) {
+		t.Fatal("unapplied primary decision should remain eligible for confirmation")
+	}
+}
+
 func TestQualifiedWaitRequiresCompleteRejections(t *testing.T) {
 	audit := analysis.LensSelectionAudit{SelectedLens: "momentum", SelectionStatus: analysis.LensSelectionSelected}
 	wait := analysis.AnalysisResponse{Action: analysis.ActionWait, Confidence: .75, SelectedStrategy: "momentum", RejectedStrategies: map[string]string{"trend_following": "range not established"}}

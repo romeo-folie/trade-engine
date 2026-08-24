@@ -58,6 +58,16 @@ func buildAntiChaseSnapshot(
 		s.EvidenceReason = fmt.Sprintf("anti-chase: only %d completed daily sessions are available; need %d", len(completed), antichase.MinimumCompletedSessions)
 		return s
 	}
+	if !antiChaseDailyHistoryFresh(completed, now) {
+		expected := MostRecentCompletedMarketSession(now, 0).Date.In(nyLoc).Format("2006-01-02")
+		latest := completed[len(completed)-1].Timestamp
+		latestDate := "unknown"
+		if !latest.IsZero() {
+			latestDate = latest.In(nyLoc).Format("2006-01-02")
+		}
+		s.EvidenceReason = fmt.Sprintf("anti-chase: latest completed daily session %s does not match expected session %s", latestDate, expected)
+		return s
+	}
 	if mark <= 0 || math.IsNaN(mark) || math.IsInf(mark, 0) {
 		s.EvidenceReason = "anti-chase: reference price is unavailable"
 		return s
@@ -128,6 +138,50 @@ func buildAntiChaseSnapshot(
 		s.CatalystAgeHours = now.Sub(*s.CatalystAt).Hours()
 	}
 	return s
+}
+
+// antiChaseDailyHistoryFresh proves that daily indicators end at the latest
+// completed US market session. A non-empty cached window is not enough: stale
+// EMA, volume, return, and high evidence must not release a fresh BUY.
+func antiChaseDailyHistoryFresh(completed []data.Candle, now time.Time) bool {
+	if len(completed) == 0 {
+		return false
+	}
+	latest := completed[len(completed)-1].Timestamp
+	if latest.IsZero() {
+		return false
+	}
+	expected := MostRecentCompletedMarketSession(now, 0)
+	return sameDate(latest, expected.Date)
+}
+
+// buildAnalysisAntiChaseSnapshot keeps a failed catalyst read distinct from a
+// confirmed empty result. Prompt-time evidence is persisted and gates BUYs, so
+// an enabled stale-catalyst rule must fail closed rather than audit an empty
+// article set as proof that no catalyst exists.
+func buildAnalysisAntiChaseSnapshot(
+	ticker string,
+	daily []data.Candle,
+	mark float64,
+	markSource string,
+	news []analysis.NewsSnippet,
+	newsErr error,
+	staleCatalystEnabled bool,
+	now time.Time,
+) *antichase.Snapshot {
+	if newsErr != nil && staleCatalystEnabled {
+		return &antichase.Snapshot{
+			SchemaVersion:   antichase.PolicyVersion,
+			Ticker:          ticker,
+			ObservedAt:      now.UTC(),
+			ReferencePrice:  mark,
+			ReferenceSource: markSource,
+			EvidenceStatus:  "unavailable",
+			HistoryScope:    "limited_history",
+			EvidenceReason:  "anti-chase: unable to load timestamped catalyst evidence",
+		}
+	}
+	return buildAntiChaseSnapshot(ticker, daily, mark, markSource, news, now)
 }
 
 func antiChaseEntryGate(snapshot *antichase.Snapshot, policy antichase.Policy) (string, antichase.Decision) {

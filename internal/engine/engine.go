@@ -1075,7 +1075,8 @@ func (e *Engine) runAnalysisWithProfile(
 	// this second query is a lightweight store read (no API call).
 	// Keep a longer timestamped source window for the deterministic timing
 	// snapshot. The prompt still receives only its configured newest subset.
-	recentNews, _ := store.GetRecentNews(ctx, ticker, time.Now().AddDate(0, 0, -30))
+	timingNow := time.Now()
+	recentNews, recentNewsErr := store.GetRecentNews(ctx, ticker, timingNow.AddDate(0, 0, -30))
 	// Cap news articles to MaxNewsArticlesPerPrompt — newest first, excess dropped.
 	newsCap := e.cfg.Analysis.MaxNewsArticlesPerPrompt
 	if newsCap <= 0 {
@@ -1163,7 +1164,10 @@ func (e *Engine) runAnalysisWithProfile(
 		if len(candles) > 0 {
 			mark = candles[len(candles)-1].Close
 		}
-		timingSnapshot = buildAntiChaseSnapshot(ticker, timingDaily, mark, "analysis_latest_close", timingNews, time.Now())
+		timingSnapshot = buildAnalysisAntiChaseSnapshot(
+			ticker, timingDaily, mark, "analysis_latest_close", timingNews, recentNewsErr,
+			e.cfg.Risk.EntryGates.AntiChase.StaleCatalystRunupEnabled, timingNow,
+		)
 	}
 
 	req := analysis.AnalysisRequest{
@@ -1278,7 +1282,7 @@ func (e *Engine) runAnalysisWithProfile(
 	}
 	if err == nil && workflow.ProfileOwned {
 		primaryResp := result.Response
-		if workflow.EntryTimingTimeframe != "" && profileConfirmationEligible(primaryResp, primaryAudit, req.LensSet()) {
+		if workflow.EntryTimingTimeframe != "" && profileConfirmationAllowed(primaryResp, primaryAudit, req.LensSet(), result.DecisionPolicy) {
 			entryTF := string(workflow.EntryTimingTimeframe)
 			logger.Info("profile timeframe: running entry confirmation", "ticker", ticker, "primary_tf", timeframe, "entry_tf", entryTF)
 			confirmation, confirmationCandles, available := e.runProfileConfirmation(ctx, req, primaryResp, entryTF, ticker, impact)

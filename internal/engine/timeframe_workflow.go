@@ -91,6 +91,13 @@ func profileConfirmationEligible(resp analysis.AnalysisResponse, audit analysis.
 		(resp.Action == analysis.ActionWait && resp.Confidence >= profileConfirmationWaitMinConfidence && completeWaitRejections(resp, audit.SelectedLens, admissible))
 }
 
+// profileConfirmationAllowed prevents a later timing pass from recreating a
+// BUY that the specialist authority policy already downgraded on the primary
+// thesis. The primary result and its applied audit remain authoritative.
+func profileConfirmationAllowed(resp analysis.AnalysisResponse, audit analysis.LensSelectionAudit, admissible []string, policy *analysis.DecisionPolicyAudit) bool {
+	return decisionPolicyAllowsReArbitration(policy) && profileConfirmationEligible(resp, audit, admissible)
+}
+
 func completeWaitRejections(resp analysis.AnalysisResponse, selected string, admissible []string) bool {
 	if len(resp.RejectedStrategies) != len(admissible)-1 {
 		return false
