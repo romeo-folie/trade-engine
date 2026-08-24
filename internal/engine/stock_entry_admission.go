@@ -565,6 +565,16 @@ func recalculateStockEntryQuantity(admission stockEntryAdmission, sizePct, ask, 
 	return quantity, nil
 }
 
+// repricePreparedStockEntryRequest makes the request that reaches the broker
+// match the final ask and quantity evaluated by release risk. It is used only
+// for a durable intent proven not to be broker-held; persistence happens at
+// the final release boundary before PlaceOrder.
+func repricePreparedStockEntryRequest(req execution.OrderRequest, quantity, referencePrice float64) execution.OrderRequest {
+	req.Quantity = quantity
+	req.ReferencePrice = referencePrice
+	return req
+}
+
 func minimumWholeShareAllowed(quantity float64, fractionable bool, sizePct, ask, equity, capacity, maxPositionPct float64) bool {
 	return quantity <= 0 && !fractionable && sizePct > 0 && ask > 0 &&
 		maxPositionPct > 0 && ask <= equity*maxPositionPct/100+1e-9 && ask <= capacity+1e-9

@@ -16,6 +16,13 @@ import (
 
 const antiChaseDailyHistoryCandles = 260
 
+const (
+	defaultNewsLookback       = 48 * time.Hour
+	antiChaseNewsLookback     = 30 * 24 * time.Hour
+	signedBullishSentimentMin = 0.1
+	signedBearishSentimentMax = -0.1
+)
+
 func antiChasePolicy(cfg config.AntiChaseConfig) antichase.Policy {
 	return antichase.Policy{
 		Enabled:                   cfg.Enabled,
@@ -32,6 +39,16 @@ func antiChasePolicy(cfg config.AntiChaseConfig) antichase.Policy {
 		StochKMin:                 cfg.StochKMin,
 		ExhaustionReturn3Pct:      cfg.ExhaustionReturn3Pct,
 	}
+}
+
+// newsLookback selects the provider window needed to make an empty catalyst
+// read meaningful. The regular prompt keeps its short horizon, while an
+// enabled stale-catalyst rule must backfill the full policy evidence window.
+func newsLookback(antiChaseEnabled, staleCatalystEnabled bool) time.Duration {
+	if antiChaseEnabled && staleCatalystEnabled {
+		return antiChaseNewsLookback
+	}
+	return defaultNewsLookback
 }
 
 // buildAntiChaseSnapshot turns full daily history into compact, immutable prompt
@@ -212,7 +229,7 @@ func (e *Engine) executionAntiChaseEvidence(ctx context.Context, ticker string, 
 	if err != nil {
 		return nil, nil, "anti-chase: unable to load refreshed daily evidence"
 	}
-	items, err := store.GetRecentNews(ctx, ticker, now.AddDate(0, 0, -30))
+	items, err := store.GetRecentNews(ctx, ticker, now.Add(-antiChaseNewsLookback))
 	news, reason := antiChaseNewsEvidence(items, err, staleCatalystEnabled)
 	if reason != "" {
 		return nil, nil, reason

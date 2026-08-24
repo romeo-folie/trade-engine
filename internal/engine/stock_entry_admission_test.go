@@ -358,6 +358,21 @@ func TestRecalculateStockEntryQuantityUsesFinalAsk(t *testing.T) {
 	}
 }
 
+func TestRepricePreparedStockEntryRequestUsesFinalAdmissionValues(t *testing.T) {
+	original := execution.OrderRequest{
+		Ticker: "AAPL", Side: execution.OrderSideBuy, Type: execution.OrderTypeMarket,
+		Quantity: 5, ReferencePrice: 100, IntentKey: "entry:prepared", ClientOrderID: "te-stock-prepared",
+		OrderClass: "bracket", StopLossPrice: 95, TakeProfitPrice: 110,
+	}
+	got := repricePreparedStockEntryRequest(original, 4, 125)
+	if got.Quantity != 4 || got.ReferencePrice != 125 {
+		t.Fatalf("repriced request = %+v, want quantity 4 at 125", got)
+	}
+	if got.ClientOrderID != original.ClientOrderID || got.OrderClass != original.OrderClass || got.StopLossPrice != original.StopLossPrice {
+		t.Fatalf("repricing changed durable order identity or policy: %+v", got)
+	}
+}
+
 func TestApplyStockEntryReservations(t *testing.T) {
 	now := time.Now().UTC()
 	prepared := store.ActiveStockEntryReservation{

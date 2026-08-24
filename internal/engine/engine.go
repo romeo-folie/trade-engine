@@ -1076,15 +1076,14 @@ func (e *Engine) runAnalysisWithProfile(
 	// Keep a longer timestamped source window for the deterministic timing
 	// snapshot. The prompt still receives only its configured newest subset.
 	timingNow := time.Now()
-	recentNews, recentNewsErr := store.GetRecentNews(ctx, ticker, timingNow.AddDate(0, 0, -30))
+	recentNews, recentNewsErr := store.GetRecentNews(ctx, ticker, timingNow.Add(-antiChaseNewsLookback))
 	// Cap news articles to MaxNewsArticlesPerPrompt — newest first, excess dropped.
 	newsCap := e.cfg.Analysis.MaxNewsArticlesPerPrompt
 	if newsCap <= 0 {
 		newsCap = 5
 	}
-	snippets := make([]analysis.NewsSnippet, 0, newsCap)
 	timingNews := make([]analysis.NewsSnippet, 0, len(recentNews))
-	for i, n := range recentNews {
+	for _, n := range recentNews {
 		item := analysis.NewsSnippet{
 			Headline:    n.Headline,
 			Source:      n.Source,
@@ -1092,10 +1091,8 @@ func (e *Engine) runAnalysisWithProfile(
 			Sentiment:   sentimentLabel(n.SentimentScore),
 		}
 		timingNews = append(timingNews, item)
-		if i < newsCap {
-			snippets = append(snippets, item)
-		}
 	}
+	snippets := promptNewsSnippets(timingNews, timingNow, newsCap)
 	e.bus.Publish(events.NewsEnriched, events.NewsEnrichedPayload{
 		Ticker: ticker,
 		Count:  len(snippets),
@@ -1819,16 +1816,37 @@ func volRatio(candles []data.Candle, volSMA float64) float64 {
 	return float64(latest.Volume) / volSMA
 }
 
-// sentimentLabel converts a numeric sentiment score (0.0–1.0 bullish) to a label.
+// sentimentLabel converts the signed [-1, 1] sentiment scale stored by Finnhub
+// (bullish percent minus bearish percent) into the prompt/gate labels.
 func sentimentLabel(score float64) string {
 	switch {
-	case score >= 0.55:
+	case score > signedBullishSentimentMin:
 		return "bullish"
-	case score <= 0.45:
+	case score < signedBearishSentimentMax:
 		return "bearish"
 	default:
 		return "neutral"
 	}
+}
+
+// promptNewsSnippets preserves the prompt's short, recent-news contract even
+// when the timing policy has loaded a longer catalyst-evidence window.
+func promptNewsSnippets(items []analysis.NewsSnippet, now time.Time, limit int) []analysis.NewsSnippet {
+	if limit <= 0 {
+		return nil
+	}
+	cutoff := now.Add(-defaultNewsLookback)
+	prompt := make([]analysis.NewsSnippet, 0, limit)
+	for _, item := range items {
+		if item.PublishedAt.Before(cutoff) {
+			continue
+		}
+		prompt = append(prompt, item)
+		if len(prompt) == limit {
+			break
+		}
+	}
+	return prompt
 }
 
 // fetchAndStoreCandles fetches recent candles from the market data provider and
@@ -1886,7 +1904,11 @@ func (e *Engine) fetchAndStoreNews(ctx context.Context, ticker string) {
 	e.newsLastFetched[ticker] = time.Now()
 	e.newsMu.Unlock()
 
-	since := time.Now().Add(-48 * time.Hour)
+	now := time.Now()
+	since := now.Add(-newsLookback(
+		e.cfg.Risk.EntryGates.AntiChase.Enabled,
+		e.cfg.Risk.EntryGates.AntiChase.StaleCatalystRunupEnabled,
+	))
 	items, err := e.newsProvider.FetchNews(ctx, ticker, since)
 	if err != nil {
 		logger.Warn("fetch news", "ticker", ticker, "err", err.Error())
@@ -2839,18 +2861,16 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 			sig.SignalPrice = finalAsk
 			if admission.BrokerAuthoritative {
 				admission.Ask, admission.QuoteAt = finalAsk, quote.Timestamp
-				if existingRequest == nil {
-					resized, err := recalculateStockEntryQuantity(
-						admission, sig.SizePct, finalAsk, e.cfg.Risk.MaxPositionPct,
-					)
-					if err != nil {
-						reason := "unable to size entry from final anti-chase ask"
-						_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
-						logger.Warn("signal execution blocked", "ticker", sig.Ticker, "reason", reason, "err", err)
-						return
-					}
-					qty, admission.Quantity = resized, resized
+				resized, err := recalculateStockEntryQuantity(
+					admission, sig.SizePct, finalAsk, e.cfg.Risk.MaxPositionPct,
+				)
+				if err != nil {
+					reason := "unable to size entry from final anti-chase ask"
+					_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+					logger.Warn("signal execution blocked", "ticker", sig.Ticker, "reason", reason, "err", err)
+					return
 				}
+				qty, admission.Quantity = resized, resized
 			}
 			if err := store.UpdateSignalPrice(ctx, sigID, sig.SignalPrice); err != nil {
 				logger.Warn("update signal with final anti-chase ask", "id", sigID, "err", err)
@@ -2922,6 +2942,9 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 	if replayingExisting {
 		orderReq = *existingRequest
 		hydrateStockEntryReplayPolicy(&sig, orderReq)
+		if !admission.BrokerHeldReplay {
+			orderReq = repricePreparedStockEntryRequest(orderReq, qty, sig.SignalPrice)
+		}
 	}
 
 	// The initial broker-protection policy is deliberately fixed brackets. An
@@ -3159,6 +3182,21 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 			BlockReason: reason, FailedCheck: "market_hours",
 		})
 		return
+	}
+	if replayingExisting && !admission.BrokerHeldReplay {
+		payload, err := json.Marshal(orderReq)
+		if err != nil {
+			reason := "unable to prepare repriced stock entry replay"
+			_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+			logger.Warn("signal execution blocked", "ticker", sig.Ticker, "reason", reason, "err", err)
+			return
+		}
+		if err := store.RefreshPreparedStockEntryRequest(ctx, intentKey, orderReq.Quantity, payload); err != nil {
+			reason := "unable to durably refresh prepared entry at final anti-chase ask"
+			_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+			logger.Warn("signal execution blocked", "ticker", sig.Ticker, "reason", reason, "err", err)
+			return
+		}
 	}
 	result, err := e.executor.PlaceOrder(ctx, orderReq)
 	if err != nil {

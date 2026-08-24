@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/romeo-folie/trade-engine/internal/analysis"
 	"github.com/romeo-folie/trade-engine/internal/data"
 )
 
@@ -176,5 +177,61 @@ func TestAntiChaseNewsEvidenceFailsClosedOnlyForEnabledCatalystRule(t *testing.T
 	}
 	if news, reason := antiChaseNewsEvidence(nil, context.DeadlineExceeded, false); reason != "" || len(news) != 0 {
 		t.Fatalf("disabled catalyst rule should tolerate missing news: news=%v reason=%q", news, reason)
+	}
+}
+
+func TestSentimentLabelUsesSignedFinnhubScale(t *testing.T) {
+	tests := []struct {
+		score float64
+		want  string
+	}{
+		{score: 0.4, want: "bullish"},
+		{score: signedBullishSentimentMin, want: "neutral"},
+		{score: 0, want: "neutral"},
+		{score: signedBearishSentimentMax, want: "neutral"},
+		{score: -0.4, want: "bearish"},
+	}
+	for _, tt := range tests {
+		if got := sentimentLabel(tt.score); got != tt.want {
+			t.Errorf("sentimentLabel(%v) = %q, want %q", tt.score, got, tt.want)
+		}
+	}
+}
+
+func TestAntiChaseNewsEvidenceKeepsSignedBullishCatalyst(t *testing.T) {
+	now := time.Date(2026, time.August, 24, 15, 0, 0, 0, nyLoc)
+	news, reason := antiChaseNewsEvidence([]data.NewsItem{{
+		Headline: "strong results", Source: "Finnhub", PublishedAt: now.Add(-48 * time.Hour), SentimentScore: 0.4,
+	}}, nil, true)
+	if reason != "" || len(news) != 1 || news[0].Sentiment != "bullish" {
+		t.Fatalf("signed bullish catalyst = %#v, reason=%q", news, reason)
+	}
+	snapshot := buildAntiChaseSnapshot("TEST", antiChaseDailyCandles(253, now), 100, "test", news, now)
+	if snapshot.CatalystAt == nil {
+		t.Fatalf("signed bullish catalyst was omitted from snapshot: %+v", snapshot)
+	}
+}
+
+func TestNewsLookbackCoversEnabledStaleCatalystPolicy(t *testing.T) {
+	if got := newsLookback(false, true); got != defaultNewsLookback {
+		t.Fatalf("disabled anti-chase lookback = %s, want %s", got, defaultNewsLookback)
+	}
+	if got := newsLookback(true, false); got != defaultNewsLookback {
+		t.Fatalf("disabled catalyst rule lookback = %s, want %s", got, defaultNewsLookback)
+	}
+	if got := newsLookback(true, true); got != antiChaseNewsLookback {
+		t.Fatalf("enabled stale catalyst lookback = %s, want %s", got, antiChaseNewsLookback)
+	}
+}
+
+func TestPromptNewsSnippetsExcludesOlderTimingEvidence(t *testing.T) {
+	now := time.Date(2026, time.August, 24, 15, 0, 0, 0, time.UTC)
+	items := []analysis.NewsSnippet{
+		{Headline: "newest", PublishedAt: now.Add(-time.Hour)},
+		{Headline: "old catalyst", PublishedAt: now.Add(-72 * time.Hour)},
+	}
+	prompt := promptNewsSnippets(items, now, 5)
+	if len(prompt) != 1 || prompt[0].Headline != "newest" {
+		t.Fatalf("prompt news = %#v, want only 48-hour item", prompt)
 	}
 }

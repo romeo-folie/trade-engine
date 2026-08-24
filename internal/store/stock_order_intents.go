@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -168,6 +169,33 @@ func CreateStockOrderIntent(ctx context.Context, in StockOrderIntent) error {
 		in.ID, in.IdempotencyKey, in.ClientOrderID, in.TradeID, in.ParentIntentID, in.Ticker, in.Side,
 		in.OrderType, in.RequestedQty, in.RequestPayload, in.PayloadHash, in.Status, purposeOrSubmit(in.Purpose))
 	return err
+}
+
+// RefreshPreparedStockEntryRequest updates an intent only while it is provably
+// pre-submit: no broker identity, submission attempt, or fill exists. This is
+// needed when a final admission gate refreshes a market order's validated ask
+// and quantity. Once submitted, the request remains immutable for idempotent
+// recovery.
+func RefreshPreparedStockEntryRequest(ctx context.Context, idempotencyKey string, requestedQty float64, payload json.RawMessage) error {
+	if requestedQty <= 0 || len(payload) == 0 {
+		return errors.New("refresh prepared stock entry: request payload and quantity are required")
+	}
+	hash := fmt.Sprintf("%x", sha256.Sum256(payload))
+	tag, err := GetDB().Exec(ctx, `
+		UPDATE stock_order_intents
+		SET requested_qty=$2, request_payload=$3, payload_hash=$4, updated_at=NOW()
+		WHERE idempotency_key=$1
+		  AND purpose='submit' AND side='buy'
+		  AND status IN ('pending','partial')
+		  AND submitted_at IS NULL AND COALESCE(broker_order_id,'')=''
+		  AND filled_qty=0`, idempotencyKey, requestedQty, payload, hash)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return errors.New("refresh prepared stock entry: intent is no longer safe to reprice")
+	}
+	return nil
 }
 
 func GetStockOrderIntentByKey(ctx context.Context, key string) (*StockOrderIntent, error) {
