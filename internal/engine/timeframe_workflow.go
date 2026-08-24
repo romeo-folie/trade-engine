@@ -160,7 +160,12 @@ func decisionPolicyAfterConfirmation(primary, confirmation *analysis.DecisionPol
 // authority downgrade from being replaced by a later arbiter pass that still
 // sees the risk reviewer's original unsupported BUY.
 func decisionPolicyAllowsReArbitration(policy *analysis.DecisionPolicyAudit) bool {
-	return policy == nil || !policy.Applied
+	if policy == nil {
+		return true
+	}
+	// A specialist risk reviewer may veto an entry directly (WAIT/HOLD) or by
+	// downgrading an unsupported BUY. Neither form may be revived downstream.
+	return !policy.Applied && !(policy.Mode == "specialist_buy_authority" && policy.RiskAction != analysis.ActionBuy)
 }
 
 func profileConfirmationConfirmed(confirmation analysis.AnalysisResponse, primaryAudit, confirmationAudit analysis.LensSelectionAudit, available bool) bool {

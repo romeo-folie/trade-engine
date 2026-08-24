@@ -181,7 +181,7 @@ func antiChaseDailyHistoryFresh(completed []data.Candle, now time.Time) bool {
 // During a live session a completed daily bar is yesterday's close, not a
 // current price; without a current-session candle the prompt-time gate must
 // record unavailable evidence and defer to the final broker-ask recheck.
-func analysisAntiChaseMark(candles []data.Candle, now time.Time) (float64, string) {
+func analysisAntiChaseMark(candles []data.Candle, timeframe data.Timeframe, now time.Time) (float64, string) {
 	if len(candles) == 0 {
 		return 0, "analysis_current_mark_unavailable"
 	}
@@ -192,7 +192,25 @@ func analysisAntiChaseMark(candles []data.Candle, now time.Time) (float64, strin
 	if latest.Timestamp.IsZero() || latest.Timestamp.After(now) || !sameDate(latest.Timestamp, now) {
 		return 0, "analysis_current_mark_unavailable"
 	}
+	if maxAge, intraday := analysisIntradayMarkMaxAge(timeframe); intraday && now.Sub(latest.Timestamp) > maxAge {
+		return 0, "analysis_current_mark_unavailable"
+	}
 	return latest.Close, "analysis_current_candle"
+}
+
+func analysisIntradayMarkMaxAge(timeframe data.Timeframe) (time.Duration, bool) {
+	switch timeframe {
+	case data.Timeframe5Min:
+		return 10 * time.Minute, true
+	case data.Timeframe15Min:
+		return 30 * time.Minute, true
+	case data.Timeframe1Hour:
+		return 2 * time.Hour, true
+	case data.Timeframe4Hour:
+		return 5 * time.Hour, true
+	default:
+		return 0, false
+	}
 }
 
 // buildAnalysisAntiChaseSnapshot keeps a failed catalyst read distinct from a

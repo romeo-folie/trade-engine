@@ -182,14 +182,17 @@ func TestBuildAnalysisAntiChaseSnapshotFailsClosedOnlyForEnabledCatalystRule(t *
 func TestAnalysisAntiChaseMarkRequiresCurrentCandleDuringLiveSession(t *testing.T) {
 	now := time.Date(2026, time.August, 24, 15, 0, 0, 0, nyLoc)
 	yesterday := MostRecentCompletedMarketSession(now, 0).Close
-	if mark, source := analysisAntiChaseMark([]data.Candle{{Close: 100, Timestamp: yesterday}}, now); mark != 0 || source != "analysis_current_mark_unavailable" {
+	if mark, source := analysisAntiChaseMark([]data.Candle{{Close: 100, Timestamp: yesterday}}, data.Timeframe1Day, now); mark != 0 || source != "analysis_current_mark_unavailable" {
 		t.Fatalf("completed-only live mark = %.2f/%s, want unavailable", mark, source)
 	}
-	if mark, source := analysisAntiChaseMark([]data.Candle{{Close: 101, Timestamp: now.Add(-time.Minute)}}, now); mark != 101 || source != "analysis_current_candle" {
+	if mark, source := analysisAntiChaseMark([]data.Candle{{Close: 101, Timestamp: now.Add(-time.Minute)}}, data.Timeframe1Hour, now); mark != 101 || source != "analysis_current_candle" {
 		t.Fatalf("current-session mark = %.2f/%s, want current candle", mark, source)
 	}
+	if mark, source := analysisAntiChaseMark([]data.Candle{{Close: 101, Timestamp: now.Add(-2*time.Hour - time.Minute)}}, data.Timeframe1Hour, now); mark != 0 || source != "analysis_current_mark_unavailable" {
+		t.Fatalf("stale current-session mark = %.2f/%s, want unavailable", mark, source)
+	}
 	afterClose := time.Date(2026, time.August, 24, 17, 0, 0, 0, nyLoc)
-	if mark, source := analysisAntiChaseMark([]data.Candle{{Close: 100, Timestamp: yesterday}}, afterClose); mark != 100 || source != "analysis_latest_close" {
+	if mark, source := analysisAntiChaseMark([]data.Candle{{Close: 100, Timestamp: yesterday}}, data.Timeframe1Day, afterClose); mark != 100 || source != "analysis_latest_close" {
 		t.Fatalf("post-close mark = %.2f/%s, want completed close", mark, source)
 	}
 }

@@ -114,6 +114,9 @@ func TestDecisionPolicyAllowsReArbitration(t *testing.T) {
 	if decisionPolicyAllowsReArbitration(&analysis.DecisionPolicyAudit{Applied: true}) {
 		t.Fatal("applied specialist authority policy must prevent re-arbitration")
 	}
+	if decisionPolicyAllowsReArbitration(&analysis.DecisionPolicyAudit{Mode: "specialist_buy_authority", RiskAction: analysis.ActionWait}) {
+		t.Fatal("specialist risk WAIT was allowed to be re-arbitrated")
+	}
 }
 
 func TestProfileConfirmationAllowedRespectsAppliedDecisionPolicy(t *testing.T) {

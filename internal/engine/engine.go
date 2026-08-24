@@ -1169,7 +1169,7 @@ func (e *Engine) runAnalysisWithProfile(
 				timingDaily = nil
 			}
 		}
-		mark, markSource := analysisAntiChaseMark(candles, timingNow)
+		mark, markSource := analysisAntiChaseMark(candles, data.Timeframe(timeframe), timingNow)
 		timingSnapshot = buildAnalysisAntiChaseSnapshot(
 			ticker, timingDaily, mark, markSource, timingNews, recentNewsErr,
 			e.cfg.Risk.EntryGates.AntiChase.StaleCatalystRunupEnabled, timingNow,
@@ -3226,6 +3226,16 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 			logger.Warn("signal execution blocked", "ticker", sig.Ticker, "reason", reason, "err", err)
 			return
 		}
+	}
+	if !admission.BrokerHeldReplay && !IsMarketOpen(time.Now()) {
+		reason := "market closed before final order submission — order would not fill this session"
+		_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+		logger.Warn("signal execution blocked before final broker submission", "ticker", sig.Ticker, "reason", reason)
+		e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+			Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
+			BlockReason: reason, FailedCheck: "market_hours",
+		})
+		return
 	}
 	result, err := e.executor.PlaceOrder(ctx, orderReq)
 	if err != nil {
