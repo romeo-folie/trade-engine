@@ -2709,9 +2709,10 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 			return store.GetLatestCandle(ctx, sig.Ticker, tf)
 		}); candle != nil {
 			sig.SignalPrice = candle.Close
-			if err := store.UpdateSignalPrice(ctx, sigID, sig.SignalPrice); err != nil {
-				logger.Warn("update signal price", "id", sigID, "err", err)
+			if err := store.SetInitialSignalReferencePrice(ctx, sigID, sig.SignalPrice); err != nil {
+				logger.Warn("set initial signal reference price", "id", sigID, "err", err)
 			}
+			sig.AcceptedReferencePrice = sig.SignalPrice
 		}
 	}
 	if sig.SignalPrice <= 0 {
@@ -2728,10 +2729,14 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		})
 		return
 	}
-	// Preserve the execution's original accepted signal mark before a pullback
-	// revalidation can deliberately reprice it. The final stale-price check must
-	// still protect a deferred/manual signal from movement while it was pending.
-	signalReferencePrice := sig.SignalPrice
+	// Preserve the immutable accepted signal mark before a pullback
+	// revalidation or broker admission can deliberately reprice the execution.
+	// SignalPrice is mutable execution state; AcceptedReferencePrice is the
+	// stale-price baseline across deferred and broker-admission retries.
+	signalReferencePrice := sig.AcceptedReferencePrice
+	if signalReferencePrice <= 0 {
+		signalReferencePrice = sig.SignalPrice
+	}
 
 	// SELL = close the ticker's open long (sell_exit.go, #436). Routed
 	// AFTER the signal-price validation above so a SELL can never execute
@@ -2915,18 +2920,8 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 			// market-data quote; if it ages during evidence gathering, retry from
 			// a complete fresh admission instead of mixing data authorities.
 			if err := validateAdmissionTimestamp("quote", admission.QuoteAt, time.Now().UTC()); err != nil {
-				reason := "broker admission aged during anti-chase evidence refresh"
-				if retryErr := store.QueueSignalForAdmissionRetry(ctx, sigID, reason); retryErr != nil {
-					logger.Error("unable to persist broker admission retry", "id", sigID, "ticker", sig.Ticker, "err", retryErr)
-					_ = store.UpdateSignalStatus(ctx, sigID, "blocked", "unable to persist broker-admission retry")
-				} else {
-					logger.Warn("broker admission aged during anti-chase evidence refresh — retrying with a fresh coordinated admission",
-						"id", sigID, "ticker", sig.Ticker, "err", err)
-					e.bus.Publish(events.SignalQueued, events.SignalQueuedPayload{
-						SignalID: sigID, Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
-						ExpiresIn: time.Until(sig.ExpiresAt), EntrySetup: sig.EntrySetup, SetupEvidence: sig.EntrySetupEvidence,
-					})
-				}
+				e.queueBrokerAdmissionRefresh(ctx, sigID, sig, signalReferencePrice,
+					"broker admission aged during anti-chase evidence refresh", err)
 				return
 			}
 		} else {
@@ -3309,6 +3304,11 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 	if err := validateFinalStockEntryRelease(
 		admission, antiChaseFinalQuoteRequired, antiChaseReleaseQuote, sig.Ticker, time.Now(),
 	); err != nil {
+		if admission.BrokerAuthoritative && !admission.BrokerHeldReplay {
+			e.queueBrokerAdmissionRefresh(ctx, sigID, sig, signalReferencePrice,
+				"broker admission aged before final order submission", err)
+			return
+		}
 		reason := err.Error()
 		_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
 		logger.Warn("signal execution blocked before final order submission", "ticker", sig.Ticker, "reason", reason)
@@ -4065,6 +4065,8 @@ func (e *Engine) ApproveSignal(ctx context.Context, sigID string) error {
 	// approval, review catch on #437).
 	if after, err := store.GetSignalByID(ctx, sigID); err == nil && after != nil && after.Status == "blocked" {
 		return fmt.Errorf("signal %s blocked at execution: %s", sigID, after.BlockReason)
+	} else if after != nil && signalRequiresManualAdmissionReapproval(*after) {
+		return fmt.Errorf("signal %s requires renewed manual approval after broker admission refresh", sigID)
 	}
 	return nil
 }
@@ -4772,11 +4774,60 @@ func signalNeedsAdmissionRetry(sig store.Signal) bool {
 		return false
 	}
 	for _, decision := range decisions {
-		if decision.Name == store.AdmissionRetryGateName && decision.Status == "retry_pending" {
+		if decision.Name == store.AdmissionRetryGateName && decision.Status == "retry_pending_auto" {
 			return true
 		}
 	}
 	return false
+}
+
+func signalRequiresManualAdmissionReapproval(sig store.Signal) bool {
+	var decisions []store.EntryGateDecision
+	if err := json.Unmarshal(sig.EntryGateDecisions, &decisions); err != nil {
+		return false
+	}
+	for _, decision := range decisions {
+		if decision.Name == store.AdmissionRetryGateName && decision.Status == "manual_reapproval_required" {
+			return true
+		}
+	}
+	return false
+}
+
+// queueBrokerAdmissionRefresh turns an elapsed coordinated broker snapshot
+// into a fresh full-admission attempt. Auto/paper signals are rescheduled by
+// the deferred sweep; manual signals return to the approval queue so an
+// operator explicitly authorizes the new broker admission.
+func (e *Engine) queueBrokerAdmissionRefresh(
+	ctx context.Context,
+	sigID string,
+	sig store.Signal,
+	signalReferencePrice float64,
+	reason string,
+	cause error,
+) {
+	if signalReferencePrice > 0 && sig.AcceptedReferencePrice <= 0 {
+		// A migrated signal normally already has this value. This write is only
+		// for an in-memory/legacy signal whose positive reference was established
+		// before the migration could backfill it.
+		if err := store.SetInitialSignalReferencePrice(ctx, sigID, signalReferencePrice); err != nil {
+			logger.Error("persist accepted signal reference before admission retry", "id", sigID, "ticker", sig.Ticker, "err", err)
+			_ = store.UpdateSignalStatus(ctx, sigID, "blocked", "unable to persist broker-admission retry")
+			return
+		}
+	}
+	automatic := e.Mode() == "auto" || e.Mode() == "paper"
+	if err := store.QueueSignalForAdmissionRetry(ctx, sigID, reason, automatic); err != nil {
+		logger.Error("unable to persist broker admission retry", "id", sigID, "ticker", sig.Ticker, "err", err)
+		_ = store.UpdateSignalStatus(ctx, sigID, "blocked", "unable to persist broker-admission retry")
+		return
+	}
+	logger.Warn("broker admission aged — scheduling a fresh coordinated admission",
+		"id", sigID, "ticker", sig.Ticker, "automatic", automatic, "reason", reason, "err", cause)
+	e.bus.Publish(events.SignalQueued, events.SignalQueuedPayload{
+		SignalID: sigID, Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
+		ExpiresIn: time.Until(sig.ExpiresAt), EntrySetup: sig.EntrySetup, SetupEvidence: sig.EntrySetupEvidence,
+	})
 }
 
 // freshStockMark returns the freshest available stock mark: a live quote mid
@@ -5029,13 +5080,18 @@ func (e *Engine) expireStaleSignals(ctx context.Context) {
 			continue
 		}
 
-		// Price-based staleness.
-		if sig.StalePriceMovePct > 0 && sig.SignalPrice > 0 {
+		// Price-based staleness always measures from the accepted thesis price,
+		// not an execution-time pullback, first-tick, or broker reprice.
+		referencePrice := sig.AcceptedReferencePrice
+		if referencePrice <= 0 {
+			referencePrice = sig.SignalPrice
+		}
+		if sig.StalePriceMovePct > 0 && referencePrice > 0 {
 			latest, err := store.GetLatestCandle(ctx, sig.Ticker, data.Timeframe1Day)
 			if err != nil || latest == nil {
 				continue
 			}
-			if priceDelta, stale := staleSignalPriceMove(sig.SignalPrice, latest.Close, sig.StalePriceMovePct); stale {
+			if priceDelta, stale := staleSignalPriceMove(referencePrice, latest.Close, sig.StalePriceMovePct); stale {
 				reason := fmt.Sprintf("price moved %.1f%% from signal (threshold %.1f%%)", priceDelta, sig.StalePriceMovePct)
 				if err := store.UpdateSignalStatus(ctx, sig.ID, "stale", reason); err != nil {
 					logger.Warn("stale signal", "id", sig.ID, "err", err)

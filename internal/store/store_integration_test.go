@@ -534,10 +534,10 @@ func TestSignal_QueueAdmissionRetryPreservesSignalAndDedupesMarker(t *testing.T)
 	if err != nil {
 		t.Fatalf("insert signal: %v", err)
 	}
-	if err := store.QueueSignalForAdmissionRetry(ctx, id, "broker admission aged during anti-chase evidence refresh"); err != nil {
+	if err := store.QueueSignalForAdmissionRetry(ctx, id, "broker admission aged during anti-chase evidence refresh", true); err != nil {
 		t.Fatalf("queue admission retry: %v", err)
 	}
-	if err := store.QueueSignalForAdmissionRetry(ctx, id, "broker admission aged during anti-chase evidence refresh"); err != nil {
+	if err := store.QueueSignalForAdmissionRetry(ctx, id, "broker admission aged during anti-chase evidence refresh", true); err != nil {
 		t.Fatalf("dedupe admission retry: %v", err)
 	}
 	got, err := store.GetSignalByID(ctx, id)
@@ -547,14 +547,14 @@ func TestSignal_QueueAdmissionRetryPreservesSignalAndDedupesMarker(t *testing.T)
 	if got.Status != "pending" || got.BlockReason == "" {
 		t.Fatalf("retry state = status=%q reason=%q", got.Status, got.BlockReason)
 	}
-	if got.SignalPrice != 100 || !got.ExpiresAt.Equal(expiresAt) {
-		t.Fatalf("retry changed signal data: price=%v expiry=%s", got.SignalPrice, got.ExpiresAt)
+	if got.SignalPrice != 100 || got.AcceptedReferencePrice != 100 || !got.ExpiresAt.Equal(expiresAt) {
+		t.Fatalf("retry changed signal data: price=%v accepted=%v expiry=%s", got.SignalPrice, got.AcceptedReferencePrice, got.ExpiresAt)
 	}
 	var decisions []store.EntryGateDecision
 	if err := json.Unmarshal(got.EntryGateDecisions, &decisions); err != nil {
 		t.Fatalf("decode decisions: %v", err)
 	}
-	if len(decisions) != 1 || decisions[0].Name != store.AdmissionRetryGateName || decisions[0].Status != "retry_pending" {
+	if len(decisions) != 1 || decisions[0].Name != store.AdmissionRetryGateName || decisions[0].Status != "retry_pending_auto" {
 		t.Fatalf("retry decisions = %+v", decisions)
 	}
 	deferred, err := store.GetDeferredSignals(ctx)
@@ -567,6 +567,88 @@ func TestSignal_QueueAdmissionRetryPreservesSignalAndDedupesMarker(t *testing.T)
 		}
 	}
 	t.Fatal("admission retry was not eligible for the deferred sweep")
+}
+
+func TestSignal_AcceptedReferencePriceIsImmutableAcrossReprices(t *testing.T) {
+	ctx := context.Background()
+	id, err := store.InsertSignal(ctx, store.Signal{
+		Ticker: "TEST_ACCEPTED_REFERENCE", Action: "BUY", Strategy: "momentum",
+		SignalPrice: 100, Confidence: .8, SizePct: 1, Status: "pending", ExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("insert signal: %v", err)
+	}
+	if err := store.UpdateSignalPrice(ctx, id, 108); err != nil {
+		t.Fatalf("reprice signal: %v", err)
+	}
+	got, err := store.GetSignalByID(ctx, id)
+	if err != nil || got == nil {
+		t.Fatalf("get repriced signal: %v", err)
+	}
+	if got.SignalPrice != 108 || got.AcceptedReferencePrice != 100 {
+		t.Fatalf("reprice mutated accepted baseline: %+v", got)
+	}
+}
+
+func TestSignal_ManualAdmissionRetryRequiresExplicitReapproval(t *testing.T) {
+	ctx := context.Background()
+	id, err := store.InsertSignal(ctx, store.Signal{
+		Ticker: "TEST_MANUAL_ADMISSION_RETRY", Action: "BUY", Strategy: "momentum",
+		SignalPrice: 100, Confidence: .8, SizePct: 1, Status: "approved", ExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("insert signal: %v", err)
+	}
+	if err := store.QueueSignalForAdmissionRetry(ctx, id, "broker admission aged before final order submission", false); err != nil {
+		t.Fatalf("queue manual admission retry: %v", err)
+	}
+	got, err := store.GetSignalByID(ctx, id)
+	if err != nil || got == nil {
+		t.Fatalf("get manual retry signal: %v", err)
+	}
+	if got.Status != "pending" || got.BlockReason == "" {
+		t.Fatalf("manual retry state = status=%q reason=%q", got.Status, got.BlockReason)
+	}
+	var decisions []store.EntryGateDecision
+	if err := json.Unmarshal(got.EntryGateDecisions, &decisions); err != nil {
+		t.Fatalf("decode decisions: %v", err)
+	}
+	if len(decisions) != 1 || decisions[0].Status != "manual_reapproval_required" {
+		t.Fatalf("manual retry decisions = %+v", decisions)
+	}
+	deferred, err := store.GetDeferredSignals(ctx)
+	if err != nil {
+		t.Fatalf("get deferred signals: %v", err)
+	}
+	for _, signal := range deferred {
+		if signal.ID == id {
+			t.Fatal("manual admission retry was eligible for automatic deferred execution")
+		}
+	}
+}
+
+func TestSignal_SetInitialReferencePriceOnlyOnce(t *testing.T) {
+	ctx := context.Background()
+	id, err := store.InsertSignal(ctx, store.Signal{
+		Ticker: "TEST_INITIAL_REFERENCE", Action: "BUY", Strategy: "momentum",
+		Confidence: .8, SizePct: 1, Status: "pending", ExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("insert zero-price signal: %v", err)
+	}
+	if err := store.SetInitialSignalReferencePrice(ctx, id, 100); err != nil {
+		t.Fatalf("set initial reference: %v", err)
+	}
+	if err := store.SetInitialSignalReferencePrice(ctx, id, 110); err != nil {
+		t.Fatalf("set initial reference twice: %v", err)
+	}
+	got, err := store.GetSignalByID(ctx, id)
+	if err != nil || got == nil {
+		t.Fatalf("get initialized signal: %v", err)
+	}
+	if got.SignalPrice != 100 || got.AcceptedReferencePrice != 100 {
+		t.Fatalf("initial reference was overwritten: %+v", got)
+	}
 }
 
 func TestBacktest_FullLifecycle(t *testing.T) {

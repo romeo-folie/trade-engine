@@ -17,13 +17,19 @@ import (
 func TestSignalNeedsAdmissionRetry(t *testing.T) {
 	decisions, err := json.Marshal([]store.EntryGateDecision{
 		{Name: "universal_anti_chase_release", Status: "passed"},
-		{Name: store.AdmissionRetryGateName, Status: "retry_pending"},
+		{Name: store.AdmissionRetryGateName, Status: "retry_pending_auto"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !signalNeedsAdmissionRetry(store.Signal{EntryGateDecisions: decisions}) {
 		t.Fatal("admission retry marker was not recognized")
+	}
+	if signalNeedsAdmissionRetry(store.Signal{EntryGateDecisions: []byte(`[{"name":"broker_admission_refresh","status":"manual_reapproval_required"}]`)}) {
+		t.Fatal("manual reapproval was treated as an automatic retry")
+	}
+	if !signalRequiresManualAdmissionReapproval(store.Signal{EntryGateDecisions: []byte(`[{"name":"broker_admission_refresh","status":"manual_reapproval_required"}]`)}) {
+		t.Fatal("manual admission retry marker was not recognized")
 	}
 	if signalNeedsAdmissionRetry(store.Signal{EntryGateDecisions: []byte(`[{"name":"broker_admission_refresh","status":"passed"}]`)}) {
 		t.Fatal("completed admission refresh was treated as retry-pending")
