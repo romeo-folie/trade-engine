@@ -182,18 +182,42 @@ func TestBuildAnalysisAntiChaseSnapshotFailsClosedOnlyForEnabledCatalystRule(t *
 func TestAnalysisAntiChaseMarkRequiresCurrentCandleDuringLiveSession(t *testing.T) {
 	now := time.Date(2026, time.August, 24, 15, 0, 0, 0, nyLoc)
 	yesterday := MostRecentCompletedMarketSession(now, 0).Close
-	if mark, source := analysisAntiChaseMark([]data.Candle{{Close: 100, Timestamp: yesterday}}, data.Timeframe1Day, now); mark != 0 || source != "analysis_current_mark_unavailable" {
+	observation := func(candle data.Candle, timeframe data.Timeframe) candleFetchObservation {
+		return candleFetchObservation{ObservedAt: now, Ticker: "TEST", Timeframe: timeframe, LatestFetched: &candle}
+	}
+	if mark, source := analysisAntiChaseMark("TEST", []data.Candle{{Close: 100, Timestamp: yesterday}}, data.Timeframe1Day, now, observation(data.Candle{Close: 100, Timestamp: yesterday}, data.Timeframe1Day)); mark != 0 || source != "analysis_current_mark_unavailable" {
 		t.Fatalf("completed-only live mark = %.2f/%s, want unavailable", mark, source)
 	}
-	if mark, source := analysisAntiChaseMark([]data.Candle{{Close: 101, Timestamp: now.Add(-time.Minute)}}, data.Timeframe1Hour, now); mark != 101 || source != "analysis_current_candle" {
+	if mark, source := analysisAntiChaseMark("TEST", []data.Candle{{Close: 101, Timestamp: now.Add(-time.Minute)}}, data.Timeframe1Hour, now, observation(data.Candle{Close: 101, Timestamp: now.Add(-time.Minute)}, data.Timeframe1Hour)); mark != 101 || source != "analysis_current_candle" {
 		t.Fatalf("current-session mark = %.2f/%s, want current candle", mark, source)
 	}
-	if mark, source := analysisAntiChaseMark([]data.Candle{{Close: 101, Timestamp: now.Add(-2*time.Hour - time.Minute)}}, data.Timeframe1Hour, now); mark != 0 || source != "analysis_current_mark_unavailable" {
+	if mark, source := analysisAntiChaseMark("TEST", []data.Candle{{Close: 101, Timestamp: now.Add(-2*time.Hour - time.Minute)}}, data.Timeframe1Hour, now, observation(data.Candle{Close: 101, Timestamp: now.Add(-2*time.Hour - time.Minute)}, data.Timeframe1Hour)); mark != 0 || source != "analysis_current_mark_unavailable" {
 		t.Fatalf("stale current-session mark = %.2f/%s, want unavailable", mark, source)
 	}
 	afterClose := time.Date(2026, time.August, 24, 17, 0, 0, 0, nyLoc)
-	if mark, source := analysisAntiChaseMark([]data.Candle{{Close: 100, Timestamp: yesterday}}, data.Timeframe1Day, afterClose); mark != 100 || source != "analysis_latest_close" {
+	if mark, source := analysisAntiChaseMark("TEST", []data.Candle{{Close: 100, Timestamp: yesterday}}, data.Timeframe1Day, afterClose, candleFetchObservation{}); mark != 100 || source != "analysis_latest_close" {
 		t.Fatalf("post-close mark = %.2f/%s, want completed close", mark, source)
+	}
+}
+
+func TestAnalysisAntiChaseMarkUsesCurrentFetchNotCachedDailyPartial(t *testing.T) {
+	now := time.Date(2026, time.August, 24, 15, 0, 0, 0, nyLoc)
+	cached := []data.Candle{{Close: 150, Timestamp: now.Add(-6 * time.Hour)}}
+	if mark, source := analysisAntiChaseMark("TEST", cached, data.Timeframe1Day, now, candleFetchObservation{}); mark != 0 || source != "analysis_current_mark_unavailable" {
+		t.Fatalf("cached daily partial after failed fetch = %.2f/%s, want unavailable", mark, source)
+	}
+	yesterday := MostRecentCompletedMarketSession(now, 0).Close
+	if mark, source := analysisAntiChaseMark("TEST", cached, data.Timeframe1Day, now, candleFetchObservation{
+		ObservedAt: now, Ticker: "TEST", Timeframe: data.Timeframe1Day,
+		LatestFetched: &data.Candle{Close: 100, Timestamp: yesterday},
+	}); mark != 0 || source != "analysis_current_mark_unavailable" {
+		t.Fatalf("completed-only daily refresh = %.2f/%s, want unavailable", mark, source)
+	}
+	fresh := data.Candle{Close: 101, Timestamp: now.Add(-time.Minute)}
+	if mark, source := analysisAntiChaseMark("TEST", cached, data.Timeframe1Day, now, candleFetchObservation{
+		ObservedAt: now, Ticker: "TEST", Timeframe: data.Timeframe1Day, LatestFetched: &fresh,
+	}); mark != 101 || source != "analysis_current_candle" {
+		t.Fatalf("current-cycle daily mark = %.2f/%s, want 101/current", mark, source)
 	}
 }
 
@@ -246,6 +270,18 @@ func TestValidateFinalAntiChaseQuote(t *testing.T) {
 	}
 	if err := validateFinalAntiChaseQuote(true, &data.Quote{Ticker: "OTHER", Bid: 99, Ask: 100, Timestamp: at}, "TEST", at); err == nil {
 		t.Fatal("wrong-ticker final quote was accepted")
+	}
+}
+
+func TestStaleSignalPriceMove(t *testing.T) {
+	if delta, stale := staleSignalPriceMove(100, 102, 2); stale || delta != 2 {
+		t.Fatalf("threshold-boundary move = %.2f/%t, want 2/false", delta, stale)
+	}
+	if delta, stale := staleSignalPriceMove(100, 97.9, 2); !stale || delta <= 2 {
+		t.Fatalf("downward move = %.2f/%t, want stale", delta, stale)
+	}
+	if _, stale := staleSignalPriceMove(100, 110, 0); stale {
+		t.Fatal("disabled stale-price threshold rejected a move")
 	}
 }
 

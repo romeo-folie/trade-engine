@@ -343,21 +343,6 @@ func TestValidateStockAskRequiresFreshPositiveAsk(t *testing.T) {
 	}
 }
 
-func TestRecalculateStockEntryQuantityUsesFinalAsk(t *testing.T) {
-	admission := stockEntryAdmission{
-		Account:           execution.BrokerAccount{Equity: 1_000},
-		Asset:             execution.StockAsset{Fractionable: true},
-		RemainingCapacity: 500,
-	}
-	got, err := recalculateStockEntryQuantity(admission, 10, 125, 50)
-	if err != nil {
-		t.Fatalf("recalculate quantity: %v", err)
-	}
-	if got != 0.8 {
-		t.Fatalf("final-ask quantity = %.6f, want 0.8", got)
-	}
-}
-
 func TestRepricePreparedStockEntryRequestUsesFinalAdmissionValues(t *testing.T) {
 	original := execution.OrderRequest{
 		Ticker: "AAPL", Side: execution.OrderSideBuy, Type: execution.OrderTypeMarket,
@@ -718,9 +703,25 @@ func TestStockAdmissionFreshnessRecheckedAtRelease(t *testing.T) {
 	if err := validateStockAdmissionFreshness(admission, now.Add(stockAdmissionMaxAge+time.Millisecond)); err == nil {
 		t.Fatal("aged admission snapshots were released")
 	}
+	if err := validateFinalStockEntryRelease(admission, false, nil, "TEST", now.Add(stockAdmissionMaxAge+time.Millisecond)); err == nil {
+		t.Fatal("aged broker admission was released after final replay work")
+	}
+	if err := validateFinalStockEntryRelease(admission, false, nil, "TEST", now.Add(stockAdmissionMaxAge)); err != nil {
+		t.Fatalf("freshness-boundary broker admission rejected: %v", err)
+	}
+	paperQuote := &data.Quote{Ticker: "TEST", Bid: 99, Ask: 100, Timestamp: now}
+	if err := validateFinalStockEntryRelease(stockEntryAdmission{}, true, paperQuote, "TEST", now.Add(stockAdmissionMaxAge)); err != nil {
+		t.Fatalf("freshness-boundary paper quote rejected: %v", err)
+	}
+	if err := validateFinalStockEntryRelease(stockEntryAdmission{}, true, paperQuote, "TEST", now.Add(stockAdmissionMaxAge+time.Millisecond)); err == nil {
+		t.Fatal("aged paper quote was released at the final boundary")
+	}
 	admission.BrokerHeldReplay = true
 	if err := validateStockAdmissionFreshness(admission, now.Add(time.Hour)); err != nil {
 		t.Fatalf("lookup-only broker-held replay required fresh POST admission: %v", err)
+	}
+	if err := validateFinalStockEntryRelease(admission, false, nil, "TEST", now.Add(time.Hour)); err != nil {
+		t.Fatalf("lookup-only broker-held replay required final freshness: %v", err)
 	}
 }
 

@@ -656,6 +656,7 @@ func (e *Engine) processStockWithProfile(
 	executionProfile *tradeprofile.ExecutionProfile,
 ) {
 	workflow := resolveTimeframeWorkflow(timeframes, executionProfile)
+	primaryTF := workflow.PrimaryTimeframe
 	// The complete pullback setup is defined on daily history even when a
 	// scanner candidate uses 1H/4H for its analyst prompt. Fetch 1D explicitly
 	// so the execution gate never silently fails open because of watchlist
@@ -677,16 +678,21 @@ func (e *Engine) processStockWithProfile(
 		fetchTimeframes = append(fetchTimeframes, string(data.Timeframe1Day))
 	}
 
+	var primaryCandleObservation candleFetchObservation
 	for _, tfStr := range fetchTimeframes {
 		tf := data.Timeframe(tfStr)
-		e.fetchAndStoreCandles(ctx, ticker, tf)
+		observation, err := e.fetchAndStoreCandlesObserved(ctx, ticker, tf)
+		if err != nil {
+			continue
+		}
+		if tf == primaryTF {
+			primaryCandleObservation = observation
+		}
 	}
 
 	// Compute indicators on the primary timeframe (prefer "1d", fall back to first).
 	// Only requested timeframes participate: an evidence-only daily fetch must
 	// not silently change a scanner item's 1H/4H analyst prompt to daily.
-	primaryTF := workflow.PrimaryTimeframe
-
 	// Determine the ticker's primary strategy for prompt-context capping.
 	// NOTE: HistoryWindowByStrategy caps how many candles reach the prompt
 	// (applied in runAnalysis), NOT the DB fetch window. We always fetch 2 years
@@ -838,7 +844,7 @@ func (e *Engine) processStockWithProfile(
 	e.runAnalysisWithProfile(
 		ctx, ticker, string(primaryTF), primaryStrategy, strategies, candles, set,
 		newsHash, source, graphContext, scannerRunID, pullbackCandidate,
-		discoveryContext, executionProfile, pullbackContext, newsRefreshErr,
+		discoveryContext, executionProfile, pullbackContext, newsRefreshErr, primaryCandleObservation,
 	)
 }
 
@@ -943,7 +949,7 @@ func (e *Engine) runAnalysis(
 	e.runAnalysisWithProfile(
 		ctx, ticker, timeframe, strategy, strategies, candles, set,
 		newsHash, source, graphContext, scannerRunID, pullbackCandidate, nil, nil,
-		nil, nil,
+		nil, nil, candleFetchObservation{},
 	)
 }
 
@@ -962,6 +968,7 @@ func (e *Engine) runAnalysisWithProfile(
 	executionProfile *tradeprofile.ExecutionProfile,
 	pullbackContext *pullback.PromptContext,
 	newsRefreshErr error,
+	primaryCandleObservation candleFetchObservation,
 ) {
 	if set == nil {
 		e.recordScannerEngineOutcome(ctx, scannerRunID, ticker, "indicators_missing", "", "")
@@ -1169,7 +1176,9 @@ func (e *Engine) runAnalysisWithProfile(
 				timingDaily = nil
 			}
 		}
-		mark, markSource := analysisAntiChaseMark(candles, data.Timeframe(timeframe), timingNow)
+		mark, markSource := analysisAntiChaseMark(
+			ticker, candles, data.Timeframe(timeframe), timingNow, primaryCandleObservation,
+		)
 		timingSnapshot = buildAnalysisAntiChaseSnapshot(
 			ticker, timingDaily, mark, markSource, timingNews, recentNewsErr,
 			e.cfg.Risk.EntryGates.AntiChase.StaleCatalystRunupEnabled, timingNow,
@@ -1864,37 +1873,55 @@ func (e *Engine) fetchAndStoreCandles(ctx context.Context, ticker string, tf dat
 	_, _ = e.fetchAndStoreCandlesObserved(ctx, ticker, tf)
 }
 
+// candleFetchObservation identifies the freshest candle that the provider
+// returned in a specific fetch cycle. Live prompt timing must use this value,
+// not merely a same-session candle that happened to already be cached.
+type candleFetchObservation struct {
+	ObservedAt    time.Time
+	Ticker        string
+	Timeframe     data.Timeframe
+	LatestFetched *data.Candle
+}
+
 // fetchAndStoreCandlesObserved is the checked variant used when callers need
 // the exact boundary at which the returned provider snapshot became observable.
 func (e *Engine) fetchAndStoreCandlesObserved(
 	ctx context.Context, ticker string, tf data.Timeframe,
-) (time.Time, error) {
+) (candleFetchObservation, error) {
 	if e.marketData == nil {
-		return time.Time{}, fmt.Errorf("market data unavailable")
+		return candleFetchObservation{}, fmt.Errorf("market data unavailable")
 	}
 	candles, err := e.marketData.FetchHistory(ctx, ticker, tf, e.historyCandleLimit(tf))
 	if err != nil {
 		logger.Warn("fetch candles", "ticker", ticker, "tf", string(tf), "err", err.Error())
-		return time.Time{}, err
+		return candleFetchObservation{}, err
 	}
 	if len(candles) == 0 {
 		err := fmt.Errorf("provider returned no candles")
 		logger.Warn("fetch candles", "ticker", ticker, "tf", string(tf), "err", err.Error())
-		return time.Time{}, err
+		return candleFetchObservation{}, err
 	}
 	// Exact post-setup invalidation starts when this provider snapshot became
 	// observable. Capture the boundary immediately after FetchHistory returns,
 	// before DB persistence or any subsequent qualification work.
 	observedAt := time.Now()
+	latest := candles[0]
+	for _, candle := range candles[1:] {
+		if candle.Timestamp.After(latest.Timestamp) {
+			latest = candle
+		}
+	}
 	if err := store.UpsertCandles(ctx, candles); err != nil {
 		logger.Warn("upsert candles", "ticker", ticker, "err", err.Error())
-		return time.Time{}, err
+		return candleFetchObservation{}, err
 	}
 	logger.Info("candles upserted", "ticker", ticker, "tf", string(tf), "count", len(candles))
 	e.bus.Publish(events.DataFetched, events.DataFetchedPayload{
 		Ticker: ticker, Timeframe: string(tf), Count: len(candles),
 	})
-	return observedAt, nil
+	return candleFetchObservation{
+		ObservedAt: observedAt, Ticker: ticker, Timeframe: tf, LatestFetched: &latest,
+	}, nil
 }
 
 // fetchAndStoreNews fetches recent news for a ticker (respecting the cadence
@@ -2196,13 +2223,14 @@ func (e *Engine) generateSignal(
 			// The analyst may take long enough for the session low to change.
 			// Refresh the partial daily bar at qualification time, then scan
 			// every exact trade print from the returned snapshot boundary.
-			var err error
-			pullbackObservedAt, err = e.fetchAndStoreCandlesObserved(
+			observation, err := e.fetchAndStoreCandlesObserved(
 				ctx, ticker, data.Timeframe1Day,
 			)
 			if err != nil {
 				logger.Warn("pullback strength: unable to refresh setup evidence; using standard entry path",
 					"ticker", ticker, "err", err)
+			} else {
+				pullbackObservedAt = observation.ObservedAt
 			}
 		}
 		if needsDailyEvidence &&
@@ -2847,6 +2875,7 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 	intentKey = effectiveIntentKey
 
 	pState := e.portfolio.CurrentState()
+	signalReferencePrice := sig.SignalPrice
 	qty := admission.Quantity
 	if admission.BrokerAuthoritative {
 		sig.SignalPrice = admission.Ask
@@ -2865,7 +2894,19 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		}
 		now := time.Now().UTC()
 		daily, news, evidenceReason := e.executionAntiChaseEvidence(ctx, sig.Ticker, now, antiPolicy.StaleCatalystRunupEnabled)
-		quote, finalAsk := e.freshAntiChaseQuote(ctx, sig.Ticker)
+		var quote *data.Quote
+		finalAsk := admission.Ask
+		if admission.BrokerAuthoritative {
+			// The coordinated broker admission ask is coupled to the account,
+			// capacity, and quantity snapshots. Never replace it with a generic
+			// market-data quote; if it ages during evidence gathering, retry from
+			// a complete fresh admission instead of mixing data authorities.
+			if err := validateAdmissionTimestamp("quote", admission.QuoteAt, time.Now().UTC()); err != nil {
+				finalAsk = 0
+			}
+		} else {
+			quote, finalAsk = e.freshAntiChaseQuote(ctx, sig.Ticker)
+		}
 		var snapshot *antichase.Snapshot
 		if evidenceReason != "" {
 			snapshot = &antichase.Snapshot{
@@ -2883,21 +2924,20 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 			// Daily evidence may take seconds to refresh. Fetch this quote only
 			// afterward, so both the anti-chase decision and submitted market
 			// order use the final validated ask.
+			if delta, stale := staleSignalPriceMove(signalReferencePrice, finalAsk, sig.StalePriceMovePct); stale {
+				reason := fmt.Sprintf("price moved %.1f%% from signal (threshold %.1f%%)", delta, sig.StalePriceMovePct)
+				if err := store.UpdateSignalStatus(ctx, sigID, "stale", reason); err != nil {
+					logger.Warn("stale signal before final anti-chase ask", "id", sigID, "err", err)
+				}
+				logger.Info("signal stale before final anti-chase ask", "id", sigID, "ticker", sig.Ticker, "move_pct", delta)
+				e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+					Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
+					BlockReason: reason, FailedCheck: "stale_signal_price",
+				})
+				return
+			}
 			sig.SignalPrice = finalAsk
 			antiChaseReleaseQuote = quote
-			if admission.BrokerAuthoritative {
-				admission.Ask, admission.QuoteAt = finalAsk, quote.Timestamp
-				resized, err := recalculateStockEntryQuantity(
-					admission, sig.SizePct, finalAsk, e.cfg.Risk.MaxPositionPct,
-				)
-				if err != nil {
-					reason := "unable to size entry from final anti-chase ask"
-					_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
-					logger.Warn("signal execution blocked", "ticker", sig.Ticker, "reason", reason, "err", err)
-					return
-				}
-				qty, admission.Quantity = resized, resized
-			}
 			if err := store.UpdateSignalPrice(ctx, sigID, sig.SignalPrice); err != nil {
 				logger.Warn("update signal with final anti-chase ask", "id", sigID, "err", err)
 			}
@@ -3241,7 +3281,9 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		})
 		return
 	}
-	if err := validateFinalAntiChaseQuote(antiChaseFinalQuoteRequired, antiChaseReleaseQuote, sig.Ticker, time.Now()); err != nil {
+	if err := validateFinalStockEntryRelease(
+		admission, antiChaseFinalQuoteRequired, antiChaseReleaseQuote, sig.Ticker, time.Now(),
+	); err != nil {
 		reason := err.Error()
 		_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
 		logger.Warn("signal execution blocked before final order submission", "ticker", sig.Ticker, "reason", reason)
@@ -4946,8 +4988,7 @@ func (e *Engine) expireStaleSignals(ctx context.Context) {
 			if err != nil || latest == nil {
 				continue
 			}
-			priceDelta := math.Abs(latest.Close-sig.SignalPrice) / sig.SignalPrice * 100
-			if priceDelta > sig.StalePriceMovePct {
+			if priceDelta, stale := staleSignalPriceMove(sig.SignalPrice, latest.Close, sig.StalePriceMovePct); stale {
 				reason := fmt.Sprintf("price moved %.1f%% from signal (threshold %.1f%%)", priceDelta, sig.StalePriceMovePct)
 				if err := store.UpdateSignalStatus(ctx, sig.ID, "stale", reason); err != nil {
 					logger.Warn("stale signal", "id", sig.ID, "err", err)
@@ -4959,6 +5000,20 @@ func (e *Engine) expireStaleSignals(ctx context.Context) {
 }
 
 // ─── Phase 4: Data retention (4.11) ──────────────────────────────────────────
+
+// staleSignalPriceMove is shared by the background expiry sweep and the final
+// execution release. Keeping the strict comparison in one place prevents a
+// deferred/manual signal from taking a different stale-price path than a
+// signal observed by the periodic sweep.
+func staleSignalPriceMove(referencePrice, currentPrice, threshold float64) (float64, bool) {
+	if threshold <= 0 || referencePrice <= 0 || currentPrice <= 0 ||
+		math.IsNaN(referencePrice) || math.IsNaN(currentPrice) ||
+		math.IsInf(referencePrice, 0) || math.IsInf(currentPrice, 0) {
+		return 0, false
+	}
+	delta := math.Abs(currentPrice-referencePrice) / referencePrice * 100
+	return delta, delta > threshold
+}
 
 func (e *Engine) runRetentionLoop(ctx context.Context) {
 	// Run once on start, then daily.

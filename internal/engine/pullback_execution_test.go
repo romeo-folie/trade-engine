@@ -200,9 +200,9 @@ func TestPullbackDailyRefreshReturnsObservationBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("refresh daily evidence: %v", err)
 	}
-	if observedAt.Before(before) || observedAt.After(after) {
+	if observedAt.ObservedAt.Before(before) || observedAt.ObservedAt.After(after) {
 		t.Fatalf("observation boundary %s outside refresh interval [%s,%s]",
-			observedAt, before, after)
+			observedAt.ObservedAt, before, after)
 	}
 	stored, err := store.GetCandles(
 		ctx, "TEST_PB_OBS", data.Timeframe1Day,

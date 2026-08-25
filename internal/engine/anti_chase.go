@@ -181,7 +181,13 @@ func antiChaseDailyHistoryFresh(completed []data.Candle, now time.Time) bool {
 // During a live session a completed daily bar is yesterday's close, not a
 // current price; without a current-session candle the prompt-time gate must
 // record unavailable evidence and defer to the final broker-ask recheck.
-func analysisAntiChaseMark(candles []data.Candle, timeframe data.Timeframe, now time.Time) (float64, string) {
+func analysisAntiChaseMark(
+	ticker string,
+	candles []data.Candle,
+	timeframe data.Timeframe,
+	now time.Time,
+	observation candleFetchObservation,
+) (float64, string) {
 	if len(candles) == 0 {
 		return 0, "analysis_current_mark_unavailable"
 	}
@@ -189,6 +195,14 @@ func analysisAntiChaseMark(candles []data.Candle, timeframe data.Timeframe, now 
 	if !IsMarketOpen(now) {
 		return latest.Close, "analysis_latest_close"
 	}
+	// A current-session mark must come from this cycle's provider response.
+	// Cached partial daily candles can otherwise be hours old yet have today's
+	// date, particularly after a temporary FetchHistory failure.
+	if observation.ObservedAt.IsZero() || observation.Ticker != ticker ||
+		observation.Timeframe != timeframe || observation.LatestFetched == nil {
+		return 0, "analysis_current_mark_unavailable"
+	}
+	latest = *observation.LatestFetched
 	if latest.Timestamp.IsZero() || latest.Timestamp.After(now) || !sameDate(latest.Timestamp, now) {
 		return 0, "analysis_current_mark_unavailable"
 	}
@@ -342,4 +356,21 @@ func validateFinalAntiChaseQuote(required bool, quote *data.Quote, ticker string
 		return fmt.Errorf("anti-chase: final reference quote expired before order submission: %w", err)
 	}
 	return nil
+}
+
+// validateFinalStockEntryRelease runs immediately before submission, after any
+// durable replay refresh. Broker admissions and non-broker paper admissions
+// deliberately use different fresh evidence, but both must still be current at
+// the actual release boundary.
+func validateFinalStockEntryRelease(
+	admission stockEntryAdmission,
+	antiChaseQuoteRequired bool,
+	antiChaseQuote *data.Quote,
+	ticker string,
+	now time.Time,
+) error {
+	if err := validateStockAdmissionFreshness(admission, now.UTC()); err != nil {
+		return err
+	}
+	return validateFinalAntiChaseQuote(antiChaseQuoteRequired, antiChaseQuote, ticker, now)
 }
