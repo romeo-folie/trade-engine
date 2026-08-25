@@ -11,6 +11,9 @@ import (
 const (
 	EntrySetupStandard         = "standard"
 	EntrySetupPullbackStrength = "pullback_strength"
+	// AdmissionRetryGateName identifies a transient release failure that must
+	// re-enter a complete stock admission on a later engine tick.
+	AdmissionRetryGateName = "broker_admission_refresh"
 )
 
 type EntryGateDecision struct {
@@ -140,6 +143,34 @@ func QueueSignalForDeferredExecution(ctx context.Context, id string) error {
 		UPDATE signals
 		SET status='pending', deferred=TRUE, block_reason=NULL, updated_at=NOW()
 		WHERE id=$1::uuid AND action='BUY' AND status IN ('pending','approved','blocked')`, id)
+	return err
+}
+
+// QueueSignalForAdmissionRetry makes a BUY retryable after its coordinated
+// broker admission became stale while later release evidence was gathered. It
+// replaces any prior retry marker, so repeated slow-provider attempts preserve
+// a bounded audit trail and do not turn a transient freshness failure into a
+// terminal anti-chase verdict.
+func QueueSignalForAdmissionRetry(ctx context.Context, id, reason string) error {
+	observedAt := time.Now().UTC()
+	marker, err := json.Marshal(EntryGateDecision{
+		Name: AdmissionRetryGateName, Status: "retry_pending", Reason: reason, ObservedAt: &observedAt,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = GetDB().Exec(ctx, `
+		UPDATE signals
+		SET status='pending', deferred=TRUE, block_reason=$1,
+		    entry_gate_decisions = COALESCE((
+		        SELECT jsonb_agg(existing.decision ORDER BY existing.ordinality)
+		        FROM jsonb_array_elements(COALESCE(signals.entry_gate_decisions, '[]'::jsonb))
+		             WITH ORDINALITY AS existing(decision, ordinality)
+		        WHERE existing.decision->>'name' <> $2
+		    ), '[]'::jsonb) || $3::jsonb,
+		    updated_at=NOW()
+		WHERE id=$4::uuid AND action='BUY' AND status IN ('pending','approved','blocked')`,
+		nullableString(reason), AdmissionRetryGateName, marker, id)
 	return err
 }
 

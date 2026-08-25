@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"math"
 	"testing"
@@ -10,7 +11,27 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/analysis"
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
+	"github.com/romeo-folie/trade-engine/internal/store"
 )
+
+func TestSignalNeedsAdmissionRetry(t *testing.T) {
+	decisions, err := json.Marshal([]store.EntryGateDecision{
+		{Name: "universal_anti_chase_release", Status: "passed"},
+		{Name: store.AdmissionRetryGateName, Status: "retry_pending"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !signalNeedsAdmissionRetry(store.Signal{EntryGateDecisions: decisions}) {
+		t.Fatal("admission retry marker was not recognized")
+	}
+	if signalNeedsAdmissionRetry(store.Signal{EntryGateDecisions: []byte(`[{"name":"broker_admission_refresh","status":"passed"}]`)}) {
+		t.Fatal("completed admission refresh was treated as retry-pending")
+	}
+	if signalNeedsAdmissionRetry(store.Signal{EntryGateDecisions: []byte(`not-json`)}) {
+		t.Fatal("malformed audit JSON was treated as a retry marker")
+	}
+}
 
 type failingNewsProvider struct{ calls int }
 

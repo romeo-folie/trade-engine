@@ -1905,14 +1905,24 @@ func (e *Engine) fetchAndStoreCandlesObserved(
 	// observable. Capture the boundary immediately after FetchHistory returns,
 	// before DB persistence or any subsequent qualification work.
 	observedAt := time.Now()
-	latest := candles[0]
-	for _, candle := range candles[1:] {
-		if candle.Timestamp.After(latest.Timestamp) {
-			latest = candle
+	survivors, err := store.UpsertCandlesObserved(ctx, candles)
+	if err != nil {
+		logger.Warn("upsert candles", "ticker", ticker, "err", err.Error())
+		return candleFetchObservation{}, err
+	}
+	var latest *data.Candle
+	for _, candle := range survivors {
+		if candle.Ticker != ticker || candle.Timeframe != tf {
+			continue
+		}
+		if latest == nil || candle.Timestamp.After(latest.Timestamp) {
+			candidate := candle
+			latest = &candidate
 		}
 	}
-	if err := store.UpsertCandles(ctx, candles); err != nil {
-		logger.Warn("upsert candles", "ticker", ticker, "err", err.Error())
+	if latest == nil {
+		err := fmt.Errorf("provider returned no admissible candles for %s/%s", ticker, tf)
+		logger.Warn("fetch candles", "ticker", ticker, "tf", string(tf), "err", err.Error())
 		return candleFetchObservation{}, err
 	}
 	logger.Info("candles upserted", "ticker", ticker, "tf", string(tf), "count", len(candles))
@@ -1920,7 +1930,7 @@ func (e *Engine) fetchAndStoreCandlesObserved(
 		Ticker: ticker, Timeframe: string(tf), Count: len(candles),
 	})
 	return candleFetchObservation{
-		ObservedAt: observedAt, Ticker: ticker, Timeframe: tf, LatestFetched: &latest,
+		ObservedAt: observedAt, Ticker: ticker, Timeframe: tf, LatestFetched: latest,
 	}, nil
 }
 
@@ -2718,6 +2728,10 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		})
 		return
 	}
+	// Preserve the execution's original accepted signal mark before a pullback
+	// revalidation can deliberately reprice it. The final stale-price check must
+	// still protect a deferred/manual signal from movement while it was pending.
+	signalReferencePrice := sig.SignalPrice
 
 	// SELL = close the ticker's open long (sell_exit.go, #436). Routed
 	// AFTER the signal-price validation above so a SELL can never execute
@@ -2875,7 +2889,6 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 	intentKey = effectiveIntentKey
 
 	pState := e.portfolio.CurrentState()
-	signalReferencePrice := sig.SignalPrice
 	qty := admission.Quantity
 	if admission.BrokerAuthoritative {
 		sig.SignalPrice = admission.Ask
@@ -2902,7 +2915,19 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 			// market-data quote; if it ages during evidence gathering, retry from
 			// a complete fresh admission instead of mixing data authorities.
 			if err := validateAdmissionTimestamp("quote", admission.QuoteAt, time.Now().UTC()); err != nil {
-				finalAsk = 0
+				reason := "broker admission aged during anti-chase evidence refresh"
+				if retryErr := store.QueueSignalForAdmissionRetry(ctx, sigID, reason); retryErr != nil {
+					logger.Error("unable to persist broker admission retry", "id", sigID, "ticker", sig.Ticker, "err", retryErr)
+					_ = store.UpdateSignalStatus(ctx, sigID, "blocked", "unable to persist broker-admission retry")
+				} else {
+					logger.Warn("broker admission aged during anti-chase evidence refresh — retrying with a fresh coordinated admission",
+						"id", sigID, "ticker", sig.Ticker, "err", err)
+					e.bus.Publish(events.SignalQueued, events.SignalQueuedPayload{
+						SignalID: sigID, Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
+						ExpiresIn: time.Until(sig.ExpiresAt), EntrySetup: sig.EntrySetup, SetupEvidence: sig.EntrySetupEvidence,
+					})
+				}
+				return
 			}
 		} else {
 			quote, finalAsk = e.freshAntiChaseQuote(ctx, sig.Ticker)
@@ -4654,6 +4679,15 @@ func (e *Engine) processDeferredSignals(ctx context.Context) {
 			}
 			continue
 		}
+		if signalNeedsAdmissionRetry(sig) {
+			// This signal already passed its ordinary release path. Its broker
+			// admission expired only while final evidence was gathered, so retry
+			// the complete coordinated admission directly rather than treating it
+			// as a first-tick candidate or mixing in a standalone quote.
+			logger.Info("retrying stock entry after broker admission refresh", "id", sig.ID, "ticker", sig.Ticker)
+			e.executeSignal(ctx, sig.ID, sig, true)
+			continue
+		}
 		if !deferredSignalPathEnabled(e.cfg.Risk.EntryGates.FirstTickDefer, false) {
 			continue
 		}
@@ -4730,6 +4764,19 @@ func (e *Engine) processDeferredSignals(ctx context.Context) {
 
 func deferredSignalPathEnabled(firstTickDefer, preparedRecovery bool) bool {
 	return preparedRecovery || firstTickDefer
+}
+
+func signalNeedsAdmissionRetry(sig store.Signal) bool {
+	var decisions []store.EntryGateDecision
+	if err := json.Unmarshal(sig.EntryGateDecisions, &decisions); err != nil {
+		return false
+	}
+	for _, decision := range decisions {
+		if decision.Name == store.AdmissionRetryGateName && decision.Status == "retry_pending" {
+			return true
+		}
+	}
+	return false
 }
 
 // freshStockMark returns the freshest available stock mark: a live quote mid

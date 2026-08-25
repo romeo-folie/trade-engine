@@ -21,8 +21,17 @@ import (
 // than swallowed — a bar disappearing silently would turn provider degradation
 // into an invisible failure.
 func UpsertCandles(ctx context.Context, candles []data.Candle) error {
+	_, err := UpsertCandlesObserved(ctx, candles)
+	return err
+}
+
+// UpsertCandlesObserved persists the same deduplicated, sanitized batch as
+// UpsertCandles and returns the exact candles eligible for persistence. Callers
+// that need a current-cycle mark must use this result rather than raw provider
+// output, which may contain bars rejected by the sanity chokepoint.
+func UpsertCandlesObserved(ctx context.Context, candles []data.Candle) ([]data.Candle, error) {
 	if len(candles) == 0 {
-		return nil
+		return []data.Candle{}, nil
 	}
 	// PostgreSQL rejects an INSERT ... ON CONFLICT DO UPDATE statement that
 	// would affect the same target row twice. Collapse duplicate provider
@@ -68,7 +77,7 @@ func UpsertCandles(ctx context.Context, candles []data.Candle) error {
 		)
 	}
 	if len(candles) == 0 {
-		return nil
+		return candles, nil
 	}
 
 	const batchSize = 500
@@ -78,10 +87,10 @@ func UpsertCandles(ctx context.Context, candles []data.Candle) error {
 			end = len(candles)
 		}
 		if err := upsertCandleBatch(ctx, candles[i:end]); err != nil {
-			return fmt.Errorf("upsert candles batch [%d:%d]: %w", i, end, err)
+			return nil, fmt.Errorf("upsert candles batch [%d:%d]: %w", i, end, err)
 		}
 	}
-	return nil
+	return candles, nil
 }
 
 func upsertCandleBatch(ctx context.Context, candles []data.Candle) error {
