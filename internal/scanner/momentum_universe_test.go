@@ -298,3 +298,16 @@ func TestCandidateStrategiesAddsPullbackPath(t *testing.T) {
 		t.Fatalf("pullback strategies = %q", got)
 	}
 }
+
+func TestScannerCandidateStrategiesCannotPersistUnqualifiedPullbackPrimary(t *testing.T) {
+	got := scannerCandidateStrategies(
+		SwingCandidate{Ticker: "UNQUALIFIED", PullbackQualified: false},
+		SwingScoreResult{Strategy: "pullback_strength"},
+	)
+	if strings.Contains(strings.Join(got, ","), "pullback_strength") {
+		t.Fatalf("unqualified candidate retained pullback strategy: %v", got)
+	}
+	if strings.Join(got, ",") != "momentum" {
+		t.Fatalf("unqualified pullback primary fallback = %v, want momentum", got)
+	}
+}

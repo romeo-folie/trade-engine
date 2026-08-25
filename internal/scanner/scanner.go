@@ -1801,7 +1801,15 @@ func sortByConviction(items []scoredCandidate) {
 }
 
 func scannerCandidateStrategies(candidate SwingCandidate, score SwingScoreResult) []string {
-	strategies := candidateStrategies(score.Strategy, candidate.PullbackQualified)
+	primary := score.Strategy
+	// pullback_strength is a qualified execution path, never a generic scanner
+	// score. The profile also removes this lens for an unqualified candidate,
+	// but the legacy strategies list independently drives engine admission and
+	// must carry the same contract.
+	if !candidate.PullbackQualified && strings.EqualFold(strings.TrimSpace(primary), "pullback_strength") {
+		primary = "momentum"
+	}
+	strategies := candidateStrategies(primary, candidate.PullbackQualified)
 	for _, source := range []string{"weekly_leader", "potent_industry", "premarket_episodic"} {
 		if hasSource(candidate.Sources, source) {
 			strategies = appendUniqueStrategy(strategies, source)

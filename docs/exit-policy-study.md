@@ -97,9 +97,9 @@ setup continue through the standard entry gates; candidates that do complete
 it use all of the following deterministic evidence:
 
 1. **Universe:** scanner candidates clear $100M market cap and $1M snapshot dollar volume, return at least 30% on a 1/3/6-month horizon, and rank in the top quartile of the qualifying pool by the equal-weighted horizon return.
-2. **Strength and structure:** at least six months of split-adjusted daily history; rising EMA9 and EMA21; a 40-session (~8-week) consolidation whose recent half makes a higher low and whose recent range is narrower than its opening range.
-3. **Anchored VWAP:** AVWAPs are computed from the consolidation's deterministic swing-high and swing-low anchors. One must stack within the configured tolerance of EMA9 or recent horizontal support.
-4. **Entry timing:** the current session must flush into stacked support, then trade positive on the day and reclaim that support.
+2. **Strength and structure:** at least six months of split-adjusted daily history; EMA9 above EMA21 with both rising; and a 40-session (~8-week) tight base. The base must have bounded width and drift, overlapping successive ranges, a higher low, contracting range, and sustained interaction with EMA9/EMA21. A smooth advance is not a consolidation.
+3. **Anchored VWAP:** AVWAPs use confirmed, sufficiently aged consolidation swing-high and swing-low anchors known before the signal session. One must stack within the configured tolerance of EMA9 or a repeated horizontal-support cluster; a single wick is not support.
+4. **Entry timing:** the current session must flush into the pre-existing stacked-support band without materially breaking it, then turn positive and reclaim support without becoming extended above it. Delayed execution repeats this qualification against the fresh daily bar and executable mark.
 5. **Risk:** the current session low replaces the analyst's generic stop. Entries wider than the configured maximum (4% by default) are rejected.
 
 The scanner keeps its standard candidate pool and tags the point-in-time

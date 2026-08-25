@@ -2227,6 +2227,7 @@ func (e *Engine) generateSignal(
 			(pullbackSelected && eg.PullbackStrengthEnabled)
 		pullbackConfirmed := false
 		pullbackFailureReason := ""
+		var pullbackQualificationDetails []byte
 		needsDailyEvidence := pullbackEvaluationRequired ||
 			eg.TrendAlignmentEnabled || eg.AntiChase.Enabled
 		if pullbackEvaluationRequired {
@@ -2293,6 +2294,7 @@ func (e *Engine) generateSignal(
 				SupportTolerancePct:   eg.PullbackSupportTolerancePct,
 				MaxStopWidthPct:       eg.PullbackMaxStopWidthPct,
 			})
+			pullbackQualificationDetails, _ = json.Marshal(setup.PromptContext())
 			entryDecision := resolveAdditiveEntry(setup)
 			if entryDecision.PullbackConfirmed {
 				// The research entry is inseparable from its tight low-of-day
@@ -2342,12 +2344,15 @@ func (e *Engine) generateSignal(
 			}
 			entryGateReason = "pullback strength: deterministic qualification required for the selected lens: " + pullbackFailureReason
 		}
-		if pullbackSelected {
+		if pullbackConfirmed || pullbackSelected {
 			status, reason := "passed", "deterministic pullback qualification passed"
 			if !pullbackConfirmed {
 				status, reason = "blocked", entryGateReason
 			}
-			gateDecisions = append(gateDecisions, store.EntryGateDecision{Name: "pullback_qualification", Status: status, Reason: reason})
+			gateDecisions = append(gateDecisions, store.EntryGateDecision{
+				Name: "pullback_qualification", Status: status, Reason: reason,
+				Details: pullbackQualificationDetails,
+			})
 		} else {
 			gateDecisions = append(gateDecisions, store.EntryGateDecision{Name: "pullback_qualification", Status: "not_applicable"})
 		}
@@ -2756,7 +2761,18 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 	// Revalidate against a fresh mark immediately before sizing/order placement:
 	// LLM latency, manual approval, or a restart may otherwise leave an already
 	// breached/inverted stop attached to a new position.
-	if sig.PullbackStrength {
+	if sig.PullbackStrength && !fromQueue {
+		sessionLow, err := pullbackSignalSessionLow(sig)
+		if err != nil {
+			reason := "pullback strength: unable to recover original signal-session low"
+			_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+			logger.Warn("pullback execution blocked", "ticker", sig.Ticker, "reason", reason, "err", err)
+			e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+				Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
+				BlockReason: reason, FailedCheck: "pullback_execution_session_low",
+			})
+			return
+		}
 		now := time.Now()
 		evidence, err := e.pullbackExecutionEvidence(
 			ctx, sig.Ticker, sig.CreatedAt, now,
@@ -2773,8 +2789,38 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 			return
 		}
 		mark := evidence.Mark
-		if reason := pullback.ValidateExecutionMark(
-			mark, sig.StopLoss,
+		if _, err := e.fetchAndStoreCandlesObserved(ctx, sig.Ticker, data.Timeframe1Day); err != nil {
+			reason := "pullback strength: unable to refresh daily setup before execution"
+			_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+			logger.Warn("pullback execution blocked", "ticker", sig.Ticker, "reason", reason, "err", err)
+			e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+				Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
+				BlockReason: reason, FailedCheck: "pullback_execution_refresh",
+			})
+			return
+		}
+		freshDailyCandles, err := store.GetCandles(
+			ctx, sig.Ticker, data.Timeframe1Day,
+			time.Now().AddDate(-2, 0, 0), time.Now(),
+		)
+		if err != nil {
+			reason := "pullback strength: unable to load refreshed daily setup before execution"
+			_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+			logger.Warn("pullback execution blocked", "ticker", sig.Ticker, "reason", reason, "err", err)
+			e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+				Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
+				BlockReason: reason, FailedCheck: "pullback_execution_daily_evidence",
+			})
+			return
+		}
+		freshSetup := pullback.Evaluate(freshDailyCandles, mark, pullback.Config{
+			MinMomentumReturnPct:  e.cfg.Risk.EntryGates.PullbackMinMomentumReturnPct,
+			ConsolidationSessions: e.cfg.Risk.EntryGates.PullbackConsolidationSessions,
+			SupportTolerancePct:   e.cfg.Risk.EntryGates.PullbackSupportTolerancePct,
+			MaxStopWidthPct:       e.cfg.Risk.EntryGates.PullbackMaxStopWidthPct,
+		})
+		if reason := pullback.ValidateExecutionSetup(
+			freshSetup, sessionLow, sig.StopLoss, mark,
 			e.cfg.Risk.EntryGates.PullbackMaxStopWidthPct,
 		); reason != "" {
 			_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
@@ -2788,10 +2834,10 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 			return
 		}
 		minTraded := evidence.MinimumTraded
-		if minTraded <= sig.StopLoss {
+		if minTraded <= sessionLow {
 			reason := fmt.Sprintf(
 				"pullback strength: setup invalidated before execution (minimum traded %.2f at/below low-of-day stop %.2f)",
-				minTraded, sig.StopLoss,
+				minTraded, sessionLow,
 			)
 			_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
 			logger.Warn("pullback execution blocked",
@@ -2908,6 +2954,7 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		}
 	}
 	var finalExecutionQuote *data.Quote
+	var pullbackVerifiedThrough time.Time
 	// Every non-broker release that acquired a current execution quote must
 	// prove it is still fresh at submission. Anti-chase and stale-only paths are
 	// mutually exclusive, so this never triggers an additional provider fetch.
@@ -3019,6 +3066,47 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 			logger.Warn("signal execution blocked — final anti-chase audit failed", "ticker", sig.Ticker, "err", err)
 			return
 		}
+	}
+	if sig.PullbackStrength && !admission.BrokerHeldReplay {
+		requestedMark := 0.0
+		if admission.BrokerAuthoritative {
+			// Keep the coordinated broker admission ask as the price for sizing and
+			// release controls. The final exact-path/reclaim check below still uses
+			// the independently refreshed mark to reject a broken or extended setup.
+			requestedMark = sig.SignalPrice
+		}
+		finalMark, finalQuote, verifiedThrough, err := e.revalidatePullbackExecution(ctx, sig, requestedMark)
+		if err != nil {
+			reason := "pullback strength: final execution revalidation failed: " + err.Error()
+			_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+			logger.Warn("pullback execution blocked", "ticker", sig.Ticker, "reason", reason, "err", err)
+			e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+				Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
+				BlockReason: reason, FailedCheck: "pullback_execution_final",
+			})
+			return
+		}
+		if admission.BrokerAuthoritative {
+			if err := validateAdmissionTimestamp("quote", admission.QuoteAt, time.Now().UTC()); err != nil {
+				e.queueBrokerAdmissionRefresh(ctx, sigID, sig, signalReferencePrice,
+					"broker admission aged during final pullback revalidation", err)
+				return
+			}
+		} else {
+			// The slow pullback refresh can move the executable ask after the
+			// earlier stale-price and anti-chase releases. Reapply both controls
+			// to this final mark before it becomes the submitted order price.
+			if e.rejectStaleSignalExecution(ctx, sigID, sig, signalReferencePrice, finalMark) ||
+				e.recheckPullbackTimingGate(ctx, sigID, sig, finalMark) {
+				return
+			}
+			sig.SignalPrice = finalMark
+			finalExecutionQuote = finalQuote
+			if err := store.UpdateSignalPrice(ctx, sigID, sig.SignalPrice); err != nil {
+				logger.Warn("update final pullback execution price", "id", sigID, "err", err)
+			}
+		}
+		pullbackVerifiedThrough = verifiedThrough
 	}
 	if !admission.BrokerAuthoritative {
 		positionValue := pState.Cash * (sig.SizePct / 100)
@@ -3332,6 +3420,53 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 			BlockReason: reason, FailedCheck: "market_hours",
 		})
 		return
+	}
+	// The final slow work above can span several seconds. Extend the exact trade
+	// path immediately before the final release so a brief low-of-day breach and
+	// recovery cannot be hidden between pullback qualification and submission.
+	if sig.PullbackStrength && !admission.BrokerHeldReplay {
+		quote, mark, err := e.verifyPullbackReleasePath(ctx, sig, pullbackVerifiedThrough)
+		if err != nil {
+			reason := "pullback strength: release-path revalidation failed: " + err.Error()
+			_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+			logger.Warn("pullback execution blocked", "ticker", sig.Ticker, "reason", reason, "err", err)
+			e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+				Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
+				BlockReason: reason, FailedCheck: "pullback_execution_release_path",
+			})
+			return
+		}
+		if !admission.BrokerAuthoritative {
+			if e.rejectStaleSignalExecution(ctx, sigID, sig, signalReferencePrice, mark) ||
+				e.recheckPullbackTimingGate(ctx, sigID, sig, mark) {
+				return
+			}
+		}
+		finalExecutionQuote = quote
+		if _, paper := e.executor.(*execution.PaperExecutor); paper {
+			// Paper market orders fill at ReferencePrice, so retain the final
+			// verified executable mark rather than the earlier sizing quote.
+			sig.SignalPrice = mark
+			orderReq.ReferencePrice = mark
+			paperRiskIn := buildRiskInput(e.cfg.Risk, sig.Action, sig.Ticker,
+				sig.Confidence, sig.SizePct, sig.StopLoss, sig.TakeProfit, mark,
+				riskState, owned)
+			paperRiskIn.ProposedQuantity = orderReq.Quantity
+			paperRiskIn.ProposedNotional = orderReq.Quantity * mark
+			if results, passed := checkStockEntryReleaseRisk(admission, paperRiskIn); !passed {
+				reason := "execution risk re-check failed after final paper pullback reprice: " + risk.BlockReason(results)
+				_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+				logger.Warn("paper pullback execution blocked", "ticker", sig.Ticker, "reason", reason)
+				e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+					Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
+					BlockReason: reason, FailedCheck: risk.BlockReason(results),
+				})
+				return
+			}
+			if err := store.UpdateSignalPrice(ctx, sigID, mark); err != nil {
+				logger.Warn("update final paper pullback price", "id", sigID, "err", err)
+			}
+		}
 	}
 	if err := validateFinalStockEntryRelease(
 		admission, finalExecutionQuoteRequired, finalExecutionQuote, sig.Ticker, time.Now(),
@@ -4915,6 +5050,7 @@ func (e *Engine) freshStockMark(ctx context.Context, ticker string, now time.Tim
 type pullbackExecutionEvidence struct {
 	Mark          float64
 	MinimumTraded float64
+	Quote         *data.Quote
 }
 
 func validatePullbackExecutionQuote(
@@ -5022,7 +5158,199 @@ func (e *Engine) pullbackExecutionEvidence(
 		}
 	}
 	evidence.Mark = refreshed.Ask
+	evidence.Quote = refreshed
 	return evidence, nil
+}
+
+// pullbackSignalSessionLow recovers the immutable raw low from the
+// qualification audit. Signal.StopLoss can be tightened later by the pyramid
+// policy, so it cannot safely stand in for the setup's signal-session low.
+func pullbackSignalSessionLow(sig store.Signal) (float64, error) {
+	var decisions []store.EntryGateDecision
+	if err := json.Unmarshal(sig.EntryGateDecisions, &decisions); err != nil {
+		return 0, fmt.Errorf("decode entry gate decisions: %w", err)
+	}
+	for _, decision := range decisions {
+		if decision.Name != "pullback_qualification" || decision.Status != "passed" {
+			continue
+		}
+		var setup pullback.PromptContext
+		if err := json.Unmarshal(decision.Details, &setup); err != nil {
+			return 0, fmt.Errorf("decode pullback qualification evidence: %w", err)
+		}
+		if setup.StopLoss <= 0 {
+			return 0, fmt.Errorf("pullback qualification has no signal-session low")
+		}
+		return setup.StopLoss, nil
+	}
+	return 0, fmt.Errorf("passed pullback qualification not found")
+}
+
+// recheckPullbackTimingGate reapplies the universal anti-chase decision after
+// a pullback's final slow refresh has produced the actual executable ask. It
+// uses the daily/news snapshot refreshed by the first release, then reads it
+// back locally so no further slow work can age the quote that supplies mark.
+func (e *Engine) recheckPullbackTimingGate(
+	ctx context.Context, sigID string, sig store.Signal, mark float64,
+) bool {
+	if !e.cfg.Risk.EntryGates.AntiChase.Enabled {
+		return false
+	}
+	policy := antiChasePolicy(e.cfg.Risk.EntryGates.AntiChase)
+	now := time.Now().UTC()
+	daily, err := store.GetCandles(ctx, sig.Ticker, data.Timeframe1Day, now.AddDate(-2, 0, 0), now)
+	evidenceReason := ""
+	if err != nil {
+		evidenceReason = "anti-chase: unable to load refreshed daily evidence"
+	}
+	items, err := store.GetRecentNews(ctx, sig.Ticker, now.Add(-antiChaseNewsLookback))
+	news, newsReason := antiChaseNewsEvidence(items, err, policy.StaleCatalystRunupEnabled)
+	if evidenceReason == "" && newsReason != "" {
+		evidenceReason = newsReason
+	}
+	var snapshot *antichase.Snapshot
+	if evidenceReason != "" {
+		snapshot = &antichase.Snapshot{
+			SchemaVersion: antichase.PolicyVersion, Ticker: sig.Ticker, ObservedAt: now,
+			ReferencePrice: mark, ReferenceSource: "final_pullback_ask",
+			EvidenceStatus: "unavailable", HistoryScope: "limited_history", EvidenceReason: evidenceReason,
+		}
+	} else {
+		snapshot = buildAntiChaseSnapshot(sig.Ticker, daily, mark, "final_pullback_ask", news, now)
+	}
+	reason, decision := antiChaseEntryGate(snapshot, policy)
+	details, _ := json.Marshal(struct {
+		Snapshot *antichase.Snapshot `json:"snapshot"`
+		Decision antichase.Decision  `json:"decision"`
+	}{snapshot, decision})
+	gate := store.EntryGateDecision{
+		Name: "universal_anti_chase_final_pullback", Status: "passed", Details: details,
+		ObservedAt: &now,
+	}
+	if reason != "" {
+		gate.Status, gate.Reason = "blocked", reason
+		if err := store.BlockSignalWithEntryGateDecision(ctx, sigID, reason, gate); err != nil {
+			logger.Warn("persist final pullback anti-chase block", "id", sigID, "err", err)
+		}
+		logger.Warn("pullback execution blocked by final universal anti-chase gate",
+			"ticker", sig.Ticker, "reason", reason)
+		e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+			Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
+			BlockReason: reason, FailedCheck: gate.Name,
+		})
+		return true
+	}
+	if err := store.AppendSignalEntryGateDecision(ctx, sigID, gate); err != nil {
+		reason := "anti-chase: unable to persist final pullback timing audit"
+		_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+		logger.Warn("pullback execution blocked — final anti-chase audit failed", "ticker", sig.Ticker, "err", err)
+		return true
+	}
+	return false
+}
+
+// verifyPullbackReleasePath is the lightweight final extension of a completed
+// pullback revalidation. The daily setup was already refreshed and checked;
+// this closes only the remaining high-resolution trade interval at release.
+func (e *Engine) verifyPullbackReleasePath(
+	ctx context.Context, sig store.Signal, since time.Time,
+) (*data.Quote, float64, error) {
+	sessionLow, err := pullbackSignalSessionLow(sig)
+	if err != nil {
+		return nil, 0, fmt.Errorf("recover original signal-session low: %w", err)
+	}
+	if since.IsZero() {
+		since = sig.CreatedAt
+	}
+	evidence, err := e.pullbackExecutionEvidence(ctx, sig.Ticker, since, time.Now())
+	if err != nil {
+		return nil, 0, fmt.Errorf("verify exact release path: %w", err)
+	}
+	if evidence.MinimumTraded <= sessionLow {
+		return nil, 0, fmt.Errorf(
+			"setup invalidated before release (minimum traded %.2f at/below low-of-day stop %.2f)",
+			evidence.MinimumTraded, sessionLow,
+		)
+	}
+	daily, err := store.GetCandles(
+		ctx, sig.Ticker, data.Timeframe1Day, time.Now().AddDate(-2, 0, 0), time.Now(),
+	)
+	if err != nil {
+		return nil, 0, fmt.Errorf("load release-time daily setup: %w", err)
+	}
+	setup := pullback.Evaluate(daily, evidence.Mark, pullback.Config{
+		MinMomentumReturnPct:  e.cfg.Risk.EntryGates.PullbackMinMomentumReturnPct,
+		ConsolidationSessions: e.cfg.Risk.EntryGates.PullbackConsolidationSessions,
+		SupportTolerancePct:   e.cfg.Risk.EntryGates.PullbackSupportTolerancePct,
+		MaxStopWidthPct:       e.cfg.Risk.EntryGates.PullbackMaxStopWidthPct,
+	})
+	if reason := pullback.ValidateExecutionSetup(
+		setup, sessionLow, sig.StopLoss, evidence.Mark,
+		e.cfg.Risk.EntryGates.PullbackMaxStopWidthPct,
+	); reason != "" {
+		return nil, 0, errors.New(reason)
+	}
+	if reason := pullback.ValidateExecutionMark(
+		evidence.Mark, sig.StopLoss, e.cfg.Risk.EntryGates.PullbackMaxStopWidthPct,
+	); reason != "" {
+		return nil, 0, errors.New(reason)
+	}
+	return evidence.Quote, evidence.Mark, nil
+}
+
+// revalidatePullbackExecution repeats every time-sensitive pullback check only
+// after the final slow daily refresh has completed. A support break that occurs
+// while refreshing candles must not be hidden by the earlier qualification
+// snapshot and then recovered before submission.
+//
+// requestedMark is the broker-authoritative ask when one exists. A non-positive
+// value uses the final executable market ask from the exact trade-path check.
+func (e *Engine) revalidatePullbackExecution(
+	ctx context.Context, sig store.Signal, requestedMark float64,
+) (float64, *data.Quote, time.Time, error) {
+	sessionLow, err := pullbackSignalSessionLow(sig)
+	if err != nil {
+		return 0, nil, time.Time{}, fmt.Errorf("recover original signal-session low: %w", err)
+	}
+	if _, err := e.fetchAndStoreCandlesObserved(ctx, sig.Ticker, data.Timeframe1Day); err != nil {
+		return 0, nil, time.Time{}, fmt.Errorf("refresh daily setup: %w", err)
+	}
+	freshDailyCandles, err := store.GetCandles(
+		ctx, sig.Ticker, data.Timeframe1Day,
+		time.Now().AddDate(-2, 0, 0), time.Now(),
+	)
+	if err != nil {
+		return 0, nil, time.Time{}, fmt.Errorf("load refreshed daily setup: %w", err)
+	}
+	// Fetch the quote and exact print path after the slow daily work. This is
+	// intentionally last so the evidence reaches the actual order decision.
+	evidence, err := e.pullbackExecutionEvidence(ctx, sig.Ticker, sig.CreatedAt, time.Now())
+	if err != nil {
+		return 0, nil, time.Time{}, fmt.Errorf("verify fresh execution price and post-signal path: %w", err)
+	}
+	mark := requestedMark
+	if mark <= 0 {
+		mark = evidence.Mark
+	}
+	setup := pullback.Evaluate(freshDailyCandles, mark, pullback.Config{
+		MinMomentumReturnPct:  e.cfg.Risk.EntryGates.PullbackMinMomentumReturnPct,
+		ConsolidationSessions: e.cfg.Risk.EntryGates.PullbackConsolidationSessions,
+		SupportTolerancePct:   e.cfg.Risk.EntryGates.PullbackSupportTolerancePct,
+		MaxStopWidthPct:       e.cfg.Risk.EntryGates.PullbackMaxStopWidthPct,
+	})
+	if reason := pullback.ValidateExecutionSetup(
+		setup, sessionLow, sig.StopLoss, mark,
+		e.cfg.Risk.EntryGates.PullbackMaxStopWidthPct,
+	); reason != "" {
+		return 0, nil, time.Time{}, errors.New(reason)
+	}
+	if evidence.MinimumTraded <= sessionLow {
+		return 0, nil, time.Time{}, fmt.Errorf(
+			"setup invalidated before execution (minimum traded %.2f at/below low-of-day stop %.2f)",
+			evidence.MinimumTraded, sessionLow,
+		)
+	}
+	return mark, evidence.Quote, evidence.Quote.Timestamp, nil
 }
 
 // withWorkingStockEntryReservations makes accepted entries that have not yet
