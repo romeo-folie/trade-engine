@@ -318,10 +318,10 @@ risk:
   # filters fail open on missing evidence; pullback is an additive setup path.
   entry_gates:
     trend_alignment_enabled: false  # Block BUYs when price is below declining daily EMA9 + EMA21 (#472)
-    pullback_strength_enabled: false  # Add the complete momentum → consolidation → AVWAP flush/reclaim setup path
+    pullback_strength_enabled: false  # Add the complete momentum → tight rotating base → AVWAP flush/reclaim setup path
     pullback_min_momentum_return_pct: 30  # Minimum return on at least one of the 1/3/6-month horizons
-    pullback_consolidation_sessions: 40  # Eight trading weeks of higher-low, narrowing structure
-    pullback_support_tolerance_pct: 1.5  # AVWAP stacking/touch tolerance around EMA9 or horizontal support
+    pullback_consolidation_sessions: 40  # Eight trading weeks of tight, overlapping, higher-low base structure
+    pullback_support_tolerance_pct: 1.5  # AVWAP/support stacking, support-cluster, flush, and entry-extension tolerance
     pullback_max_stop_width_pct: 4.0  # Maximum entry-to-low-of-day risk; the session low becomes the stop
     news_min_runup_pct: 0      # news_sentiment BUY needs price >= this % above prior close (tape confirms headline); 0 disables. Recommended 2.0
     momentum_max_runup_pct: 0  # momentum BUY blocked when already > this % above prior close (anti-chase); 0 disables. Recommended 2.0

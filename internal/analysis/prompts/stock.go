@@ -925,16 +925,19 @@ func writePullbackContext(b *strings.Builder, context *pullback.PromptContext) {
 	b.WriteString(fmt.Sprintf("Momentum (1M/3M/6M): %s / %s / %s | EMA9/EMA21: %s / %s\n",
 		formatPromptPct(context.Return1M), formatPromptPct(context.Return3M), formatPromptPct(context.Return6M),
 		formatPromptPrice(context.EMA9), formatPromptPrice(context.EMA21)))
-	b.WriteString(fmt.Sprintf("Consolidation: %s sessions (%s to %s); higher low=%t; range narrower=%t (%s early → %s recent)\n",
+	b.WriteString(fmt.Sprintf("Base: %s sessions (%s to %s); width=%s; drift=%s; overlapping=%t; higher low=%t; range narrower=%t (%s early → %s recent)\n",
 		formatPromptSessions(context.ConsolidationSessions), formatPromptTime(context.ConsolidationStart), formatPromptTime(context.ConsolidationEnd),
+		formatPromptPct(context.ConsolidationWidthPct), formatPromptPct(context.ConsolidationDriftPct), context.ConsolidationOverlapping,
 		context.ConsolidationHigherLow, context.ConsolidationRangeNarrower,
 		formatPromptPct(context.EarlyRangePct), formatPromptPct(context.RecentRangePct)))
+	b.WriteString(fmt.Sprintf("EMA structure: aligned/rising=%t; base closes at/above EMA21=%s; EMA interaction=%s\n",
+		context.EMAAligned, formatPromptPct(context.EMA21HoldPct), formatPromptPct(context.EMAInteractionPct)))
 	b.WriteString(fmt.Sprintf("AVWAP definition: %s\n", valueOrUnknown(context.AVWAPDefinition)))
 	b.WriteString(fmt.Sprintf("AVWAPs: swing-high %s (anchor %s); swing-low %s (anchor %s)\n",
 		formatPromptPrice(context.AVWAPHigh), formatPromptTime(context.AVWAPHighAnchor),
 		formatPromptPrice(context.AVWAPLow), formatPromptTime(context.AVWAPLowAnchor)))
-	b.WriteString(fmt.Sprintf("Support components: horizontal=%s; selected AVWAP=%s + %s=%s; tolerance=%s; effective support=%s\n",
-		formatPromptPrice(context.HorizontalSupport), formatPromptPrice(context.StackedAVWAP),
+	b.WriteString(fmt.Sprintf("Support components: horizontal=%s (%d tests); selected AVWAP=%s + %s=%s; tolerance=%s; effective support=%s\n",
+		formatPromptPrice(context.HorizontalSupport), context.HorizontalSupportTests, formatPromptPrice(context.StackedAVWAP),
 		valueOrUnknown(context.StackedCompanionKind), formatPromptPrice(context.StackedCompanion),
 		formatPromptPct(context.SupportTolerancePct), formatPromptPrice(context.Support)))
 	b.WriteString(fmt.Sprintf("Signal checks: flushed into support=%t; positive reclaim=%t\n", context.FlushedIntoSupport, context.PositiveReclaim))

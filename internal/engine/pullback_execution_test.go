@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -9,6 +10,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/events"
 	"github.com/romeo-folie/trade-engine/internal/store"
+	"github.com/romeo-folie/trade-engine/internal/strategy/pullback"
 )
 
 type pullbackEvidenceMarket struct {
@@ -61,6 +63,31 @@ func freshEvidenceQuote(now time.Time, mark float64) *data.Quote {
 	return &data.Quote{
 		Bid: mark - 0.02, Ask: mark, Last: mark - 0.01,
 		Timestamp: now.Add(-time.Second),
+	}
+}
+
+func TestPullbackSignalSessionLowUsesQualificationEvidenceNotPolicyStop(t *testing.T) {
+	details, err := json.Marshal(pullback.PromptContext{StopLoss: 98})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decisions, err := json.Marshal([]store.EntryGateDecision{{
+		Name: "pullback_qualification", Status: "passed", Details: details,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := pullbackSignalSessionLow(store.Signal{
+		PullbackStrength: true, StopLoss: 99, EntryGateDecisions: decisions,
+	})
+	if err != nil || got != 98 {
+		t.Fatalf("session low = %.2f, err=%v; want raw qualification low 98", got, err)
+	}
+}
+
+func TestPullbackSignalSessionLowFailsClosedWithoutQualificationEvidence(t *testing.T) {
+	if _, err := pullbackSignalSessionLow(store.Signal{PullbackStrength: true, StopLoss: 98}); err == nil {
+		t.Fatal("missing qualification evidence accepted")
 	}
 }
 
@@ -140,6 +167,9 @@ func TestPullbackExecutionEvidenceExtendsThroughRefreshedQuote(t *testing.T) {
 	}
 	if got.Mark != 102 || got.MinimumTraded != 97.5 {
 		t.Fatalf("refreshed evidence = %+v, want mark 102/min 97.5", got)
+	}
+	if got.Quote != market.quotes[1] {
+		t.Fatalf("final quote = %#v, want refreshed quote %#v", got.Quote, market.quotes[1])
 	}
 	if len(market.fetches) != 2 {
 		t.Fatalf("trade path fetches = %d, want initial plus extension", len(market.fetches))

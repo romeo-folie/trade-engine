@@ -139,8 +139,9 @@ func pullbackSelectionDisabled(enabled, selected bool) bool {
 
 func pullbackEntryEvidence(setup pullback.Result) string {
 	return fmt.Sprintf(
-		"Momentum %.1f/%.1f/%.1f%%; reclaimed $%.2f support; low-of-day stop $%.2f (%.2f%% risk)",
+		"Momentum %.1f/%.1f/%.1f%%; tight base %.1f%% wide / %.1f%% drift; EMA21 held %.0f%%; reclaimed $%.2f support; low-of-day stop $%.2f (%.2f%% risk)",
 		setup.Return1M, setup.Return3M, setup.Return6M,
+		setup.ConsolidationWidthPct, setup.ConsolidationDriftPct, setup.EMA21HoldPct,
 		setup.Support, setup.StopLoss, setup.StopWidthPct,
 	)
 }

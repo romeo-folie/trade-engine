@@ -1889,12 +1889,12 @@ type EntryGatesConfig struct {
 	// open when daily history is unavailable or insufficient.
 	TrendAlignmentEnabled bool `yaml:"trend_alignment_enabled"`
 	// PullbackStrengthEnabled adds the complete Phase 2 pullback-in-strength
-	// path for universe-qualified scanner candidates: strong multi-month momentum, an
-	// eight-week higher-low/narrowing consolidation around rising EMA9/EMA21,
-	// an intraday flush into stacked AVWAP support, a positive reclaim, and a
-	// sufficiently tight low-of-day stop. Candidates that do not complete the
-	// setup continue through the standard entry path. False preserves existing
-	// behavior.
+	// path for universe-qualified scanner candidates: strong multi-month momentum,
+	// a tight, rotating eight-week base around aligned rising EMA9/EMA21, causal
+	// AVWAP/horizontal stacked support, an intraday flush and positive reclaim,
+	// and a sufficiently tight low-of-day stop. Candidates that do not complete
+	// the setup continue through the standard entry path. False preserves
+	// existing behavior.
 	PullbackStrengthEnabled bool `yaml:"pullback_strength_enabled"`
 	// PullbackMinMomentumReturnPct is the minimum return on at least one of the
 	// 1/3/6-month horizons. Zero defaults to the study's 30%.
@@ -1902,8 +1902,9 @@ type EntryGatesConfig struct {
 	// PullbackConsolidationSessions is the completed-session structure window.
 	// Zero defaults to 40 trading sessions (approximately eight weeks).
 	PullbackConsolidationSessions int `yaml:"pullback_consolidation_sessions"`
-	// PullbackSupportTolerancePct controls both AVWAP/EMA stacking and how far
-	// above support the session low may trade and still count as a touch.
+	// PullbackSupportTolerancePct controls AVWAP/EMA stacking, support clustering,
+	// the maximum flush penetration, and the maximum executable extension above
+	// reclaimed support.
 	// Zero defaults to 1.5%.
 	PullbackSupportTolerancePct float64 `yaml:"pullback_support_tolerance_pct"`
 	// PullbackMaxStopWidthPct caps the entry-to-low-of-day risk. Zero defaults

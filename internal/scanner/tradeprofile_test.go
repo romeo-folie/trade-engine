@@ -58,6 +58,16 @@ func TestBuildScannerTradeProfileUsesSourceOwnedMenus(t *testing.T) {
 			wantRecommend: "momentum",
 		},
 		{
+			name: "weekly leader does not offer pullback without point-in-time qualification",
+			candidate: SwingCandidate{
+				Ticker: "UNQUALIFIED", Sources: []string{"weekly_leader"},
+				WeeklyLeaderEvidence: "rank 4, composite score 0.880", PullbackQualified: false,
+			},
+			score:      SwingScoreResult{Strategy: "pullback_strength"},
+			wantLenses: []string{"trend_following", "momentum"}, wantPrimary: "1D", wantEntry: "4H",
+			wantRecommend: "trend_following",
+		},
+		{
 			name: "premarket uses event timing",
 			candidate: SwingCandidate{Ticker: "GAP", Sources: []string{"premarket_episodic"},
 				PremarketEpisodicEvidence: "gap +12%; catalyst confirmed"},

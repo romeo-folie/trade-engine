@@ -42,8 +42,15 @@ type PromptContext struct {
 	ConsolidationRangeNarrower bool
 	EarlyRangePct              float64
 	RecentRangePct             float64
+	ConsolidationWidthPct      float64
+	ConsolidationDriftPct      float64
+	ConsolidationOverlapping   bool
+	EMAAligned                 bool
+	EMA21HoldPct               float64
+	EMAInteractionPct          float64
 	FlushedIntoSupport         bool
 	PositiveReclaim            bool
+	HorizontalSupportTests     int
 
 	StopLoss              float64
 	StopWidthPct          float64
@@ -72,8 +79,14 @@ func (r Result) PromptContext() PromptContext {
 		ConsolidationHigherLow:     r.ConsolidationHigherLow,
 		ConsolidationRangeNarrower: r.ConsolidationRangeNarrower,
 		EarlyRangePct:              r.EarlyRangePct, RecentRangePct: r.RecentRangePct,
+		ConsolidationWidthPct:    r.ConsolidationWidthPct,
+		ConsolidationDriftPct:    r.ConsolidationDriftPct,
+		ConsolidationOverlapping: r.ConsolidationOverlapping,
+		EMAAligned:               r.EMAAligned, EMA21HoldPct: r.EMA21HoldPct,
+		EMAInteractionPct:  r.EMAInteractionPct,
 		FlushedIntoSupport: r.FlushedIntoSupport, PositiveReclaim: r.PositiveReclaim,
-		StopLoss: r.StopLoss, StopWidthPct: r.StopWidthPct,
+		HorizontalSupportTests: r.HorizontalSupportTests,
+		StopLoss:               r.StopLoss, StopWidthPct: r.StopWidthPct,
 		MaxStopWidthPct: r.MaxStopWidthPct, ExecutionInvalidation: r.ExecutionInvalidation,
 	}
 }

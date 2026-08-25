@@ -43,6 +43,12 @@ func buildScannerTradeProfile(
 
 	defaults := scannerDefaultsForSources(sources)
 	lenses := append([]string(nil), defaults.lenses...)
+	// pullback_strength is a deterministically qualified entry setup, not a
+	// generic weekly-leader opinion. Do not offer the lens unless this exact
+	// scanner candidate passed the point-in-time pullback universe contract.
+	if !candidate.PullbackQualified {
+		lenses = removeLens(lenses, "pullback_strength")
+	}
 	recommended := lenses[0]
 	if scoreLens := strings.ToLower(strings.TrimSpace(score.Strategy)); containsLens(lenses, scoreLens) {
 		recommended = scoreLens
@@ -61,6 +67,16 @@ func buildScannerTradeProfile(
 		return nil, nil, fmt.Errorf("canonicalize execution profile: %w", err)
 	}
 	return &canonicalDiscovery, &canonicalProfile, nil
+}
+
+func removeLens(lenses []string, remove string) []string {
+	out := lenses[:0]
+	for _, lens := range lenses {
+		if !strings.EqualFold(lens, remove) {
+			out = append(out, lens)
+		}
+	}
+	return out
 }
 
 func scannerDefaultsForSources(sources []string) scannerProfileDefaults {

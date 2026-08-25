@@ -17,11 +17,14 @@ func TestPullbackContextReachesGeneralistAndSpecialistPrompts(t *testing.T) {
 		ConsolidationStart:     time.Date(2026, time.June, 20, 0, 0, 0, 0, time.UTC),
 		ConsolidationEnd:       time.Date(2026, time.August, 13, 0, 0, 0, 0, time.UTC),
 		ConsolidationHigherLow: true, ConsolidationRangeNarrower: true,
+		ConsolidationWidthPct: 12.4, ConsolidationDriftPct: 3.2,
+		ConsolidationOverlapping: true, EMAAligned: true,
+		EMA21HoldPct: 82.5, EMAInteractionPct: 67.5,
 		EarlyRangePct: 3.1, RecentRangePct: 1.2,
 		AVWAPHigh: 118.5, AVWAPHighAnchor: time.Date(2026, time.June, 25, 0, 0, 0, 0, time.UTC),
 		AVWAPLow: 117.9, AVWAPLowAnchor: time.Date(2026, time.July, 2, 0, 0, 0, 0, time.UTC),
 		AVWAPDefinition:   "volume-weighted average from the named swing",
-		HorizontalSupport: 118, SupportTolerancePct: 1.5,
+		HorizontalSupport: 118, HorizontalSupportTests: 2, SupportTolerancePct: 1.5,
 		StackedAVWAP: 118.5, StackedCompanion: 118, StackedCompanionKind: "EMA9", Support: 118.5,
 		FlushedIntoSupport: true, PositiveReclaim: true,
 		StopLoss: 117, StopWidthPct: 2.5, MaxStopWidthPct: 4,
@@ -41,6 +44,8 @@ func TestPullbackContextReachesGeneralistAndSpecialistPrompts(t *testing.T) {
 	for _, want := range []string{
 		"### PULLBACK STRENGTH (DETERMINISTIC DAILY EVALUATION)", "Qualified: true", "anchor 2026-06-25",
 		"selected AVWAP=$118.50 + EMA9=$118.00", "Low-of-day stop: $117.00 (2.50% risk; maximum 4.00%)",
+		"width=12.40%; drift=3.20%; overlapping=true", "aligned/rising=true; base closes at/above EMA21=82.50%",
+		"horizontal=$118.00 (2 tests)",
 	} {
 		if !strings.Contains(user, want) {
 			t.Errorf("generalist user prompt missing %q:\n%s", want, user)
