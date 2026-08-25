@@ -118,6 +118,7 @@ interface IndicatorSnapshot {
 
 interface TimeframePass {
   timeframe: string;
+  role?: string;
   status?: string;
   action?: string;
   confidence?: number;
@@ -130,7 +131,9 @@ interface TimeframeWorkflow {
   mode: string;
   primary: TimeframePass;
   confirmation?: TimeframePass;
+  contexts?: TimeframePass[];
   final_action: string;
+  decisive_reason?: string;
 }
 
 interface EntryGateDecision {
@@ -165,7 +168,6 @@ interface DecisionPolicy {
 function formatConfidence(value?: number): string {
   return value == null ? '' : ` · ${(value * 100).toFixed(0)}%`;
 }
-
 
 export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps) {
   const panelRef = useRef<HTMLDivElement>(null);
@@ -317,19 +319,32 @@ export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps)
                 <span className={styles.metaChip}>Selection: {titleCase(detail.LensSelectionStatus)}</span>
               )}
             </div>
+            {detail?.TimeframeWorkflow?.decisive_reason && (
+              <div className={styles.finalOutcome}>
+                <span>FINAL OUTCOME · {detail.TimeframeWorkflow.final_action || action}</span>
+                <strong>{detail.TimeframeWorkflow.decisive_reason}</strong>
+              </div>
+            )}
             <div className={styles.reasoning}>{decisionReasoning || 'No decision reasoning was recorded.'}</div>
             {detailLoading && !detail && (
               <div className={styles.detailLoading} aria-live="polite">Loading structured evidence…</div>
             )}
             {detail?.TimeframeWorkflow && (
               <div className={styles.workflow}>
-                <div className={styles.workflowRow}>
-                  <span>Primary · {detail.TimeframeWorkflow.primary.timeframe}</span>
-                  <strong>
-                    {detail.TimeframeWorkflow.primary.action || action}
-                    {formatConfidence(detail.TimeframeWorkflow.primary.confidence)}
-                  </strong>
-                </div>
+                {detail.TimeframeWorkflow.contexts?.length ? detail.TimeframeWorkflow.contexts.map((context) => (
+                  <div className={styles.workflowRow} key={`${context.role ?? 'primary'}-${context.timeframe}`}>
+                    <span>{titleCase(context.role || 'primary thesis')} · {context.timeframe}</span>
+                    <strong>{titleCase(context.status || 'included')}</strong>
+                  </div>
+                )) : (
+                  <div className={styles.workflowRow}>
+                    <span>Primary · {detail.TimeframeWorkflow.primary.timeframe}</span>
+                    <strong>
+                      {detail.TimeframeWorkflow.primary.action || action}
+                      {formatConfidence(detail.TimeframeWorkflow.primary.confidence)}
+                    </strong>
+                  </div>
+                )}
                 {detail.TimeframeWorkflow.confirmation && (
                   <div className={styles.workflowRow}>
                     <span>Entry · {detail.TimeframeWorkflow.confirmation.timeframe}</span>

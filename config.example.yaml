@@ -407,18 +407,6 @@ analysis:
       risk_proximity: 0.25          # Distance to stop/drawdown contribution
       trend_strength: 0.20          # ADX normalised contribution
 
-  # Multi-timeframe borderline arbiter (Issue #321): when a WAIT lands in the
-  # borderline confidence band, re-run the ensemble on the mapped alternate
-  # timeframe and re-arbitrate across both views. Narrow band by design — only
-  # a small fraction of WAITs incur the 2× token cost.
-  multi_timeframe_borderline_enabled: true
-  multi_timeframe_borderline_conf_min: 0.55  # Band lower bound (below = plain WAIT)
-  multi_timeframe_borderline_conf_max: 0.70  # Band upper bound (above = plain WAIT)
-  multi_timeframe_alt_map:                   # primary timeframe → alternate to consult
-    1h: 4h
-    4h: 1h
-    1d: 1h
-
 # ── Cost profiles & budget guardrails (cost-reduction Epic 3) ────────────────
 # profile sets a named preset for tick_interval, hold_cooldown, classifier mode,
 # adaptive_depth, and cache TTL. Explicit values in this file always override the

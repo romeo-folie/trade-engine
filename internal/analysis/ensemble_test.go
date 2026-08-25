@@ -45,6 +45,25 @@ func TestArbitrate_PreservesEntryConfirmationConstraints(t *testing.T) {
 		t.Fatalf("arbiter user prompt omitted primary thesis context: %q", cap.captured)
 	}
 }
+
+func TestArbitrateUsesEntryTimingPriceAndUnifiedEvidence(t *testing.T) {
+	cap := &captureArbiter{}
+	req := AnalysisRequest{
+		Ticker: "TEST", RecentCandles: []CandleSnapshot{{Close: 100}},
+		TimeframeContexts: []TimeframeContext{{
+			Timeframe: "4h", Role: "entry_timing", RecentCandles: []CandleSnapshot{{Close: 102}},
+		}},
+	}
+	if _, err := Arbitrate(context.Background(), cap, req, []AnalystResult{makeResult(ActionBuy, .8, nil), makeResult(ActionBuy, .7, nil)}); err != nil {
+		t.Fatalf("Arbitrate: %v", err)
+	}
+	if !strings.Contains(cap.captured, "Current price (latest close): 102.00") || !strings.Contains(cap.captured, "SUPPLEMENTAL TIMEFRAME EVIDENCE") {
+		t.Fatalf("arbiter did not receive unified entry timing context: %q", cap.captured)
+	}
+	if !strings.Contains(cap.capturedSystem, "MULTI-TIMEFRAME CONTRACT") {
+		t.Fatalf("arbiter system prompt omitted unified contract: %q", cap.capturedSystem)
+	}
+}
 func (c *captureArbiter) ProviderName() string { return "test" }
 func (c *captureArbiter) ModelName() string    { return "arbiter" }
 func (c *captureArbiter) IsAvailable() bool    { return true }
@@ -59,6 +78,7 @@ func makeResult(action Action, conf float64, err error) AnalystResult {
 
 func TestTryFastPath_UnanimousAboveThreshold(t *testing.T) {
 	results := []AnalystResult{makeResult(ActionBuy, 0.88, nil), makeResult(ActionBuy, 0.85, nil), makeResult(ActionBuy, 0.82, nil), makeResult(ActionBuy, 0.84, nil)}
+	results[0].Response.DecisiveReason = "Breakout volume confirmed the trend."
 	resp, ok := TryFastPath(results, 0.80, 0.15)
 	if !ok {
 		t.Fatal("expected fast-path to hit on unanimous BUY")
@@ -68,6 +88,9 @@ func TestTryFastPath_UnanimousAboveThreshold(t *testing.T) {
 	}
 	if resp.Confidence < 0.84 || resp.Confidence > 0.86 {
 		t.Fatalf("avg confidence = %.3f, want ~0.848", resp.Confidence)
+	}
+	if resp.DecisiveReason != "Breakout volume confirmed the trend." {
+		t.Fatalf("fast-path decisive reason = %q", resp.DecisiveReason)
 	}
 }
 

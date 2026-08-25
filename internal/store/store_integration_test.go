@@ -299,10 +299,11 @@ func TestAnalysis_TimeframeWorkflowRoundTrip(t *testing.T) {
 		t.Fatal("idx_signals_analysis_ids_gin is missing")
 	}
 	wf := store.TimeframeWorkflowAudit{
-		Version: 1, RoutingSource: "profile", Mode: "enforce",
-		Primary:      store.TimeframePassAudit{Timeframe: "1d", Action: "BUY", Confidence: .82, SelectedLens: "momentum"},
-		Confirmation: &store.TimeframePassAudit{Timeframe: "4h", Status: "confirmed", Action: "BUY", Confidence: .76, SelectedLens: "momentum"},
-		FinalAction:  "BUY",
+		Version: 2, RoutingSource: "profile", Mode: "unified",
+		Primary:        store.TimeframePassAudit{Timeframe: "1d", Action: "BUY", Confidence: .82, SelectedLens: "momentum"},
+		Contexts:       []store.TimeframePassAudit{{Timeframe: "1d", Role: "primary_thesis", Status: "included"}, {Timeframe: "4h", Role: "entry_timing", Status: "included"}},
+		FinalAction:    "BUY",
+		DecisiveReason: "Daily trend and 4H timing both support the entry.",
 	}
 	meta := testModelMeta()
 	meta.IndicatorJSON = []byte(`{"RSI":62.5,"EMA20":101.25}`)
@@ -324,7 +325,7 @@ func TestAnalysis_TimeframeWorkflowRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(got.TimeframeWorkflow, &decoded); err != nil {
 		t.Fatalf("decode workflow audit: %v", err)
 	}
-	if decoded.RoutingSource != "profile" || decoded.Confirmation == nil || decoded.Confirmation.Status != "confirmed" {
+	if decoded.RoutingSource != "profile" || len(decoded.Contexts) != 2 || decoded.DecisiveReason == "" {
 		t.Fatalf("workflow audit = %+v", decoded)
 	}
 

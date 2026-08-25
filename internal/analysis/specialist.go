@@ -124,6 +124,7 @@ func (a *Analyzer) AnalyzeSpecialist(ctx context.Context, req AnalysisRequest, _
 			req.KnowledgeContext, promptSimilar, req.PerformanceContext, req.DiscoveryContext, req.PullbackContext,
 			req.TimeframeRole, req.PrimaryThesisContext,
 		)
+		sys, user = appendTimeframeContexts(sys, user, req.TimeframeContexts)
 		if sys == "" || user == "" {
 			logger.Warn("specialist role builder returned empty prompt — skipping", "role", rp.role)
 			continue
@@ -208,6 +209,7 @@ func (a *Analyzer) AnalyzeSpecialist(ctx context.Context, req AnalysisRequest, _
 		formatDirectionalFindings(results), req.DiscoveryContext, req.PullbackContext,
 		req.TimeframeRole, req.PrimaryThesisContext,
 	)
+	sys, user = appendTimeframeContexts(sys, user, req.TimeframeContexts)
 	if sys == "" || user == "" {
 		return AnalyzeResult{AnalystResults: projectSpecialistResults(results)},
 			fmt.Errorf("specialist: failed to build mandatory risk-manager review prompt")

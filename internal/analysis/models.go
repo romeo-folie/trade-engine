@@ -60,6 +60,11 @@ type AnalysisRequest struct {
 	// fixes the selected lens and records the first-pass evidence; confirmation
 	// cannot issue an independent exit decision.
 	PrimaryThesisContext *PrimaryThesisContext
+	// TimeframeContexts carries supplemental market evidence for the same
+	// analyst decision. It replaces the former follow-up LLM passes: the
+	// primary timeframe still anchors the request, while every configured
+	// supplemental timeframe is considered by the very same ensemble.
+	TimeframeContexts []TimeframeContext
 
 	// DiscoveryContext records why scanner promotion found this ticker. It is
 	// prompt context only: source labels must never become execution lenses.
@@ -153,6 +158,10 @@ type AnalysisResponse struct {
 	StopLoss   float64 `json:"stop_loss"`
 	TakeProfit float64 `json:"take_profit"`
 	Reasoning  string  `json:"reasoning"`
+	// DecisiveReason is the one-sentence fact that determined the final action.
+	// For WAIT it must name the concrete blocker, so the persisted outcome is
+	// intelligible even when every directional analyst favoured BUY.
+	DecisiveReason string `json:"decisive_reason"`
 
 	// Regime is the analyst's classification of current conditions
 	// ("trending" | "ranging" | "transitional"). Observation-only.
@@ -171,6 +180,16 @@ type AnalysisResponse struct {
 	// lens-shopping: a menu of lenses is also a menu of justifications, so the
 	// analyst must say why the others do not fit.
 	RejectedStrategies map[string]string `json:"rejected_strategies"`
+}
+
+// TimeframeContext is supplemental evidence supplied to one unified analyst
+// decision. Role is descriptive (for example "entry_timing"), never a second
+// decision authority.
+type TimeframeContext struct {
+	Timeframe     string
+	Role          string
+	RecentCandles []CandleSnapshot
+	Indicators    IndicatorSnapshot
 }
 
 // ModelCallMeta records operational metadata for a single model invocation.

@@ -343,26 +343,6 @@ type AnalysisConfig struct {
 	// AdaptiveDepth configures impact-score-driven analyst tier routing (PRD §7.3).
 	AdaptiveDepth AdaptiveDepthConfig `yaml:"adaptive_depth"`
 
-	// MultiTimeframeBorderlineEnabled enables a second analyst pass on the
-	// alternate timeframe when the arbiter resolves to WAIT inside a narrow
-	// borderline confidence band. The combined arbiter then picks the final
-	// action (Issue #321). Default: true.
-	MultiTimeframeBorderlineEnabled bool `yaml:"multi_timeframe_borderline_enabled"`
-
-	// MultiTimeframeAltMap maps a primary timeframe to its alternate. Keys and
-	// values are timeframe strings (e.g. "1h", "4h", "1d"). When a primary
-	// timeframe has no entry the second pass is skipped for that ticker.
-	// Defaults: 1h → 4h, 4h → 1h, 1d → 1h.
-	MultiTimeframeAltMap map[string]string `yaml:"multi_timeframe_alt_map"`
-
-	// MultiTimeframeBorderlineConfMin is the inclusive lower bound of the
-	// borderline confidence band. Defaults to 0.55.
-	MultiTimeframeBorderlineConfMin float64 `yaml:"multi_timeframe_borderline_conf_min"`
-
-	// MultiTimeframeBorderlineConfMax is the inclusive upper bound of the
-	// borderline confidence band. Defaults to 0.70.
-	MultiTimeframeBorderlineConfMax float64 `yaml:"multi_timeframe_borderline_conf_max"`
-
 	// SpecialistModeEnabled toggles the sequential specialist path: three
 	// directional roles followed by a mandatory risk-manager review.
 	// When true, the engine routes signal-generation calls to
