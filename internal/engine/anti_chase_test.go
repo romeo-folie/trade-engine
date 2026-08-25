@@ -312,6 +312,29 @@ func TestStaleSignalPriceMove(t *testing.T) {
 	}
 }
 
+func TestNeedsFreshStaleSignalQuote(t *testing.T) {
+	tests := []struct {
+		name      string
+		admission stockEntryAdmission
+		antiChase bool
+		threshold float64
+		wantQuote bool
+	}{
+		{name: "nonbroker stale-only", threshold: 2, wantQuote: true},
+		{name: "anti-chase already acquires quote", antiChase: true, threshold: 2},
+		{name: "disabled threshold preserves legacy price", threshold: 0},
+		{name: "broker admission supplies execution ask", admission: stockEntryAdmission{BrokerAuthoritative: true}, threshold: 2},
+		{name: "broker-held replay skips fresh release checks", admission: stockEntryAdmission{BrokerAuthoritative: true, BrokerHeldReplay: true}, threshold: 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := needsFreshStaleSignalQuote(tt.admission, tt.antiChase, tt.threshold); got != tt.wantQuote {
+				t.Fatalf("needs fresh stale quote = %t, want %t", got, tt.wantQuote)
+			}
+		})
+	}
+}
+
 func TestAntiChaseNewsEvidenceFailsClosedOnlyForEnabledCatalystRule(t *testing.T) {
 	if _, reason := antiChaseNewsEvidence(nil, context.DeadlineExceeded, true); reason == "" {
 		t.Fatal("missing catalyst evidence passed with stale-catalyst rule enabled")

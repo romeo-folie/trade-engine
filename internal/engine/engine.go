@@ -2895,7 +2895,13 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 
 	pState := e.portfolio.CurrentState()
 	qty := admission.Quantity
-	if admission.BrokerAuthoritative {
+	if admission.BrokerAuthoritative && !admission.BrokerHeldReplay {
+		// The broker admission ask is the authoritative execution price. Check it
+		// against the accepted thesis price before any optional anti-chase work so
+		// stale-price protection is never disabled with the anti-chase policy.
+		if e.rejectStaleSignalExecution(ctx, sigID, sig, signalReferencePrice, admission.Ask) {
+			return
+		}
 		sig.SignalPrice = admission.Ask
 		if err := store.UpdateSignalPrice(ctx, sigID, sig.SignalPrice); err != nil {
 			logger.Warn("update signal with fresh broker ask", "id", sigID, "err", err)
@@ -2904,6 +2910,29 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 	var antiChaseReleaseQuote *data.Quote
 	antiChaseFinalQuoteRequired := e.cfg.Risk.EntryGates.AntiChase.Enabled &&
 		!admission.BrokerAuthoritative && !admission.BrokerHeldReplay
+	if needsFreshStaleSignalQuote(admission, e.cfg.Risk.EntryGates.AntiChase.Enabled, sig.StalePriceMovePct) {
+		// Without anti-chase evidence there is no later quote acquisition. Still
+		// obtain one validated two-sided quote when stale-price protection is
+		// configured, rather than allowing a delayed approval to chase a move.
+		_, finalAsk := e.freshAntiChaseQuote(ctx, sig.Ticker)
+		if finalAsk <= 0 {
+			reason := "unable to verify current price for stale-signal check"
+			_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+			logger.Warn("signal execution blocked", "ticker", sig.Ticker, "reason", reason)
+			e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+				Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
+				BlockReason: reason, FailedCheck: "stale_signal_price_quote",
+			})
+			return
+		}
+		if e.rejectStaleSignalExecution(ctx, sigID, sig, signalReferencePrice, finalAsk) {
+			return
+		}
+		sig.SignalPrice = finalAsk
+		if err := store.UpdateSignalPrice(ctx, sigID, sig.SignalPrice); err != nil {
+			logger.Warn("update signal with fresh stale-signal ask", "id", sigID, "err", err)
+		}
+	}
 	if e.cfg.Risk.EntryGates.AntiChase.Enabled && !admission.BrokerHeldReplay {
 		antiPolicy := antiChasePolicy(e.cfg.Risk.EntryGates.AntiChase)
 		source := "broker_validated_ask"
@@ -2928,6 +2957,19 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 			quote, finalAsk = e.freshAntiChaseQuote(ctx, sig.Ticker)
 		}
 		var snapshot *antichase.Snapshot
+		if finalAsk > 0 {
+			// Daily evidence may take seconds to refresh. The non-broker quote is
+			// deliberately fetched afterward, so both this decision and the market
+			// order use the final validated ask.
+			if !admission.BrokerAuthoritative && e.rejectStaleSignalExecution(ctx, sigID, sig, signalReferencePrice, finalAsk) {
+				return
+			}
+			sig.SignalPrice = finalAsk
+			antiChaseReleaseQuote = quote
+			if err := store.UpdateSignalPrice(ctx, sigID, sig.SignalPrice); err != nil {
+				logger.Warn("update signal with final anti-chase ask", "id", sigID, "err", err)
+			}
+		}
 		if evidenceReason != "" {
 			snapshot = &antichase.Snapshot{
 				SchemaVersion: antichase.PolicyVersion, Ticker: sig.Ticker, ObservedAt: now,
@@ -2941,26 +2983,6 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 				HistoryScope: "limited_history", EvidenceReason: "anti-chase: fresh two-sided ask is unavailable",
 			}
 		} else {
-			// Daily evidence may take seconds to refresh. Fetch this quote only
-			// afterward, so both the anti-chase decision and submitted market
-			// order use the final validated ask.
-			if delta, stale := staleSignalPriceMove(signalReferencePrice, finalAsk, sig.StalePriceMovePct); stale {
-				reason := fmt.Sprintf("price moved %.1f%% from signal (threshold %.1f%%)", delta, sig.StalePriceMovePct)
-				if err := store.UpdateSignalStatus(ctx, sigID, "stale", reason); err != nil {
-					logger.Warn("stale signal before final anti-chase ask", "id", sigID, "err", err)
-				}
-				logger.Info("signal stale before final anti-chase ask", "id", sigID, "ticker", sig.Ticker, "move_pct", delta)
-				e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
-					Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
-					BlockReason: reason, FailedCheck: "stale_signal_price",
-				})
-				return
-			}
-			sig.SignalPrice = finalAsk
-			antiChaseReleaseQuote = quote
-			if err := store.UpdateSignalPrice(ctx, sigID, sig.SignalPrice); err != nil {
-				logger.Warn("update signal with final anti-chase ask", "id", sigID, "err", err)
-			}
 			snapshot = buildAntiChaseSnapshot(sig.Ticker, daily, sig.SignalPrice, source, news, time.Now())
 		}
 		reason, decision := antiChaseEntryGate(snapshot, antiPolicy)
@@ -3240,6 +3262,11 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 	}
 
 	if err := validateStockAdmissionFreshness(admission, time.Now().UTC()); err != nil {
+		if admission.BrokerAuthoritative && !admission.BrokerHeldReplay {
+			e.queueBrokerAdmissionRefresh(ctx, sigID, sig, signalReferencePrice,
+				"broker admission aged before release controls", err)
+			return
+		}
 		reason := err.Error()
 		_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
 		logger.Warn("signal execution blocked before broker release", "ticker", sig.Ticker, "reason", reason)
@@ -5116,6 +5143,34 @@ func staleSignalPriceMove(referencePrice, currentPrice, threshold float64) (floa
 	}
 	delta := math.Abs(currentPrice-referencePrice) / referencePrice * 100
 	return delta, delta > threshold
+}
+
+// needsFreshStaleSignalQuote identifies the one release path that lacks a
+// broker admission ask and also does not acquire the final anti-chase quote.
+func needsFreshStaleSignalQuote(admission stockEntryAdmission, antiChaseEnabled bool, stalePriceMovePct float64) bool {
+	return !admission.BrokerAuthoritative && !admission.BrokerHeldReplay &&
+		!antiChaseEnabled && stalePriceMovePct > 0
+}
+
+// rejectStaleSignalExecution applies the immutable accepted thesis price to
+// the authoritative release price. Callers choose that release price exactly
+// once: the coordinated broker ask, a fresh stale-only quote, or the final
+// non-broker anti-chase quote after evidence gathering.
+func (e *Engine) rejectStaleSignalExecution(ctx context.Context, sigID string, sig store.Signal, referencePrice, executionPrice float64) bool {
+	delta, stale := staleSignalPriceMove(referencePrice, executionPrice, sig.StalePriceMovePct)
+	if !stale {
+		return false
+	}
+	reason := fmt.Sprintf("price moved %.1f%% from signal (threshold %.1f%%)", delta, sig.StalePriceMovePct)
+	if err := store.UpdateSignalStatus(ctx, sigID, "stale", reason); err != nil {
+		logger.Warn("stale signal before final execution price", "id", sigID, "err", err)
+	}
+	logger.Info("signal stale before final execution price", "id", sigID, "ticker", sig.Ticker, "move_pct", delta)
+	e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+		Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
+		BlockReason: reason, FailedCheck: "stale_signal_price",
+	})
+	return true
 }
 
 func (e *Engine) runRetentionLoop(ctx context.Context) {
