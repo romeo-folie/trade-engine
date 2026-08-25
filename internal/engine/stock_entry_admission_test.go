@@ -692,6 +692,33 @@ func TestDeferredSignalPathHonorsFlagExceptForPreparedRecovery(t *testing.T) {
 	}
 }
 
+func TestTerminalPreparedEntrySignalRejectsFinalBlockedDisposition(t *testing.T) {
+	now := time.Now()
+	for _, status := range []string{"executed", "rejected", "expired", "stale"} {
+		if !terminalPreparedEntrySignal(&store.Signal{Status: status}, now) {
+			t.Fatalf("prepared signal status %q remained retryable", status)
+		}
+	}
+	blockedGate, err := json.Marshal([]store.EntryGateDecision{{
+		Name: "universal_anti_chase_release", Status: "blocked",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !terminalPreparedEntrySignal(&store.Signal{Status: "blocked", EntryGateDecisions: blockedGate}, now) {
+		t.Fatal("final anti-chase blocked signal remained retryable")
+	}
+	if terminalPreparedEntrySignal(&store.Signal{Status: "blocked"}, now) {
+		t.Fatal("temporary blocked prepared signal became terminal")
+	}
+	if terminalPreparedEntrySignal(&store.Signal{Status: "pending"}, now) {
+		t.Fatal("pending prepared signal became terminal")
+	}
+	if !terminalPreparedEntrySignal(&store.Signal{Status: "pending", ExpiresAt: now.Add(-time.Nanosecond)}, now) {
+		t.Fatal("expired prepared signal remained retryable")
+	}
+}
+
 func TestStockAdmissionFreshnessRecheckedAtRelease(t *testing.T) {
 	now := time.Now().UTC()
 	admission := stockEntryAdmission{

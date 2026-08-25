@@ -283,19 +283,19 @@ func TestFreshAntiChaseQuoteValidatesAtPostFetchClock(t *testing.T) {
 	}
 }
 
-func TestValidateFinalAntiChaseQuote(t *testing.T) {
+func TestValidateFinalExecutionQuote(t *testing.T) {
 	at := time.Date(2026, time.August, 24, 15, 0, 0, 0, time.UTC)
 	quote := &data.Quote{Ticker: "TEST", Bid: 99, Ask: 100, Timestamp: at}
-	if err := validateFinalAntiChaseQuote(true, quote, "TEST", at.Add(stockAdmissionMaxAge)); err != nil {
+	if err := validateFinalExecutionQuote(true, quote, "TEST", at.Add(stockAdmissionMaxAge)); err != nil {
 		t.Fatalf("freshness-boundary quote rejected: %v", err)
 	}
-	if err := validateFinalAntiChaseQuote(true, quote, "TEST", at.Add(stockAdmissionMaxAge+time.Nanosecond)); err == nil {
+	if err := validateFinalExecutionQuote(true, quote, "TEST", at.Add(stockAdmissionMaxAge+time.Nanosecond)); err == nil {
 		t.Fatal("expired final quote was accepted")
 	}
-	if err := validateFinalAntiChaseQuote(false, nil, "TEST", at); err != nil {
+	if err := validateFinalExecutionQuote(false, nil, "TEST", at); err != nil {
 		t.Fatalf("unrequired final quote rejected: %v", err)
 	}
-	if err := validateFinalAntiChaseQuote(true, &data.Quote{Ticker: "OTHER", Bid: 99, Ask: 100, Timestamp: at}, "TEST", at); err == nil {
+	if err := validateFinalExecutionQuote(true, &data.Quote{Ticker: "OTHER", Bid: 99, Ask: 100, Timestamp: at}, "TEST", at); err == nil {
 		t.Fatal("wrong-ticker final quote was accepted")
 	}
 }
@@ -314,22 +314,26 @@ func TestStaleSignalPriceMove(t *testing.T) {
 
 func TestNeedsFreshStaleSignalQuote(t *testing.T) {
 	tests := []struct {
-		name      string
-		admission stockEntryAdmission
-		antiChase bool
-		threshold float64
-		wantQuote bool
+		name              string
+		admission         stockEntryAdmission
+		antiChase         bool
+		threshold         float64
+		wantFreshQuote    bool
+		wantFinalValidate bool
 	}{
-		{name: "nonbroker stale-only", threshold: 2, wantQuote: true},
-		{name: "anti-chase already acquires quote", antiChase: true, threshold: 2},
+		{name: "nonbroker stale-only", threshold: 2, wantFreshQuote: true, wantFinalValidate: true},
+		{name: "anti-chase already acquires quote", antiChase: true, threshold: 2, wantFinalValidate: true},
 		{name: "disabled threshold preserves legacy price", threshold: 0},
 		{name: "broker admission supplies execution ask", admission: stockEntryAdmission{BrokerAuthoritative: true}, threshold: 2},
 		{name: "broker-held replay skips fresh release checks", admission: stockEntryAdmission{BrokerAuthoritative: true, BrokerHeldReplay: true}, threshold: 2},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := needsFreshStaleSignalQuote(tt.admission, tt.antiChase, tt.threshold); got != tt.wantQuote {
-				t.Fatalf("needs fresh stale quote = %t, want %t", got, tt.wantQuote)
+			if got := needsFreshStaleSignalQuote(tt.admission, tt.antiChase, tt.threshold); got != tt.wantFreshQuote {
+				t.Fatalf("needs fresh stale quote = %t, want %t", got, tt.wantFreshQuote)
+			}
+			if got := requiresFinalExecutionQuote(tt.admission, tt.antiChase, tt.threshold); got != tt.wantFinalValidate {
+				t.Fatalf("requires final execution quote validation = %t, want %t", got, tt.wantFinalValidate)
 			}
 		})
 	}

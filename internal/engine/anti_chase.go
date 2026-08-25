@@ -344,16 +344,16 @@ func (e *Engine) freshAntiChaseAsk(ctx context.Context, ticker string) float64 {
 	return ask
 }
 
-// validateFinalAntiChaseQuote keeps non-broker execution from releasing a
-// paper order against an ask that was fresh when the anti-chase decision was
-// made but expired while the final release work completed. Broker-authoritative
+// validateFinalExecutionQuote keeps non-broker execution from releasing an
+// order against a quote that was current for a stale-only or anti-chase check
+// but expired while final release work completed. Broker-authoritative
 // admissions have their own complete snapshot freshness gate instead.
-func validateFinalAntiChaseQuote(required bool, quote *data.Quote, ticker string, now time.Time) error {
+func validateFinalExecutionQuote(required bool, quote *data.Quote, ticker string, now time.Time) error {
 	if !required {
 		return nil
 	}
 	if _, err := validateStockAsk(quote, ticker, now.UTC()); err != nil {
-		return fmt.Errorf("anti-chase: final reference quote expired before order submission: %w", err)
+		return fmt.Errorf("final execution quote expired before order submission: %w", err)
 	}
 	return nil
 }
@@ -364,13 +364,13 @@ func validateFinalAntiChaseQuote(required bool, quote *data.Quote, ticker string
 // the actual release boundary.
 func validateFinalStockEntryRelease(
 	admission stockEntryAdmission,
-	antiChaseQuoteRequired bool,
-	antiChaseQuote *data.Quote,
+	finalExecutionQuoteRequired bool,
+	finalExecutionQuote *data.Quote,
 	ticker string,
 	now time.Time,
 ) error {
 	if err := validateStockAdmissionFreshness(admission, now.UTC()); err != nil {
 		return err
 	}
-	return validateFinalAntiChaseQuote(antiChaseQuoteRequired, antiChaseQuote, ticker, now)
+	return validateFinalExecutionQuote(finalExecutionQuoteRequired, finalExecutionQuote, ticker, now)
 }

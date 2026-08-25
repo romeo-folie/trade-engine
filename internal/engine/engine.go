@@ -2907,14 +2907,18 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 			logger.Warn("update signal with fresh broker ask", "id", sigID, "err", err)
 		}
 	}
-	var antiChaseReleaseQuote *data.Quote
-	antiChaseFinalQuoteRequired := e.cfg.Risk.EntryGates.AntiChase.Enabled &&
-		!admission.BrokerAuthoritative && !admission.BrokerHeldReplay
+	var finalExecutionQuote *data.Quote
+	// Every non-broker release that acquired a current execution quote must
+	// prove it is still fresh at submission. Anti-chase and stale-only paths are
+	// mutually exclusive, so this never triggers an additional provider fetch.
+	finalExecutionQuoteRequired := requiresFinalExecutionQuote(
+		admission, e.cfg.Risk.EntryGates.AntiChase.Enabled, sig.StalePriceMovePct,
+	)
 	if needsFreshStaleSignalQuote(admission, e.cfg.Risk.EntryGates.AntiChase.Enabled, sig.StalePriceMovePct) {
 		// Without anti-chase evidence there is no later quote acquisition. Still
 		// obtain one validated two-sided quote when stale-price protection is
 		// configured, rather than allowing a delayed approval to chase a move.
-		_, finalAsk := e.freshAntiChaseQuote(ctx, sig.Ticker)
+		quote, finalAsk := e.freshAntiChaseQuote(ctx, sig.Ticker)
 		if finalAsk <= 0 {
 			reason := "unable to verify current price for stale-signal check"
 			_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
@@ -2929,6 +2933,7 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 			return
 		}
 		sig.SignalPrice = finalAsk
+		finalExecutionQuote = quote
 		if err := store.UpdateSignalPrice(ctx, sigID, sig.SignalPrice); err != nil {
 			logger.Warn("update signal with fresh stale-signal ask", "id", sigID, "err", err)
 		}
@@ -2965,7 +2970,7 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 				return
 			}
 			sig.SignalPrice = finalAsk
-			antiChaseReleaseQuote = quote
+			finalExecutionQuote = quote
 			if err := store.UpdateSignalPrice(ctx, sigID, sig.SignalPrice); err != nil {
 				logger.Warn("update signal with final anti-chase ask", "id", sigID, "err", err)
 			}
@@ -3329,7 +3334,7 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		return
 	}
 	if err := validateFinalStockEntryRelease(
-		admission, antiChaseFinalQuoteRequired, antiChaseReleaseQuote, sig.Ticker, time.Now(),
+		admission, finalExecutionQuoteRequired, finalExecutionQuote, sig.Ticker, time.Now(),
 	); err != nil {
 		if admission.BrokerAuthoritative && !admission.BrokerHeldReplay {
 			e.queueBrokerAdmissionRefresh(ctx, sigID, sig, signalReferencePrice,
@@ -4017,9 +4022,31 @@ func terminalPreparedEntrySignal(sig *store.Signal, now time.Time) bool {
 	switch sig.Status {
 	case "executed", "rejected", "expired", "stale":
 		return true
+	case "blocked":
+		return signalHasTerminalReleaseGate(sig)
 	default:
 		return false
 	}
+}
+
+// signalHasTerminalReleaseGate distinguishes a durable policy rejection from
+// temporary admission failures, both of which use status=blocked. Recovery may
+// retry the latter after a broker miss, but must never revive a signal whose
+// final anti-chase release gate was persisted as blocked.
+func signalHasTerminalReleaseGate(sig *store.Signal) bool {
+	if sig == nil || len(sig.EntryGateDecisions) == 0 {
+		return false
+	}
+	var decisions []store.EntryGateDecision
+	if err := json.Unmarshal(sig.EntryGateDecisions, &decisions); err != nil {
+		return false
+	}
+	for _, decision := range decisions {
+		if decision.Name == "universal_anti_chase_release" && decision.Status == "blocked" {
+			return true
+		}
+	}
+	return false
 }
 
 func preparedEntrySignalID(intentKey string) (string, bool) {
@@ -4699,13 +4726,9 @@ func (e *Engine) processDeferredSignals(ctx context.Context) {
 			// hold/precheck and let executeSignal's self-excluding fresh admission
 			// perform the one complete release gate.
 			e.executeSignal(ctx, sig.ID, sig, true)
-			// Admission failures report their reason by blocking the signal. The
-			// prepared reservation is still unresolved broker state, so make that
-			// signal retryable until recovery either finds the order or confirms a
-			// broker miss after the signal becomes terminal.
-			if err := store.QueueSignalForDeferredExecution(ctx, sig.ID); err != nil {
-				logger.Warn("requeue prepared stock entry after admission attempt", "id", sig.ID, "err", err)
-			}
+			// executeSignal owns the durable disposition. Its explicit transient
+			// admission paths requeue themselves; do not overwrite a final stale,
+			// risk, or anti-chase block with a fresh pending state here.
 			continue
 		}
 		if signalNeedsAdmissionRetry(sig) {
@@ -5150,6 +5173,11 @@ func staleSignalPriceMove(referencePrice, currentPrice, threshold float64) (floa
 func needsFreshStaleSignalQuote(admission stockEntryAdmission, antiChaseEnabled bool, stalePriceMovePct float64) bool {
 	return !admission.BrokerAuthoritative && !admission.BrokerHeldReplay &&
 		!antiChaseEnabled && stalePriceMovePct > 0
+}
+
+func requiresFinalExecutionQuote(admission stockEntryAdmission, antiChaseEnabled bool, stalePriceMovePct float64) bool {
+	return !admission.BrokerAuthoritative && !admission.BrokerHeldReplay &&
+		(antiChaseEnabled || stalePriceMovePct > 0)
 }
 
 // rejectStaleSignalExecution applies the immutable accepted thesis price to
