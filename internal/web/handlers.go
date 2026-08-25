@@ -1017,6 +1017,8 @@ type analysisSummaryResponse struct {
 	Regime                   string                        `json:"Regime,omitempty"`
 	LensSelectionStatus      string                        `json:"LensSelectionStatus,omitempty"`
 	TimeframeWorkflow        *store.TimeframeWorkflowAudit `json:"TimeframeWorkflow,omitempty"`
+	TimingSnapshot           json.RawMessage               `json:"TimingSnapshot,omitempty"`
+	DecisionPolicy           json.RawMessage               `json:"DecisionPolicy,omitempty"`
 	RelatedSignalAction      string                        `json:"RelatedSignalAction,omitempty"`
 	RelatedSignalStatus      string                        `json:"RelatedSignalStatus,omitempty"`
 	RelatedSignalBlockReason string                        `json:"RelatedSignalBlockReason,omitempty"`
@@ -1050,6 +1052,12 @@ func newAnalysisDetailResponse(a *store.AnalysisSummary) analysisSummaryResponse
 		if json.Unmarshal(a.TimeframeWorkflowRaw, &workflow) == nil && workflow.Version > 0 {
 			out.TimeframeWorkflow = &workflow
 		}
+	}
+	if json.Valid(a.TimingSnapshotRaw) && string(a.TimingSnapshotRaw) != "{}" {
+		out.TimingSnapshot = json.RawMessage(a.TimingSnapshotRaw)
+	}
+	if json.Valid(a.DecisionPolicyRaw) && string(a.DecisionPolicyRaw) != "{}" {
+		out.DecisionPolicy = json.RawMessage(a.DecisionPolicyRaw)
 	}
 	if len(a.EntryGateDecisionsRaw) > 0 {
 		_ = json.Unmarshal(a.EntryGateDecisionsRaw, &out.EntryGateDecisions)

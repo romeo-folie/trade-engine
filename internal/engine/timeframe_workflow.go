@@ -91,6 +91,13 @@ func profileConfirmationEligible(resp analysis.AnalysisResponse, audit analysis.
 		(resp.Action == analysis.ActionWait && resp.Confidence >= profileConfirmationWaitMinConfidence && completeWaitRejections(resp, audit.SelectedLens, admissible))
 }
 
+// profileConfirmationAllowed prevents a later timing pass from recreating a
+// BUY that the specialist authority policy already downgraded on the primary
+// thesis. The primary result and its applied audit remain authoritative.
+func profileConfirmationAllowed(resp analysis.AnalysisResponse, audit analysis.LensSelectionAudit, admissible []string, policy *analysis.DecisionPolicyAudit) bool {
+	return decisionPolicyAllowsReArbitration(policy) && profileConfirmationEligible(resp, audit, admissible)
+}
+
 func completeWaitRejections(resp analysis.AnalysisResponse, selected string, admissible []string) bool {
 	if len(resp.RejectedStrategies) != len(admissible)-1 {
 		return false
@@ -136,6 +143,29 @@ func mergeProfileConfirmation(primary, confirmation analysis.AnalysisResponse, p
 	primary.TakeProfit = confirmation.TakeProfit
 	primary.Reasoning = fmt.Sprintf("[PRIMARY]\n%s\n\n[ENTRY CONFIRMATION]\n%s", primary.Reasoning, confirmation.Reasoning)
 	return primary
+}
+
+// decisionPolicyAfterConfirmation keeps the policy audit belonging to the
+// decision that determined the final entry outcome. A profile confirmation can
+// independently downgrade an otherwise valid primary BUY, so its deterministic
+// authority audit is more relevant than the primary pass's audit.
+func decisionPolicyAfterConfirmation(primary, confirmation *analysis.DecisionPolicyAudit) *analysis.DecisionPolicyAudit {
+	if confirmation != nil {
+		return confirmation
+	}
+	return primary
+}
+
+// decisionPolicyAllowsReArbitration prevents a deterministic specialist BUY
+// authority downgrade from being replaced by a later arbiter pass that still
+// sees the risk reviewer's original unsupported BUY.
+func decisionPolicyAllowsReArbitration(policy *analysis.DecisionPolicyAudit) bool {
+	if policy == nil {
+		return true
+	}
+	// A specialist risk reviewer may veto an entry directly (WAIT/HOLD) or by
+	// downgrading an unsupported BUY. Neither form may be revived downstream.
+	return !policy.Applied && !(policy.Mode == "specialist_buy_authority" && policy.RiskAction != analysis.ActionBuy)
 }
 
 func profileConfirmationConfirmed(confirmation analysis.AnalysisResponse, primaryAudit, confirmationAudit analysis.LensSelectionAudit, available bool) bool {

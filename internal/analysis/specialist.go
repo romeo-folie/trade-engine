@@ -236,22 +236,28 @@ func (a *Analyzer) AnalyzeSpecialist(ctx context.Context, req AnalysisRequest, _
 			fmt.Errorf("specialist: mandatory risk-manager review failed: %w", riskErr)
 	}
 
-	final := riskResp
-	final.Reasoning = composeSequentialSpecialistReasoning(results, riskResp)
-	// The risk manager synthesises the directional findings but is not asked to
-	// re-select a lens, so its response carries no usable lens fields. Derive
-	// them from the directional specialists who reached the same verdict —
-	// without this, specialist mode reports an empty selection and the engine's
-	// selected-lens entry gates silently fall back to the configured primary
-	// (the same defect fixed for the ensemble aggregation paths).
-	final.SelectedStrategy, final.Regime = specialistConsensusLens(results, final.Action)
+	final, policyAudit := resolveSpecialistRiskDecision(results, riskResp)
+	final.Reasoning = composeSequentialSpecialistReasoning(results, final)
+	// A risk BUY can retain an admissible selected lens. Any deterministic
+	// downgrade must instead use consensus evidence for its non-directional
+	// outcome; retaining a BUY lens on WAIT/HOLD would misstate the audit.
+	riskSelectedLens := final.Action == ActionBuy && validSpecialistRiskLens(riskResp.SelectedStrategy, req.LensSet())
+	if !riskSelectedLens {
+		final.SelectedStrategy, final.Regime = specialistConsensusLens(results, final.Action)
+	} else {
+		final.SelectedStrategy, final.Regime = riskResp.SelectedStrategy, riskResp.Regime
+	}
 	// The risk manager runs the full candidate-lens contract too, so riskResp
 	// carries ITS OWN rejection map. Left in place beside a consensus-derived
 	// SelectedStrategy, the aggregate could name its selected lens as a
 	// rejected one. Inert today (only len() is read, and the field is not
 	// persisted), but the two fields must describe the same decision before
 	// anything is ever wired to them.
-	final.RejectedStrategies = specialistConsensusRejections(results, final.Action, final.SelectedStrategy)
+	if riskSelectedLens {
+		final.RejectedStrategies = riskResp.RejectedStrategies
+	} else {
+		final.RejectedStrategies = specialistConsensusRejections(results, final.Action, final.SelectedStrategy)
+	}
 	logger.Info("specialist risk review complete",
 		"ticker", req.Ticker,
 		"action", string(final.Action),
@@ -262,7 +268,61 @@ func (a *Analyzer) AnalyzeSpecialist(ctx context.Context, req AnalysisRequest, _
 		Response:       final,
 		Meta:           riskMeta,
 		AnalystResults: projectSpecialistResults(results),
+		DecisionPolicy: policyAudit,
 	}, nil
+}
+
+// resolveSpecialistRiskDecision gives the risk reviewer asymmetric authority:
+// it may always veto a BUY, but it cannot invent a new long entry absent at
+// least two independent directional BUY votes. Protective exits remain intact.
+func resolveSpecialistRiskDecision(results []specialistResult, riskResp AnalysisResponse) (AnalysisResponse, *DecisionPolicyAudit) {
+	votes := make(map[string]Action, 3)
+	buyVotes := 0
+	hasWait := false
+	for _, result := range results {
+		if result.Err != nil || result.Role == "risk_manager" {
+			continue
+		}
+		votes[result.Role] = result.Response.Action
+		if result.Response.Action == ActionBuy {
+			buyVotes++
+		}
+		if result.Response.Action == ActionWait {
+			hasWait = true
+		}
+	}
+	audit := &DecisionPolicyAudit{
+		Version: 1, Mode: "specialist_buy_authority", DirectionalVotes: votes,
+		RiskAction: riskResp.Action, BuyVotes: buyVotes, RequiredBuyVotes: 2,
+		OriginalAction: riskResp.Action, ResolvedAction: riskResp.Action,
+	}
+	if riskResp.Action != ActionBuy || buyVotes >= 2 {
+		return riskResp, audit
+	}
+	resolved := ActionHold
+	if hasWait {
+		resolved = ActionWait
+	}
+	final := riskResp
+	final.Action = resolved
+	final.SizePct, final.StopLoss, final.TakeProfit = 0, 0, 0
+	audit.ResolvedAction = resolved
+	audit.Applied = true
+	audit.Reason = fmt.Sprintf("risk BUY requires at least 2/3 directional BUY votes; received %d/3", buyVotes)
+	return final, audit
+}
+
+func validSpecialistRiskLens(selected string, admissible []string) bool {
+	selected = strings.ToLower(strings.TrimSpace(selected))
+	if selected == "" || selected == "none" {
+		return false
+	}
+	for _, lens := range prompts.Lenses(admissible) {
+		if selected == lens {
+			return true
+		}
+	}
+	return false
 }
 
 func specialistNodeID(role string) string {

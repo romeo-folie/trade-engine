@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -10,32 +11,40 @@ import (
 const (
 	EntrySetupStandard         = "standard"
 	EntrySetupPullbackStrength = "pullback_strength"
+	// AdmissionRetryGateName identifies a transient release failure that must
+	// re-enter a complete stock admission on a later engine tick.
+	AdmissionRetryGateName = "broker_admission_refresh"
 )
 
 type EntryGateDecision struct {
-	Name   string `json:"name"`
-	Status string `json:"status"`
-	Reason string `json:"reason,omitempty"`
+	Name       string          `json:"name"`
+	Status     string          `json:"status"`
+	Reason     string          `json:"reason,omitempty"`
+	Details    json.RawMessage `json:"details,omitempty"`
+	ObservedAt *time.Time      `json:"observed_at,omitempty"`
 }
 
 // Signal mirrors a row from the signals table.
 type Signal struct {
-	ID                 string
-	Ticker             string
-	Action             string // BUY | SELL
-	Strategy           string
-	SignalPrice        float64
-	StopLoss           float64
-	TakeProfit         float64
-	Confidence         float64
-	SizePct            float64
-	Status             string // pending | approved | blocked | executed | expired | stale
-	BlockReason        string
-	AnalysisIDs        []string
-	ExpiresAt          time.Time
-	StalePriceMovePct  float64
-	EntrySetup         string
-	EntrySetupEvidence string
+	ID          string
+	Ticker      string
+	Action      string // BUY | SELL
+	Strategy    string
+	SignalPrice float64
+	// AcceptedReferencePrice is the immutable positive price at which the BUY
+	// thesis was accepted. Execution-time reprices update SignalPrice only.
+	AcceptedReferencePrice float64
+	StopLoss               float64
+	TakeProfit             float64
+	Confidence             float64
+	SizePct                float64
+	Status                 string // pending | approved | blocked | executed | expired | stale
+	BlockReason            string
+	AnalysisIDs            []string
+	ExpiresAt              time.Time
+	StalePriceMovePct      float64
+	EntrySetup             string
+	EntrySetupEvidence     string
 	// ScannerRunID links scanner-originated signals to the exact prospective
 	// universe snapshot that sourced the ticker.
 	ScannerRunID       string
@@ -70,17 +79,21 @@ func InsertSignal(ctx context.Context, s Signal) (string, error) {
 	if entrySetup == "" {
 		entrySetup = EntrySetupStandard
 	}
+	acceptedReferencePrice := s.AcceptedReferencePrice
+	if acceptedReferencePrice <= 0 && s.SignalPrice > 0 {
+		acceptedReferencePrice = s.SignalPrice
+	}
 	var id string
 	err := GetDB().QueryRow(ctx, `
 		INSERT INTO signals (
-			ticker, action, strategy, signal_price, stop_loss, take_profit,
+			ticker, action, strategy, signal_price, accepted_reference_price, stop_loss, take_profit,
 			confidence, size_pct, status, block_reason,
 			analysis_ids, expires_at, stale_threshold_pct, deferred,
 			pullback_strength, entry_setup, entry_setup_evidence, created_at,
 			scanner_run_id, entry_gate_decisions
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
 		RETURNING id`,
-		s.Ticker, s.Action, s.Strategy, s.SignalPrice,
+		s.Ticker, s.Action, s.Strategy, s.SignalPrice, nullableFloat(acceptedReferencePrice),
 		nullableFloat(s.StopLoss), nullableFloat(s.TakeProfit),
 		s.Confidence, s.SizePct, s.Status, nullableString(s.BlockReason),
 		ids, s.ExpiresAt, s.StalePriceMovePct, s.Deferred,
@@ -98,6 +111,37 @@ func UpdateSignalStatus(ctx context.Context, id, status, blockReason string) err
 	return err
 }
 
+// AppendSignalEntryGateDecision records a release-time gate without replacing
+// the analysis-time audit trail.
+func AppendSignalEntryGateDecision(ctx context.Context, id string, decision EntryGateDecision) error {
+	payload, err := json.Marshal(decision)
+	if err != nil {
+		return err
+	}
+	_, err = GetDB().Exec(ctx, `
+		UPDATE signals
+		SET entry_gate_decisions = COALESCE(entry_gate_decisions, '[]'::jsonb) || $1::jsonb,
+		    updated_at=NOW()
+		WHERE id=$2::uuid`, payload, id)
+	return err
+}
+
+// BlockSignalWithEntryGateDecision atomically records the final failed gate
+// and prevents further automated execution of the signal.
+func BlockSignalWithEntryGateDecision(ctx context.Context, id, reason string, decision EntryGateDecision) error {
+	payload, err := json.Marshal(decision)
+	if err != nil {
+		return err
+	}
+	_, err = GetDB().Exec(ctx, `
+		UPDATE signals
+		SET status='blocked', block_reason=$1,
+		    entry_gate_decisions = COALESCE(entry_gate_decisions, '[]'::jsonb) || $2::jsonb,
+		    updated_at=NOW()
+		WHERE id=$3::uuid`, nullableString(reason), payload, id)
+	return err
+}
+
 // QueueSignalForDeferredExecution makes an approved, pending, or temporarily
 // blocked BUY retryable by the normal fresh engine admission path without
 // changing its strategy data.
@@ -106,6 +150,51 @@ func QueueSignalForDeferredExecution(ctx context.Context, id string) error {
 		UPDATE signals
 		SET status='pending', deferred=TRUE, block_reason=NULL, updated_at=NOW()
 		WHERE id=$1::uuid AND action='BUY' AND status IN ('pending','approved','blocked')`, id)
+	return err
+}
+
+// QueueSignalForAdmissionRetry makes a BUY retryable after its coordinated
+// broker admission became stale while later release evidence was gathered. It
+// replaces any prior retry marker, so repeated slow-provider attempts preserve
+// a bounded audit trail and do not turn a transient freshness failure into a
+// terminal anti-chase verdict.
+func QueueSignalForAdmissionRetry(ctx context.Context, id, reason string, automatic bool) error {
+	observedAt := time.Now().UTC()
+	status := "manual_reapproval_required"
+	if automatic {
+		status = "retry_pending_auto"
+	}
+	marker, err := json.Marshal(EntryGateDecision{
+		Name: AdmissionRetryGateName, Status: status, Reason: reason, ObservedAt: &observedAt,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = GetDB().Exec(ctx, `
+		UPDATE signals
+		SET status='pending', deferred=$2, block_reason=$1,
+		    entry_gate_decisions = COALESCE((
+		        SELECT jsonb_agg(existing.decision ORDER BY existing.ordinality)
+		        FROM jsonb_array_elements(COALESCE(signals.entry_gate_decisions, '[]'::jsonb))
+		             WITH ORDINALITY AS existing(decision, ordinality)
+		        WHERE existing.decision->>'name' <> $3
+		    ), '[]'::jsonb) || $4::jsonb,
+		    updated_at=NOW()
+		WHERE id=$5::uuid AND action='BUY' AND status IN ('pending','approved','blocked')`,
+		nullableString(reason), automatic, AdmissionRetryGateName, marker, id)
+	return err
+}
+
+// SetInitialSignalReferencePrice atomically establishes the accepted signal
+// reference for a legacy zero-price signal when execution discovers its first
+// usable mark. Subsequent reprices intentionally leave it unchanged.
+func SetInitialSignalReferencePrice(ctx context.Context, id string, price float64) error {
+	_, err := GetDB().Exec(ctx, `
+		UPDATE signals
+		SET signal_price=CASE WHEN accepted_reference_price IS NULL THEN $1 ELSE signal_price END,
+		    accepted_reference_price=COALESCE(accepted_reference_price, $1),
+		    updated_at=NOW()
+		WHERE id=$2::uuid AND $1 > 0`, price, id)
 	return err
 }
 
@@ -120,7 +209,7 @@ func UpdateSignalPrice(ctx context.Context, id string, price float64) error {
 // GetPendingSignals returns all signals with status = 'pending' or 'approved'.
 func GetPendingSignals(ctx context.Context) ([]Signal, error) {
 	rows, err := GetDB().Query(ctx, `
-		SELECT id, ticker, action, strategy, signal_price,
+		SELECT id, ticker, action, strategy, signal_price, COALESCE(accepted_reference_price,0),
 		       COALESCE(stop_loss,0), COALESCE(take_profit,0),
 		       confidence, COALESCE(size_pct,0), status,
 		       COALESCE(block_reason,''), expires_at, stale_threshold_pct,
@@ -140,7 +229,7 @@ func GetPendingSignals(ctx context.Context) ([]Signal, error) {
 // (deferred = FALSE) — see migration 043.
 func GetDeferredSignals(ctx context.Context) ([]Signal, error) {
 	rows, err := GetDB().Query(ctx, `
-		SELECT id, ticker, action, strategy, signal_price,
+		SELECT id, ticker, action, strategy, signal_price, COALESCE(accepted_reference_price,0),
 		       COALESCE(stop_loss,0), COALESCE(take_profit,0),
 		       confidence, COALESCE(size_pct,0), status,
 		       COALESCE(block_reason,''), expires_at, stale_threshold_pct,
@@ -162,7 +251,7 @@ func GetDeferredSignals(ctx context.Context) ([]Signal, error) {
 // GetSignalsByTicker returns recent signals for a ticker.
 func GetSignalsByTicker(ctx context.Context, ticker string, limit int) ([]Signal, error) {
 	rows, err := GetDB().Query(ctx, `
-		SELECT id, ticker, action, strategy, signal_price,
+		SELECT id, ticker, action, strategy, signal_price, COALESCE(accepted_reference_price,0),
 		       COALESCE(stop_loss,0), COALESCE(take_profit,0),
 		       confidence, COALESCE(size_pct,0), status,
 		       COALESCE(block_reason,''), expires_at, stale_threshold_pct,
@@ -180,7 +269,7 @@ func GetSignalsByTicker(ctx context.Context, ticker string, limit int) ([]Signal
 // GetSignalByID retrieves a single signal by UUID.
 func GetSignalByID(ctx context.Context, id string) (*Signal, error) {
 	rows, err := GetDB().Query(ctx, `
-		SELECT id, ticker, action, strategy, signal_price,
+		SELECT id, ticker, action, strategy, signal_price, COALESCE(accepted_reference_price,0),
 		       COALESCE(stop_loss,0), COALESCE(take_profit,0),
 		       confidence, COALESCE(size_pct,0), status,
 		       COALESCE(block_reason,''), expires_at, stale_threshold_pct,
@@ -207,7 +296,7 @@ func scanSignals(rows interface {
 	for rows.Next() {
 		var s Signal
 		if err := rows.Scan(
-			&s.ID, &s.Ticker, &s.Action, &s.Strategy, &s.SignalPrice,
+			&s.ID, &s.Ticker, &s.Action, &s.Strategy, &s.SignalPrice, &s.AcceptedReferencePrice,
 			&s.StopLoss, &s.TakeProfit,
 			&s.Confidence, &s.SizePct, &s.Status,
 			&s.BlockReason, &s.ExpiresAt, &s.StalePriceMovePct,
@@ -224,7 +313,7 @@ func scanSignals(rows interface {
 // GetRecentSignals returns the most recent signals regardless of ticker or status.
 func GetRecentSignals(ctx context.Context, limit int) ([]Signal, error) {
 	rows, err := GetDB().Query(ctx, `
-		SELECT id, ticker, action, strategy, signal_price,
+		SELECT id, ticker, action, strategy, signal_price, COALESCE(accepted_reference_price,0),
 		       COALESCE(stop_loss,0), COALESCE(take_profit,0),
 		       confidence, COALESCE(size_pct,0), status, COALESCE(block_reason,''),
 		       COALESCE(analysis_ids, '{}'), expires_at, stale_threshold_pct,
@@ -241,7 +330,7 @@ func GetRecentSignals(ctx context.Context, limit int) ([]Signal, error) {
 	for rows.Next() {
 		var s Signal
 		if err := rows.Scan(
-			&s.ID, &s.Ticker, &s.Action, &s.Strategy, &s.SignalPrice,
+			&s.ID, &s.Ticker, &s.Action, &s.Strategy, &s.SignalPrice, &s.AcceptedReferencePrice,
 			&s.StopLoss, &s.TakeProfit,
 			&s.Confidence, &s.SizePct, &s.Status,
 			&s.BlockReason, &s.AnalysisIDs, &s.ExpiresAt, &s.StalePriceMovePct,
@@ -291,7 +380,7 @@ func ListSignals(ctx context.Context, opts ListSignalsOpts) ([]Signal, error) {
 
 	args = append(args, opts.Limit)
 	q := fmt.Sprintf(`
-		SELECT id, ticker, action, strategy, signal_price,
+		SELECT id, ticker, action, strategy, signal_price, COALESCE(accepted_reference_price,0),
 		       COALESCE(stop_loss,0), COALESCE(take_profit,0),
 		       confidence, COALESCE(size_pct,0), status, COALESCE(block_reason,''),
 		       COALESCE(analysis_ids, '{}'), expires_at, stale_threshold_pct,
@@ -312,7 +401,7 @@ func ListSignals(ctx context.Context, opts ListSignalsOpts) ([]Signal, error) {
 	for rows.Next() {
 		var s Signal
 		if err := rows.Scan(
-			&s.ID, &s.Ticker, &s.Action, &s.Strategy, &s.SignalPrice,
+			&s.ID, &s.Ticker, &s.Action, &s.Strategy, &s.SignalPrice, &s.AcceptedReferencePrice,
 			&s.StopLoss, &s.TakeProfit,
 			&s.Confidence, &s.SizePct, &s.Status,
 			&s.BlockReason, &s.AnalysisIDs, &s.ExpiresAt, &s.StalePriceMovePct,

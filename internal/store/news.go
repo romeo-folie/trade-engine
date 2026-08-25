@@ -60,12 +60,21 @@ func upsertNewsBatch(ctx context.Context, items []data.NewsItem, ids map[string]
 			item.PublishedAt.UTC(), item.Tickers, sentiment,
 		)
 	}
-	// Dedup on external_id if present, otherwise on url. The no-op DO UPDATE
-	// (instead of DO NOTHING) makes RETURNING yield conflicting rows too, so the
-	// caller gets a UUID for every externally-identified article — new or
-	// already stored — without a second query.
+	// Dedup on external_id if present. Merge ticker associations on conflict:
+	// a syndicated article can arrive through separate company feeds, and every
+	// associated ticker must be able to retrieve it as catalyst evidence.
 	q += ` ON CONFLICT (external_id) WHERE external_id IS NOT NULL
-	       DO UPDATE SET external_id = EXCLUDED.external_id
+	       DO UPDATE SET
+	         tickers = ARRAY(
+	           SELECT DISTINCT ticker
+	           FROM unnest(
+	             COALESCE(news_items.tickers, ARRAY[]::text[]) ||
+	             COALESCE(EXCLUDED.tickers, ARRAY[]::text[])
+	           ) AS merged(ticker)
+	           WHERE ticker IS NOT NULL AND ticker <> ''
+	           ORDER BY ticker
+	         ),
+	         sentiment_score = COALESCE(EXCLUDED.sentiment_score, news_items.sentiment_score)
 	       RETURNING id, external_id`
 
 	rows, err := GetDB().Query(ctx, q, args...)

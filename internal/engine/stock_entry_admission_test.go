@@ -343,6 +343,46 @@ func TestValidateStockAskRequiresFreshPositiveAsk(t *testing.T) {
 	}
 }
 
+func TestRepricePreparedStockEntryRequestUsesFinalAdmissionValues(t *testing.T) {
+	original := execution.OrderRequest{
+		Ticker: "AAPL", Side: execution.OrderSideBuy, Type: execution.OrderTypeMarket,
+		Quantity: 5, ReferencePrice: 100, IntentKey: "entry:prepared", ClientOrderID: "te-stock-prepared",
+		OrderClass: "bracket", StopLossPrice: 95, TakeProfitPrice: 110,
+	}
+	got, err := repricePreparedStockEntryRequest(original, 4, 125)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Quantity != 4 || got.ReferencePrice != 125 {
+		t.Fatalf("repriced request = %+v, want quantity 4 at 125", got)
+	}
+	if got.ClientOrderID != original.ClientOrderID || got.OrderClass != original.OrderClass || got.StopLossPrice != original.StopLossPrice {
+		t.Fatalf("repricing changed durable order identity or policy: %+v", got)
+	}
+}
+
+func TestRepricePreparedStockEntryRequestPreservesProtectedWholeShareSizing(t *testing.T) {
+	protected := execution.OrderRequest{RequireBrokerProtection: true}
+	got, err := repricePreparedStockEntryRequest(protected, 4.8, 125)
+	if err != nil || got.Quantity != 4 {
+		t.Fatalf("protected replay = %+v, err=%v; want 4 whole shares", got, err)
+	}
+	if _, err := repricePreparedStockEntryRequest(execution.OrderRequest{UncappedTakeProfit: true}, .8, 125); err == nil {
+		t.Fatal("sub-share uncapped replay was accepted")
+	}
+	legacyBracket, err := repricePreparedStockEntryRequest(execution.OrderRequest{OrderClass: "bracket"}, 4.8, 125)
+	if err != nil || legacyBracket.Quantity != 4 {
+		t.Fatalf("legacy bracket replay = %+v, err=%v; want 4 whole shares", legacyBracket, err)
+	}
+	if _, err := repricePreparedStockEntryRequest(execution.OrderRequest{OrderClass: "bracket"}, .8, 125); err == nil {
+		t.Fatal("sub-share legacy bracket replay was accepted")
+	}
+	fractional, err := repricePreparedStockEntryRequest(execution.OrderRequest{}, .8, 125)
+	if err != nil || fractional.Quantity != .8 {
+		t.Fatalf("ordinary fractional replay = %+v, err=%v", fractional, err)
+	}
+}
+
 func TestApplyStockEntryReservations(t *testing.T) {
 	now := time.Now().UTC()
 	prepared := store.ActiveStockEntryReservation{
@@ -652,6 +692,33 @@ func TestDeferredSignalPathHonorsFlagExceptForPreparedRecovery(t *testing.T) {
 	}
 }
 
+func TestTerminalPreparedEntrySignalRejectsFinalBlockedDisposition(t *testing.T) {
+	now := time.Now()
+	for _, status := range []string{"executed", "rejected", "expired", "stale"} {
+		if !terminalPreparedEntrySignal(&store.Signal{Status: status}, now) {
+			t.Fatalf("prepared signal status %q remained retryable", status)
+		}
+	}
+	blockedGate, err := json.Marshal([]store.EntryGateDecision{{
+		Name: "universal_anti_chase_release", Status: "blocked",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !terminalPreparedEntrySignal(&store.Signal{Status: "blocked", EntryGateDecisions: blockedGate}, now) {
+		t.Fatal("final anti-chase blocked signal remained retryable")
+	}
+	if terminalPreparedEntrySignal(&store.Signal{Status: "blocked"}, now) {
+		t.Fatal("temporary blocked prepared signal became terminal")
+	}
+	if terminalPreparedEntrySignal(&store.Signal{Status: "pending"}, now) {
+		t.Fatal("pending prepared signal became terminal")
+	}
+	if !terminalPreparedEntrySignal(&store.Signal{Status: "pending", ExpiresAt: now.Add(-time.Nanosecond)}, now) {
+		t.Fatal("expired prepared signal remained retryable")
+	}
+}
+
 func TestStockAdmissionFreshnessRecheckedAtRelease(t *testing.T) {
 	now := time.Now().UTC()
 	admission := stockEntryAdmission{
@@ -663,9 +730,25 @@ func TestStockAdmissionFreshnessRecheckedAtRelease(t *testing.T) {
 	if err := validateStockAdmissionFreshness(admission, now.Add(stockAdmissionMaxAge+time.Millisecond)); err == nil {
 		t.Fatal("aged admission snapshots were released")
 	}
+	if err := validateFinalStockEntryRelease(admission, false, nil, "TEST", now.Add(stockAdmissionMaxAge+time.Millisecond)); err == nil {
+		t.Fatal("aged broker admission was released after final replay work")
+	}
+	if err := validateFinalStockEntryRelease(admission, false, nil, "TEST", now.Add(stockAdmissionMaxAge)); err != nil {
+		t.Fatalf("freshness-boundary broker admission rejected: %v", err)
+	}
+	paperQuote := &data.Quote{Ticker: "TEST", Bid: 99, Ask: 100, Timestamp: now}
+	if err := validateFinalStockEntryRelease(stockEntryAdmission{}, true, paperQuote, "TEST", now.Add(stockAdmissionMaxAge)); err != nil {
+		t.Fatalf("freshness-boundary paper quote rejected: %v", err)
+	}
+	if err := validateFinalStockEntryRelease(stockEntryAdmission{}, true, paperQuote, "TEST", now.Add(stockAdmissionMaxAge+time.Millisecond)); err == nil {
+		t.Fatal("aged paper quote was released at the final boundary")
+	}
 	admission.BrokerHeldReplay = true
 	if err := validateStockAdmissionFreshness(admission, now.Add(time.Hour)); err != nil {
 		t.Fatalf("lookup-only broker-held replay required fresh POST admission: %v", err)
+	}
+	if err := validateFinalStockEntryRelease(admission, false, nil, "TEST", now.Add(time.Hour)); err != nil {
+		t.Fatalf("lookup-only broker-held replay required final freshness: %v", err)
 	}
 }
 

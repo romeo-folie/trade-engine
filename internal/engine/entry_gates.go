@@ -264,7 +264,7 @@ func completedEntryDailyCandles(candles []data.Candle, now time.Time) []data.Can
 	barET := last.Timestamp.In(nyLoc)
 	sameSessionDate := nowET.Year() == barET.Year() &&
 		nowET.YearDay() == barET.YearDay()
-	if sameSessionDate && nowET.Hour() < 16 {
+	if session, ok := MarketSessionForDate(now); sameSessionDate && ok && now.Before(session.Close) {
 		return candles[:len(candles)-1]
 	}
 	return candles

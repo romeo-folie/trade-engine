@@ -53,8 +53,17 @@ func TestUpsertCandles_DropsCorruptBar(t *testing.T) {
 			`DELETE FROM candles WHERE ticker = $1`, ticker)
 	})
 
-	if err := store.UpsertCandles(ctx, batch); err != nil {
-		t.Fatalf("UpsertCandles: %v", err)
+	survivors, err := store.UpsertCandlesObserved(ctx, batch)
+	if err != nil {
+		t.Fatalf("UpsertCandlesObserved: %v", err)
+	}
+	if len(survivors) != 25 {
+		t.Fatalf("sanitized survivors = %d, want 25", len(survivors))
+	}
+	for _, candle := range survivors {
+		if candle.High < candle.Low {
+			t.Fatalf("rejected candle leaked into observed survivors: %+v", candle)
+		}
 	}
 
 	stored, err := store.GetCandles(ctx, ticker, data.Timeframe1Hour,
@@ -88,8 +97,12 @@ func TestUpsertCandles_AllRejectedIsNotAnError(t *testing.T) {
 		Ticker: "ZZSANITY2", Timeframe: data.Timeframe1Hour, Timestamp: time.Now().UTC(),
 		Open: 10, High: 8, Low: 12, Close: 10, // high < low
 	}}
-	if err := store.UpsertCandles(ctx, bad); err != nil {
+	survivors, err := store.UpsertCandlesObserved(ctx, bad)
+	if err != nil {
 		t.Fatalf("all-rejected batch should be a no-op, got %v", err)
+	}
+	if len(survivors) != 0 {
+		t.Fatalf("all-rejected observed survivors = %v, want empty", survivors)
 	}
 }
 

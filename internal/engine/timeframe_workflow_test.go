@@ -96,6 +96,46 @@ func TestMergeProfileConfirmation(t *testing.T) {
 	}
 }
 
+func TestDecisionPolicyAfterConfirmationPrefersConfirmationAudit(t *testing.T) {
+	primary := &analysis.DecisionPolicyAudit{Mode: "primary", Applied: false}
+	confirmation := &analysis.DecisionPolicyAudit{Mode: "confirmation", Applied: true}
+	if got := decisionPolicyAfterConfirmation(primary, confirmation); got != confirmation {
+		t.Fatalf("final policy = %+v, want confirmation %+v", got, confirmation)
+	}
+	if got := decisionPolicyAfterConfirmation(primary, nil); got != primary {
+		t.Fatalf("missing confirmation policy = %+v, want primary %+v", got, primary)
+	}
+}
+
+func TestDecisionPolicyAllowsReArbitration(t *testing.T) {
+	if !decisionPolicyAllowsReArbitration(nil) || !decisionPolicyAllowsReArbitration(&analysis.DecisionPolicyAudit{}) {
+		t.Fatal("unapplied policy should allow re-arbitration")
+	}
+	if decisionPolicyAllowsReArbitration(&analysis.DecisionPolicyAudit{Applied: true}) {
+		t.Fatal("applied specialist authority policy must prevent re-arbitration")
+	}
+	if decisionPolicyAllowsReArbitration(&analysis.DecisionPolicyAudit{Mode: "specialist_buy_authority", RiskAction: analysis.ActionWait}) {
+		t.Fatal("specialist risk WAIT was allowed to be re-arbitrated")
+	}
+}
+
+func TestProfileConfirmationAllowedRespectsAppliedDecisionPolicy(t *testing.T) {
+	resp := analysis.AnalysisResponse{
+		Action:             analysis.ActionWait,
+		Confidence:         profileConfirmationWaitMinConfidence,
+		SelectedStrategy:   "momentum",
+		RejectedStrategies: map[string]string{"trend_following": "wait for confirmation"},
+	}
+	audit := analysis.LensSelectionAudit{SelectionStatus: analysis.LensSelectionSelected, SelectedLens: "momentum"}
+	lenses := []string{"momentum", "trend_following"}
+	if profileConfirmationAllowed(resp, audit, lenses, &analysis.DecisionPolicyAudit{Applied: true}) {
+		t.Fatal("applied primary authority downgrade was eligible for confirmation")
+	}
+	if !profileConfirmationAllowed(resp, audit, lenses, &analysis.DecisionPolicyAudit{}) {
+		t.Fatal("unapplied primary decision should remain eligible for confirmation")
+	}
+}
+
 func TestQualifiedWaitRequiresCompleteRejections(t *testing.T) {
 	audit := analysis.LensSelectionAudit{SelectedLens: "momentum", SelectionStatus: analysis.LensSelectionSelected}
 	wait := analysis.AnalysisResponse{Action: analysis.ActionWait, Confidence: .75, SelectedStrategy: "momentum", RejectedStrategies: map[string]string{"trend_following": "range not established"}}

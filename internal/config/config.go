@@ -1879,6 +1879,10 @@ type RiskConfig struct {
 // missing or incomplete pullback evidence falls back to the standard entry
 // gates, while a confirmed setup receives its dedicated stop and revalidation.
 type EntryGatesConfig struct {
+	// AntiChase is the universal, deterministic BUY timing policy. Unlike the
+	// legacy lens-specific run-up checks below, it cannot be bypassed by a lens
+	// fallback and is re-evaluated immediately before broker submission.
+	AntiChase AntiChaseConfig `yaml:"anti_chase"`
 	// TrendAlignmentEnabled blocks stock BUYs in a confirmed daily downtrend:
 	// price below both the 9- and 21-day EMAs while both completed-session
 	// EMAs are declining. False preserves existing behavior. The gate fails
@@ -1926,6 +1930,28 @@ type EntryGatesConfig struct {
 	// deferred signal's price and still count as "held". Defaults to 1.0
 	// when FirstTickDefer is on and this is 0.
 	FirstTickHoldTolerancePct float64 `yaml:"first_tick_hold_tolerance_pct"`
+}
+
+// AntiChaseConfig controls the V1 deterministic BUY timing policy. The three
+// combinations are deliberately typed rather than expressed as arbitrary YAML
+// logic so every persisted decision has stable, reviewable semantics.
+type AntiChaseConfig struct {
+	Enabled bool `yaml:"enabled"`
+
+	StaleCatalystRunupEnabled bool    `yaml:"stale_catalyst_runup_enabled"`
+	StaleAfterHours           float64 `yaml:"stale_after_hours"`
+	MinReturn3SessionPct      float64 `yaml:"min_return_3_session_pct"`
+	WeakVolumeRatioMax        float64 `yaml:"weak_volume_ratio_max"`
+	StaleEMAExtensionATR      float64 `yaml:"stale_ema_extension_atr"`
+
+	PriorHighExtensionEnabled bool    `yaml:"prior_high_extension_enabled"`
+	NearPriorHighPct          float64 `yaml:"near_prior_high_pct"`
+	HighEMAExtensionATR       float64 `yaml:"high_ema_extension_atr"`
+
+	MomentumExhaustionEnabled bool    `yaml:"momentum_exhaustion_enabled"`
+	RSIMin                    float64 `yaml:"rsi_min"`
+	StochKMin                 float64 `yaml:"stoch_k_min"`
+	ExhaustionReturn3Pct      float64 `yaml:"exhaustion_return_3_session_pct"`
 }
 
 // TrailingStopConfig governs the server-side trailing stop manager (#322).
@@ -3005,6 +3031,36 @@ func Validate(cfg *Config) []string {
 	}
 	if v := entryGates.PullbackMaxStopWidthPct; v < 0 || v > 20 {
 		errs = append(errs, fmt.Sprintf("risk.entry_gates.pullback_max_stop_width_pct must be within [0,20], got %.4f", v))
+	}
+	if anti := entryGates.AntiChase; anti.Enabled {
+		validate := func(name string, value, max float64) {
+			if value <= 0 || value > max || math.IsNaN(value) || math.IsInf(value, 0) {
+				errs = append(errs, fmt.Sprintf("risk.entry_gates.anti_chase.%s must be within (0,%.0f], got %.4f", name, max, value))
+			}
+		}
+		needsWeakVolume := anti.StaleCatalystRunupEnabled || anti.PriorHighExtensionEnabled || anti.MomentumExhaustionEnabled
+		if !needsWeakVolume {
+			errs = append(errs, "risk.entry_gates.anti_chase.enabled requires at least one enabled rule")
+		}
+		if anti.StaleCatalystRunupEnabled {
+			if anti.StaleAfterHours <= 0 || anti.StaleAfterHours >= 24*30 || math.IsNaN(anti.StaleAfterHours) || math.IsInf(anti.StaleAfterHours, 0) {
+				errs = append(errs, fmt.Sprintf("risk.entry_gates.anti_chase.stale_after_hours must be within (0,720), got %.4f", anti.StaleAfterHours))
+			}
+			validate("min_return_3_session_pct", anti.MinReturn3SessionPct, 200)
+			validate("stale_ema_extension_atr", anti.StaleEMAExtensionATR, 20)
+		}
+		if anti.PriorHighExtensionEnabled {
+			validate("near_prior_high_pct", anti.NearPriorHighPct, 100)
+			validate("high_ema_extension_atr", anti.HighEMAExtensionATR, 20)
+		}
+		if anti.MomentumExhaustionEnabled {
+			validate("rsi_min", anti.RSIMin, 100)
+			validate("stoch_k_min", anti.StochKMin, 100)
+			validate("exhaustion_return_3_session_pct", anti.ExhaustionReturn3Pct, 200)
+		}
+		if needsWeakVolume {
+			validate("weak_volume_ratio_max", anti.WeakVolumeRatioMax, 10)
+		}
 	}
 
 	// Validate cost budgets. Guardrail.Check gates on budget > 0, so negative

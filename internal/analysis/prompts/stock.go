@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/romeo-folie/trade-engine/internal/strategy/antichase"
 	"github.com/romeo-folie/trade-engine/internal/strategy/pullback"
 	"github.com/romeo-folie/trade-engine/internal/tradeprofile"
 )
@@ -34,6 +35,7 @@ type Indicators struct {
 	ADX, ATR, OBV                       float64
 	StochK, StochD                      float64
 	VWAP, VolSMA20, VolRatio            float64
+	TimingSnapshot                      *antichase.Snapshot
 }
 
 // NewsItem is a compressed news entry.
@@ -568,6 +570,7 @@ func buildUserWithTimeframeContext(
 	writePrimaryThesisContext(&b, timeframeRole, primaryThesis)
 	writeDiscoveryContext(&b, discoveryContext)
 	writePullbackContext(&b, pullbackContext)
+	writeTimingSnapshot(&b, ind.TimingSnapshot)
 	// The R:R self-filter in every system prompt computes against
 	// "signal_price", which was otherwise never supplied — models had to guess
 	// it meant the latest close. Define it explicitly.
@@ -705,6 +708,32 @@ func buildUserWithTimeframeContext(
 
 	b.WriteString("\nRespond with ONLY the JSON object.")
 	return b.String()
+}
+
+// writeTimingSnapshot gives every analysis topology the same compact,
+// deterministic view of entry extension. It is evidence, not a model-created
+// strategy: knowledge-graph prose and reasoning never establish freshness.
+func writeTimingSnapshot(b *strings.Builder, s *antichase.Snapshot) {
+	if s == nil {
+		return
+	}
+	b.WriteString("### DETERMINISTIC BUY TIMING SNAPSHOT\n")
+	b.WriteString(fmt.Sprintf("Observed: %s | reference price: %.2f (%s) | evidence: %s | completed daily sessions: %d | history: %s\n",
+		s.ObservedAt.UTC().Format(time.RFC3339), s.ReferencePrice, valueOrUnknown(s.ReferenceSource),
+		s.EvidenceStatus, s.CompletedSessions, s.HistoryScope))
+	if s.EvidenceReason != "" {
+		b.WriteString("Evidence note: " + s.EvidenceReason + "\n")
+	}
+	b.WriteString(fmt.Sprintf("3-session return: %+.2f%% | EMA20: %.2f | ATR14: %.2f | extension above EMA20: %.2f ATR | volume ratio: %.2fx\n",
+		s.Return3SessionPct, s.EMA20, s.ATR14, s.EMAExtensionATR, s.VolumeRatio))
+	b.WriteString(fmt.Sprintf("RSI14: %.2f | Stoch K: %.2f | Bollinger upper: %.2f | prior 52-week high: %.2f | proximity: %.2f%%\n",
+		s.RSI14, s.StochK, s.BBUpper, s.PriorHigh52Week, s.PriorHighProximity*100))
+	if s.CatalystAt != nil {
+		b.WriteString(fmt.Sprintf("Latest timestamped bullish catalyst: %s from %s (%.1fh old).\n", s.CatalystAt.UTC().Format(time.RFC3339), valueOrUnknown(s.CatalystSource), s.CatalystAgeHours))
+	} else {
+		b.WriteString("Latest timestamped bullish catalyst: unavailable. Knowledge-graph prose does NOT establish catalyst freshness.\n")
+	}
+	b.WriteString("The engine enforces this timing policy again at broker admission. A strong trend is not by itself proof that a late entry is safe.\n\n")
 }
 
 // writeDiscoveryContext renders scanner evidence as compact, structured

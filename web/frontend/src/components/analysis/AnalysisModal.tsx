@@ -88,6 +88,8 @@ interface AnalysisDetail {
   EntrySetup?: string;
   EntrySetupEvidence?: string;
   EntryGateDecisions?: EntryGateDecision[];
+  TimingSnapshot?: TimingSnapshot;
+  DecisionPolicy?: DecisionPolicy;
 }
 
 interface IndicatorSnapshot {
@@ -135,6 +137,29 @@ interface EntryGateDecision {
   name: string;
   status: string;
   reason?: string;
+}
+
+interface TimingSnapshot {
+  evidence_status: string;
+  evidence_reason?: string;
+  history_scope?: string;
+  completed_sessions?: number;
+  reference_price?: number;
+  return_3_session_pct?: number;
+  ema_extension_atr?: number;
+  volume_ratio?: number;
+  rsi14?: number;
+  stoch_k?: number;
+  prior_high_proximity?: number;
+  catalyst_age_hours?: number;
+}
+
+interface DecisionPolicy {
+  applied?: boolean;
+  reason?: string;
+  buy_votes?: number;
+  required_buy_votes?: number;
+  resolved_action?: string;
 }
 
 function formatConfidence(value?: number): string {
@@ -207,6 +232,7 @@ export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps)
   const entryChecks = shouldShowEntryChecks(detail?.RelatedSignalAction, availableEntryChecks.length)
     ? availableEntryChecks
     : [];
+  const timing = detail?.TimingSnapshot;
 
   // DissentSummary is not independent content: the arbiter prompt asks the
   // model to BEGIN its reasoning with "DISSENT:" (ensemble.go), and
@@ -362,6 +388,40 @@ export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps)
                   <span>Volume SMA 20 / ratio</span>
                   <strong>{formatIndicator(detail.Indicators.VolSMA20, 0)} / {formatIndicator(detail.Indicators.VolRatio)}×</strong>
                 </div>
+              </div>
+            </div>
+          )}
+
+          {(timing || detail?.DecisionPolicy) && (
+            <div className={styles.section}>
+              <div className={styles.sectionLabel}>BUY TIMING SAFEGUARDS</div>
+              <div className={styles.kvList}>
+                {detail?.DecisionPolicy && (
+                  <>
+                    <div className={styles.kvRow}>
+                      <span className={styles.kvKey}>Specialist BUY support</span>
+                      <span className={styles.kvVal}>{detail.DecisionPolicy.buy_votes ?? 0} / {detail.DecisionPolicy.required_buy_votes ?? 2}</span>
+                    </div>
+                    {detail.DecisionPolicy.applied && (
+                      <div className={styles.structureFinding}>{detail.DecisionPolicy.reason || `Resolved to ${detail.DecisionPolicy.resolved_action}`}</div>
+                    )}
+                  </>
+                )}
+                {timing && (
+                  <>
+                    <div className={styles.kvRow}>
+                      <span className={styles.kvKey}>Timing evidence</span>
+                      <span className={styles.kvVal}>{titleCase(timing.evidence_status || 'unavailable')}</span>
+                    </div>
+                    {timing.evidence_reason && <div className={styles.structureFinding}>{timing.evidence_reason}</div>}
+                    {timing.evidence_status === 'available' && <>
+                      <div className={styles.kvRow}><span className={styles.kvKey}>3-session move / volume</span><span className={styles.kvVal}>{formatIndicator(timing.return_3_session_pct)}% / {formatIndicator(timing.volume_ratio)}×</span></div>
+                      <div className={styles.kvRow}><span className={styles.kvKey}>EMA extension / RSI / Stoch</span><span className={styles.kvVal}>{formatIndicator(timing.ema_extension_atr)} ATR / {formatIndicator(timing.rsi14)} / {formatIndicator(timing.stoch_k)}</span></div>
+                      <div className={styles.kvRow}><span className={styles.kvKey}>Prior high scope / proximity</span><span className={styles.kvVal}>{titleCase(timing.history_scope || 'limited history')} / {timing.prior_high_proximity ? `${(timing.prior_high_proximity * 100).toFixed(1)}%` : '—'}</span></div>
+                      <div className={styles.kvRow}><span className={styles.kvKey}>Bullish catalyst age</span><span className={styles.kvVal}>{timing.catalyst_age_hours == null ? '—' : `${timing.catalyst_age_hours.toFixed(1)}h`}</span></div>
+                    </>}
+                  </>
+                )}
               </div>
             </div>
           )}
