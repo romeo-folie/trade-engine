@@ -2862,7 +2862,7 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		}
 		now := time.Now().UTC()
 		daily, news, evidenceReason := e.executionAntiChaseEvidence(ctx, sig.Ticker, now, antiPolicy.StaleCatalystRunupEnabled)
-		quote, finalAsk := e.freshAntiChaseQuote(ctx, sig.Ticker, time.Now().UTC())
+		quote, finalAsk := e.freshAntiChaseQuote(ctx, sig.Ticker)
 		var snapshot *antichase.Snapshot
 		if evidenceReason != "" {
 			snapshot = &antichase.Snapshot{

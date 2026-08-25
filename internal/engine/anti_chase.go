@@ -304,7 +304,11 @@ func antiChaseNewsEvidence(items []data.NewsItem, err error, staleCatalystEnable
 	return news, ""
 }
 
-func (e *Engine) freshAntiChaseQuote(ctx context.Context, ticker string, now time.Time) (*data.Quote, float64) {
+func (e *Engine) freshAntiChaseQuote(ctx context.Context, ticker string) (*data.Quote, float64) {
+	return e.freshAntiChaseQuoteWithClock(ctx, ticker, time.Now)
+}
+
+func (e *Engine) freshAntiChaseQuoteWithClock(ctx context.Context, ticker string, now func() time.Time) (*data.Quote, float64) {
 	if e.marketData == nil {
 		return nil, 0
 	}
@@ -312,7 +316,9 @@ func (e *Engine) freshAntiChaseQuote(ctx context.Context, ticker string, now tim
 	if err != nil || quote == nil || quote.Bid <= 0 {
 		return nil, 0
 	}
-	ask, err := validateStockAsk(quote, ticker, now)
+	// Validate at the post-fetch clock: a slow provider response can otherwise
+	// make a quote that was current when requested look fresh on return.
+	ask, err := validateStockAsk(quote, ticker, now().UTC())
 	if err != nil {
 		return nil, 0
 	}
@@ -320,6 +326,6 @@ func (e *Engine) freshAntiChaseQuote(ctx context.Context, ticker string, now tim
 }
 
 func (e *Engine) freshAntiChaseAsk(ctx context.Context, ticker string) float64 {
-	_, ask := e.freshAntiChaseQuote(ctx, ticker, time.Now().UTC())
+	_, ask := e.freshAntiChaseQuote(ctx, ticker)
 	return ask
 }

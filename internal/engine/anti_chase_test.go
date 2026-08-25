@@ -213,6 +213,25 @@ func TestFreshAntiChaseAskRejectsStaleQuote(t *testing.T) {
 	}
 }
 
+func TestFreshAntiChaseQuoteValidatesAtPostFetchClock(t *testing.T) {
+	at := time.Date(2026, time.August, 24, 15, 0, 0, 0, time.UTC)
+	market := &pullbackEvidenceMarket{quotes: []*data.Quote{{Ticker: "TEST", Bid: 99, Ask: 100, Timestamp: at}}}
+	engine := &Engine{marketData: market}
+	if quote, ask := engine.freshAntiChaseQuoteWithClock(context.Background(), "TEST", func() time.Time {
+		if market.quoteCall == 0 {
+			t.Fatal("validation clock ran before FetchQuote")
+		}
+		return at.Add(stockAdmissionMaxAge + time.Nanosecond)
+	}); quote != nil || ask != 0 {
+		t.Fatalf("post-fetch stale quote accepted: quote=%+v ask=%.2f", quote, ask)
+	}
+	if quote, ask := engine.freshAntiChaseQuoteWithClock(context.Background(), "TEST", func() time.Time {
+		return at.Add(stockAdmissionMaxAge)
+	}); quote == nil || ask != 100 {
+		t.Fatalf("freshness-boundary quote rejected: quote=%+v ask=%.2f", quote, ask)
+	}
+}
+
 func TestAntiChaseNewsEvidenceFailsClosedOnlyForEnabledCatalystRule(t *testing.T) {
 	if _, reason := antiChaseNewsEvidence(nil, context.DeadlineExceeded, true); reason == "" {
 		t.Fatal("missing catalyst evidence passed with stale-catalyst rule enabled")
