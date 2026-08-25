@@ -74,6 +74,7 @@ type AnalysisAudit struct {
 
 type TimeframePassAudit struct {
 	Timeframe    string  `json:"timeframe"`
+	Role         string  `json:"role,omitempty"`
 	Status       string  `json:"status,omitempty"`
 	Action       string  `json:"action,omitempty"`
 	Confidence   float64 `json:"confidence,omitempty"`
@@ -87,7 +88,11 @@ type TimeframeWorkflowAudit struct {
 	Mode          string              `json:"mode"`
 	Primary       TimeframePassAudit  `json:"primary"`
 	Confirmation  *TimeframePassAudit `json:"confirmation,omitempty"`
-	FinalAction   string              `json:"final_action"`
+	// Contexts is the v2 unified-evidence lineage. Primary is retained for
+	// backwards-compatible readers of v1 records.
+	Contexts       []TimeframePassAudit `json:"contexts,omitempty"`
+	FinalAction    string               `json:"final_action"`
+	DecisiveReason string               `json:"decisive_reason,omitempty"`
 }
 
 // InsertAnalysisWithScannerRunAudit persists a completed analysis with its

@@ -210,6 +210,28 @@
   border-top: 1px solid var(--border-muted);
 }
 
+.finalOutcome {
+  display: grid;
+  gap: 5px;
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border-left: 2px solid var(--amber, #f5b942);
+  background: var(--card-bg);
+  font-family: var(--font-mono);
+}
+
+.finalOutcome span {
+  color: var(--text-muted);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+}
+
+.finalOutcome strong {
+  color: var(--text-primary);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .workflowRow {
   display: flex;
   justify-content: space-between;

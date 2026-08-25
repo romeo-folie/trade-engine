@@ -305,6 +305,7 @@ const OutputSchema = `OUTPUT FORMAT — respond with ONLY a valid JSON object an
   "stop_loss":           <float price, or 0 if HOLD/WAIT>,
   "take_profit":         <float price, or 0 if HOLD/WAIT>,
   "rejected_strategies": {"<lens>": "<one clause on why it does not fit>"},
+  "decisive_reason":     "<one concrete sentence naming the fact that determined the final action>",
   "reasoning":           "<the evidence that decided it — specific values, not a summary>"
 }
 
@@ -317,6 +318,7 @@ RULES:
 - size_pct must be between 0.0 and 5.0 (max 5% of portfolio per position).
 - selected_strategy must be exactly one of the candidate lenses listed above, or "none".
 - rejected_strategies must name every candidate lens you did not select, each with a one-clause reason. Use {} only when a single lens was offered and you selected it.
+- decisive_reason is mandatory. For WAIT, name the concrete blocker; never write a vague timing phrase.
 - Do not output markdown, explanations, or any text outside the JSON object.
 - If data is insufficient, return HOLD with low confidence.
 - Never recommend size_pct > 0 for a HOLD or WAIT action.`

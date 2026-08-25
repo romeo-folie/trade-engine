@@ -138,19 +138,6 @@ type Engine struct {
 
 	feedbackReviewer *feedback.Reviewer
 
-	// multiTFCandleFetcher is the on-demand fetch path used by the borderline
-	// re-arbitration alt pass (Issue #321 PR #336). Watchlist-driven refresh
-	// only fetches the timeframes listed on the item, so an alt-tf candle
-	// store would otherwise go stale and the second pass would re-arbitrate
-	// over outdated bars. This field lets the alt pass proactively refresh
-	// the alt timeframe before reading. Defaults to fetchAndStoreCandles;
-	// tests override it to avoid network/DB.
-	multiTFCandleFetcher func(ctx context.Context, ticker string, tf data.Timeframe)
-	// profileConfirmationCandleFetcher is checked because the mandatory
-	// profile entry pass must fail closed when fresh market data cannot be
-	// obtained. It intentionally does not share the legacy fail-open seam.
-	profileConfirmationCandleFetcher func(ctx context.Context, ticker string, tf data.Timeframe) error
-
 	// recoveredEntryEffects keeps asynchronous polling and coordinator startup
 	// recovery from publishing the same in-process entry event twice.
 	recoveredEntryEffects sync.Map
@@ -255,15 +242,6 @@ func New(cfg *config.Config, market data.MarketDataProvider, news data.NewsProvi
 		costTracker:       tracker,
 		costGuardrail:     guardrail,
 		activeCostProfile: cfg.Cost.Profile,
-	}
-
-	// Default the multi-tf alt-pass fetcher to the production candle fetch path.
-	// Tests override this field directly to avoid network/DB. See Issue #321
-	// PR #336 fix for stale alt-tf candles.
-	e.multiTFCandleFetcher = e.fetchAndStoreCandles
-	e.profileConfirmationCandleFetcher = func(ctx context.Context, ticker string, tf data.Timeframe) error {
-		_, err := e.fetchAndStoreCandlesObserved(ctx, ticker, tf)
-		return err
 	}
 
 	if cfg.Feedback.Enabled && store.IsConnected() {
@@ -668,21 +646,20 @@ func (e *Engine) processStockWithProfile(
 	needsDailyEvidence := pullbackCandidate || pullbackPromptCandidate ||
 		entryGates.TrendAlignmentEnabled || entryGates.AntiChase.Enabled
 	fetchTimeframes := workflow.FetchTimeframes
-	if workflow.ProfileOwned {
-		// Entry-timing evidence is fetched only if the primary decision is
-		// eligible for confirmation. That checked on-demand refresh is the
-		// fail-closed freshness boundary for the second pass.
-		fetchTimeframes = []string{string(workflow.PrimaryTimeframe)}
-	}
 	if needsDailyEvidence && workflow.PrimaryTimeframe != data.Timeframe1Day {
 		fetchTimeframes = append(fetchTimeframes, string(data.Timeframe1Day))
 	}
 
 	var primaryCandleObservation candleFetchObservation
+	// Supplemental timeframe evidence is only valid when this tick refreshed
+	// it successfully. Do not fall back to cached rows after a provider error:
+	// unified analysis must not turn a stale entry-timing close into a trade.
+	timeframeRefreshErrors := make(map[data.Timeframe]error)
 	for _, tfStr := range fetchTimeframes {
-		tf := data.Timeframe(tfStr)
+		tf := data.Timeframe(strings.ToLower(strings.TrimSpace(tfStr)))
 		observation, err := e.fetchAndStoreCandlesObserved(ctx, ticker, tf)
 		if err != nil {
+			timeframeRefreshErrors[tf] = err
 			continue
 		}
 		if tf == primaryTF {
@@ -844,7 +821,7 @@ func (e *Engine) processStockWithProfile(
 	e.runAnalysisWithProfile(
 		ctx, ticker, string(primaryTF), primaryStrategy, strategies, candles, set,
 		newsHash, source, graphContext, scannerRunID, pullbackCandidate,
-		discoveryContext, executionProfile, pullbackContext, newsRefreshErr, primaryCandleObservation,
+		discoveryContext, executionProfile, pullbackContext, newsRefreshErr, primaryCandleObservation, workflow, timeframeRefreshErrors,
 	)
 }
 
@@ -949,7 +926,7 @@ func (e *Engine) runAnalysis(
 	e.runAnalysisWithProfile(
 		ctx, ticker, timeframe, strategy, strategies, candles, set,
 		newsHash, source, graphContext, scannerRunID, pullbackCandidate, nil, nil,
-		nil, nil, candleFetchObservation{},
+		nil, nil, candleFetchObservation{}, resolveTimeframeWorkflow([]string{timeframe}, nil), nil,
 	)
 }
 
@@ -969,6 +946,8 @@ func (e *Engine) runAnalysisWithProfile(
 	pullbackContext *pullback.PromptContext,
 	newsRefreshErr error,
 	primaryCandleObservation candleFetchObservation,
+	workflow timeframeWorkflow,
+	timeframeRefreshErrors map[data.Timeframe]error,
 ) {
 	if set == nil {
 		e.recordScannerEngineOutcome(ctx, scannerRunID, ticker, "indicators_missing", "", "")
@@ -1218,19 +1197,35 @@ func (e *Engine) runAnalysisWithProfile(
 		News:      snippets,
 		Portfolio: e.portfolioContextForPrompt(ctx),
 	}
+	contextEvidence, timeframeCandles, contextErr := e.unifiedTimeframeEvidence(
+		ctx, ticker, workflow, req, time.Now().AddDate(-2, 0, 0), timeframeRefreshErrors,
+	)
+	// Missing supplemental evidence must never support a new entry, but a
+	// primary-timeframe analysis can still return a risk-reducing SELL for an
+	// existing position. Run that degraded analysis and suppress BUY below.
+	if contextErr != nil {
+		logger.Warn("supplemental timeframe evidence unavailable — retaining exit analysis", "ticker", ticker, "err", contextErr)
+	}
+	req.TimeframeContexts = contextEvidence
 
 	impact := e.calculateImpactScore(ticker, snippets, candles)
-	workflow := resolveTimeframeWorkflow([]string{timeframe}, executionProfile)
 	routingSource := "legacy"
 	if workflow.ProfileOwned {
 		routingSource = "profile"
 	}
 	workflowAudit := store.TimeframeWorkflowAudit{
-		Version: 1, RoutingSource: routingSource, Mode: "enforce",
-		Primary: store.TimeframePassAudit{Timeframe: timeframe},
+		Version: 2, RoutingSource: routingSource, Mode: "unified",
+		Primary:  store.TimeframePassAudit{Timeframe: timeframe, Status: "primary"},
+		Contexts: timeframeAuditContexts(timeframe, workflow, req.TimeframeContexts, contextErr),
 	}
 	signalCandles := candles
 	signalTimeframe := timeframe
+	if workflow.ProfileOwned && workflow.EntryTimingTimeframe != "" {
+		entryTF := string(workflow.EntryTimingTimeframe)
+		if entryCandles := timeframeCandles[entryTF]; len(entryCandles) > 0 {
+			signalCandles, signalTimeframe = entryCandles, entryTF
+		}
+	}
 	// Specialist mode runs three directional roles followed by a mandatory
 	// Risk Specialist instead of the generalist ensemble. Both paths return
 	// AnalyzeResult so downstream cost tracking and persistence stay shared.
@@ -1282,90 +1277,16 @@ func (e *Engine) runAnalysisWithProfile(
 		}
 	}
 
-	// Issue #321 — Multi-timeframe arbiter for borderline WAITs.
-	// If the first pass resolved to WAIT inside the configured borderline band,
-	// run a second analyst pass on the alternate timeframe and re-arbitrate
-	// over the combined set. The recursion guard is enforced by passing the
-	// secondPass=false flag here; runSecondTimeframePass never re-invokes this
-	// branch, so a third pass cannot fire.
 	var primaryAudit analysis.LensSelectionAudit
 	if err == nil {
+		beforePrimaryLensValidation := result.Response.Action
 		primaryResp := result.Response
 		primaryAudit = analysis.ValidateFinalLensSelection(&primaryResp, req, len(result.AnalystResults) > 1)
+		if primaryResp.Action != beforePrimaryLensValidation {
+			primaryResp.DecisiveReason = finalLensSuppressionReason(primaryAudit)
+		}
 		result.Response = primaryResp
 		populatePrimaryWorkflowAudit(&workflowAudit, primaryResp, primaryAudit)
-	}
-	if err == nil && workflow.ProfileOwned {
-		primaryResp := result.Response
-		if workflow.EntryTimingTimeframe != "" && profileConfirmationAllowed(primaryResp, primaryAudit, req.LensSet(), result.DecisionPolicy) {
-			entryTF := string(workflow.EntryTimingTimeframe)
-			logger.Info("profile timeframe: running entry confirmation", "ticker", ticker, "primary_tf", timeframe, "entry_tf", entryTF)
-			confirmation, confirmationCandles, available := e.runProfileConfirmation(ctx, req, primaryResp, entryTF, ticker, impact)
-			e.recordProfileConfirmationCost(confirmation)
-			confirmationResp := confirmation.Response
-			confirmationAudit := analysis.LensSelectionAudit{}
-			confirmationPass := &store.TimeframePassAudit{Timeframe: entryTF, Status: "unavailable", Reason: "fresh candles or confirmation model unavailable"}
-			if available {
-				confirmationAudit = analysis.ValidateFinalLensSelection(&confirmationResp, analysis.AnalysisRequest{
-					ExecutionProfile: executionProfile,
-				}, len(confirmation.AnalystResults) > 1)
-				confirmationPass.Action = string(confirmationResp.Action)
-				confirmationPass.Confidence = confirmationResp.Confidence
-				confirmationPass.SelectedLens = confirmationAudit.SelectedLens
-				confirmationPass.Status = "rejected"
-				if profileConfirmationConfirmed(confirmationResp, primaryAudit, confirmationAudit, available) {
-					confirmationPass.Status = "confirmed"
-					confirmationPass.Reason = "entry timing confirmed"
-				} else {
-					confirmationPass.Reason = "confirmation did not return BUY under the primary lens"
-				}
-			}
-			workflowAudit.Confirmation = confirmationPass
-			result.Response = mergeProfileConfirmation(primaryResp, confirmationResp, primaryAudit, confirmationAudit, req.LensSet(), available)
-			result.DecisionPolicy = decisionPolicyAfterConfirmation(result.DecisionPolicy, confirmation.DecisionPolicy)
-			signalCandles, signalTimeframe = signalEvidenceAfterConfirmation(
-				candles, timeframe, confirmationCandles, entryTF, confirmationPass.Status, result.Response.Action,
-			)
-		} else if workflow.EntryTimingTimeframe != "" {
-			workflowAudit.Confirmation = &store.TimeframePassAudit{Timeframe: string(workflow.EntryTimingTimeframe), Status: "not_requested", Reason: "primary outcome was not eligible for timing confirmation"}
-		}
-	}
-
-	if err == nil && !workflow.ProfileOwned && decisionPolicyAllowsReArbitration(result.DecisionPolicy) {
-		if altTF, run := shouldRunSecondPass(e.cfg.Analysis, result.Response, timeframe, false); run {
-			logger.Info("multi-tf: borderline WAIT — running alt-timeframe pass",
-				"ticker", ticker, "primary_tf", timeframe, "alt_tf", altTF,
-				"confidence", fmt.Sprintf("%.3f", result.Response.Confidence))
-			if altResult, ok := e.runSecondTimeframePass(ctx, req, altTF, ticker, impact); ok {
-				// Charge the alt-pass tokens to a distinct bucket
-				// ("<model>#mtf2") so we can measure marginal cost.
-				e.recordMultiTFCost(altResult)
-				combined := combineForArbiter(timeframe, altTF, result.AnalystResults, altResult.AnalystResults)
-				combinedReq := req
-				combinedReq.Timeframe = fmt.Sprintf("%s+%s", timeframe, altTF)
-				if reArb, rerr := reArbitrate(ctx, e.analyzer, combinedReq, combined); rerr == nil {
-					// Charge re-arbiter tokens to the multi-tf bucket too —
-					// it would not have run absent the second pass.
-					if reArb.Arbiter != nil && reArb.Arbiter.Meta.Provider != "" && reArb.Arbiter.Meta.Model != "" &&
-						(reArb.Arbiter.Meta.InputTokens > 0 || reArb.Arbiter.Meta.OutputTokens > 0) {
-						e.costTracker.Record(reArb.Arbiter.Meta.Provider, reArb.Arbiter.Meta.Model+multiTFCostSuffix,
-							reArb.Arbiter.Meta.InputTokens, reArb.Arbiter.Meta.OutputTokens)
-					}
-					logger.Info("multi-tf: re-arbitration complete",
-						"ticker", ticker,
-						"original_action", string(result.Response.Action),
-						"final_action", string(reArb.Response.Action),
-						"final_confidence", fmt.Sprintf("%.3f", reArb.Response.Confidence))
-					result = reArb
-				} else {
-					logger.Warn("multi-tf: re-arbitration failed — keeping original WAIT",
-						"ticker", ticker, "err", rerr.Error())
-				}
-			} else {
-				logger.Debug("multi-tf: alt-timeframe pass unavailable — keeping original WAIT",
-					"ticker", ticker, "alt_tf", altTF)
-			}
-		}
 	}
 
 	if err != nil {
@@ -1374,12 +1295,22 @@ func (e *Engine) runAnalysisWithProfile(
 		return
 	}
 	resp, meta := result.Response, result.Meta
+	if contextErr != nil && resp.Action == analysis.ActionBuy {
+		resp.Action = analysis.ActionWait
+		resp.SizePct, resp.StopLoss, resp.TakeProfit = 0, 0, 0
+		resp.DecisiveReason = "Entry blocked because required supplemental timeframe evidence was unavailable this cycle."
+		resp.Reasoning = resp.Reasoning + "\n\nEntry blocked: required supplemental timeframe evidence was unavailable."
+	}
 	// Validate the final aggregate, rather than individual analyst responses:
 	// an execution profile bounds what may be persisted as the selected lens.
 	// Invalid model output remains in meta.RawResponse, but is cleared from the
 	// live response before the existing downstream compatibility paths see it.
 	lensAudit := analysis.ValidateFinalLensSelection(&resp, req, len(result.AnalystResults) > 1)
+	if result.DecisionPolicy != nil && result.DecisionPolicy.Applied && result.DecisionPolicy.OriginalAction != result.DecisionPolicy.ResolvedAction {
+		resp.DecisiveReason = result.DecisionPolicy.Reason
+	}
 	workflowAudit.FinalAction = string(resp.Action)
+	workflowAudit.DecisiveReason = decisiveReason(resp)
 	if lensAudit.SelectionStatus == analysis.LensSelectionInvalid {
 		logger.Warn("invalid profile-bound lens selection",
 			"ticker", ticker, "selected", lensAudit.SelectedLens,

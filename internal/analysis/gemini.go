@@ -81,6 +81,7 @@ func (c *GeminiClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 			req.PerformanceContext, req.MomentumPlay, req.DiscoveryContext, req.PullbackContext,
 			req.TimeframeRole, req.PrimaryThesisContext,
 		)
+		systemPrompt, userMessage = appendTimeframeContexts(systemPrompt, userMessage, req.TimeframeContexts)
 	}
 	rawPrompt := systemPrompt + "\n\n---\n\n" + userMessage
 	promptHash := hashPrompt(rawPrompt)

@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"errors"
 	"reflect"
 	"testing"
 
@@ -13,138 +14,72 @@ import (
 func TestResolveTimeframeWorkflow(t *testing.T) {
 	validProfile := func(primary, entry string) *tradeprofile.ExecutionProfile {
 		return &tradeprofile.ExecutionProfile{
-			Version:              tradeprofile.ExecutionProfileVersion,
-			RecommendedLens:      "momentum",
-			AdmissibleLenses:     []string{"momentum"},
-			PrimaryTimeframe:     primary,
-			EntryTimingTimeframe: entry,
-			ScorerRationale:      "source-owned timeframe roles",
+			Version: tradeprofile.ExecutionProfileVersion, RecommendedLens: "momentum",
+			AdmissibleLenses: []string{"momentum"}, PrimaryTimeframe: primary,
+			EntryTimingTimeframe: entry, ScorerRationale: "source-owned timeframe roles",
 		}
 	}
-
 	tests := []struct {
-		name        string
-		legacy      []string
-		profile     *tradeprofile.ExecutionProfile
-		wantPrimary data.Timeframe
-		wantEntry   data.Timeframe
-		wantFetch   []string
-		wantProfile bool
+		name                   string
+		legacy                 []string
+		profile                *tradeprofile.ExecutionProfile
+		wantPrimary, wantEntry data.Timeframe
+		wantFetch              []string
+		wantProfile            bool
 	}{
-		{
-			name:   "valid profile owns primary and entry timing over legacy list",
-			legacy: []string{"1h", "4h"}, profile: validProfile(" 1d ", " 4H "),
-			wantPrimary: data.Timeframe1Day, wantEntry: data.Timeframe4Hour,
-			wantFetch: []string{"1d", "4h"}, wantProfile: true,
-		},
-		{
-			name:   "valid profile without entry timing has one thesis timeframe",
-			legacy: []string{"1d", "4h"}, profile: validProfile("4H", ""),
-			wantPrimary: data.Timeframe4Hour, wantFetch: []string{"4h"}, wantProfile: true,
-		},
-		{
-			name:        "legacy keeps first non daily timeframe as primary",
-			legacy:      []string{"1H", "4H"},
-			wantPrimary: data.Timeframe1Hour, wantFetch: []string{"1h", "4h"},
-		},
-		{
-			name:        "legacy keeps daily preference even when daily is later",
-			legacy:      []string{"1h", "1D"},
-			wantPrimary: data.Timeframe1Day, wantFetch: []string{"1h", "1d"},
-		},
-		{
-			name:   "invalid profile falls back to legacy behaviour",
-			legacy: []string{"1h", "4h"}, profile: validProfile("1D", "1D"),
-			wantPrimary: data.Timeframe1Hour, wantFetch: []string{"1h", "4h"},
-		},
+		{"profile uses thesis and entry evidence in one workflow", []string{"1h", "4h"}, validProfile(" 1d ", " 4H "), data.Timeframe1Day, data.Timeframe4Hour, []string{"1d", "4h"}, true},
+		{"legacy retains every configured timeframe as evidence", []string{"1H", "4H"}, nil, data.Timeframe1Hour, "", []string{"1h", "4h"}, false},
+		{"legacy keeps daily primary but preserves intraday context", []string{"1h", "1D"}, nil, data.Timeframe1Day, "", []string{"1h", "1d"}, false},
 	}
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := resolveTimeframeWorkflow(tt.legacy, tt.profile)
-			if got.PrimaryTimeframe != tt.wantPrimary ||
-				got.EntryTimingTimeframe != tt.wantEntry ||
-				got.ProfileOwned != tt.wantProfile ||
-				!reflect.DeepEqual(got.FetchTimeframes, tt.wantFetch) {
-				t.Fatalf("resolveTimeframeWorkflow() = %+v, want primary=%q entry=%q fetch=%v profileOwned=%t",
-					got, tt.wantPrimary, tt.wantEntry, tt.wantFetch, tt.wantProfile)
+			if got.PrimaryTimeframe != tt.wantPrimary || got.EntryTimingTimeframe != tt.wantEntry || got.ProfileOwned != tt.wantProfile || !reflect.DeepEqual(got.FetchTimeframes, tt.wantFetch) {
+				t.Fatalf("resolveTimeframeWorkflow() = %+v", got)
 			}
 		})
 	}
 }
 
-func TestMergeProfileConfirmation(t *testing.T) {
-	primary := analysis.AnalysisResponse{Action: analysis.ActionBuy, Confidence: .84, SizePct: 3, StopLoss: 90, TakeProfit: 120, SelectedStrategy: "momentum", Reasoning: "daily thesis"}
-	audit := analysis.LensSelectionAudit{SelectedLens: "momentum", SelectionStatus: analysis.LensSelectionSelected}
-	confirmation := analysis.AnalysisResponse{Action: analysis.ActionBuy, Confidence: .76, SizePct: 2, StopLoss: 96, TakeProfit: 115, SelectedStrategy: "momentum", Reasoning: "timing confirmed"}
-	confirmed := mergeProfileConfirmation(primary, confirmation, audit, audit, []string{"momentum"}, true)
-	if confirmed.Action != analysis.ActionBuy || confirmed.Confidence != .76 || confirmed.SizePct != 2 || confirmed.StopLoss != 96 || confirmed.TakeProfit != 115 {
-		t.Fatalf("confirmed merge = %+v", confirmed)
+func TestTimeframeAuditContextsRecordUnifiedEvidence(t *testing.T) {
+	workflow := timeframeWorkflow{PrimaryTimeframe: data.Timeframe1Day, EntryTimingTimeframe: data.Timeframe4Hour, FetchTimeframes: []string{"1d", "4h", "1h"}}
+	contexts := []analysis.TimeframeContext{{Timeframe: "4h", Role: "entry_timing"}, {Timeframe: "1h", Role: "supporting"}}
+	got := timeframeAuditContexts("1d", workflow, contexts, nil)
+	want := []store.TimeframePassAudit{
+		{Timeframe: "1d", Role: "primary_thesis", Status: "included"},
+		{Timeframe: "4h", Role: "entry_timing", Status: "included"},
+		{Timeframe: "1h", Role: "supporting", Status: "included"},
 	}
-
-	rejected := confirmation
-	rejected.Action = analysis.ActionSell
-	got := mergeProfileConfirmation(primary, rejected, audit, audit, []string{"momentum"}, true)
-	if got.Action != analysis.ActionWait || got.SizePct != 0 || got.StopLoss != 0 || got.TakeProfit != 0 {
-		t.Fatalf("rejected confirmation must fail closed: %+v", got)
-	}
-
-	driftAudit := analysis.LensSelectionAudit{SelectedLens: "trend_following", SelectionStatus: analysis.LensSelectionSelected}
-	got = mergeProfileConfirmation(primary, confirmation, audit, driftAudit, []string{"momentum"}, true)
-	if got.Action != analysis.ActionWait {
-		t.Fatalf("lens drift must fail closed: %+v", got)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("contexts = %+v, want %+v", got, want)
 	}
 }
 
-func TestDecisionPolicyAfterConfirmationPrefersConfirmationAudit(t *testing.T) {
-	primary := &analysis.DecisionPolicyAudit{Mode: "primary", Applied: false}
-	confirmation := &analysis.DecisionPolicyAudit{Mode: "confirmation", Applied: true}
-	if got := decisionPolicyAfterConfirmation(primary, confirmation); got != confirmation {
-		t.Fatalf("final policy = %+v, want confirmation %+v", got, confirmation)
+func TestDecisiveReasonUsesModelFieldThenReasoningFallback(t *testing.T) {
+	if got := decisiveReason(analysis.AnalysisResponse{DecisiveReason: "4H volume failed to confirm."}); got != "4H volume failed to confirm." {
+		t.Fatalf("got %q", got)
 	}
-	if got := decisionPolicyAfterConfirmation(primary, nil); got != primary {
-		t.Fatalf("missing confirmation policy = %+v, want primary %+v", got, primary)
+	if got := decisiveReason(analysis.AnalysisResponse{Reasoning: "Price is above resistance.\nMore detail."}); got != "Price is above resistance." {
+		t.Fatalf("got %q", got)
 	}
 }
 
-func TestDecisionPolicyAllowsReArbitration(t *testing.T) {
-	if !decisionPolicyAllowsReArbitration(nil) || !decisionPolicyAllowsReArbitration(&analysis.DecisionPolicyAudit{}) {
-		t.Fatal("unapplied policy should allow re-arbitration")
+func TestFinalLensSuppressionReasonMatchesFinalOutcome(t *testing.T) {
+	if got := finalLensSuppressionReason(analysis.LensSelectionAudit{SelectionStatus: analysis.LensSelectionInvalid}); got != "Entry suppressed because the selected lens is not valid for this scanner profile." {
+		t.Fatalf("invalid suppression reason = %q", got)
 	}
-	if decisionPolicyAllowsReArbitration(&analysis.DecisionPolicyAudit{Applied: true}) {
-		t.Fatal("applied specialist authority policy must prevent re-arbitration")
-	}
-	if decisionPolicyAllowsReArbitration(&analysis.DecisionPolicyAudit{Mode: "specialist_buy_authority", RiskAction: analysis.ActionWait}) {
-		t.Fatal("specialist risk WAIT was allowed to be re-arbitrated")
+	if got := finalLensSuppressionReason(analysis.LensSelectionAudit{SelectionStatus: analysis.LensSelectionNone}); got != "Entry suppressed because no configured lens fits the current regime." {
+		t.Fatalf("no-fit suppression reason = %q", got)
 	}
 }
 
-func TestProfileConfirmationAllowedRespectsAppliedDecisionPolicy(t *testing.T) {
-	resp := analysis.AnalysisResponse{
-		Action:             analysis.ActionWait,
-		Confidence:         profileConfirmationWaitMinConfidence,
-		SelectedStrategy:   "momentum",
-		RejectedStrategies: map[string]string{"trend_following": "wait for confirmation"},
+func TestTimeframeRefreshErrorRejectsStaleSupplementalEvidence(t *testing.T) {
+	refreshErr := errors.New("provider unavailable")
+	if got := timeframeRefreshError(data.Timeframe4Hour, map[data.Timeframe]error{data.Timeframe4Hour: refreshErr}); !errors.Is(got, refreshErr) {
+		t.Fatalf("refresh error = %v, want %v", got, refreshErr)
 	}
-	audit := analysis.LensSelectionAudit{SelectionStatus: analysis.LensSelectionSelected, SelectedLens: "momentum"}
-	lenses := []string{"momentum", "trend_following"}
-	if profileConfirmationAllowed(resp, audit, lenses, &analysis.DecisionPolicyAudit{Applied: true}) {
-		t.Fatal("applied primary authority downgrade was eligible for confirmation")
-	}
-	if !profileConfirmationAllowed(resp, audit, lenses, &analysis.DecisionPolicyAudit{}) {
-		t.Fatal("unapplied primary decision should remain eligible for confirmation")
-	}
-}
-
-func TestQualifiedWaitRequiresCompleteRejections(t *testing.T) {
-	audit := analysis.LensSelectionAudit{SelectedLens: "momentum", SelectionStatus: analysis.LensSelectionSelected}
-	wait := analysis.AnalysisResponse{Action: analysis.ActionWait, Confidence: .75, SelectedStrategy: "momentum", RejectedStrategies: map[string]string{"trend_following": "range not established"}}
-	if !profileConfirmationEligible(wait, audit, []string{"momentum", "trend_following"}) {
-		t.Fatal("qualified WAIT should request confirmation")
-	}
-	wait.RejectedStrategies = map[string]string{}
-	if profileConfirmationEligible(wait, audit, []string{"momentum", "trend_following"}) {
-		t.Fatal("WAIT without complete rejection coverage must not request confirmation")
+	if got := timeframeRefreshError(data.Timeframe4Hour, nil); got != nil {
+		t.Fatalf("nil refresh map error = %v", got)
 	}
 }
 
@@ -157,50 +92,14 @@ func TestProfileMomentumPlayUsesTimeframeRole(t *testing.T) {
 	if !profileMomentumPlay("4h", "scanner", profile) {
 		t.Fatal("event profile must use momentum prompt")
 	}
-	if !profileMomentumPlay("1d", "scanner", nil) {
-		t.Fatal("legacy scanner behavior must remain unchanged")
-	}
 }
 
-func TestEntryGateAuditStatus(t *testing.T) {
-	tests := []struct {
-		name      string
-		evaluated bool
-		reason    string
-		want      string
-	}{
-		{name: "unavailable evidence fails open", want: "unavailable_fail_open"},
-		{name: "evaluated and blocked", evaluated: true, reason: "too extended", want: "blocked"},
-		{name: "evaluated and passed", evaluated: true, want: "passed"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := entryGateAuditStatus(tt.evaluated, tt.reason); got != tt.want {
-				t.Fatalf("entryGateAuditStatus(%t, %q) = %q, want %q", tt.evaluated, tt.reason, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestPopulatePrimaryWorkflowAuditIncludesLegacyDecision(t *testing.T) {
+func TestPopulatePrimaryWorkflowAuditIncludesFinalDecision(t *testing.T) {
 	workflow := store.TimeframeWorkflowAudit{RoutingSource: "legacy", Primary: store.TimeframePassAudit{Timeframe: "4h"}}
 	resp := analysis.AnalysisResponse{Action: analysis.ActionWait, Confidence: .63}
 	audit := analysis.LensSelectionAudit{SelectedLens: "momentum"}
 	populatePrimaryWorkflowAudit(&workflow, resp, audit)
 	if workflow.Primary.Action != "WAIT" || workflow.Primary.Confidence != .63 || workflow.Primary.SelectedLens != "momentum" {
-		t.Fatalf("legacy primary audit omitted decision fields: %+v", workflow.Primary)
-	}
-}
-
-func TestSignalEvidenceAfterConfirmationKeepsCandlesAndTimeframePaired(t *testing.T) {
-	primary := []data.Candle{{Close: 100}}
-	confirmation := []data.Candle{{Close: 105}}
-	got, timeframe := signalEvidenceAfterConfirmation(primary, "1d", confirmation, "4h", "confirmed", analysis.ActionBuy)
-	if got[len(got)-1].Close != 105 || timeframe != "4h" {
-		t.Fatalf("confirmed BUY evidence = close %.2f timeframe %q, want fresh 4h confirmation", got[len(got)-1].Close, timeframe)
-	}
-	got, timeframe = signalEvidenceAfterConfirmation(primary, "1d", confirmation, "4h", "rejected", analysis.ActionWait)
-	if got[len(got)-1].Close != 100 || timeframe != "1d" {
-		t.Fatalf("rejected confirmation must retain primary evidence, got close %.2f timeframe %q", got[len(got)-1].Close, timeframe)
+		t.Fatalf("audit = %+v", workflow.Primary)
 	}
 }

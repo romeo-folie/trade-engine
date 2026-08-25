@@ -302,7 +302,7 @@ func TestNewAnalysisDetailResponseMapsStructuredEvidence(t *testing.T) {
 		RejectedLensesRaw:        []byte(`{"trend_following":"trend was weak"}`),
 		Regime:                   "expansion",
 		LensSelectionStatus:      "selected",
-		TimeframeWorkflowRaw:     []byte(`{"version":1,"routing_source":"profile","mode":"enforce","primary":{"timeframe":"1D","action":"BUY"},"confirmation":{"timeframe":"4H","status":"confirmed"},"final_action":"BUY"}`),
+		TimeframeWorkflowRaw:     []byte(`{"version":2,"routing_source":"profile","mode":"unified","primary":{"timeframe":"1D","action":"WAIT"},"contexts":[{"timeframe":"1D","role":"primary_thesis","status":"included"},{"timeframe":"4H","role":"entry_timing","status":"included"}],"final_action":"WAIT","decisive_reason":"4H volume did not confirm the entry."}`),
 		RelatedSignalAction:      "BUY",
 		RelatedSignalStatus:      "pending",
 		RelatedSignalBlockReason: "",
@@ -318,7 +318,7 @@ func TestNewAnalysisDetailResponseMapsStructuredEvidence(t *testing.T) {
 	if got.SelectedLens != "momentum" || got.RejectedLenses["trend_following"] != "trend was weak" {
 		t.Fatalf("lens audit = selected %q rejected %#v", got.SelectedLens, got.RejectedLenses)
 	}
-	if got.TimeframeWorkflow == nil || got.TimeframeWorkflow.Confirmation == nil || got.TimeframeWorkflow.Confirmation.Status != "confirmed" {
+	if got.TimeframeWorkflow == nil || len(got.TimeframeWorkflow.Contexts) != 2 || got.TimeframeWorkflow.DecisiveReason != "4H volume did not confirm the entry." {
 		t.Fatalf("workflow = %+v", got.TimeframeWorkflow)
 	}
 	if len(got.EntryGateDecisions) != 1 || got.EntryGateDecisions[0].Name != "momentum_anti_chase" {

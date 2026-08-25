@@ -93,6 +93,7 @@ func TryFastPath(results []AnalystResult, minConf, maxSpread float64) (AnalysisR
 		StopLoss:           avgSL,
 		TakeProfit:         avgTP,
 		Reasoning:          "[fast-path] All analysts unanimous — confidence, size and risk levels averaged across analysts.",
+		DecisiveReason:     consensusDecisiveReason(results, action),
 		SelectedStrategy:   fpSelected,
 		Regime:             fpRegime,
 		RejectedStrategies: consensusRejections(results, action, fpSelected),
@@ -212,14 +213,21 @@ func Arbitrate(ctx context.Context, arbiter ModelProvider, req AnalysisRequest, 
 	if len(req.RecentCandles) > 0 {
 		currentPrice = req.RecentCandles[0].Close
 	}
+	for _, context := range req.TimeframeContexts {
+		if context.Role == "entry_timing" && len(context.RecentCandles) > 0 {
+			currentPrice = context.RecentCandles[0].Close
+			break
+		}
+	}
 
 	arbReq := AnalysisRequest{
-		CustomSystemPrompt: arbiterSystemPrompt() + prompts.ExitOnlyOverride(req.LensSet()) + prompts.TimeframeRoleInstruction(req.TimeframeRole),
+		CustomSystemPrompt: arbiterSystemPrompt() + prompts.ExitOnlyOverride(req.LensSet()) + prompts.TimeframeRoleInstruction(req.TimeframeRole) + multiTimeframeArbiterInstruction(req.TimeframeContexts),
 		CustomUserMessage: buildArbiterUserMessage(req.Ticker, currentPrice, sb.String()) + "\n\n" +
-			prompts.RenderTimeframeWorkflow(req.TimeframeRole, req.PrimaryThesisContext),
+			prompts.RenderTimeframeWorkflow(req.TimeframeRole, req.PrimaryThesisContext) + RenderTimeframeContexts(req.TimeframeContexts),
 		Ticker:               req.Ticker,
 		TimeframeRole:        req.TimeframeRole,
 		PrimaryThesisContext: req.PrimaryThesisContext,
+		TimeframeContexts:    req.TimeframeContexts,
 	}
 
 	t0 := time.Now()
@@ -364,10 +372,23 @@ func majorityVote(results []AnalystResult) (AnalysisResponse, bool) {
 		Action: winner, Confidence: avgConf,
 		SizePct: ref.SizePct, StopLoss: ref.StopLoss, TakeProfit: ref.TakeProfit,
 		Reasoning:          fmt.Sprintf("[majority vote: %d/%d analysts agreed on %s]", maxCount, len(successes), winner),
+		DecisiveReason:     consensusDecisiveReason(results, winner),
 		SelectedStrategy:   mvSelected,
 		Regime:             mvRegime,
 		RejectedStrategies: consensusRejections(results, winner, mvSelected),
 	}, true
+}
+
+func consensusDecisiveReason(results []AnalystResult, action Action) string {
+	for _, result := range successfulResults(results) {
+		if result.Response.Action != action {
+			continue
+		}
+		if reason := strings.TrimSpace(result.Response.DecisiveReason); reason != "" {
+			return reason
+		}
+	}
+	return fmt.Sprintf("The ensemble selected %s by consensus.", action)
 }
 
 // ─── Prompt builders ───────────────────────────────────────────────────────────
@@ -398,6 +419,7 @@ Output ONLY a valid JSON object:
   "size_pct": <0.0–5.0>,
   "stop_loss": <price or 0>,
   "take_profit": <price or 0>,
+  "decisive_reason": "<one concrete sentence naming the fact that determined the final action>",
   "reasoning": "<synthesis; include 'DISSENT: ...' if analysts disagreed>"
 }
 
@@ -415,6 +437,9 @@ Action semantics:
   SELL with appropriately reduced confidence instead. Set size_pct to 0 for
   WAIT.
 - HOLD: no meaningful catalyst or setup — nothing to track.
+
+decisive_reason is mandatory. For WAIT, it must name that concrete blocker;
+it must not be a vague timing phrase.
 
 DECISION BIAS: when analysts disagree, default to the directional side they
 propose unless WAIT is justified by a concrete, named blocker per the rules
