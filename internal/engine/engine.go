@@ -4819,6 +4819,9 @@ func deferredSignalPathEnabled(firstTickDefer, preparedRecovery bool) bool {
 }
 
 func signalNeedsAdmissionRetry(sig store.Signal) bool {
+	if sig.Status != "pending" || !sig.Deferred {
+		return false
+	}
 	var decisions []store.EntryGateDecision
 	if err := json.Unmarshal(sig.EntryGateDecisions, &decisions); err != nil {
 		return false
@@ -4832,6 +4835,9 @@ func signalNeedsAdmissionRetry(sig store.Signal) bool {
 }
 
 func signalRequiresManualAdmissionReapproval(sig store.Signal) bool {
+	if sig.Status != "pending" || sig.Deferred {
+		return false
+	}
 	var decisions []store.EntryGateDecision
 	if err := json.Unmarshal(sig.EntryGateDecisions, &decisions); err != nil {
 		return false

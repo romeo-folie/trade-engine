@@ -22,19 +22,32 @@ func TestSignalNeedsAdmissionRetry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !signalNeedsAdmissionRetry(store.Signal{EntryGateDecisions: decisions}) {
+	if !signalNeedsAdmissionRetry(store.Signal{Status: "pending", Deferred: true, EntryGateDecisions: decisions}) {
 		t.Fatal("admission retry marker was not recognized")
 	}
-	if signalNeedsAdmissionRetry(store.Signal{EntryGateDecisions: []byte(`[{"name":"broker_admission_refresh","status":"manual_reapproval_required"}]`)}) {
+	if signalNeedsAdmissionRetry(store.Signal{Status: "pending", Deferred: true, EntryGateDecisions: []byte(`[{"name":"broker_admission_refresh","status":"manual_reapproval_required"}]`)}) {
 		t.Fatal("manual reapproval was treated as an automatic retry")
 	}
-	if !signalRequiresManualAdmissionReapproval(store.Signal{EntryGateDecisions: []byte(`[{"name":"broker_admission_refresh","status":"manual_reapproval_required"}]`)}) {
+	manual := []byte(`[{"name":"broker_admission_refresh","status":"manual_reapproval_required"}]`)
+	if !signalRequiresManualAdmissionReapproval(store.Signal{Status: "pending", EntryGateDecisions: manual}) {
 		t.Fatal("manual admission retry marker was not recognized")
 	}
-	if signalNeedsAdmissionRetry(store.Signal{EntryGateDecisions: []byte(`[{"name":"broker_admission_refresh","status":"passed"}]`)}) {
+	if signalRequiresManualAdmissionReapproval(store.Signal{Status: "executed", EntryGateDecisions: manual}) {
+		t.Fatal("historical manual retry marker remained active after execution")
+	}
+	if signalRequiresManualAdmissionReapproval(store.Signal{Status: "pending", Deferred: true, EntryGateDecisions: manual}) {
+		t.Fatal("automatic queue signal required manual reapproval")
+	}
+	if signalNeedsAdmissionRetry(store.Signal{Status: "executed", Deferred: true, EntryGateDecisions: decisions}) {
+		t.Fatal("historical automatic retry marker remained active after execution")
+	}
+	if signalNeedsAdmissionRetry(store.Signal{Status: "pending", EntryGateDecisions: decisions}) {
+		t.Fatal("nondeferred pending signal was treated as automatic retry")
+	}
+	if signalNeedsAdmissionRetry(store.Signal{Status: "pending", Deferred: true, EntryGateDecisions: []byte(`[{"name":"broker_admission_refresh","status":"passed"}]`)}) {
 		t.Fatal("completed admission refresh was treated as retry-pending")
 	}
-	if signalNeedsAdmissionRetry(store.Signal{EntryGateDecisions: []byte(`not-json`)}) {
+	if signalNeedsAdmissionRetry(store.Signal{Status: "pending", Deferred: true, EntryGateDecisions: []byte(`not-json`)}) {
 		t.Fatal("malformed audit JSON was treated as a retry marker")
 	}
 }
