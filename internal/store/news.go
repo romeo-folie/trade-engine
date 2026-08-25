@@ -65,7 +65,15 @@ func upsertNewsBatch(ctx context.Context, items []data.NewsItem, ids map[string]
 	// associated ticker must be able to retrieve it as catalyst evidence.
 	q += ` ON CONFLICT (external_id) WHERE external_id IS NOT NULL
 	       DO UPDATE SET
-	         tickers = ARRAY(SELECT DISTINCT unnest(news_items.tickers || EXCLUDED.tickers)),
+	         tickers = ARRAY(
+	           SELECT DISTINCT ticker
+	           FROM unnest(
+	             COALESCE(news_items.tickers, ARRAY[]::text[]) ||
+	             COALESCE(EXCLUDED.tickers, ARRAY[]::text[])
+	           ) AS merged(ticker)
+	           WHERE ticker IS NOT NULL AND ticker <> ''
+	           ORDER BY ticker
+	         ),
 	         sentiment_score = COALESCE(EXCLUDED.sentiment_score, news_items.sentiment_score)
 	       RETURNING id, external_id`
 

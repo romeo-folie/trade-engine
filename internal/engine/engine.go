@@ -2854,6 +2854,9 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 			logger.Warn("update signal with fresh broker ask", "id", sigID, "err", err)
 		}
 	}
+	var antiChaseReleaseQuote *data.Quote
+	antiChaseFinalQuoteRequired := e.cfg.Risk.EntryGates.AntiChase.Enabled &&
+		!admission.BrokerAuthoritative && !admission.BrokerHeldReplay
 	if e.cfg.Risk.EntryGates.AntiChase.Enabled && !admission.BrokerHeldReplay {
 		antiPolicy := antiChasePolicy(e.cfg.Risk.EntryGates.AntiChase)
 		source := "broker_validated_ask"
@@ -2881,6 +2884,7 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 			// afterward, so both the anti-chase decision and submitted market
 			// order use the final validated ask.
 			sig.SignalPrice = finalAsk
+			antiChaseReleaseQuote = quote
 			if admission.BrokerAuthoritative {
 				admission.Ask, admission.QuoteAt = finalAsk, quote.Timestamp
 				resized, err := recalculateStockEntryQuantity(
@@ -3234,6 +3238,16 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
 			Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
 			BlockReason: reason, FailedCheck: "market_hours",
+		})
+		return
+	}
+	if err := validateFinalAntiChaseQuote(antiChaseFinalQuoteRequired, antiChaseReleaseQuote, sig.Ticker, time.Now()); err != nil {
+		reason := err.Error()
+		_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+		logger.Warn("signal execution blocked before final order submission", "ticker", sig.Ticker, "reason", reason)
+		e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+			Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
+			BlockReason: reason, FailedCheck: "final_anti_chase_quote_freshness",
 		})
 		return
 	}

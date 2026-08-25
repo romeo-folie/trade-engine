@@ -841,6 +841,44 @@ func TestNews_UpsertAndQuery(t *testing.T) {
 
 // ─── Orders ───────────────────────────────────────────────────────────────────
 
+func TestNews_UpsertMergesTickerIntoNullAssociation(t *testing.T) {
+	ctx := context.Background()
+	extID := "intg-news-null-tickers-" + time.Now().Format("150405.000")
+	url := "https://example.com/" + extID
+	published := time.Now().Add(-time.Hour)
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(ctx, "DELETE FROM news_items WHERE external_id=$1", extID)
+	})
+
+	if _, err := store.GetDB().Exec(ctx, `
+		INSERT INTO news_items (external_id, headline, source, url, published_at, tickers)
+		VALUES ($1, 'nullable ticker association', 'test', $2, $3, NULL)
+	`, extID, url, published); err != nil {
+		t.Fatalf("seed null ticker association: %v", err)
+	}
+	if _, err := store.UpsertNewsItems(ctx, []data.NewsItem{{
+		ExternalID: extID, Headline: "nullable ticker association", Source: "test", URL: url,
+		PublishedAt: published, Tickers: []string{"MSFT"},
+	}}); err != nil {
+		t.Fatalf("upsert ticker association: %v", err)
+	}
+
+	var tickers []string
+	if err := store.GetDB().QueryRow(ctx, "SELECT tickers FROM news_items WHERE external_id=$1", extID).Scan(&tickers); err != nil {
+		t.Fatalf("read merged ticker association: %v", err)
+	}
+	if len(tickers) != 1 || tickers[0] != "MSFT" {
+		t.Fatalf("merged tickers = %v, want [MSFT]", tickers)
+	}
+	items, err := store.GetRecentNews(ctx, "MSFT", published.Add(-time.Minute))
+	if err != nil {
+		t.Fatalf("query merged ticker association: %v", err)
+	}
+	if len(items) != 1 || items[0].ExternalID != extID {
+		t.Fatalf("MSFT news = %v, want %q", items, extID)
+	}
+}
+
 func TestOrder_InsertAndUpdate(t *testing.T) {
 	ctx := context.Background()
 

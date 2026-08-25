@@ -329,3 +329,17 @@ func (e *Engine) freshAntiChaseAsk(ctx context.Context, ticker string) float64 {
 	_, ask := e.freshAntiChaseQuote(ctx, ticker)
 	return ask
 }
+
+// validateFinalAntiChaseQuote keeps non-broker execution from releasing a
+// paper order against an ask that was fresh when the anti-chase decision was
+// made but expired while the final release work completed. Broker-authoritative
+// admissions have their own complete snapshot freshness gate instead.
+func validateFinalAntiChaseQuote(required bool, quote *data.Quote, ticker string, now time.Time) error {
+	if !required {
+		return nil
+	}
+	if _, err := validateStockAsk(quote, ticker, now.UTC()); err != nil {
+		return fmt.Errorf("anti-chase: final reference quote expired before order submission: %w", err)
+	}
+	return nil
+}

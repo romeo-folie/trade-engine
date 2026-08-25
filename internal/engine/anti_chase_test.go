@@ -232,6 +232,23 @@ func TestFreshAntiChaseQuoteValidatesAtPostFetchClock(t *testing.T) {
 	}
 }
 
+func TestValidateFinalAntiChaseQuote(t *testing.T) {
+	at := time.Date(2026, time.August, 24, 15, 0, 0, 0, time.UTC)
+	quote := &data.Quote{Ticker: "TEST", Bid: 99, Ask: 100, Timestamp: at}
+	if err := validateFinalAntiChaseQuote(true, quote, "TEST", at.Add(stockAdmissionMaxAge)); err != nil {
+		t.Fatalf("freshness-boundary quote rejected: %v", err)
+	}
+	if err := validateFinalAntiChaseQuote(true, quote, "TEST", at.Add(stockAdmissionMaxAge+time.Nanosecond)); err == nil {
+		t.Fatal("expired final quote was accepted")
+	}
+	if err := validateFinalAntiChaseQuote(false, nil, "TEST", at); err != nil {
+		t.Fatalf("unrequired final quote rejected: %v", err)
+	}
+	if err := validateFinalAntiChaseQuote(true, &data.Quote{Ticker: "OTHER", Bid: 99, Ask: 100, Timestamp: at}, "TEST", at); err == nil {
+		t.Fatal("wrong-ticker final quote was accepted")
+	}
+}
+
 func TestAntiChaseNewsEvidenceFailsClosedOnlyForEnabledCatalystRule(t *testing.T) {
 	if _, reason := antiChaseNewsEvidence(nil, context.DeadlineExceeded, true); reason == "" {
 		t.Fatal("missing catalyst evidence passed with stale-catalyst rule enabled")
