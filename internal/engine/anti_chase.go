@@ -71,6 +71,16 @@ func buildAntiChaseSnapshot(
 		ReferenceSource: markSource, EvidenceStatus: "unavailable", HistoryScope: "limited_history",
 	}
 	completed := completedEntryDailyCandles(daily, now)
+	// Every calculation below consumes at most one current evidence horizon:
+	// 253 sessions live, or 254 after close because the newest close is the
+	// reference mark and must leave 253 prior sessions for the high window.
+	horizon := antichase.TrueHighSessions
+	if !IsMarketOpen(now) {
+		horizon++
+	}
+	if len(completed) > horizon {
+		completed = completed[len(completed)-horizon:]
+	}
 	s.CompletedSessions = len(completed)
 	if len(completed) < antichase.MinimumCompletedSessions {
 		s.EvidenceReason = fmt.Sprintf("anti-chase: only %d completed daily sessions are available; need %d", len(completed), antichase.MinimumCompletedSessions)
@@ -84,6 +94,10 @@ func buildAntiChaseSnapshot(
 			latestDate = latest.In(nyLoc).Format("2006-01-02")
 		}
 		s.EvidenceReason = fmt.Sprintf("anti-chase: latest completed daily session %s does not match expected session %s", latestDate, expected)
+		return s
+	}
+	if !antiChaseDailyHistoryContinuous(completed, now) {
+		s.EvidenceReason = "anti-chase: completed daily history has missing market sessions"
 		return s
 	}
 	if mark <= 0 || math.IsNaN(mark) || math.IsInf(mark, 0) {
@@ -175,6 +189,28 @@ func antiChaseDailyHistoryFresh(completed []data.Candle, now time.Time) bool {
 	}
 	expected := MostRecentCompletedMarketSession(now, 0)
 	return sameDate(latest, expected.Date)
+}
+
+// antiChaseDailyHistoryContinuous ensures every observation maps to the
+// expected consecutive US market session. A fresh final bar alone cannot make
+// a window with an outage gap safe for return, volume, or 52-week evidence.
+func antiChaseDailyHistoryContinuous(completed []data.Candle, now time.Time) bool {
+	if len(completed) == 0 {
+		return false
+	}
+	expected := MostRecentCompletedMarketSession(now, 0)
+	for i := len(completed) - 1; i >= 0; i-- {
+		if !sameDate(completed[i].Timestamp, expected.Date) {
+			return false
+		}
+		for date := expected.Date.AddDate(0, 0, -1); ; date = date.AddDate(0, 0, -1) {
+			if previous, ok := MarketSessionForDate(date); ok {
+				expected = previous
+				break
+			}
+		}
+	}
+	return true
 }
 
 // analysisAntiChaseMark uses the already-fetched analysis candle as the mark.

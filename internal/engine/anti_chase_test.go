@@ -192,6 +192,18 @@ func TestBuildAntiChaseSnapshotRejectsStaleDailyHistory(t *testing.T) {
 	}
 }
 
+func TestBuildAntiChaseSnapshotRejectsGappedDailyHistory(t *testing.T) {
+	now := time.Date(2026, time.August, 24, 15, 0, 0, 0, nyLoc)
+	candles := antiChaseDailyCandles(253, now)
+	// Keep the latest session fresh while replacing an interior session with a
+	// duplicate; the window must not treat the resulting outage gap as valid.
+	candles[100].Timestamp = candles[99].Timestamp
+	snapshot := buildAntiChaseSnapshot("TEST", candles, 100, "test", nil, now)
+	if snapshot.EvidenceStatus != "unavailable" || snapshot.EvidenceReason == "" {
+		t.Fatalf("gapped history snapshot = %+v", snapshot)
+	}
+}
+
 func TestBuildAntiChaseSnapshotRejectsUntimestampedDailyHistory(t *testing.T) {
 	now := time.Date(2026, time.August, 24, 15, 0, 0, 0, nyLoc)
 	candles := antiChaseDailyCandles(253, now)
