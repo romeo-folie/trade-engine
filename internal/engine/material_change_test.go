@@ -166,35 +166,31 @@ func TestApplyScannerOverrides_NonScannerUntouched(t *testing.T) {
 	}
 }
 
-func TestApplyScannerOverrides_ScannerLowConvictionOnlyCooldown(t *testing.T) {
+func TestApplyScannerOverrides_ScannerCooldownDoesNotDependOnAdmissionPriority(t *testing.T) {
 	base := config.AnalysisConfig{
 		HoldCooldownMin:   120,
 		RSIDeltaThreshold: 3.0,
 	}
 	out := applyScannerOverrides(base, "scanner", 0.60)
-	// Cooldown still drops (this isn't gated by conviction).
 	if out.HoldCooldownMin != 30 {
 		t.Fatalf("cooldown should drop to 30, got %d", out.HoldCooldownMin)
 	}
-	// RSI threshold must NOT drop for conviction below the 0.75 floor.
 	if out.RSIDeltaThreshold != 3.0 {
-		t.Fatalf("low-conviction scanner must keep RSI threshold at 3.0, got %.1f", out.RSIDeltaThreshold)
+		t.Fatalf("scanner priority must not change RSI threshold, got %.1f", out.RSIDeltaThreshold)
 	}
 }
 
-func TestApplyScannerOverrides_ScannerHighConvictionLoosensRSI(t *testing.T) {
+func TestApplyScannerOverrides_ScannerHighLegacyConfidenceDoesNotLoosenRSI(t *testing.T) {
 	base := config.AnalysisConfig{
 		HoldCooldownMin:   120,
 		RSIDeltaThreshold: 3.0,
 	}
 	out := applyScannerOverrides(base, "scanner", 0.80)
-	if out.RSIDeltaThreshold != 2.0 {
-		t.Fatalf("high-conviction scanner must drop RSI threshold to 2.0, got %.1f", out.RSIDeltaThreshold)
+	if out.RSIDeltaThreshold != 3.0 {
+		t.Fatalf("legacy confidence must not drop RSI threshold, got %.1f", out.RSIDeltaThreshold)
 	}
 }
 
-// If a config already sets RSI threshold below the 2.0 floor, the override
-// must not raise it. The override is a one-way relaxation.
 func TestApplyScannerOverrides_DoesNotRaiseRSIThreshold(t *testing.T) {
 	base := config.AnalysisConfig{
 		HoldCooldownMin:   120,

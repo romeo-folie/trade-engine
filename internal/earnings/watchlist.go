@@ -23,10 +23,11 @@ type MarketCalendarFetcher interface {
 // WatchlistFeeder selects liquid, next-session earnings names and attaches an
 // independently expiring context to the ordinary watchlist funnel.
 type WatchlistFeeder struct {
-	Calendar MarketCalendarFetcher
-	Bars     data.BulkDailyBarsProvider
-	Cfg      config.EarningsWatchlistConfig
-	Now      func() time.Time
+	Calendar      MarketCalendarFetcher
+	Bars          data.BulkDailyBarsProvider
+	Cfg           config.EarningsWatchlistConfig
+	ResearchQueue config.ResearchQueueConfig
+	Now           func() time.Time
 }
 
 type rankedRelease struct {
@@ -167,10 +168,18 @@ func (f *WatchlistFeeder) RunSession(ctx context.Context, completed engine.USMar
 	expires := engine.MarketSessionOffset(target.Date, f.Cfg.WatchlistSessions-1).Close
 	candidates := make([]store.EarningsWatchlistCandidate, 0, cap)
 	for index, candidate := range ranked[:cap] {
+		priority, _ := json.Marshal(map[string]any{
+			"bucket": "earnings_scheduled", "liquidity_rank": index + 1,
+			"median_dollar_volume": candidate.dollar, "ticker": candidate.release.Symbol,
+		})
 		candidates = append(candidates, store.EarningsWatchlistCandidate{
 			Ticker: candidate.release.Symbol, ContextKey: "earnings_scheduled:" + target.Date.Format("2006-01-02"),
 			Context: earningsDiscoveryContext(candidate.release, target, index+1, candidate.dollar), ExpiresAt: expires,
 			LiquidityRank: index + 1, MedianDollarVolume: candidate.dollar,
+			ResearchQueue: &store.ResearchQueueAdmission{
+				Capacity: f.ResearchQueue.Capacity, Bucket: "earnings_scheduled", Reservation: f.ResearchQueue.Reservations.EarningsScheduled,
+				Overflow: f.ResearchQueue.Overflow, Priority: priority,
+			},
 		})
 	}
 	stage = "publish"

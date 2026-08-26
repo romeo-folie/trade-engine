@@ -1,12 +1,16 @@
 package scanner
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/analysis"
 	"github.com/romeo-folie/trade-engine/internal/config"
+	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/store"
 	"github.com/romeo-folie/trade-engine/internal/tradeprofile"
 )
@@ -28,6 +32,96 @@ func TestCandidateTTLDaysUsesSourcePolicy(t *testing.T) {
 	}
 	if got := scanner.candidateTTLDays(SwingCandidate{Sources: []string{"weekly_leader", "potent_industry"}}); got != 10 {
 		t.Fatalf("multi-source TTL = %d, want longest source TTL 10", got)
+	}
+}
+
+func TestFetchCandidatesKeepsMoverWithPartialIEXVolume(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1beta1/screener/stocks/movers":
+			_, _ = w.Write([]byte(`{"gainers":[{"symbol":"LIQUID","percent_change":8,"change":1,"price":20},{"symbol":"IEX_RICH","percent_change":5,"change":1,"price":20}],"losers":[]}`))
+		case "/v2/stocks/snapshots":
+			// IEX's partial volume must not control the top-N cutoff. A lower-gap
+			// name with heavy IEX activity cannot displace LIQUID's larger gap.
+			_, _ = w.Write([]byte(`{"LIQUID":{"dailyBar":{"v":1000}},"IEX_RICH":{"dailyBar":{"v":1000000}}}`))
+		case "/v1beta1/screener/stocks/most-actives":
+			_, _ = w.Write([]byte(`{"most_actives":[]}`))
+		default:
+			http.Error(w, "unexpected path", http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	scanner := &MarketScanner{
+		AlpacaClient: data.NewAlpacaClient("key", "secret", server.URL),
+		Cfg: config.ScannerConfig{Universe: config.UniverseConfig{
+			MinPrice: 5, MinMedianDollarVolume: 1_000_000,
+		}, TopMovers: 1},
+	}
+	candidates, err := scanner.fetchCandidates(context.Background())
+	if err != nil {
+		t.Fatalf("fetch candidates: %v", err)
+	}
+	if len(candidates) != 1 || candidates[0].Ticker != "LIQUID" {
+		t.Fatalf("partial-IEX mover was filtered: %+v", candidates)
+	}
+	if candidates[0].DollarVolume != 0 || candidates[0].Volume == 0 {
+		t.Fatalf("IEX volume leaked into queue liquidity: %+v", candidates[0])
+	}
+}
+
+func TestFetchCandidatesKeepsIntradayActiveBelowCompletedSessionFloor(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1beta1/screener/stocks/movers":
+			_, _ = w.Write([]byte(`{"gainers":[],"losers":[]}`))
+		case "/v1beta1/screener/stocks/most-actives":
+			// Both current-session notionals are below the completed-session
+			// median floor, but they are still valid most-active observations.
+			_, _ = w.Write([]byte(`{"most_actives":[{"symbol":"SKIP","price":4,"volume":10},{"symbol":"EARLY","price":10,"volume":10,"trade_count":2},{"symbol":"LATER","price":20,"volume":20,"trade_count":3}]}`))
+		default:
+			http.Error(w, "unexpected path", http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	scanner := &MarketScanner{
+		AlpacaClient: data.NewAlpacaClient("key", "secret", server.URL),
+		Cfg: config.ScannerConfig{Universe: config.UniverseConfig{
+			MinPrice: 5, MinMedianDollarVolume: 1_000_000,
+		}, TopActives: 2},
+	}
+	candidates, err := scanner.fetchCandidates(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 2 || candidates[0].Ticker != "EARLY" || candidates[1].Ticker != "LATER" {
+		t.Fatalf("intraday active candidates were filtered: %+v", candidates)
+	}
+	for _, candidate := range candidates {
+		if candidate.DollarVolume != 0 || candidate.SourceScores["active"] <= 0 {
+			t.Fatalf("active candidate leaked intraday liquidity into queue fields: %+v", candidate)
+		}
+	}
+	if candidates[0].SourceScores["active"] != 1 || candidates[0].SourceScores["active"] <= candidates[1].SourceScores["active"] {
+		t.Fatalf("provider ordinal scores = %+v, want rank one above rank two", candidates)
+	}
+}
+
+func TestScannerCandidateStrategiesUsesSourceDefaultWithoutLLMScore(t *testing.T) {
+	for _, test := range []struct {
+		sources []string
+		want    string
+	}{
+		{sources: []string{"mover"}, want: "momentum"},
+		{sources: []string{"graph_neighbor"}, want: "news_sentiment"},
+		{sources: []string{"weekly_leader"}, want: "trend_following"},
+	} {
+		strategies := scannerCandidateStrategies(SwingCandidate{Sources: test.sources}, SwingScoreResult{})
+		if len(strategies) == 0 || strategies[0] != test.want {
+			t.Fatalf("sources %v strategies=%v, want primary %q", test.sources, strategies, test.want)
+		}
 	}
 }
 

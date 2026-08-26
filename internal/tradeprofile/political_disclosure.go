@@ -11,6 +11,11 @@ type PoliticalDisclosureEvidence struct {
 	Ticker                        string                             `json:"ticker"`
 	DistinctFilerCount            int                                `json:"distinct_filer_count"`
 	DistinctBuyerCount            int                                `json:"distinct_buyer_count"`
+	QualifyingFilerCount          int                                `json:"qualifying_filer_count"`
+	QualifyingBuyerCount          int                                `json:"qualifying_buyer_count"`
+	QualifyingPurchaseMinimum     int64                              `json:"qualifying_purchase_minimum"`
+	LatestQualifyingPurchaseDate  string                             `json:"latest_qualifying_purchase_date,omitempty"`
+	LatestQualifyingFilingDate    string                             `json:"latest_qualifying_filing_date,omitempty"`
 	ReportCount                   int                                `json:"report_count"`
 	AmendmentReportCount          int                                `json:"amendment_report_count"`
 	IndependentReportCount        int                                `json:"independent_report_count"`

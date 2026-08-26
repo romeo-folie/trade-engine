@@ -1257,18 +1257,23 @@ type ScannerConfig struct {
 	// Default: 2 (runs at roughly 10am, 12pm, 2pm ET on a standard trading day).
 	ScanIntervalHours int `yaml:"scan_interval_hours"`
 
-	// CandidateCap is the maximum number of scanner-sourced tickers that may be
-	// active on the watchlist at any one time. New promotions are suppressed when
-	// the cap is reached; lease refreshes never consume an additional slot.
+	// CandidateCap is retained only so older operator files continue to load. New
+	// installations use ResearchQueue, which also includes scheduled earnings.
 	CandidateCap int `yaml:"candidate_cap"`
 
 	// TTLDays is the default source-lease duration for ordinary scanner sources.
 	// A scanner ticker is expired only after every source lease has elapsed.
 	TTLDays int `yaml:"ttl_days"`
 
-	// MinConviction is the minimum LLM conviction score (0–1) required for a
-	// candidate to be added to the watchlist. Default: 0.65.
+	// MinConviction is retained for configuration compatibility. Scanner
+	// admission is deterministic and never reads this value.
 	MinConviction float64 `yaml:"min_conviction"`
+
+	// ResearchQueue bounds all scanner-originated analyst work, including the
+	// scheduled earnings scanner. Source reservations preserve research coverage
+	// while Overflow provides shared capacity once a source's own reservation is
+	// full.
+	ResearchQueue ResearchQueueConfig `yaml:"research_queue"`
 
 	// NewsLookbackHours controls how far back to fetch news when enriching
 	// screener candidates before LLM scoring. Default: 24.
@@ -1282,13 +1287,14 @@ type ScannerConfig struct {
 	// Default: 20.
 	TopActives int `yaml:"top_actives"`
 
-	// PromotionMaxPerIndustry bounds how many scanner candidates from one
-	// known industry may enter the watchlist in a scan. It requires the
-	// point-in-time scanner universe; zero preserves legacy behavior.
+	// PromotionMaxPerIndustry is retained for legacy configuration only. The
+	// deterministic research queue deliberately has no scanner-wide industry
+	// admission cap; source reservations are the shared capacity contract.
 	PromotionMaxPerIndustry int `yaml:"max_promotions_per_industry"`
 
-	// PromotionCorrelationEnabled enables the additive correlation/exposure
-	// selector. False preserves the legacy promotion path byte-for-byte.
+	// PromotionCorrelation* values are retained for compatibility. When enabled,
+	// the scanner applies its legacy DB-backed position/active-row duplicate
+	// guard only; the former correlation selector no longer controls admission.
 	PromotionCorrelationEnabled      bool    `yaml:"promotion_correlation_enabled"`
 	PromotionMaxAbsCorrelation       float64 `yaml:"promotion_max_abs_correlation"`
 	PromotionCorrelationLookbackDays int     `yaml:"promotion_correlation_lookback_days"`
@@ -1331,6 +1337,29 @@ type ScannerConfig struct {
 	// sentiment-strong news on a manually-watched ticker fans out to its graph
 	// neighbours as candidates, carrying the triggering headline as the thesis.
 	NewsSympathy NewsSympathyConfig `yaml:"news_sympathy"`
+}
+
+type ResearchQueueConfig struct {
+	Capacity     int                       `yaml:"capacity"`
+	Overflow     int                       `yaml:"overflow"`
+	Reservations ResearchQueueReservations `yaml:"reservations"`
+}
+
+type ResearchQueueReservations struct {
+	PoliticalDisclosure int `yaml:"political_disclosure"`
+	WeeklyLeader        int `yaml:"weekly_leader"`
+	PotentIndustry      int `yaml:"potent_industry"`
+	MarketActivity      int `yaml:"market_activity"`
+	PremarketEpisodic   int `yaml:"premarket_episodic"`
+	GraphNeighbor       int `yaml:"graph_neighbor"`
+	NewsSympathy        int `yaml:"news_sympathy"`
+	EarningsScheduled   int `yaml:"earnings_scheduled"`
+}
+
+func (r ResearchQueueReservations) Total() int {
+	return r.PoliticalDisclosure + r.WeeklyLeader + r.PotentIndustry +
+		r.MarketActivity + r.PremarketEpisodic + r.GraphNeighbor +
+		r.NewsSympathy + r.EarningsScheduled
 }
 
 type PoliticalDisclosureScannerConfig struct {
@@ -2401,33 +2430,36 @@ const delayedSIPSnapshotDelayMinutes = 16
 
 func Validate(cfg *Config) []string {
 	var errs []string
+	queue := cfg.Scanner.ResearchQueue
+	if queue.Capacity <= 0 {
+		errs = append(errs, "scanner.research_queue.capacity must be > 0")
+	}
+	if queue.Overflow < 0 {
+		errs = append(errs, "scanner.research_queue.overflow must be >= 0")
+	}
+	for name, value := range map[string]int{
+		"political_disclosure": queue.Reservations.PoliticalDisclosure,
+		"weekly_leader":        queue.Reservations.WeeklyLeader,
+		"potent_industry":      queue.Reservations.PotentIndustry,
+		"market_activity":      queue.Reservations.MarketActivity,
+		"premarket_episodic":   queue.Reservations.PremarketEpisodic,
+		"graph_neighbor":       queue.Reservations.GraphNeighbor,
+		"news_sympathy":        queue.Reservations.NewsSympathy,
+		"earnings_scheduled":   queue.Reservations.EarningsScheduled,
+	} {
+		if value < 0 {
+			errs = append(errs, "scanner.research_queue.reservations."+name+" must be >= 0")
+		}
+	}
+	if queue.Capacity > 0 && queue.Reservations.Total()+queue.Overflow != queue.Capacity {
+		errs = append(errs, "scanner.research_queue.capacity must equal reservations plus overflow")
+	}
 	if cfg.Scanner.PromotionMaxPerIndustry < 0 {
 		errs = append(errs, "scanner.max_promotions_per_industry must be >= 0")
-	}
-	if cfg.Scanner.PromotionMaxPerIndustry > 0 && !cfg.Scanner.Universe.Enabled {
-		errs = append(errs,
-			"scanner.max_promotions_per_industry requires scanner.universe.enabled=true")
 	}
 	if cfg.Scanner.PromotionMaxAbsCorrelation <= 0 || cfg.Scanner.PromotionMaxAbsCorrelation > 1 ||
 		math.IsNaN(cfg.Scanner.PromotionMaxAbsCorrelation) || math.IsInf(cfg.Scanner.PromotionMaxAbsCorrelation, 0) {
 		errs = append(errs, "scanner.promotion_max_abs_correlation must be in (0,1]")
-	}
-	if cfg.Scanner.PromotionCorrelationEnabled {
-		if !cfg.Scanner.Enabled {
-			errs = append(errs, "scanner.promotion_correlation_enabled requires scanner.enabled=true")
-		}
-		if cfg.Scanner.PromotionCorrelationLookbackDays <= 0 {
-			errs = append(errs, "scanner.promotion_correlation_lookback_days must be > 0")
-		}
-		if cfg.Scanner.PromotionCorrelationMinOverlap <= 0 ||
-			cfg.Scanner.PromotionCorrelationMinOverlap > cfg.Scanner.PromotionCorrelationLookbackDays {
-			errs = append(errs, "scanner.promotion_correlation_min_overlap must be in (0,lookback]")
-		}
-		if !validUniverseHistoricalFeed(cfg.Scanner.Universe.HistoricalFeed) {
-			errs = append(errs, fmt.Sprintf(
-				"scanner.universe.historical_feed must be one of iex|sip when promotion correlation is enabled, got %q",
-				cfg.Scanner.Universe.HistoricalFeed))
-		}
 	}
 	if cfg.Scanner.Universe.Enabled || cfg.Scanner.PromotionCorrelationEnabled || cfg.Scanner.EarningsWatchlist.Enabled {
 		delay := cfg.Scanner.Universe.SIPRecentDataDelayMinutes

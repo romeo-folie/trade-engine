@@ -21,7 +21,7 @@ const (
 )
 
 func (s *MarketScanner) politicalDisclosureCandidates(
-	ctx context.Context,
+	ctx context.Context, recorder *scanRecorder,
 ) ([]SwingCandidate, error) {
 	cfg := s.Cfg.PoliticalDisclosures
 	if !cfg.Enabled || !cfg.PromoteCandidates || !store.IsConnected() {
@@ -30,6 +30,10 @@ func (s *MarketScanner) politicalDisclosureCandidates(
 	token, err := newWeeklyLeaderPromotionClaimToken()
 	if err != nil {
 		return nil, err
+	}
+	scannerRunID := ""
+	if recorder != nil {
+		scannerRunID = recorder.run.ID
 	}
 	now := s.now()
 	rows, err := store.ClaimPoliticalDisclosureCandidatesWithEvidence(
@@ -52,9 +56,20 @@ func (s *MarketScanner) politicalDisclosureCandidates(
 	sort.Strings(tickers)
 	out := make([]SwingCandidate, 0, len(tickers))
 	for _, ticker := range tickers {
-		out = append(out, buildPoliticalDisclosureCandidate(ticker, token, byTicker[ticker]))
+		candidate := buildPoliticalDisclosureCandidate(ticker, token, byTicker[ticker])
+		if !politicalDisclosureQualifies(candidate) {
+			if recorder != nil {
+				recorder.register([]SwingCandidate{candidate})
+				recorder.deterministicRejected(candidate,
+					"no independent purchase remains after same-filer contradictory sales")
+			}
+			s.markPoliticalDisclosureCandidate(ctx, candidate, "rejected", scannerRunID,
+				"no independent purchase remains after same-filer contradictory sales")
+			continue
+		}
+		out = append(out, candidate)
 	}
-	return s.hydratePoliticalDisclosureMarketData(ctx, out), nil
+	return s.hydratePoliticalDisclosureMarketData(ctx, out, recorder), nil
 }
 
 type politicalDisclosureAggregate struct {
@@ -74,6 +89,8 @@ type politicalDisclosureFilerAggregate struct {
 	latestTransactionFilingDate time.Time
 	lagKnown                    bool
 	independentTransactionCount int
+	latestPurchaseDate          time.Time
+	latestPurchaseFilingDate    time.Time
 }
 
 func buildPoliticalDisclosureCandidate(
@@ -89,25 +106,103 @@ func buildPoliticalDisclosureCandidate(
 		},
 		filers: make(map[string]*politicalDisclosureFilerAggregate),
 	}
+	// The trigger-eligible rows are the trigger window. The store claims every
+	// evidence-horizon row to fence the aggregate, so Claimed cannot distinguish
+	// fresh triggers from historical context here. Older rows are retained in the
+	// complete aggregate as analyst context, but may not independently qualify
+	// a candidate surfaced by a newly claimed non-purchase disclosure.
+	triggerAggregate := politicalDisclosureAggregate{
+		evidence: tradeprofile.PoliticalDisclosureEvidence{
+			Version: tradeprofile.PoliticalDisclosureEvidenceVersion,
+			Ticker:  ticker,
+		},
+		filers: make(map[string]*politicalDisclosureFilerAggregate),
+	}
 	reportIDs := make([]string, 0, len(items))
 	for _, item := range items {
 		if item.Claimed {
 			reportIDs = append(reportIDs, item.ReportID)
 		}
+		if item.TriggerEligible {
+			triggerAggregate.addReport(item)
+		}
 		aggregate.addReport(item)
 	}
 	aggregate.finish()
+	triggerAggregate.finish()
+	copyPoliticalDisclosureQualifyingFacts(&aggregate.evidence,
+		qualifyingPoliticalDisclosureFacts(triggerAggregate, aggregate))
 	facts, err := json.Marshal(aggregate.evidence)
 	if err != nil {
 		facts = json.RawMessage(`{}`)
 	}
 	return SwingCandidate{
-		Ticker: ticker, Sources: []string{"political_disclosure"},
+		Ticker:                            ticker,
+		Sources:                           []string{"political_disclosure"},
 		PoliticalDisclosureClaimToken:     token,
 		PoliticalDisclosureClaimReportIDs: reportIDs,
 		PoliticalDisclosureEvidence:       summarizePoliticalDisclosure(aggregate.evidence),
 		PoliticalDisclosureFacts:          facts,
 	}
+}
+
+// qualifyingPoliticalDisclosureFacts requires the purchase itself to be a
+// fresh claimable trigger while applying same-filer sales from the complete
+// fenced evidence horizon as the contradiction check.
+func qualifyingPoliticalDisclosureFacts(
+	trigger, complete politicalDisclosureAggregate,
+) tradeprofile.PoliticalDisclosureEvidence {
+	var qualifying tradeprofile.PoliticalDisclosureEvidence
+	ids := make([]string, 0, len(trigger.filers))
+	for id := range trigger.filers {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		triggerFiler := trigger.filers[id]
+		completeFiler := complete.filers[id]
+		if triggerFiler.evidence.PurchaseCount == 0 ||
+			(completeFiler != nil && completeFiler.evidence.ContradictoryActivity) {
+			continue
+		}
+		qualifying.QualifyingFilerCount++
+		qualifying.QualifyingBuyerCount += len(triggerFiler.purchasers)
+		qualifying.QualifyingPurchaseMinimum += triggerFiler.evidence.PurchaseAmounts.MinimumTotal
+		if triggerFiler.latestPurchaseDate.After(parseEvidenceDate(qualifying.LatestQualifyingPurchaseDate)) ||
+			(triggerFiler.latestPurchaseDate.Equal(parseEvidenceDate(qualifying.LatestQualifyingPurchaseDate)) &&
+				triggerFiler.latestPurchaseFilingDate.After(parseEvidenceDate(qualifying.LatestQualifyingFilingDate))) {
+			qualifying.LatestQualifyingPurchaseDate = evidenceDate(triggerFiler.latestPurchaseDate)
+			qualifying.LatestQualifyingFilingDate = evidenceDate(triggerFiler.latestPurchaseFilingDate)
+		}
+	}
+	return qualifying
+}
+
+// copyPoliticalDisclosureQualifyingFacts keeps the complete disclosure
+// history available to analysts while making the admission and priority facts
+// authoritative for the claimed trigger window only.
+func copyPoliticalDisclosureQualifyingFacts(
+	destination *tradeprofile.PoliticalDisclosureEvidence,
+	trigger tradeprofile.PoliticalDisclosureEvidence,
+) {
+	destination.QualifyingFilerCount = trigger.QualifyingFilerCount
+	destination.QualifyingBuyerCount = trigger.QualifyingBuyerCount
+	destination.QualifyingPurchaseMinimum = trigger.QualifyingPurchaseMinimum
+	destination.LatestQualifyingPurchaseDate = trigger.LatestQualifyingPurchaseDate
+	destination.LatestQualifyingFilingDate = trigger.LatestQualifyingFilingDate
+}
+
+// politicalDisclosureQualifies implements the source policy without an LLM:
+// one completed independent purchase is enough, unknown amount ranges remain
+// eligible, and sales invalidate only the purchasing filer's own signal.
+func politicalDisclosureQualifies(candidate SwingCandidate) bool {
+	var facts tradeprofile.PoliticalDisclosureEvidence
+	if err := json.Unmarshal(candidate.PoliticalDisclosureFacts, &facts); err != nil {
+		return false
+	}
+	// Version-2 qualifying aggregates are deliberately trigger-window scoped;
+	// bounded historical filer details must never bypass them.
+	return facts.QualifyingFilerCount > 0
 }
 
 func (a *politicalDisclosureAggregate) addReport(item store.PoliticalDisclosureCandidate) {
@@ -221,6 +316,11 @@ func (a *politicalDisclosureAggregate) addTransaction(
 			}
 			addPoliticalAmount(&a.evidence.PurchaseAmounts, transaction)
 			addPoliticalAmount(&filer.evidence.PurchaseAmounts, transaction)
+			if transaction.TransactionDate.After(filer.latestPurchaseDate) ||
+				(transaction.TransactionDate.Equal(filer.latestPurchaseDate) && filingDate.After(filer.latestPurchaseFilingDate)) {
+				filer.latestPurchaseDate = transaction.TransactionDate
+				filer.latestPurchaseFilingDate = filingDate
+			}
 		}
 	case "sale":
 		report.SaleCount++
@@ -300,6 +400,16 @@ func (a *politicalDisclosureAggregate) finish() {
 		a.evidence.DistinctBuyerCount += len(filer.purchasers)
 		if filer.evidence.PurchaseCount > 0 {
 			purchasingFilerCount++
+		}
+		if filer.evidence.PurchaseCount > 0 && !filer.evidence.ContradictoryActivity {
+			a.evidence.QualifyingFilerCount++
+			a.evidence.QualifyingBuyerCount += len(filer.purchasers)
+			a.evidence.QualifyingPurchaseMinimum += filer.evidence.PurchaseAmounts.MinimumTotal
+			if filer.latestPurchaseDate.After(parseEvidenceDate(a.evidence.LatestQualifyingPurchaseDate)) ||
+				(filer.latestPurchaseDate.Equal(parseEvidenceDate(a.evidence.LatestQualifyingPurchaseDate)) && filer.latestPurchaseFilingDate.After(parseEvidenceDate(a.evidence.LatestQualifyingFilingDate))) {
+				a.evidence.LatestQualifyingPurchaseDate = evidenceDate(filer.latestPurchaseDate)
+				a.evidence.LatestQualifyingFilingDate = evidenceDate(filer.latestPurchaseFilingDate)
+			}
 		}
 		if filer.evidence.RepeatedActivity {
 			a.evidence.RepeatedFilerActivity = true
@@ -522,8 +632,18 @@ func attachPoliticalFallback(fallback *SwingCandidate, source SwingCandidate) {
 // definitive asset/snapshot failures are terminally recorded so malformed
 // symbols do not churn forever.
 func (s *MarketScanner) hydratePoliticalDisclosureMarketData(
-	ctx context.Context, candidates []SwingCandidate,
+	ctx context.Context, candidates []SwingCandidate, recorder *scanRecorder,
 ) []SwingCandidate {
+	scannerRunID := ""
+	if recorder != nil {
+		scannerRunID = recorder.run.ID
+	}
+	recordRejection := func(candidate SwingCandidate, reason string) {
+		if recorder != nil {
+			recorder.register([]SwingCandidate{candidate})
+			recorder.deterministicRejected(candidate, reason)
+		}
+	}
 	political := make([]string, 0)
 	for _, candidate := range candidates {
 		if candidate.PoliticalDisclosureClaimToken != "" {
@@ -566,8 +686,9 @@ func (s *MarketScanner) hydratePoliticalDisclosureMarketData(
 			continue
 		}
 		if _, ok := tradable[candidate.Ticker]; !ok {
-			s.rejectPoliticalDisclosureMarketData(ctx, candidate,
-				"political disclosure symbol is not an active, tradeable US equity")
+			reason := "political disclosure symbol is not an active, tradeable US equity"
+			recordRejection(candidate, reason)
+			s.rejectPoliticalDisclosureMarketData(ctx, candidate, scannerRunID, reason)
 			continue
 		}
 		snapshot, ok := snapshots.Snapshots[candidate.Ticker]
@@ -577,8 +698,9 @@ func (s *MarketScanner) hydratePoliticalDisclosureMarketData(
 					fmt.Sprintf("political disclosure snapshot unavailable: %v", failure))
 				continue
 			}
-			s.rejectPoliticalDisclosureMarketData(ctx, candidate,
-				"political disclosure symbol has no current market snapshot")
+			reason := "political disclosure symbol has no current market snapshot"
+			recordRejection(candidate, reason)
+			s.rejectPoliticalDisclosureMarketData(ctx, candidate, scannerRunID, reason)
 			continue
 		}
 		if snapshot.PreviousDailyBar == nil ||
@@ -589,17 +711,22 @@ func (s *MarketScanner) hydratePoliticalDisclosureMarketData(
 			continue
 		}
 		hydratePoliticalSnapshot(&candidate, snapshot)
-		if candidate.Price <= 0 {
+		minPrice := s.Cfg.Universe.MinPrice
+		if minPrice <= 0 {
+			minPrice = 5
+		}
+		if candidate.Price < minPrice {
 			s.releasePoliticalDisclosureMarketData(ctx, candidate,
-				"political disclosure current price is unavailable")
+				fmt.Sprintf("political disclosure market evidence failed price gate: price=%.4f minimum=%.4f", candidate.Price, minPrice))
 			continue
 		}
 		if candidate.DollarVolume < pullbackMinDollarVolume {
-			s.rejectPoliticalDisclosureMarketData(ctx, candidate, fmt.Sprintf(
+			reason := fmt.Sprintf(
 				"political disclosure market evidence failed liquidity gate: price=%.4f volume=%d dollar_volume=%.2f minimum=%.2f",
 				candidate.Price, candidate.Volume, candidate.DollarVolume,
-				pullbackMinDollarVolume,
-			))
+				pullbackMinDollarVolume)
+			recordRejection(candidate, reason)
+			s.rejectPoliticalDisclosureMarketData(ctx, candidate, scannerRunID, reason)
 			continue
 		}
 		out = append(out, candidate)
@@ -629,11 +756,11 @@ func hydratePoliticalSnapshot(candidate *SwingCandidate, snapshot data.StockSnap
 }
 
 func (s *MarketScanner) rejectPoliticalDisclosureMarketData(
-	ctx context.Context, candidate SwingCandidate, reason string,
+	ctx context.Context, candidate SwingCandidate, scannerRunID, reason string,
 ) {
 	// This is a definitive asset/snapshot failure, not a transient scoring
 	// failure. It must remain terminal instead of being requeued forever.
-	s.markPoliticalDisclosureCandidate(ctx, candidate, "rejected", "", reason)
+	s.markPoliticalDisclosureCandidate(ctx, candidate, "rejected", scannerRunID, reason)
 	slog.Warn("scanner: political disclosure candidate rejected",
 		"ticker", candidate.Ticker, "reason", reason)
 }

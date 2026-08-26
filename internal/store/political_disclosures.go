@@ -204,6 +204,10 @@ type PoliticalDisclosureCandidate struct {
 	Evidence            json.RawMessage
 	PromotionClaimToken string
 	Claimed             bool
+	// TriggerEligible identifies fresh rows actually claimed or reclaimed by
+	// this promotion. Claimed fences the complete evidence aggregate and is
+	// intentionally broader than this flag.
+	TriggerEligible bool
 }
 
 type PoliticalDisclosureReportFilter struct {
@@ -954,8 +958,9 @@ func ClaimPoliticalDisclosureCandidates(
 
 // ClaimPoliticalDisclosureCandidatesWithEvidence claims tickers that have a
 // fresh trigger filing while returning a longer completed-filing horizon for
-// analyst context. Only trigger-window rows are claimed and promotion-fenced;
-// older evidence is context, never a reason to re-promote a ticker.
+// analyst context. The complete evidence aggregate is promotion-fenced, while
+// TriggerEligible distinguishes fresh rows from older context so callers do
+// not re-promote a ticker solely because of historical evidence.
 func ClaimPoliticalDisclosureCandidatesWithEvidence(
 	ctx context.Context, triggerSince, evidenceSince, now time.Time, lease time.Duration,
 	maxTickers int, token string,
@@ -1041,13 +1046,20 @@ func ClaimPoliticalDisclosureCandidatesWithEvidence(
 			WHERE r.filing_date >= $1::date AND r.filing_date <= $2::date
 			  AND r.extraction_status='completed' AND c.promotion_status <> 'superseded'
 			  AND c.ticker = ANY($6::text[])
-		), evidence AS (
+	), evidence AS (
 			SELECT c.*, r.source, r.external_id, r.chamber, r.filer_name, r.office,
 				r.report_type, r.is_amendment, r.filing_date, r.document_url, r.extraction_status
 			FROM political_disclosure_candidates c JOIN political_disclosure_reports r ON r.id=c.report_id
 			WHERE r.filing_date >= $7::date AND r.filing_date <= $2::date
 			  AND r.extraction_status='completed' AND c.promotion_status <> 'superseded'
 			  AND c.ticker = ANY($6::text[])
+		), trigger_claimable AS (
+			SELECT c.report_id, c.ticker
+			FROM trigger_eligible c
+			WHERE c.promotion_status='pending' OR (
+				c.promotion_status='processing' AND
+				(c.promotion_claimed_at IS NULL OR c.promotion_claimed_at < $2::timestamptz - $3::interval)
+			)
 		), selected AS (
 			SELECT c.ticker
 			FROM trigger_eligible c
@@ -1067,10 +1079,7 @@ func ClaimPoliticalDisclosureCandidatesWithEvidence(
 		), claimed AS (
 			UPDATE political_disclosure_candidates c
 			SET promotion_status=CASE
-				WHEN EXISTS (SELECT 1 FROM trigger_eligible t WHERE t.report_id=c.report_id AND t.ticker=c.ticker) AND (c.promotion_status='pending' OR (
-					c.promotion_status='processing' AND
-					(c.promotion_claimed_at IS NULL OR c.promotion_claimed_at < $2::timestamptz - $3::interval)
-				)) THEN 'processing'
+				WHEN EXISTS (SELECT 1 FROM trigger_claimable t WHERE t.report_id=c.report_id AND t.ticker=c.ticker) THEN 'processing'
 					ELSE c.promotion_status
 				END,
 				promotion_claim_token=$5, promotion_claimed_at=$2::timestamptz
@@ -1086,7 +1095,8 @@ func ClaimPoliticalDisclosureCandidatesWithEvidence(
 			COALESCE(c.transaction_count, e.transaction_count),
 			COALESCE(c.latest_transaction_date, e.latest_transaction_date),
 			COALESCE(c.evidence, e.evidence),
-			COALESCE(c.promotion_claim_token, ''), c.report_id IS NOT NULL
+			COALESCE(c.promotion_claim_token, ''), c.report_id IS NOT NULL,
+			EXISTS (SELECT 1 FROM trigger_claimable t WHERE t.report_id=e.report_id AND t.ticker=e.ticker)
 		FROM evidence e JOIN selected s ON s.ticker=e.ticker
 		LEFT JOIN claimed c ON c.report_id=e.report_id AND c.ticker=e.ticker
 		ORDER BY e.ticker, e.filing_date DESC, e.report_id`,
@@ -1105,6 +1115,7 @@ func ClaimPoliticalDisclosureCandidatesWithEvidence(
 			&candidate.ExtractionStatus,
 			&candidate.TransactionCount, &candidate.LatestTransaction,
 			&candidate.Evidence, &candidate.PromotionClaimToken, &candidate.Claimed,
+			&candidate.TriggerEligible,
 		); err != nil {
 			rows.Close()
 			return nil, err

@@ -441,10 +441,8 @@ func promoteScannerSourcesToWatchlist(
 	// Take all potentially blocking source/advisory locks before touching the
 	// lease row. This leaves an expired lease reclaimable while this transaction
 	// waits, then fences the final watchlist write with the current owner.
-	if lease != nil || refreshOnly {
-		if err := lockScannerWatchlistItem(ctx, tx, item); err != nil {
-			return err
-		}
+	if err := lockScannerWatchlistItem(ctx, tx, item); err != nil {
+		return err
 	}
 	if lease != nil {
 		if err := renewScannerCycleTx(ctx, tx, *lease); err != nil {
@@ -469,6 +467,11 @@ func promoteScannerSourcesToWatchlist(
 		if err != nil {
 			return err
 		}
+		if len(changedLeases) > 0 {
+			if err := ReclassifyResearchQueueMemberships(ctx, tx); err != nil {
+				return err
+			}
+		}
 		if err := completeScannerSourcePromotionClaims(ctx, tx, item, claims,
 			"active_watchlist", reason, at); err != nil {
 			return err
@@ -485,6 +488,11 @@ func promoteScannerSourcesToWatchlist(
 	if err := addWatchlistItem(ctx, tx, item, preserveActive, &changedLeases); err != nil {
 		if !errors.Is(err, ErrWatchlistActiveItemExists) {
 			return err
+		}
+		if len(changedLeases) > 0 {
+			if err := ReclassifyResearchQueueMemberships(ctx, tx); err != nil {
+				return err
+			}
 		}
 		if completionErr := completeScannerSourcePromotionClaims(
 			ctx, tx, item, claims, "active_watchlist",

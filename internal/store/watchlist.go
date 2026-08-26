@@ -23,6 +23,10 @@ var (
 	// scanner snapshot expired or was removed before its refresh transaction.
 	// The caller may send it through normal admission/cap selection instead.
 	ErrWatchlistRefreshNotActive = errors.New("watchlist item is no longer active for refresh")
+	// ErrWatchlistResearchReactivationRequiresAdmission prevents a direct UI
+	// toggle from making scanner-owned research visible without first reserving
+	// a deterministic research-queue membership.
+	ErrWatchlistResearchReactivationRequiresAdmission = errors.New("research-owned watchlist item requires fresh scanner or earnings admission")
 )
 
 // WatchlistItem represents a row in the watchlist table.
@@ -62,6 +66,10 @@ type WatchlistItem struct {
 	// residency. They are source-owned and must not replace the admission-time
 	// execution contract when a ticker is rediscovered.
 	SourceLeases []WatchlistSourceLease
+	// ResearchQueue is present only for scanner-originated admissions. It is
+	// deliberately separate from MinConfidence: queue priority never changes
+	// execution, sizing, or downstream analysis thresholds.
+	ResearchQueue *ResearchQueueAdmission
 	// PullbackRequalificationRequired quarantines legacy scanner rows whose
 	// pullback-universe status was not persisted before migration 055.
 	PullbackRequalificationRequired bool
@@ -128,6 +136,14 @@ func RefreshActiveScannerWatchlistItemWithChangedLeases(
 	if err != nil {
 		return nil, err
 	}
+	if len(changedLeases) > 0 {
+		// A refresh can attach higher-precedence source evidence to an existing
+		// queue member. Reclassify before commit so the very next candidate sees
+		// the correct protected lane and capacity accounting.
+		if err := ReclassifyResearchQueueMemberships(ctx, tx); err != nil {
+			return nil, err
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
@@ -175,7 +191,7 @@ func AddWatchlistItemWithChangedLeases(
 	if len(item.SourceLeases) > 0 {
 		return addWatchlistItemInTransactionWithChangedLeases(ctx, item, false)
 	}
-	return nil, addWatchlistItem(ctx, GetDB(), item, false, nil)
+	return nil, addWatchlistItemInTransaction(ctx, item, false)
 }
 
 // AddWatchlistItemWithScannerLease fences a scanner promotion and its lease
@@ -229,9 +245,17 @@ func addWatchlistItemInTransactionWithChangedLeases(
 		return nil, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	if err := lockScannerWatchlistItem(ctx, tx, item); err != nil {
+		return nil, err
+	}
 	var changedLeases []WatchlistSourceLease
 	if err := addWatchlistItem(ctx, tx, item, preserveActive, &changedLeases); err != nil {
 		if errors.Is(err, ErrWatchlistActiveItemExists) {
+			if len(changedLeases) > 0 {
+				if reclassifyErr := ReclassifyResearchQueueMemberships(ctx, tx); reclassifyErr != nil {
+					return nil, reclassifyErr
+				}
+			}
 			if commitErr := tx.Commit(ctx); commitErr != nil {
 				return nil, commitErr
 			}
@@ -286,6 +310,11 @@ func addWatchlistItemWithScannerLeaseWithChangedLeases(
 	var changedLeases []WatchlistSourceLease
 	if err := addWatchlistItem(ctx, tx, item, preserveActive, &changedLeases); err != nil {
 		if errors.Is(err, ErrWatchlistActiveItemExists) {
+			if len(changedLeases) > 0 {
+				if reclassifyErr := ReclassifyResearchQueueMemberships(ctx, tx); reclassifyErr != nil {
+					return nil, reclassifyErr
+				}
+			}
 			if commitErr := tx.Commit(ctx); commitErr != nil {
 				return nil, commitErr
 			}
@@ -349,6 +378,18 @@ func addWatchlistItem(
 	}
 	if err := validateWatchlistSourceLeases(item.SourceLeases); err != nil {
 		return err
+	}
+	var queueReservation researchQueueReservation
+	if item.ResearchQueue != nil {
+		tx, ok := db.(pgx.Tx)
+		if !ok {
+			return errors.New("research queue admission requires a transaction")
+		}
+		reservation, err := reserveResearchQueueSlotTx(ctx, tx, item, *item.ResearchQueue)
+		if err != nil {
+			return err
+		}
+		queueReservation = reservation
 	}
 	discoveryContext, err := tradeprofile.MarshalDiscoveryContext(item.DiscoveryContext)
 	if err != nil {
@@ -471,22 +512,11 @@ func addWatchlistItem(
 			$13
 			AND watchlist.active
 			AND (watchlist.expires_at IS NULL OR watchlist.expires_at > NOW())
-			-- An earnings context may temporarily take over a scanner row after
-			-- its final scanner lease expired. Its retained, expired lease history
-			-- identifies that re-admission path; fresh scanner evidence must be
-			-- able to restore scanner residency without waiting for the earnings
-			-- context to expire. A normal earnings-only row still owns its active
-			-- lifecycle and remains protected by this conflict guard.
+			-- A scheduled-earnings row can receive fresh scanner evidence. Keep
+			-- the one shared watchlist row and its earnings context rather than
+			-- discarding the new source or charging a second research slot.
 			AND NOT (
 				watchlist.source = 'earnings_watchlist'
-				AND EXISTS (
-					SELECT 1 FROM watchlist_source_leases l
-					WHERE l.watchlist_id=watchlist.id
-				)
-				AND NOT EXISTS (
-					SELECT 1 FROM watchlist_source_leases l
-					WHERE l.watchlist_id=watchlist.id AND l.expires_at > NOW()
-				)
 			)
 		)
 	`,
@@ -541,6 +571,12 @@ func addWatchlistItem(
 			if !live {
 				return ErrWatchlistRequalificationRequired
 			}
+		}
+	}
+	if item.ResearchQueue != nil {
+		tx := db.(pgx.Tx) // checked before the write above
+		if err := recordResearchQueueAdmissionTx(ctx, tx, item, *item.ResearchQueue, queueReservation); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -809,11 +845,76 @@ func RemoveWatchlistItem(ctx context.Context, ticker, platform string) error {
 	if platform == "" {
 		platform = "stock"
 	}
-	_, err := GetDB().Exec(ctx, `
+	tx, err := GetDB().Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if err := lockScannerWatchlistItem(ctx, tx, WatchlistItem{Ticker: ticker, Platform: platform}); err != nil {
+		return err
+	}
+	if err := lockResearchQueueTx(ctx, tx); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
 		UPDATE watchlist SET active = false, updated_at = NOW()
 		WHERE ticker = $1 AND platform = $2
-	`, ticker, platform)
-	return err
+	`, ticker, platform); err != nil {
+		return err
+	}
+	if err := releaseInactiveResearchQueueMemberships(ctx, tx); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// ReactivateWatchlistItem restores a manual/config row that an operator
+// previously disabled. Research-owned rows must instead return through their
+// scanner or earnings admission path, which has the source-specific queue
+// capacity and priority required to recreate a membership safely.
+func ReactivateWatchlistItem(ctx context.Context, ticker, platform string) error {
+	if platform == "" {
+		platform = "stock"
+	}
+	item := WatchlistItem{Ticker: ticker, Platform: platform}
+	tx, err := GetDB().Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if err := lockScannerWatchlistItem(ctx, tx, item); err != nil {
+		return err
+	}
+	var researchOwned bool
+	err = tx.QueryRow(ctx, `
+		SELECT source IN ('scanner', 'earnings_watchlist')
+			OR EXISTS (
+				SELECT 1 FROM watchlist_source_leases l
+				WHERE l.watchlist_id=watchlist.id AND l.expires_at > NOW()
+			)
+			OR EXISTS (
+				SELECT 1 FROM watchlist_discovery_contexts c
+				WHERE c.watchlist_id=watchlist.id AND c.active
+				  AND (c.expires_at IS NULL OR c.expires_at > NOW())
+			)
+		FROM watchlist
+		WHERE ticker=$1 AND platform=$2 AND NOT active
+		FOR UPDATE`, strings.ToUpper(strings.TrimSpace(ticker)), platform).Scan(&researchOwned)
+	if isNoRows(err) {
+		return fmt.Errorf("inactive watchlist %s/%s does not exist", strings.ToUpper(strings.TrimSpace(ticker)), platform)
+	}
+	if err != nil {
+		return err
+	}
+	if researchOwned {
+		return ErrWatchlistResearchReactivationRequiresAdmission
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE watchlist SET active=true, updated_at=NOW()
+		WHERE ticker=$1 AND platform=$2`, strings.ToUpper(strings.TrimSpace(ticker)), platform); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // GetWatchlistItems returns watchlist entries. Pass activeOnly = true during engine
@@ -1032,5 +1133,22 @@ func ExpireScannedItems(ctx context.Context) ([]string, error) {
 		}
 		tickers = append(tickers, t)
 	}
-	return tickers, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	tx, err := GetDB().Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	// Reclassify after the expiration row locks have been released. Scanner
+	// admission locks ticker then queue, so holding an expired ticker lock while
+	// waiting for the queue would invert that order.
+	if err := ReclassifyResearchQueueMemberships(ctx, tx); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return tickers, nil
 }

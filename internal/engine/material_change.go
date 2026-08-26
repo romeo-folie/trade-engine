@@ -143,11 +143,7 @@ func emaGapPct(price, ema float64) float64 {
 //  1. HOLD cooldown ÷ 4 (PR #309): scanner-added tickers shouldn't sit on a
 //     2-hour cooldown after one HOLD when they're meant to be actively
 //     watched. Floored at 10 minutes so we don't thrash the LLM on noise.
-//  2. RSI-delta threshold loosened to 2.0 (#317), but only when the
-//     scanner's conviction in the ticker is ≥ 0.75. High-conviction
-//     scanner finds re-trigger LLM analysis on smaller indicator moves
-//     than the default 3.0 floor would allow.
-func applyScannerOverrides(cfg config.AnalysisConfig, source string, scannerConviction float64) config.AnalysisConfig {
+func applyScannerOverrides(cfg config.AnalysisConfig, source string, _ float64) config.AnalysisConfig {
 	if source != "scanner" {
 		return cfg
 	}
@@ -163,11 +159,6 @@ func applyScannerOverrides(cfg config.AnalysisConfig, source string, scannerConv
 		cfg.HoldCooldownMin = reduced
 	}
 
-	const scannerRSIDeltaFloor = 2.0
-	const scannerConvictionFloor = 0.75
-	if scannerConviction >= scannerConvictionFloor && cfg.RSIDeltaThreshold > scannerRSIDeltaFloor {
-		cfg.RSIDeltaThreshold = scannerRSIDeltaFloor
-	}
 	return cfg
 }
 

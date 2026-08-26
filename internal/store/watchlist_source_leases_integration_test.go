@@ -75,6 +75,512 @@ func TestWatchlistSourceLeaseRefreshIsEvidenceGatedAndPreservesAdmission(t *test
 	}
 }
 
+func TestActiveWatchlistRaceReclassifiesResearchQueueMembership(t *testing.T) {
+	ctx := context.Background()
+	const ticker = "LEASE_QUEUE_RECLASSIFY_RT"
+	t.Cleanup(func() { _, _ = store.GetDB().Exec(ctx, "DELETE FROM watchlist WHERE ticker=$1", ticker) })
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	expiresAt := now.Add(24 * time.Hour)
+	item := store.WatchlistItem{
+		Ticker: ticker, Platform: "stock", Source: "scanner", Active: true,
+		Strategies: []string{"momentum"}, Timeframes: []string{"4H"}, ExpiresAt: &expiresAt,
+		SourceLeases: []store.WatchlistSourceLease{{
+			Source: "mover", EvidenceFingerprint: "market", QualifiedAt: now, ObservedAt: now,
+			EffectiveAt: now, ExpiresAt: expiresAt, Evidence: json.RawMessage(`{"price":10}`),
+		}},
+	}
+	if err := store.AddWatchlistItem(ctx, item); err != nil {
+		t.Fatalf("add scanner item: %v", err)
+	}
+	if _, err := store.GetDB().Exec(ctx, `
+		INSERT INTO research_queue_memberships (watchlist_id,bucket,allocation,priority)
+		SELECT id,'market_activity','reserved','{}'::jsonb FROM watchlist
+		WHERE ticker=$1 AND platform='stock'`, ticker); err != nil {
+		t.Fatalf("seed research queue membership: %v", err)
+	}
+
+	political := item
+	political.SourceLeases = []store.WatchlistSourceLease{{
+		Source: "political_disclosure", EvidenceFingerprint: "political", QualifiedAt: now, ObservedAt: now,
+		EffectiveAt: now, ExpiresAt: expiresAt, Evidence: json.RawMessage(`{"report_ids":["r1"]}`),
+	}}
+	if changed, err := store.AddWatchlistItemUnlessActiveWithChangedLeases(ctx, political); !errors.Is(err, store.ErrWatchlistActiveItemExists) || len(changed) != 1 {
+		t.Fatalf("active-row race refresh = changed=%+v err=%v", changed, err)
+	}
+	var bucket string
+	if err := store.GetDB().QueryRow(ctx, `
+		SELECT q.bucket FROM research_queue_memberships q
+		JOIN watchlist w ON w.id=q.watchlist_id WHERE w.ticker=$1`, ticker).Scan(&bucket); err != nil {
+		t.Fatalf("read research queue membership: %v", err)
+	}
+	if bucket != "political_disclosure" {
+		t.Fatalf("membership bucket=%q, want political_disclosure", bucket)
+	}
+}
+
+func TestExpireDiscoveryContextsReleasesSharedScannerQueueMembership(t *testing.T) {
+	ctx := context.Background()
+	const ticker = "EXPIRED_SHARED_CONTEXT_RT"
+	t.Cleanup(func() { _, _ = store.GetDB().Exec(ctx, "DELETE FROM watchlist WHERE ticker=$1", ticker) })
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	expiredAt := now.Add(-time.Hour)
+	item := store.WatchlistItem{
+		Ticker: ticker, Platform: "stock", Source: "scanner", Active: true,
+		Strategies: []string{"momentum"}, Timeframes: []string{"4H"}, ExpiresAt: &expiredAt,
+		SourceLeases: []store.WatchlistSourceLease{{
+			Source: "mover", EvidenceFingerprint: "expired-market", QualifiedAt: expiredAt.Add(-time.Hour),
+			ObservedAt: expiredAt.Add(-time.Hour), EffectiveAt: expiredAt.Add(-time.Hour), ExpiresAt: expiredAt,
+			Evidence: json.RawMessage(`{"price":10}`),
+		}},
+	}
+	if err := store.AddWatchlistItem(ctx, item); err != nil {
+		t.Fatalf("add expired scanner item: %v", err)
+	}
+	context := tradeprofile.DiscoveryContext{
+		Version: tradeprofile.DiscoveryContextVersion, Sources: []string{"earnings_scheduled"},
+		Thesis:           "Expired scheduled earnings context.",
+		EvidenceBySource: map[string]json.RawMessage{"earnings_scheduled": json.RawMessage(`{"event":"earnings"}`)},
+	}
+	if err := store.UpsertWatchlistDiscoveryContext(ctx, ticker, "stock", "earnings_scheduled:expired", context, &expiredAt); err != nil {
+		t.Fatalf("upsert expired earnings context: %v", err)
+	}
+	if _, err := store.GetDB().Exec(ctx, `
+		INSERT INTO research_queue_memberships (watchlist_id,bucket,allocation,priority)
+		SELECT id,'market_activity','reserved','{}'::jsonb FROM watchlist
+		WHERE ticker=$1 AND platform='stock'`, ticker); err != nil {
+		t.Fatalf("seed research queue membership: %v", err)
+	}
+
+	if err := store.ExpireWatchlistDiscoveryContexts(ctx); err != nil {
+		t.Fatalf("expire discovery contexts: %v", err)
+	}
+	var active bool
+	if err := store.GetDB().QueryRow(ctx, `SELECT active FROM watchlist WHERE ticker=$1 AND platform='stock'`, ticker).Scan(&active); err != nil {
+		t.Fatalf("read watchlist state: %v", err)
+	}
+	if active {
+		t.Fatal("shared scanner row remained active after its final lease and context expired")
+	}
+	var memberships int
+	if err := store.GetDB().QueryRow(ctx, `
+		SELECT COUNT(*) FROM research_queue_memberships q
+		JOIN watchlist w ON w.id=q.watchlist_id WHERE w.ticker=$1`, ticker).Scan(&memberships); err != nil {
+		t.Fatalf("count queue memberships: %v", err)
+	}
+	if memberships != 0 {
+		t.Fatalf("expired shared row retained %d research queue memberships", memberships)
+	}
+}
+
+func TestExpireDiscoveryContextsReleasesManualEarningsQueueMembership(t *testing.T) {
+	ctx := context.Background()
+	const ticker = "EXPIRED_MANUAL_CONTEXT_RT"
+	t.Cleanup(func() { _, _ = store.GetDB().Exec(ctx, "DELETE FROM watchlist WHERE ticker=$1", ticker) })
+	if err := store.AddWatchlistItem(ctx, store.WatchlistItem{
+		Ticker: ticker, Platform: "stock", Source: "manual", Active: true,
+		Strategies: []string{"momentum"}, Timeframes: []string{"4H"},
+	}); err != nil {
+		t.Fatalf("add manual item: %v", err)
+	}
+	expiredAt := time.Now().UTC().Add(-time.Hour)
+	context := tradeprofile.DiscoveryContext{
+		Version: tradeprofile.DiscoveryContextVersion, Sources: []string{"earnings_scheduled"},
+		Thesis:           "Expired scheduled earnings context.",
+		EvidenceBySource: map[string]json.RawMessage{"earnings_scheduled": json.RawMessage(`{"event":"earnings"}`)},
+	}
+	if err := store.UpsertWatchlistDiscoveryContext(ctx, ticker, "stock", "earnings_scheduled:expired", context, &expiredAt); err != nil {
+		t.Fatalf("upsert expired earnings context: %v", err)
+	}
+	if _, err := store.GetDB().Exec(ctx, `
+		INSERT INTO research_queue_memberships (watchlist_id,bucket,allocation,priority)
+		SELECT id,'earnings_scheduled','reserved','{}'::jsonb FROM watchlist
+		WHERE ticker=$1 AND platform='stock'`, ticker); err != nil {
+		t.Fatalf("seed research queue membership: %v", err)
+	}
+	if err := store.ExpireWatchlistDiscoveryContexts(ctx); err != nil {
+		t.Fatalf("expire discovery contexts: %v", err)
+	}
+	var active bool
+	if err := store.GetDB().QueryRow(ctx, `SELECT active FROM watchlist WHERE ticker=$1 AND platform='stock'`, ticker).Scan(&active); err != nil {
+		t.Fatalf("read manual watchlist state: %v", err)
+	}
+	if !active {
+		t.Fatal("expired earnings context deactivated its manual owner")
+	}
+	var memberships int
+	if err := store.GetDB().QueryRow(ctx, `
+		SELECT COUNT(*) FROM research_queue_memberships q
+		JOIN watchlist w ON w.id=q.watchlist_id WHERE w.ticker=$1`, ticker).Scan(&memberships); err != nil {
+		t.Fatalf("count queue memberships: %v", err)
+	}
+	if memberships != 0 {
+		t.Fatalf("manual row retained %d expired earnings queue memberships", memberships)
+	}
+}
+
+func TestExpireDiscoveryContextsKeepsLegacyScannerWithoutExpiry(t *testing.T) {
+	ctx := context.Background()
+	const ticker = "LEGACY_SCANNER_NO_EXPIRY_RT"
+	t.Cleanup(func() { _, _ = store.GetDB().Exec(ctx, "DELETE FROM watchlist WHERE ticker=$1", ticker) })
+	if err := store.AddWatchlistItem(ctx, store.WatchlistItem{
+		Ticker: ticker, Platform: "stock", Source: "scanner", Active: true,
+		Strategies: []string{"momentum"}, Timeframes: []string{"4H"},
+	}); err != nil {
+		t.Fatalf("add legacy scanner item: %v", err)
+	}
+	if err := store.ExpireWatchlistDiscoveryContexts(ctx); err != nil {
+		t.Fatalf("expire discovery contexts: %v", err)
+	}
+	var active bool
+	if err := store.GetDB().QueryRow(ctx, `SELECT active FROM watchlist WHERE ticker=$1 AND platform='stock'`, ticker).Scan(&active); err != nil {
+		t.Fatalf("read legacy scanner state: %v", err)
+	}
+	if !active {
+		t.Fatal("after-close context cleanup deactivated a legacy scanner row with no expiry")
+	}
+}
+
+func TestRemoveWatchlistItemReleasesResearchQueueMembership(t *testing.T) {
+	ctx := context.Background()
+	const ticker = "REMOVE_QUEUE_MEMBERSHIP_RT"
+	t.Cleanup(func() { _, _ = store.GetDB().Exec(ctx, "DELETE FROM watchlist WHERE ticker=$1", ticker) })
+	if err := store.AddWatchlistItem(ctx, store.WatchlistItem{
+		Ticker: ticker, Platform: "stock", Source: "manual", Active: true,
+		Strategies: []string{"momentum"}, Timeframes: []string{"4H"},
+	}); err != nil {
+		t.Fatalf("add manual item: %v", err)
+	}
+	if _, err := store.GetDB().Exec(ctx, `
+		INSERT INTO research_queue_memberships (watchlist_id,bucket,allocation,priority)
+		SELECT id,'earnings_scheduled','reserved','{}'::jsonb FROM watchlist
+		WHERE ticker=$1 AND platform='stock'`, ticker); err != nil {
+		t.Fatalf("seed research queue membership: %v", err)
+	}
+	if err := store.RemoveWatchlistItem(ctx, ticker, "stock"); err != nil {
+		t.Fatalf("remove watchlist item: %v", err)
+	}
+	var memberships int
+	if err := store.GetDB().QueryRow(ctx, `
+		SELECT COUNT(*) FROM research_queue_memberships q
+		JOIN watchlist w ON w.id=q.watchlist_id WHERE w.ticker=$1`, ticker).Scan(&memberships); err != nil {
+		t.Fatalf("count queue memberships: %v", err)
+	}
+	if memberships != 0 {
+		t.Fatalf("removed row retained %d research queue memberships", memberships)
+	}
+}
+
+func TestReactivateWatchlistItemRequiresFreshResearchAdmission(t *testing.T) {
+	ctx := context.Background()
+	const scannerTicker = "REACTIVATE_RESEARCH_RT"
+	const manualTicker = "REACTIVATE_MANUAL_RT"
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(ctx, "DELETE FROM watchlist WHERE ticker IN ($1,$2)", scannerTicker, manualTicker)
+	})
+	now := time.Now().UTC()
+	expires := now.Add(time.Hour)
+	if err := store.AddWatchlistItem(ctx, store.WatchlistItem{
+		Ticker: scannerTicker, Platform: "stock", Source: "scanner",
+		Strategies: []string{"momentum"}, Timeframes: []string{"4H"},
+		SourceLeases: []store.WatchlistSourceLease{{
+			Source: "mover", EvidenceFingerprint: "research", QualifiedAt: now,
+			ObservedAt: now, EffectiveAt: now, ExpiresAt: expires, Evidence: json.RawMessage(`{}`),
+		}},
+	}); err != nil {
+		t.Fatalf("add scanner item: %v", err)
+	}
+	if _, err := store.GetDB().Exec(ctx, `
+		INSERT INTO research_queue_memberships (watchlist_id,bucket,allocation,priority)
+		SELECT id,'market_activity','reserved','{}'::jsonb FROM watchlist WHERE ticker=$1`, scannerTicker); err != nil {
+		t.Fatalf("seed research membership: %v", err)
+	}
+	if err := store.RemoveWatchlistItem(ctx, scannerTicker, "stock"); err != nil {
+		t.Fatalf("disable scanner item: %v", err)
+	}
+	if err := store.ReactivateWatchlistItem(ctx, scannerTicker, "stock"); !errors.Is(err, store.ErrWatchlistResearchReactivationRequiresAdmission) {
+		t.Fatalf("reactivate scanner item error=%v, want research admission requirement", err)
+	}
+	var active bool
+	var memberships int
+	if err := store.GetDB().QueryRow(ctx, `
+		SELECT w.active,COUNT(q.watchlist_id) FROM watchlist w
+		LEFT JOIN research_queue_memberships q ON q.watchlist_id=w.id
+		WHERE w.ticker=$1 GROUP BY w.active`, scannerTicker).Scan(&active, &memberships); err != nil {
+		t.Fatalf("read disabled scanner state: %v", err)
+	}
+	if active || memberships != 0 {
+		t.Fatalf("research reactivation changed active=%v memberships=%d", active, memberships)
+	}
+
+	if err := store.AddWatchlistItem(ctx, store.WatchlistItem{
+		Ticker: manualTicker, Platform: "stock", Source: "manual",
+		Strategies: []string{"momentum"}, Timeframes: []string{"4H"},
+	}); err != nil {
+		t.Fatalf("add manual item: %v", err)
+	}
+	if err := store.RemoveWatchlistItem(ctx, manualTicker, "stock"); err != nil {
+		t.Fatalf("disable manual item: %v", err)
+	}
+	if err := store.ReactivateWatchlistItem(ctx, manualTicker, "stock"); err != nil {
+		t.Fatalf("reactivate manual item: %v", err)
+	}
+	if err := store.GetDB().QueryRow(ctx, `SELECT active FROM watchlist WHERE ticker=$1`, manualTicker).Scan(&active); err != nil {
+		t.Fatalf("read reactivated manual state: %v", err)
+	}
+	if !active {
+		t.Fatal("manual item did not reactivate")
+	}
+}
+
+func TestStaleEarningsCapacitySuppressionRollsBackCohort(t *testing.T) {
+	ctx := context.Background()
+	var earningsRunsTable *string
+	if err := store.GetDB().QueryRow(ctx, `SELECT to_regclass('public.earnings_watchlist_runs')::text`).Scan(&earningsRunsTable); err != nil {
+		t.Fatalf("check earnings watchlist schema: %v", err)
+	}
+	if earningsRunsTable == nil {
+		t.Skip("earnings watchlist schema is unavailable in this integration database")
+	}
+	target := time.Date(2035, time.January, 8, 0, 0, 0, 0, time.UTC)
+	const slotTicker = "EARNINGS_STALE_SLOT_RT"
+	const candidateTicker = "EARNINGS_STALE_CANDIDATE_RT"
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), `DELETE FROM earnings_watchlist_runs WHERE target_session_date=$1::date`, target)
+		_, _ = store.GetDB().Exec(context.Background(), "DELETE FROM watchlist WHERE ticker IN ($1,$2)", slotTicker, candidateTicker)
+	})
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	expiresAt := now.Add(24 * time.Hour)
+	if err := store.AddWatchlistItem(ctx, store.WatchlistItem{
+		Ticker: slotTicker, Platform: "stock", Source: "scanner", Active: true,
+		Strategies: []string{"momentum"}, Timeframes: []string{"4H"}, ExpiresAt: &expiresAt,
+		SourceLeases: []store.WatchlistSourceLease{{
+			Source: "mover", EvidenceFingerprint: "slot", QualifiedAt: now, ObservedAt: now,
+			EffectiveAt: now, ExpiresAt: expiresAt, Evidence: json.RawMessage(`{"price":10}`),
+		}},
+	}); err != nil {
+		t.Fatalf("add capacity fixture: %v", err)
+	}
+	if _, err := store.GetDB().Exec(ctx, `
+		INSERT INTO research_queue_memberships (watchlist_id,bucket,allocation,priority)
+		SELECT id,'market_activity','reserved','{}'::jsonb FROM watchlist WHERE ticker=$1`, slotTicker); err != nil {
+		t.Fatalf("seed occupied queue slot: %v", err)
+	}
+	staleAttempt, claimed, err := store.ClaimEarningsWatchlistRun(ctx, target, now)
+	if err != nil || !claimed {
+		t.Fatalf("claim stale attempt=%q claimed=%v err=%v", staleAttempt, claimed, err)
+	}
+	if _, err := store.GetDB().Exec(ctx, `UPDATE earnings_watchlist_runs SET lease_until=$2 WHERE target_session_date=$1::date`, target, now.Add(-time.Minute)); err != nil {
+		t.Fatalf("expire stale lease: %v", err)
+	}
+	if freshAttempt, claimed, err := store.ClaimEarningsWatchlistRun(ctx, target, now); err != nil || !claimed || freshAttempt == staleAttempt {
+		t.Fatalf("reclaim attempt=%q claimed=%v err=%v", freshAttempt, claimed, err)
+	}
+	context := tradeprofile.DiscoveryContext{
+		Version: tradeprofile.DiscoveryContextVersion, Sources: []string{"earnings_scheduled"}, Thesis: "Scheduled earnings.",
+		EvidenceBySource: map[string]json.RawMessage{"earnings_scheduled": json.RawMessage(`{"event":"earnings"}`)},
+	}
+	err = store.PublishEarningsWatchlistRun(ctx, target, staleAttempt, []store.EarningsWatchlistCandidate{{
+		Ticker: candidateTicker, ContextKey: "earnings_scheduled:stale", Context: context, ExpiresAt: expiresAt,
+		ResearchQueue: &store.ResearchQueueAdmission{Capacity: 1, Bucket: "earnings_scheduled", Reservation: 1, Overflow: 0},
+	}})
+	if err == nil {
+		t.Fatal("stale capacity-suppressed publish succeeded")
+	}
+	var contexts, decisions int
+	if err := store.GetDB().QueryRow(ctx, `SELECT COUNT(*) FROM watchlist_discovery_contexts c JOIN watchlist w ON w.id=c.watchlist_id WHERE w.ticker=$1`, candidateTicker).Scan(&contexts); err != nil {
+		t.Fatalf("count stale contexts: %v", err)
+	}
+	if err := store.GetDB().QueryRow(ctx, `SELECT COUNT(*) FROM research_queue_decisions WHERE ticker=$1`, candidateTicker).Scan(&decisions); err != nil {
+		t.Fatalf("count stale decisions: %v", err)
+	}
+	if contexts != 0 || decisions != 0 {
+		t.Fatalf("stale publish committed contexts=%d decisions=%d", contexts, decisions)
+	}
+}
+
+func TestEarningsCapacitySuppressionPreservesLiquidityOrderAndRollsBackCohort(t *testing.T) {
+	ctx := context.Background()
+	var earningsRunsTable *string
+	if err := store.GetDB().QueryRow(ctx, `SELECT to_regclass('public.earnings_watchlist_runs')::text`).Scan(&earningsRunsTable); err != nil {
+		t.Fatalf("check earnings watchlist schema: %v", err)
+	}
+	if earningsRunsTable == nil {
+		t.Skip("earnings watchlist schema is unavailable in this integration database")
+	}
+	target := time.Date(2035, time.January, 9, 0, 0, 0, 0, time.UTC)
+	const firstTicker = "ZZZ_EARNINGS_LIQUIDITY_FIRST_RT"
+	const suppressedTicker = "AAA_EARNINGS_LIQUIDITY_SUPPRESSED_RT"
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), `DELETE FROM research_queue_decisions WHERE ticker IN ($1,$2)`, firstTicker, suppressedTicker)
+		_, _ = store.GetDB().Exec(context.Background(), `DELETE FROM earnings_watchlist_runs WHERE target_session_date=$1::date`, target)
+		_, _ = store.GetDB().Exec(context.Background(), "DELETE FROM watchlist WHERE ticker IN ($1,$2)", firstTicker, suppressedTicker)
+	})
+	var baselineMemberships int
+	if err := store.GetDB().QueryRow(ctx, `SELECT COUNT(*) FROM research_queue_memberships`).Scan(&baselineMemberships); err != nil {
+		t.Fatalf("count baseline queue memberships: %v", err)
+	}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	attemptID, claimed, err := store.ClaimEarningsWatchlistRun(ctx, target, now)
+	if err != nil || !claimed {
+		t.Fatalf("claim attempt=%q claimed=%v err=%v", attemptID, claimed, err)
+	}
+	context := tradeprofile.DiscoveryContext{
+		Version: tradeprofile.DiscoveryContextVersion, Sources: []string{"earnings_scheduled"}, Thesis: "Scheduled earnings.",
+		EvidenceBySource: map[string]json.RawMessage{"earnings_scheduled": json.RawMessage(`{"event":"earnings"}`)},
+	}
+	queue := func(rank int) *store.ResearchQueueAdmission {
+		priority, marshalErr := json.Marshal(map[string]any{"liquidity_rank": rank})
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		return &store.ResearchQueueAdmission{
+			Capacity: baselineMemberships + 1, Bucket: "earnings_scheduled",
+			Reservation: baselineMemberships + 1, Overflow: 0, Priority: priority,
+		}
+	}
+	err = store.PublishEarningsWatchlistRun(ctx, target, attemptID, []store.EarningsWatchlistCandidate{
+		// The feeder supplies liquidity order. Canonical lock order must not
+		// change it, so this first Z ticker claims the final slot and A is the
+		// durable capacity suppression.
+		{Ticker: firstTicker, ContextKey: "earnings_scheduled:first", Context: context, ExpiresAt: now.Add(24 * time.Hour), LiquidityRank: 1, ResearchQueue: queue(1)},
+		{Ticker: suppressedTicker, ContextKey: "earnings_scheduled:suppressed", Context: context, ExpiresAt: now.Add(24 * time.Hour), LiquidityRank: 2, ResearchQueue: queue(2)},
+	})
+	if !errors.Is(err, store.ErrResearchQueueCapacity) {
+		t.Fatalf("publish error=%v, want research queue capacity", err)
+	}
+	var contexts, memberships, audits, firstDecisions, suppressedDecisions int
+	if err := store.GetDB().QueryRow(ctx, `
+		SELECT
+			(SELECT COUNT(*) FROM watchlist_discovery_contexts c JOIN watchlist w ON w.id=c.watchlist_id WHERE w.ticker IN ($1,$2)),
+			(SELECT COUNT(*) FROM research_queue_memberships q JOIN watchlist w ON w.id=q.watchlist_id WHERE w.ticker IN ($1,$2)),
+			(SELECT COUNT(*) FROM earnings_watchlist_candidates WHERE target_session_date=$3::date),
+			(SELECT COUNT(*) FROM research_queue_decisions WHERE ticker=$1),
+			(SELECT COUNT(*) FROM research_queue_decisions WHERE ticker=$2)`,
+		firstTicker, suppressedTicker, target,
+	).Scan(&contexts, &memberships, &audits, &firstDecisions, &suppressedDecisions); err != nil {
+		t.Fatalf("read rollback state: %v", err)
+	}
+	if contexts != 0 || memberships != 0 || audits != 0 || firstDecisions != 0 || suppressedDecisions != 1 {
+		t.Fatalf("capacity rollback contexts=%d memberships=%d audits=%d first_decisions=%d suppressed_decisions=%d", contexts, memberships, audits, firstDecisions, suppressedDecisions)
+	}
+	var status string
+	if err := store.GetDB().QueryRow(ctx, `SELECT status FROM earnings_watchlist_runs WHERE target_session_date=$1::date`, target).Scan(&status); err != nil {
+		t.Fatalf("read failed run: %v", err)
+	}
+	if status != "failed" {
+		t.Fatalf("run status=%q, want failed for retry", status)
+	}
+}
+
+func TestResearchQueueReclassificationSerializesWithAdmissionLock(t *testing.T) {
+	ctx := context.Background()
+	var queueTable *string
+	if err := store.GetDB().QueryRow(ctx, `SELECT to_regclass('public.research_queue_memberships')::text`).Scan(&queueTable); err != nil {
+		t.Fatalf("check research queue schema: %v", err)
+	}
+	if queueTable == nil {
+		t.Skip("research queue schema is unavailable in this integration database")
+	}
+	holder, err := store.GetDB().Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Rollback(ctx) //nolint:errcheck
+	if _, err := holder.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('research-queue:v1', 0))`); err != nil {
+		t.Fatal(err)
+	}
+	reclassifier, err := store.GetDB().Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		err := store.ReclassifyResearchQueueMemberships(ctx, reclassifier)
+		if err == nil {
+			err = reclassifier.Commit(ctx)
+		} else {
+			_ = reclassifier.Rollback(ctx)
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("reclassification bypassed queue lock: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := holder.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("reclassification after queue release: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reclassification remained blocked after queue release")
+	}
+}
+
+func TestRemoveWatchlistItemTakesTickerBeforeQueueLock(t *testing.T) {
+	ctx := context.Background()
+	const ticker = "REMOVE_QUEUE_LOCK_ORDER_RT"
+	t.Cleanup(func() { _, _ = store.GetDB().Exec(ctx, "DELETE FROM watchlist WHERE ticker=$1", ticker) })
+	if err := store.AddWatchlistItem(ctx, store.WatchlistItem{Ticker: ticker, Platform: "stock", Source: "scanner", Strategies: []string{"momentum"}, Timeframes: []string{"4H"}}); err != nil {
+		t.Fatal(err)
+	}
+	holder, err := store.GetDB().Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Rollback(ctx) //nolint:errcheck
+	var backendPID int
+	if err := holder.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&backendPID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := holder.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, "scanner-watchlist:stock:"+ticker); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- store.RemoveWatchlistItem(ctx, ticker, "stock") }()
+	blocked := false
+	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+		if err := store.GetDB().QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity a WHERE $1 = ANY(pg_blocking_pids(a.pid)) AND a.wait_event_type='Lock' AND a.query LIKE '%pg_advisory_xact_lock%')`, backendPID).Scan(&blocked); err != nil {
+			t.Fatal(err)
+		}
+		if blocked {
+			break
+		}
+	}
+	if !blocked {
+		t.Fatal("removal did not block on held ticker lock")
+	}
+	queueTx, err := store.GetDB().Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var acquired bool
+	if err := queueTx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtextextended('research-queue:v1',0))`).Scan(&acquired); err != nil {
+		t.Fatal(err)
+	}
+	if !acquired {
+		t.Fatal("removal acquired queue before its ticker lock")
+	}
+	if err := queueTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := holder.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("removal remained blocked")
+	}
+}
+
 func TestLegacyScannerLeaseRefreshInstallsCompleteTradeProfile(t *testing.T) {
 	ctx := context.Background()
 	const ticker = "LEASE_LEGACY_PROFILE_RT"

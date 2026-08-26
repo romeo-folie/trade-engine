@@ -19,6 +19,68 @@ type politicalAssetProvider struct {
 	err    error
 }
 
+func TestPoliticalPolicyRejectionLinksScannerRunAndSnapshot(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	const ticker = "RUNPOLICY"
+	report := store.PoliticalDisclosureReport{
+		Source: "house", ExternalID: "scanner-run-policy-rejection", Chamber: "house",
+		FilerName: "Policy Test Member", Office: "PT01", ReportType: "periodic_transaction",
+		FilingDate: now, DocumentURL: "https://example.test/scanner-run-policy", ContentHash: "policy-run",
+		ExtractionStatus: "completed", Transactions: []store.PoliticalDisclosureTransaction{
+			{Ordinal: 1, AssetName: "Policy Test (RUNPOLICY) [ST]", Ticker: ticker, AssetType: "ST", TransactionType: "purchase", TransactionDate: now.AddDate(0, 0, -2)},
+			{Ordinal: 2, AssetName: "Policy Test (RUNPOLICY) [ST]", Ticker: ticker, AssetType: "ST", TransactionType: "sale", TransactionDate: now.AddDate(0, 0, -1)},
+		},
+	}
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(ctx, "DELETE FROM political_disclosure_reports WHERE source=$1 AND external_id=$2", report.Source, report.ExternalID)
+	})
+	if err := store.SavePoliticalDisclosureReport(ctx, report); err != nil {
+		t.Fatal(err)
+	}
+	scanner := &MarketScanner{Now: func() time.Time { return now }, Cfg: config.ScannerConfig{
+		PoliticalDisclosures: config.PoliticalDisclosureScannerConfig{
+			Enabled: true, PromoteCandidates: true, MaxCandidatesPerRun: 10, ClaimLeaseMinutes: 5,
+			TriggerLookbackDays: 50, AnalystEvidenceHorizonDays: 50,
+		},
+	}}
+	recorder := newScanRecorder(scanner, now)
+	if err := recorder.begin(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(ctx, "UPDATE political_disclosure_candidates SET scanner_run_id=NULL WHERE scanner_run_id=$1::uuid", recorder.run.ID)
+		_, _ = store.GetDB().Exec(ctx, "DELETE FROM scanner_runs WHERE id=$1::uuid", recorder.run.ID)
+	})
+	if candidates, err := scanner.politicalDisclosureCandidates(ctx, recorder); err != nil || len(candidates) != 0 {
+		t.Fatalf("policy-rejected candidates=%+v err=%v", candidates, err)
+	}
+	var sourceRunID string
+	if err := store.GetDB().QueryRow(ctx, `
+		SELECT scanner_run_id::text FROM political_disclosure_candidates
+		WHERE ticker=$1 AND promotion_status='rejected'`, ticker).Scan(&sourceRunID); err != nil {
+		t.Fatal(err)
+	}
+	if sourceRunID != recorder.run.ID {
+		t.Fatalf("policy rejection run=%q, want %q", sourceRunID, recorder.run.ID)
+	}
+	// Finish synchronously so the linked rejection snapshot is durable before
+	// asserting its lineage.
+	recorder.finish(nil)
+	var snapshotRunID string
+	if err := store.GetDB().QueryRow(ctx, `
+		SELECT scanner_run_id::text FROM scanner_candidate_snapshots
+		WHERE scanner_run_id=$1::uuid AND ticker=$2`, recorder.run.ID, ticker).Scan(&snapshotRunID); err != nil {
+		t.Fatal(err)
+	}
+	if snapshotRunID != recorder.run.ID {
+		t.Fatalf("snapshot run=%q, want %q", snapshotRunID, recorder.run.ID)
+	}
+}
+
 func (p politicalAssetProvider) FetchStockAssets(context.Context) ([]data.StockAsset, error) {
 	return p.assets, p.err
 }
@@ -87,7 +149,7 @@ func TestHydratePoliticalDisclosureMarketData(t *testing.T) {
 		PoliticalDisclosureClaimReportIDs: []string{"report-1", "report-2"},
 		PoliticalDisclosureEvidence:       "two filings",
 	}
-	got := scanner.hydratePoliticalDisclosureMarketData(context.Background(), []SwingCandidate{candidate})
+	got := scanner.hydratePoliticalDisclosureMarketData(context.Background(), []SwingCandidate{candidate}, nil)
 	if len(got) != 1 || got[0].Price != 25 || got[0].Volume != 90_000 ||
 		got[0].DollarVolume != 1_800_000 || got[0].ChangePct != 25 {
 		t.Fatalf("hydrated = %+v", got)
@@ -99,8 +161,16 @@ func TestHydratePoliticalDisclosureMarketData(t *testing.T) {
 
 	bad := candidate
 	bad.Ticker = "IRA"
-	if got := scanner.hydratePoliticalDisclosureMarketData(context.Background(), []SwingCandidate{bad}); len(got) != 0 {
+	if got := scanner.hydratePoliticalDisclosureMarketData(context.Background(), []SwingCandidate{bad}, nil); len(got) != 0 {
 		t.Fatalf("non-tradeable standalone candidate survived: %+v", got)
+	}
+	lowPrice := candidate
+	scanner.Cfg.Universe.MinPrice = 5
+	scanner.StockSnapshots = politicalSnapshotProvider{result: data.StockSnapshotBatchResult{Snapshots: map[string]data.StockSnapshotEvidence{
+		"GOOD": {Symbol: "GOOD", LatestTradePrice: 4, DailyBar: &daily, PreviousDailyBar: &previous},
+	}, Failures: map[string]error{}}}
+	if got := scanner.hydratePoliticalDisclosureMarketData(context.Background(), []SwingCandidate{lowPrice}, nil); len(got) != 0 {
+		t.Fatalf("low-price political candidate survived: %+v", got)
 	}
 
 	missingCompletedSession := candidate
@@ -111,7 +181,7 @@ func TestHydratePoliticalDisclosureMarketData(t *testing.T) {
 		Failures: map[string]error{},
 	}}
 	if got := scanner.hydratePoliticalDisclosureMarketData(
-		context.Background(), []SwingCandidate{missingCompletedSession},
+		context.Background(), []SwingCandidate{missingCompletedSession}, nil,
 	); len(got) != 0 {
 		t.Fatalf("candidate without completed-session liquidity survived: %+v", got)
 	}
@@ -129,7 +199,7 @@ func TestPoliticalMarketProviderFailureDoesNotReturnUnhydratedCandidate(t *testi
 		PoliticalDisclosureEvidence:       "filing",
 	}
 	got := scanner.hydratePoliticalDisclosureMarketData(
-		context.Background(), []SwingCandidate{disclosure},
+		context.Background(), []SwingCandidate{disclosure}, nil,
 	)
 	if len(got) != 0 {
 		t.Fatalf("unhydrated candidates = %+v", got)
@@ -142,6 +212,22 @@ func TestPoliticalDisclosurePromotionRequeuesTransientOutcomes(t *testing.T) {
 		politicalDisclosurePromotionRequeues("pending") ||
 		!politicalDisclosurePromotionRequeues("cap_suppressed") {
 		t.Fatal("transient failure and capacity suppression must requeue disclosure claims")
+	}
+}
+
+func TestPoliticalDisclosureQualificationUsesUnboundedQualifyingAggregate(t *testing.T) {
+	raw, err := json.Marshal(tradeprofile.PoliticalDisclosureEvidence{
+		Version: tradeprofile.PoliticalDisclosureEvidenceVersion,
+		Ticker:  "TEST", QualifyingFilerCount: 1,
+		// Presentation detail may be bounded away; qualification must remain
+		// correct for a valid filer outside that bounded list.
+		Filers: []tradeprofile.PoliticalDisclosureFilerEvidence{{PurchaseCount: 1, ContradictoryActivity: true}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !politicalDisclosureQualifies(SwingCandidate{PoliticalDisclosureFacts: raw}) {
+		t.Fatal("qualifying aggregate must survive bounded filer presentation")
 	}
 }
 
@@ -341,6 +427,60 @@ func TestPoliticalDisclosureCandidateAggregateLineageIncludesHistoricalEvidence(
 	}
 }
 
+func TestPoliticalDisclosureQualificationRequiresTriggerWindowPurchase(t *testing.T) {
+	filing := time.Date(2026, 8, 15, 0, 0, 0, 0, time.UTC)
+	items := []store.PoliticalDisclosureCandidate{
+		// This recent purchase is terminal from a prior promotion. The store
+		// still fences it as aggregate context, but it is not a fresh trigger.
+		politicalCandidateFixture(t, "terminal-purchase", "terminal-purchase", "house", "house", "Alex Buyer", "CA12", filing.AddDate(0, 0, -2), []store.PoliticalDisclosureTransaction{{
+			Owner: "Self", TransactionType: "purchase", TransactionDate: filing.AddDate(0, 0, -3),
+		}}),
+		// A newly claimed sale must not revive that older purchase as a new
+		// political-disclosure candidate.
+		politicalCandidateFixture(t, "trigger-sale", "trigger-sale", "senate", "senate", "Sam Seller", "OH", filing, []store.PoliticalDisclosureTransaction{{
+			Owner: "Self", TransactionType: "sale", TransactionDate: filing.AddDate(0, 0, -1),
+		}}),
+	}
+	// The store fences both rows with Claimed=true, but only fresh claimable
+	// rows receive TriggerEligible=true.
+	items[0].Claimed = true
+	items[1].Claimed = true
+	items[1].TriggerEligible = true
+	candidate := buildPoliticalDisclosureCandidate("TEST", "claim", items)
+	if politicalDisclosureQualifies(candidate) {
+		t.Fatalf("historical purchase bypassed claimed trigger qualification: %+v", candidate)
+	}
+	var facts tradeprofile.PoliticalDisclosureEvidence
+	if err := json.Unmarshal(candidate.PoliticalDisclosureFacts, &facts); err != nil {
+		t.Fatal(err)
+	}
+	if facts.PurchaseCount != 1 || facts.SaleCount != 1 || facts.QualifyingFilerCount != 0 {
+		t.Fatalf("historical context or trigger qualifier was lost: %+v", facts)
+	}
+}
+
+func TestPoliticalDisclosureFreshPurchaseUsesFencedSameFilerSale(t *testing.T) {
+	filing := time.Date(2026, 8, 15, 0, 0, 0, 0, time.UTC)
+	items := []store.PoliticalDisclosureCandidate{
+		politicalCandidateFixture(t, "terminal-sale", "terminal-sale", "house", "house", "Alex Buyer", "CA12", filing.AddDate(0, 0, -2), []store.PoliticalDisclosureTransaction{{
+			Owner: "Self", TransactionType: "sale", TransactionDate: filing.AddDate(0, 0, -3),
+		}}),
+		politicalCandidateFixture(t, "fresh-purchase", "fresh-purchase", "house", "house", "Alex Buyer", "CA12", filing, []store.PoliticalDisclosureTransaction{{
+			Owner: "Self", TransactionType: "purchase", TransactionDate: filing.AddDate(0, 0, -4),
+		}}),
+	}
+	// The sale is terminal but remains fenced analyst context. The purchase is
+	// the only fresh trigger, and must still be contradicted by that sale.
+	for i := range items {
+		items[i].Claimed = true
+	}
+	items[1].TriggerEligible = true
+	candidate := buildPoliticalDisclosureCandidate("TEST", "claim", items)
+	if politicalDisclosureQualifies(candidate) {
+		t.Fatalf("fresh purchase ignored fenced same-filer sale: %+v", candidate)
+	}
+}
+
 func politicalCandidateFixture(
 	t *testing.T, reportID, externalID, source, chamber, filer, office string,
 	filingDate time.Time, transactions []store.PoliticalDisclosureTransaction,
@@ -416,8 +556,8 @@ func TestPoliticalDisclosureBreadthDoesNotChangeConvictionOrder(t *testing.T) {
 		{candidate: SwingCandidate{Ticker: "A", PoliticalDisclosureFacts: json.RawMessage(`{"distinct_buyer_count":20}`)}, score: SwingScoreResult{Conviction: .80}},
 	}
 	sortByConviction(items)
-	if items[0].candidate.Ticker != "B" {
-		t.Fatalf("equal-conviction order changed due to disclosure breadth: %#v", items)
+	if items[0].candidate.Ticker != "A" {
+		t.Fatalf("equal priority ordering must use ticker tie-break: %#v", items)
 	}
 }
 
@@ -681,7 +821,7 @@ func TestClaimLossAfterDisclosureHydrationRetainsLiquidityAndTaxonomy(t *testing
 	disclosure := scanner.hydratePoliticalDisclosureMarketData(context.Background(), []SwingCandidate{{
 		Ticker: "GOOD", Sources: []string{"political_disclosure"},
 		PoliticalDisclosureClaimToken: "political", PoliticalDisclosureClaimReportIDs: []string{"report-1"},
-	}})
+	}}, nil)
 	if len(disclosure) != 1 {
 		t.Fatalf("hydrated disclosure = %+v", disclosure)
 	}
@@ -708,5 +848,32 @@ func TestPoliticalOnlyFallbackFailsClosedWithoutFullLiquidityEvidence(t *testing
 		if fallback, ok := politicalDisclosureOnlyFallback(candidate); ok {
 			t.Fatalf("insufficiently liquid fallback survived: %+v", fallback)
 		}
+	}
+}
+
+func TestPoliticalDisclosureQualificationUsesSameFilerContradictionOnly(t *testing.T) {
+	makeCandidate := func(filers []tradeprofile.PoliticalDisclosureFilerEvidence) SwingCandidate {
+		qualifyingFilers := 0
+		for _, filer := range filers {
+			if filer.PurchaseCount > 0 && !filer.ContradictoryActivity {
+				qualifyingFilers++
+			}
+		}
+		raw, err := json.Marshal(tradeprofile.PoliticalDisclosureEvidence{
+			Version: tradeprofile.PoliticalDisclosureEvidenceVersion, Ticker: "TEST",
+			QualifyingFilerCount: qualifyingFilers, Filers: filers,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return SwingCandidate{Ticker: "TEST", PoliticalDisclosureFacts: raw}
+	}
+	if politicalDisclosureQualifies(makeCandidate([]tradeprofile.PoliticalDisclosureFilerEvidence{{PurchaseCount: 1, ContradictoryActivity: true}})) {
+		t.Fatal("same-filer purchase and sale must not qualify")
+	}
+	if !politicalDisclosureQualifies(makeCandidate([]tradeprofile.PoliticalDisclosureFilerEvidence{
+		{PurchaseCount: 1, ContradictoryActivity: false}, {SaleCount: 1},
+	})) {
+		t.Fatal("another filer's sale must not invalidate the buyer")
 	}
 }

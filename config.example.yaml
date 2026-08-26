@@ -904,19 +904,32 @@ disclosures:
 
 # ── Market scanner — autonomous candidate discovery ───────────────────────────
 # Runs during market hours, sourcing candidates from screeners (top movers,
-# most active), the knowledge graph, and news-sympathy triggers. Every candidate
-# passes the same LLM conviction gate before joining the watchlist with a TTL.
+# most active), the knowledge graph, and news-sympathy triggers. Admission is
+# deterministic; LLMs enrich evidence and evaluate candidates only after they
+# enter the watchlist research queue.
 scanner:
   enabled: false
   scan_interval_hours: 2       # Scan cadence during market hours (9:30–16:00 ET)
-  candidate_cap: 10            # Max scanner-sourced items on the watchlist at once
+  candidate_cap: 10            # Legacy compatibility only; research_queue governs admission
   ttl_days: 3                  # Default source-lease duration; expire only after every scanner source lease ends
-  min_conviction: 0.65         # Min LLM conviction to add — discovery gate, not trade approval
+  min_conviction: 0.65         # Legacy compatibility only; no longer used for admission
+  research_queue:
+    capacity: 30               # Total concurrent scanner research rows, including earnings
+    overflow: 6                # Shared capacity after protected source reservations
+    reservations:
+      political_disclosure: 4
+      weekly_leader: 2
+      potent_industry: 2
+      market_activity: 4       # Movers and most-active share this reservation
+      premarket_episodic: 2
+      graph_neighbor: 2
+      news_sympathy: 2
+      earnings_scheduled: 6
   news_lookback_hours: 24      # News window when enriching candidates before scoring
   top_movers: 20               # Top gainers+losers fetched per scan
   top_actives: 20              # Most-active-by-volume fetched per scan
-  max_promotions_per_industry: 0 # Optional per-industry promotion cap; 0 disables
-  promotion_correlation_enabled: false # Additive exposure/correlation selector; off preserves legacy behavior
+  max_promotions_per_industry: 0 # Deprecated compatibility setting; source reservations own research capacity
+  promotion_correlation_enabled: false # Compatibility: retains DB-backed duplicate guard only; no queue selection
   promotion_max_abs_correlation: 0.85    # Absolute daily-return Pearson ceiling
   promotion_correlation_lookback_days: 60
   promotion_correlation_min_overlap: 30
@@ -1036,8 +1049,8 @@ scanner:
     max_candidates_per_run: 20             # Bound filing-driven LLM reviews per scan
     claim_lease_minutes: 60                 # Reclaim a scanner cycle that crashed mid-review
     ttl_days: 7                             # Legacy fallback for all three windows; retain when upgrading an existing config
-    trigger_lookback_days: 7                # New/retried filing must be this recent to enter promotion
-    analyst_evidence_horizon_days: 30       # Older completed filings retained in the analyst's disclosure context
+    trigger_lookback_days: 50               # New/retried filing must be this recent to enter deterministic research admission
+    analyst_evidence_horizon_days: 50       # Older completed filings retained in the analyst's disclosure context
     watchlist_lease_days: 7                 # Meaningful new disclosure evidence renews this source's residency lease
   graph_neighbors:
     enabled: false             # Source candidates from knowledge-graph neighbors of manually-watched tickers

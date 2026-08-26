@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -22,6 +23,7 @@ type EarningsWatchlistCandidate struct {
 	ExpiresAt          time.Time
 	LiquidityRank      int
 	MedianDollarVolume float64
+	ResearchQueue      *ResearchQueueAdmission
 }
 
 // ClaimEarningsWatchlistRun serializes one target-session selection. Completed
@@ -83,17 +85,43 @@ func RecordEarningsWatchlistCandidate(ctx context.Context, target time.Time, tic
 }
 
 // PublishEarningsWatchlistRun attaches every selected context, records its
-// audit row, and completes the claim in one transaction. A failed publish
-// leaves no partial cohort visible to analysts.
+// audit row, and completes the claim in one transaction. A full research queue
+// records a durable suppression decision but rolls back the entire cohort, so
+// a retry cannot mix a changed ranking with partially admitted earlier peers.
 func PublishEarningsWatchlistRun(ctx context.Context, target time.Time, attemptID string, candidates []EarningsWatchlistCandidate) error {
 	tx, err := GetDB().Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
-	for _, candidate := range candidates {
-		if err := publishEarningsCandidate(ctx, tx, candidate); err != nil {
+	orderedCandidates := orderedEarningsWatchlistCandidates(candidates)
+	// Scanner admission locks a ticker before reserving a global research-queue
+	// slot. Lock the complete earnings cohort in ticker order before any member
+	// can acquire that queue lock, so a multi-candidate cohort cannot hold the
+	// queue while waiting for a scanner-held ticker lock.
+	for _, candidate := range orderedCandidates {
+		if err := lockScannerWatchlistItem(ctx, tx, WatchlistItem{
+			Ticker: candidate.Ticker, Platform: "stock",
+		}); err != nil {
 			return err
+		}
+	}
+	for _, candidate := range candidates {
+		publishErr := publishEarningsCandidate(ctx, tx, candidate)
+		if publishErr != nil && !errors.Is(publishErr, ErrResearchQueueCapacity) {
+			return publishErr
+		}
+		if errors.Is(publishErr, ErrResearchQueueCapacity) {
+			if candidate.ResearchQueue == nil {
+				return publishErr
+			}
+			// Do not expose a partial liquidity-ranked cohort. Rolling back keeps
+			// retries from mixing a newly fetched ranking with already-admitted
+			// peers from an earlier capacity-limited attempt.
+			if err := tx.Rollback(ctx); err != nil {
+				return err
+			}
+			return recordEarningsCapacityFailure(ctx, target, attemptID, candidate)
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO earnings_watchlist_candidates (target_session_date,ticker,liquidity_rank,median_dollar_volume) VALUES ($1::date,$2,$3,$4) ON CONFLICT (target_session_date,ticker) DO NOTHING`, target, candidate.Ticker, candidate.LiquidityRank, candidate.MedianDollarVolume); err != nil {
 			return err
@@ -109,6 +137,44 @@ func PublishEarningsWatchlistRun(ctx context.Context, target time.Time, attemptI
 	return tx.Commit(ctx)
 }
 
+// recordEarningsCapacityFailure preserves the suppression decision without
+// committing a partial cohort, then releases the run for a later full retry.
+func recordEarningsCapacityFailure(
+	ctx context.Context, target time.Time, attemptID string, candidate EarningsWatchlistCandidate,
+) error {
+	tx, err := GetDB().Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if candidate.ResearchQueue == nil {
+		return ErrResearchQueueCapacity
+	}
+	if err := recordResearchQueueSuppressionTx(ctx, tx, WatchlistItem{Ticker: candidate.Ticker, Platform: "stock"}, *candidate.ResearchQueue); err != nil {
+		return err
+	}
+	tag, err := tx.Exec(ctx, `UPDATE earnings_watchlist_runs SET status='failed', last_error=$3, updated_at=NOW() WHERE target_session_date=$1::date AND status='running' AND attempt_id=$2::uuid`, target, attemptID, ErrResearchQueueCapacity.Error())
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("fail earnings watchlist run %s: claim is no longer running", target.Format("2006-01-02"))
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	return ErrResearchQueueCapacity
+}
+
+func orderedEarningsWatchlistCandidates(candidates []EarningsWatchlistCandidate) []EarningsWatchlistCandidate {
+	ordered := append([]EarningsWatchlistCandidate(nil), candidates...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return strings.ToUpper(strings.TrimSpace(ordered[i].Ticker)) <
+			strings.ToUpper(strings.TrimSpace(ordered[j].Ticker))
+	})
+	return ordered
+}
+
 func publishEarningsCandidate(ctx context.Context, tx pgx.Tx, candidate EarningsWatchlistCandidate) error {
 	ticker := strings.ToUpper(strings.TrimSpace(candidate.Ticker))
 	if ticker == "" {
@@ -120,12 +186,25 @@ func publishEarningsCandidate(ctx context.Context, tx pgx.Tx, candidate Earnings
 	if err != nil && !isNoRows(err) {
 		return err
 	}
+	queueRecorded := false
 	if isNoRows(err) || !active || (expiresAt != nil && !expiresAt.After(time.Now())) {
 		if err := addWatchlistItem(ctx, tx, WatchlistItem{
 			Ticker: ticker, Platform: "stock", Source: "earnings_watchlist",
 			Strategies: []string{"trend_following", "momentum", "news_sentiment"},
 			Timeframes: []string{"1D", "4H", "1H"}, GraphContext: "Scheduled earnings watchlist candidate.",
+			ResearchQueue: candidate.ResearchQueue,
 		}, true, nil); err != nil && !errors.Is(err, ErrWatchlistActiveItemExists) {
+			return err
+		} else if err == nil && candidate.ResearchQueue != nil {
+			queueRecorded = true
+		}
+	}
+	var queueReservation researchQueueReservation
+	if candidate.ResearchQueue != nil && !queueRecorded {
+		// Reserve before writing the context. A capacity-suppressed candidate
+		// must not become analyst-visible without a queue membership.
+		queueReservation, err = reserveResearchQueueSlotTx(ctx, tx, WatchlistItem{Ticker: ticker, Platform: "stock"}, *candidate.ResearchQueue)
+		if err != nil {
 			return err
 		}
 	}
@@ -147,5 +226,21 @@ func publishEarningsCandidate(ctx context.Context, tx pgx.Tx, candidate Earnings
 		ON CONFLICT (watchlist_id, context_key) DO UPDATE SET
 			source=EXCLUDED.source, context=EXCLUDED.context, expires_at=EXCLUDED.expires_at,
 			active=true, updated_at=NOW()`, ticker, "stock", key, canonical.Sources[0], raw, candidate.ExpiresAt)
-	return err
+	if err != nil {
+		return err
+	}
+	if candidate.ResearchQueue != nil && !queueRecorded {
+		if err := recordResearchQueueAdmissionTx(ctx, tx, WatchlistItem{Ticker: ticker, Platform: "stock"}, *candidate.ResearchQueue, queueReservation); err != nil {
+			return err
+		}
+	}
+	if candidate.ResearchQueue != nil {
+		// A newly created earnings row records its initial membership before the
+		// context is upserted. Recompute once the context is live as well, so an
+		// expired scanner handoff cannot retain a stale scanner bucket.
+		if err := ReclassifyResearchQueueMemberships(ctx, tx); err != nil {
+			return err
+		}
+	}
+	return nil
 }

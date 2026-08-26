@@ -286,3 +286,28 @@ func TestScanRecorderFallbackReplacesProfilePair(t *testing.T) {
 		t.Fatalf("fallback did not replace the profile pair: %+v", snapshot)
 	}
 }
+
+func TestScanRecorderDeterministicFallbackReplacesSourceLineage(t *testing.T) {
+	recorder := &scanRecorder{candidates: make(map[string]*store.ScannerCandidateSnapshot)}
+	original := SwingCandidate{Ticker: "AAA", Sources: []string{"mover", "political_disclosure"}}
+	fallback := SwingCandidate{Ticker: "AAA", Sources: []string{"mover"}, SourceScores: map[string]float64{"mover": .7}}
+	recorder.register([]SwingCandidate{original})
+	recorder.deterministicFallback(fallback)
+	discovery, profile, err := buildScannerTradeProfile(fallback, SwingScoreResult{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recorder.setTradeProfile(fallback, discovery, profile); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := recorder.candidates["AAA"]
+	if !reflect.DeepEqual(snapshot.Sources, fallback.Sources) ||
+		snapshot.DiscoveryContext == nil ||
+		!reflect.DeepEqual(snapshot.Sources, snapshot.DiscoveryContext.Sources) {
+		t.Fatalf("deterministic fallback lineage mismatch: %+v", snapshot)
+	}
+	if snapshot.FinalStage != "deterministically_qualified" || snapshot.LLMAction != "" ||
+		snapshot.LLMError != "" || snapshot.PassedMinConviction {
+		t.Fatalf("deterministic fallback synthesized an LLM outcome: %+v", snapshot)
+	}
+}

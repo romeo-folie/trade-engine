@@ -167,7 +167,10 @@ func (s *MarketScanner) newsSympathyCandidates(ctx context.Context, existing []S
 	for _, p := range best {
 		ranked = append(ranked, p)
 	}
-	sort.Slice(ranked, func(i, j int) bool { return ranked[i].score > ranked[j].score })
+	sort.Slice(ranked, func(i, j int) bool {
+		return ranked[i].score > ranked[j].score ||
+			(ranked[i].score == ranked[j].score && ranked[i].neighbor.Ticker < ranked[j].neighbor.Ticker)
+	})
 
 	if s.AlpacaClient == nil {
 		slog.Warn("scanner: sympathy sourcing — no Alpaca client, cannot price neighbors")
@@ -177,6 +180,10 @@ func (s *MarketScanner) newsSympathyCandidates(ctx context.Context, existing []S
 	// Cap applies to PRICED candidates (same rationale as graph sourcing).
 	var out []SwingCandidate
 	admissions := 0
+	minPrice := s.Cfg.Universe.MinPrice
+	if minPrice <= 0 {
+		minPrice = 5
+	}
 	for _, p := range ranked {
 		if ctx.Err() != nil {
 			break
@@ -185,7 +192,7 @@ func (s *MarketScanner) newsSympathyCandidates(ctx context.Context, existing []S
 			continue
 		}
 		q, err := s.AlpacaClient.FetchQuote(ctx, p.neighbor.Ticker)
-		if err != nil || q == nil || q.Last <= 0 {
+		if err != nil || q == nil || q.Last < minPrice {
 			slog.Warn("scanner: sympathy sourcing — skip unpriceable neighbor",
 				"ticker", p.neighbor.Ticker, "err", err)
 			continue
@@ -194,6 +201,7 @@ func (s *MarketScanner) newsSympathyCandidates(ctx context.Context, existing []S
 			Ticker:       p.neighbor.Ticker,
 			Price:        q.Last,
 			Sources:      []string{"news_sympathy"},
+			SourceScores: map[string]float64{"news_sympathy": p.score},
 			GraphContext: sympathyPhrase(p.trigger, p.neighbor),
 			SympathySeed: p.trigger.Seed, SympathyRelationship: graphLinkPhrase(p.neighbor),
 			SympathyTrigger: &SwingNewsItem{

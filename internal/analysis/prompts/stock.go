@@ -752,6 +752,7 @@ func writeDiscoveryContext(b *strings.Builder, context *tradeprofile.DiscoveryCo
 	}
 	b.WriteString("### DISCOVERY CONTEXT\n")
 	b.WriteString("Scanner provenance only; use it as evidence, not as an execution lens.\n")
+	b.WriteString("For political-disclosure evidence, a separately sourced board or committee relationship may corroborate the thesis, but is optional and must never be inferred from the filing or required for analysis.\n")
 	b.WriteString("Sources: " + strings.Join(canonical.Sources, ", ") + "\n")
 	b.WriteString("Thesis: " + truncateStr(canonical.Thesis, 320) + "\n")
 	for _, source := range canonical.Sources {
@@ -806,6 +807,15 @@ func writePoliticalDisclosureEvidence(b *strings.Builder, raw json.RawMessage) b
 		valueOrUnknown(evidence.LatestFilingOrPublicationDate),
 		formatPoliticalLagSummary(evidence.DisclosureLagDays),
 	))
+	if evidence.Version >= tradeprofile.PoliticalDisclosureEvidenceVersion {
+		b.WriteString(fmt.Sprintf(
+			"Evidence[political_disclosure].qualifying_trigger: filers=%d; buyers=%d; purchase_minimum=$%d; latest_purchase=%s; latest_filing_or_publication=%s. These qualification fields apply only to the claimed trigger-window disclosures; older evidence remains context only.\n",
+			evidence.QualifyingFilerCount, evidence.QualifyingBuyerCount,
+			evidence.QualifyingPurchaseMinimum,
+			valueOrUnknown(evidence.LatestQualifyingPurchaseDate),
+			valueOrUnknown(evidence.LatestQualifyingFilingDate),
+		))
+	}
 	b.WriteString(fmt.Sprintf(
 		"Evidence[political_disclosure].patterns: repeated_filer=%t; independent_buyers=%t; contradictory_buying_and_selling=%t\n",
 		evidence.RepeatedFilerActivity, evidence.IndependentBuyerActivity,

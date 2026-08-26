@@ -479,11 +479,11 @@ func (s *MarketScanner) promoteDiscoveryCandidate(
 	}
 	if lease != nil {
 		return store.PromoteScannerSourcesToWatchlistWithScannerLeaseWithChangedLeases(
-			ctx, item, claims, "passed conviction and was added to the watchlist", s.now(), *lease,
+			ctx, item, claims, deterministicAdmissionPromotionReason, s.now(), *lease,
 		)
 	}
 	return store.PromoteScannerSourcesToWatchlistWithChangedLeases(
-		ctx, item, claims, "passed conviction and was added to the watchlist", s.now(),
+		ctx, item, claims, deterministicAdmissionPromotionReason, s.now(),
 	)
 }
 
@@ -502,13 +502,18 @@ func (s *MarketScanner) promoteDiscoveryFallback(
 	if lease != nil {
 		return store.PromoteScannerSourcesToWatchlistUnlessActiveWithScannerLeaseWithChangedLeases(
 			ctx, item, claims,
-			"remaining source passed conviction after another source claim was lost",
+			deterministicFallbackPromotionReason,
 			s.now(), *lease,
 		)
 	}
 	return store.PromoteScannerSourcesToWatchlistUnlessActiveWithChangedLeases(
 		ctx, item, claims,
-		"remaining source passed conviction after another source claim was lost",
+		deterministicFallbackPromotionReason,
 		s.now(),
 	)
 }
+
+const (
+	deterministicAdmissionPromotionReason = "deterministic source qualification admitted to research queue"
+	deterministicFallbackPromotionReason  = "remaining deterministic source evidence qualified after another source claim was lost"
+)

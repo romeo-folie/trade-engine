@@ -1087,7 +1087,8 @@ Modes:
 						Historical:         cfg.Scanner.Universe.HistoricalFeed,
 						SIPRecentDataDelay: time.Duration(cfg.Scanner.Universe.SIPRecentDataDelayMinutes) * time.Minute,
 					}),
-					Cfg: cfg.Scanner.EarningsWatchlist,
+					Cfg:           cfg.Scanner.EarningsWatchlist,
+					ResearchQueue: cfg.Scanner.ResearchQueue,
 				}
 				scheduler := &earnings.WatchlistScheduler{Cfg: cfg.Scanner.EarningsWatchlist, Job: feeder}
 				go func() {

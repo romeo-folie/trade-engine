@@ -228,15 +228,41 @@ func filterDiscoveryContextSources(value *tradeprofile.DiscoveryContext, live ma
 	return &filtered, pruned
 }
 
-// ExpireWatchlistDiscoveryContexts ends due contexts. Earnings-only rows are
-// deactivated once their final context expires; positions remain managed by the
-// ordinary position lifecycle and are never touched here.
+// ExpireWatchlistDiscoveryContexts ends due contexts. A shared scanner/earnings
+// row remains active while it has either live scanner evidence or a live
+// discovery context; it is deactivated only after its final retaining reason
+// expires. Positions and manual/config watchlist rows are never touched here.
 func ExpireWatchlistDiscoveryContexts(ctx context.Context) error {
 	tx, err := GetDB().Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	if err := expireWatchlistDiscoveryContextsTx(ctx, tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	// Do this after the expiry writes commit so queue serialization never waits
+	// while holding watchlist/context row locks. Reclassification also releases
+	// inactive memberships under that lock, preventing an admission from
+	// observing a membership that expiry deletes concurrently.
+	queueTx, err := GetDB().Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer queueTx.Rollback(ctx) //nolint:errcheck
+	if err := ReclassifyResearchQueueMemberships(ctx, queueTx); err != nil {
+		return err
+	}
+	return queueTx.Commit(ctx)
+}
+
+// expireWatchlistDiscoveryContextsTx performs expiry's row/context phase. It
+// deliberately leaves research-queue membership release to the post-commit,
+// queue-serialized reclassification phase in ExpireWatchlistDiscoveryContexts.
+func expireWatchlistDiscoveryContextsTx(ctx context.Context, tx watchlistExecer) error {
 	if _, err := tx.Exec(ctx, `
 		UPDATE watchlist_discovery_contexts SET active=false, updated_at=NOW()
 		WHERE active=true AND expires_at IS NOT NULL AND expires_at <= NOW()`); err != nil {
@@ -244,12 +270,22 @@ func ExpireWatchlistDiscoveryContexts(ctx context.Context) error {
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE watchlist w SET active=false, updated_at=NOW()
-		WHERE w.active=true AND w.source='earnings_watchlist'
+		WHERE w.active=true AND w.source IN ('scanner', 'earnings_watchlist')
+		AND (
+			w.source='earnings_watchlist'
+			OR (
+				(EXISTS (SELECT 1 FROM watchlist_source_leases l WHERE l.watchlist_id=w.id)
+				 AND NOT EXISTS (SELECT 1 FROM watchlist_source_leases l WHERE l.watchlist_id=w.id AND l.expires_at > NOW()))
+				OR
+				(NOT EXISTS (SELECT 1 FROM watchlist_source_leases l WHERE l.watchlist_id=w.id)
+				 AND w.expires_at IS NOT NULL AND w.expires_at <= NOW())
+			)
+		)
 		AND NOT EXISTS (
 			SELECT 1 FROM watchlist_discovery_contexts c
 			WHERE c.watchlist_id=w.id AND c.active=true AND (c.expires_at IS NULL OR c.expires_at > NOW())
 		)`); err != nil {
 		return err
 	}
-	return tx.Commit(ctx)
+	return nil
 }

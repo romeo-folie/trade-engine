@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -35,9 +36,7 @@ func TestScanRecorderRetainsEveryTerminalStage(t *testing.T) {
 		Action: "add", Conviction: .8, Strategy: "momentum",
 	}}}
 	recorder.selected(selected)
-	recorder.watchlistResult(
-		remaining[1], selected[0].score, []string{"momentum", "pullback_strength"}, nil,
-	)
+	recorder.watchlistResult(remaining[1], []string{"momentum", "pullback_strength"}, nil)
 
 	if got := recorder.candidates["ACTIVE"]; got.FinalStage != "active_watchlist" ||
 		!got.ActiveWatchlistDuplicate {
@@ -50,7 +49,7 @@ func TestScanRecorderRetainsEveryTerminalStage(t *testing.T) {
 		got.LLMError == "" {
 		t.Fatalf("error snapshot = %+v", got)
 	}
-	if got := recorder.candidates["ADD"]; got.FinalStage != "watchlist_added" ||
+	if got := recorder.candidates["ADD"]; got.FinalStage != "research_queue_admitted" ||
 		!got.WatchlistAdded || !got.CapSelected ||
 		len(got.Strategies) != 2 {
 		t.Fatalf("added snapshot = %+v", got)
@@ -60,6 +59,37 @@ func TestScanRecorderRetainsEveryTerminalStage(t *testing.T) {
 		recorder.run.ScoredCandidateCount != 2 ||
 		recorder.run.AddedCandidateCount != 1 {
 		t.Fatalf("run counts = %+v", recorder.run)
+	}
+}
+
+func TestDeterministicSnapshotMetadataRefreshesAfterFallback(t *testing.T) {
+	recorder := &scanRecorder{candidates: make(map[string]*store.ScannerCandidateSnapshot)}
+	candidate := SwingCandidate{Ticker: "TEST", Sources: []string{"political_disclosure"}}
+	recorder.register([]SwingCandidate{candidate})
+	recorder.deterministicQualification(candidate, &store.ResearchQueueAdmission{
+		Bucket: "political_disclosure", Priority: json.RawMessage(`{"ticker":"TEST","score":2}`),
+	})
+	fallback := candidate
+	fallback.Sources = []string{"weekly_leader"}
+	recorder.deterministicQualification(fallback, &store.ResearchQueueAdmission{
+		Bucket: "weekly_leader", Priority: json.RawMessage(`{"ticker":"TEST","score":1}`),
+	})
+	if !strings.Contains(string(recorder.candidates["TEST"].PromotionEvidence), `"bucket":"weekly_leader"`) ||
+		strings.Contains(string(recorder.candidates["TEST"].PromotionEvidence), `"bucket":"political_disclosure"`) {
+		t.Fatalf("fallback metadata was not refreshed: %s", recorder.candidates["TEST"].PromotionEvidence)
+	}
+}
+
+func TestPoliticalRejectionDoesNotPoisonIndependentSourceSnapshot(t *testing.T) {
+	recorder := &scanRecorder{candidates: make(map[string]*store.ScannerCandidateSnapshot)}
+	political := SwingCandidate{Ticker: "TEST", Sources: []string{"political_disclosure"}, PoliticalDisclosureEvidence: "rejected filing"}
+	recorder.register([]SwingCandidate{political})
+	recorder.deterministicRejected(political, "same-filer sale")
+	recorder.register([]SwingCandidate{{Ticker: "TEST", Sources: []string{"mover"}, SourceScores: map[string]float64{"mover": .8}}})
+	snapshot := recorder.candidates["TEST"]
+	if strings.Join(snapshot.Sources, ",") != "mover" || snapshot.FailureStage != "" ||
+		!strings.Contains(string(snapshot.PromotionEvidence), `"political_disclosure"`) {
+		t.Fatalf("independent source did not replace rejected political lineage: %+v", snapshot)
 	}
 }
 
