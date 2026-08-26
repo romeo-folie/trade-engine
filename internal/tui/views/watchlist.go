@@ -54,10 +54,7 @@ func FetchWatchlistData(ctx context.Context) WatchlistData {
 // ToggleWatchlistItem enables or disables a watchlist item by ticker.
 func ToggleWatchlistItem(ctx context.Context, ticker string, active bool) error {
 	if active {
-		// Re-enable: update active=true
-		_, err := store.GetDB().Exec(ctx,
-			`UPDATE watchlist SET active=true, updated_at=NOW() WHERE ticker=$1`, ticker)
-		return err
+		return store.ReactivateWatchlistItem(ctx, ticker, "stock")
 	}
 	// Disable (soft delete) — default to stock platform
 	return store.RemoveWatchlistItem(ctx, ticker, "stock")

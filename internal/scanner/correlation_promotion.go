@@ -133,6 +133,11 @@ func loadPromotionExposure(ctx context.Context) (promotionExposure, error) {
 	}
 	for _, item := range items {
 		add(exposure.watchlist, item.Ticker)
+		// A scheduled-earnings row is a source peer, not a duplicate admission.
+		// Fresh scanner evidence must attach to that shared queue row.
+		if item.Source == "earnings_watchlist" {
+			continue
+		}
 		if !expiredScannerResidency(item, time.Now()) {
 			add(exposure.admissionGuard, item.Ticker)
 		}

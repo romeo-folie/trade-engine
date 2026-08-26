@@ -222,6 +222,12 @@ func TestScannerSourcePromotionIsAtomicAcrossWeeklyAndIndustryClaims(t *testing.
 	}
 	claims.WeeklyLeader.Token = "weekly-fallback"
 	claims.PotentIndustry.Token = "industry-fallback"
+	if _, err := store.GetDB().Exec(ctx, `
+		INSERT INTO research_queue_memberships (watchlist_id,bucket,allocation,priority)
+		SELECT id,'market_activity','reserved','{}'::jsonb FROM watchlist
+		WHERE ticker=$1 AND platform='stock'`, ticker); err != nil {
+		t.Fatal(err)
+	}
 	item.SourceLeases = []store.WatchlistSourceLease{{
 		Source:              "weekly_leader",
 		EvidenceFingerprint: "fallback-rediscovery",
@@ -242,24 +248,58 @@ func TestScannerSourcePromotionIsAtomicAcrossWeeklyAndIndustryClaims(t *testing.
 	}
 	var strategies []string
 	var confidence float64
+	var queueBucket string
 	if err := store.GetDB().QueryRow(ctx, `
 		SELECT w.strategies, w.min_confidence, q.promotion_status,
-		       i.promotion_status
+		       i.promotion_status, r.bucket
 		FROM watchlist w
 		JOIN weekly_leader_qualifications q ON q.ticker=w.ticker
 		JOIN industry_rotation_members i ON i.ticker=w.ticker
+		JOIN research_queue_memberships r ON r.watchlist_id=w.id
 		WHERE w.ticker=$1 AND w.platform='stock'
 		  AND q.run_id=$2 AND i.run_id=$3`,
 		ticker, weeklyRun.ID, industryRun.ID,
-	).Scan(&strategies, &confidence, &weeklyStatus, &industryStatus); err != nil {
+	).Scan(&strategies, &confidence, &weeklyStatus, &industryStatus, &queueBucket); err != nil {
 		t.Fatal(err)
 	}
 	if len(strategies) != 1 || strategies[0] != "newer_worker" ||
 		confidence != .99 || weeklyStatus != "active_watchlist" ||
-		industryStatus != "active_watchlist" {
+		industryStatus != "active_watchlist" || queueBucket != "weekly_leader" {
 		t.Fatalf(
-			"fallback overwrote active row or stranded claims: strategies=%v confidence=%v weekly=%s industry=%s",
-			strategies, confidence, weeklyStatus, industryStatus,
+			"fallback overwrote active row, stranded claims, or retained old queue bucket: strategies=%v confidence=%v weekly=%s industry=%s bucket=%s",
+			strategies, confidence, weeklyStatus, industryStatus, queueBucket,
 		)
+	}
+
+	if _, err := store.GetDB().Exec(ctx, `
+		UPDATE weekly_leader_qualifications
+		SET promotion_status='processing', promotion_claim_token='weekly-direct-refresh', promotion_claimed_at=$3
+		WHERE run_id=$1 AND ticker=$2`, weeklyRun.ID, ticker, base.Add(27*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GetDB().Exec(ctx, `
+		UPDATE research_queue_memberships r SET bucket='market_activity'
+		FROM watchlist w WHERE r.watchlist_id=w.id AND w.ticker=$1`, ticker); err != nil {
+		t.Fatal(err)
+	}
+	item.SourceLeases[0].EvidenceFingerprint = "direct-refresh-rediscovery"
+	item.SourceLeases[0].ObservedAt = base.Add(27 * time.Minute)
+	item.SourceLeases[0].EffectiveAt = base.Add(27 * time.Minute)
+	item.SourceLeases[0].Evidence = json.RawMessage(`{"run":"direct-refresh"}`)
+	changedLeases, err = store.RefreshScannerSourcesOnActiveWatchlistWithChangedLeases(
+		ctx, item, store.ScannerSourcePromotionClaims{WeeklyLeader: &store.WeeklyLeaderPromotionClaim{
+			RunID: weeklyRun.ID, Ticker: ticker, Token: "weekly-direct-refresh",
+		}}, "direct refresh", base.Add(27*time.Minute), nil,
+	)
+	if err != nil || len(changedLeases) != 1 {
+		t.Fatalf("direct claimed refresh changed=%+v err=%v", changedLeases, err)
+	}
+	if err := store.GetDB().QueryRow(ctx, `
+		SELECT r.bucket FROM research_queue_memberships r
+		JOIN watchlist w ON w.id=r.watchlist_id WHERE w.ticker=$1`, ticker).Scan(&queueBucket); err != nil {
+		t.Fatal(err)
+	}
+	if queueBucket != "weekly_leader" {
+		t.Fatalf("direct claimed refresh queue bucket=%q, want weekly_leader", queueBucket)
 	}
 }

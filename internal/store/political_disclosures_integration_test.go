@@ -191,6 +191,71 @@ func TestPoliticalDisclosurePersistenceAndClaimLifecycle(t *testing.T) {
 	}
 }
 
+func TestPoliticalDisclosureTerminalDispositionLinksScannerRun(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	const ticker = "RUNLINKPD"
+	report := store.PoliticalDisclosureReport{
+		Source: "house", ExternalID: "run-link-political-disclosure", Chamber: "house",
+		FilerName: "Run Link Member", Office: "RL01", ReportType: "periodic_transaction",
+		FilingDate: now, DocumentURL: "https://example.test/run-link", ContentHash: "run-link",
+		ExtractionStatus: "completed", Transactions: []store.PoliticalDisclosureTransaction{{
+			Ordinal: 1, AssetName: "Run Link (RUNLINKPD) [ST]", Ticker: ticker, AssetType: "ST",
+			TransactionType: "purchase", TransactionDate: now.AddDate(0, 0, -1),
+		}},
+	}
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(ctx, "DELETE FROM political_disclosure_reports WHERE source=$1 AND external_id=$2", report.Source, report.ExternalID)
+	})
+	if err := store.SavePoliticalDisclosureReport(ctx, report); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimPoliticalDisclosureCandidates(ctx, now.AddDate(0, 0, -7), now.Add(time.Minute), time.Hour, 100, "run-link-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var claimedFixture *store.PoliticalDisclosureCandidate
+	for i := range claimed {
+		if claimed[i].Ticker == ticker {
+			claimedFixture = &claimed[i]
+			break
+		}
+	}
+	if claimedFixture == nil {
+		t.Fatalf("did not claim political fixture from %+v", claimed)
+	}
+	runID, err := store.BeginScannerRun(ctx, store.ScannerRun{StartedAt: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(ctx, "UPDATE political_disclosure_candidates SET scanner_run_id=NULL WHERE scanner_run_id=$1::uuid", runID)
+		_, _ = store.GetDB().Exec(ctx, "DELETE FROM scanner_runs WHERE id=$1::uuid", runID)
+	})
+	if err := store.MarkPoliticalDisclosurePromotion(ctx, ticker, "run-link-token", []string{claimedFixture.ReportID}, "rejected", runID, "deterministic test rejection", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishScannerRun(ctx, store.ScannerRun{ID: runID, CompletedAt: now, Status: "completed"}, []store.ScannerCandidateSnapshot{{
+		ScannerRunID: runID, Ticker: ticker, Sources: []string{"political_disclosure"}, FinalStage: "deterministically_rejected",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	var sourceRunID, snapshotRunID string
+	if err := store.GetDB().QueryRow(ctx, `
+		SELECT COALESCE(p.scanner_run_id::text,''),COALESCE(s.scanner_run_id::text,'')
+		FROM political_disclosure_candidates p
+		JOIN scanner_candidate_snapshots s ON s.ticker=p.ticker
+		WHERE p.report_id=$1 AND p.ticker=$2 AND s.scanner_run_id=$3::uuid`, claimedFixture.ReportID, ticker, runID).Scan(&sourceRunID, &snapshotRunID); err != nil {
+		t.Fatal(err)
+	}
+	if sourceRunID != runID || snapshotRunID != runID {
+		t.Fatalf("terminal linkage source=%q snapshot=%q, want %q", sourceRunID, snapshotRunID, runID)
+	}
+}
+
 func TestClaimDuePoliticalDisclosureRetriesLeasesWithoutIncrementingAttempts(t *testing.T) {
 	ctx := context.Background()
 	report := store.PoliticalDisclosureReport{
@@ -937,6 +1002,50 @@ func TestClaimPoliticalDisclosureCandidatesSeparatesTriggerFromEvidenceHorizon(t
 	}
 	if !byExternalID[trigger.ExternalID].Claimed || byExternalID[trigger.ExternalID].PromotionClaimToken != "horizon-token" {
 		t.Fatalf("fresh trigger was not claimed: %+v", byExternalID[trigger.ExternalID])
+	}
+	if byExternalID[history.ExternalID].TriggerEligible || !byExternalID[trigger.ExternalID].TriggerEligible {
+		t.Fatalf("trigger eligibility = history:%t trigger:%t, want false/true",
+			byExternalID[history.ExternalID].TriggerEligible, byExternalID[trigger.ExternalID].TriggerEligible)
+	}
+}
+
+func TestClaimPoliticalDisclosureCandidatesMarksOnlyFreshClaimableTriggerRows(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2300, time.March, 17, 12, 0, 0, 0, time.UTC)
+	terminalPurchase := politicalDisclosureClaimFixture("test-trigger-terminal-purchase", "PDTERMINAL", now.AddDate(0, 0, -2))
+	pendingSale := politicalDisclosureClaimFixture("test-trigger-pending-sale", "PDTERMINAL", now.AddDate(0, 0, -1))
+	pendingSale.Transactions[0].TransactionType = "sale"
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), `
+			DELETE FROM political_disclosure_reports
+			WHERE source='house' AND external_id = ANY($1::text[])`,
+			[]string{terminalPurchase.ExternalID, pendingSale.ExternalID})
+	})
+	for _, report := range []store.PoliticalDisclosureReport{terminalPurchase, pendingSale} {
+		if err := store.SavePoliticalDisclosureReport(ctx, report); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.GetDB().Exec(ctx, `
+		UPDATE political_disclosure_candidates SET promotion_status='promoted'
+		WHERE report_id=(SELECT id FROM political_disclosure_reports WHERE source=$1 AND external_id=$2)`,
+		terminalPurchase.Source, terminalPurchase.ExternalID); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := store.ClaimPoliticalDisclosureCandidatesWithEvidence(
+		ctx, now.AddDate(0, 0, -7), now.AddDate(0, 0, -30), now, time.Hour, 1, "terminal-trigger-token",
+	)
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("claim rows=%+v err=%v", rows, err)
+	}
+	byExternalID := make(map[string]store.PoliticalDisclosureCandidate, len(rows))
+	for _, row := range rows {
+		byExternalID[row.ExternalID] = row
+	}
+	terminal := byExternalID[terminalPurchase.ExternalID]
+	fresh := byExternalID[pendingSale.ExternalID]
+	if !terminal.Claimed || !fresh.Claimed || terminal.TriggerEligible || !fresh.TriggerEligible {
+		t.Fatalf("fenced/trigger rows = terminal:%+v fresh:%+v, want both fenced and only fresh trigger-eligible", terminal, fresh)
 	}
 }
 

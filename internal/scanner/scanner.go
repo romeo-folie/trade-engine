@@ -1,14 +1,12 @@
-// Package scanner implements the autonomous market scanner that discovers
-// swing-trade candidates and adds them to the watchlist with a configurable TTL.
+// Package scanner implements deterministic, source-aware market discovery.
 //
 // The scanner runs on a configurable interval (default: every 2 hours) during
 // market hours only. Each scan cycle:
 //  1. Fetches top movers (gainers/losers) and most-active stocks from Alpaca.
-//  2. Deduplicates candidates and enriches them with recent news.
-//  3. Scores each candidate via LLM — evaluating swing-trade suitability,
-//     setup type, strategy fit, and conviction.
-//  4. Adds high-conviction candidates to the watchlist (source="scanner") with
-//     an expiry timestamp.
+//  2. Deterministically qualifies and ranks each source's candidates.
+//  3. Deduplicates source evidence, then allocates bounded research capacity.
+//  4. Adds qualified candidates to the watchlist (source="scanner") with an
+//     expiry timestamp; the normal analyst ensemble evaluates them later.
 //  5. Expires stale scanner-added items that have passed their TTL.
 //  6. Publishes committed watchlist admission and rediscovery events.
 package scanner
@@ -21,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -126,14 +125,6 @@ func (s *MarketScanner) Run(ctx context.Context) error {
 func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 	start := s.now()
 	var scanCandidatesEvaluated, scanItemsAdded, scanItemsExpired int
-	if s.Cfg.PromotionCorrelationEnabled {
-		if s.DailyBars == nil {
-			return fmt.Errorf("promotion correlation enabled but daily-bars provider is unavailable")
-		}
-		if !store.IsConnected() {
-			return fmt.Errorf("promotion correlation enabled but database is unavailable")
-		}
-	}
 	scanCtx, cancelScan := context.WithCancel(ctx)
 	defer cancelScan()
 	ctx = scanCtx
@@ -199,6 +190,7 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			}
 		}()
 	}
+	recorder := newScanRecorder(s, start)
 	weeklyCandidates, err := s.weeklyLeaderCandidates(ctx)
 	if err != nil {
 		return fmt.Errorf("load weekly leader candidates: %w", err)
@@ -214,20 +206,6 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 		return fmt.Errorf("load premarket episodic candidates: %w", err)
 	}
 	defer s.releasePremarketEpisodicClaims(ctx, premarketCandidates)
-	politicalCandidates, err := s.politicalDisclosureCandidates(ctx)
-	if err != nil {
-		return fmt.Errorf("load political disclosure candidates: %w", err)
-	}
-	defer s.releasePoliticalDisclosureClaims(ctx, politicalCandidates)
-	if len(weeklyCandidates) > 0 && len(industryCandidates) > 0 &&
-		weeklyCandidates[0].UniverseVersionID != industryCandidates[0].UniverseVersionID {
-		return fmt.Errorf(
-			"discovery source universe mismatch: weekly leader=%s potent industry=%s",
-			weeklyCandidates[0].UniverseVersionID,
-			industryCandidates[0].UniverseVersionID,
-		)
-	}
-	recorder := newScanRecorder(s, start)
 	// Premarket observations normally use today's newest eligible universe,
 	// while after-close weekly/industry claims may still belong to the previous
 	// completed session. Prefer the newest premarket denominator for the scanner
@@ -246,8 +224,28 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 		asOf := industryCandidates[0].UniverseAsOf
 		recorder.run.UniverseAsOf = &asOf
 	}
-	recorder.begin(ctx)
+	// Start the audit run before any terminal source decision. The source
+	// claims below then carry this run ID even if validation exits early.
+	recorder.register(weeklyCandidates)
+	recorder.register(industryCandidates)
+	recorder.register(premarketCandidates)
+	if err := recorder.begin(ctx); err != nil {
+		return err
+	}
 	defer func() { recorder.finish(scanErr) }()
+	if len(weeklyCandidates) > 0 && len(industryCandidates) > 0 &&
+		weeklyCandidates[0].UniverseVersionID != industryCandidates[0].UniverseVersionID {
+		return fmt.Errorf(
+			"discovery source universe mismatch: weekly leader=%s potent industry=%s",
+			weeklyCandidates[0].UniverseVersionID,
+			industryCandidates[0].UniverseVersionID,
+		)
+	}
+	politicalCandidates, err := s.politicalDisclosureCandidates(ctx, recorder)
+	if err != nil {
+		return fmt.Errorf("load political disclosure candidates: %w", err)
+	}
+	defer s.releasePoliticalDisclosureClaims(ctx, politicalCandidates)
 	scanID := recorder.run.ID
 
 	if s.Bus != nil {
@@ -310,31 +308,6 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 	candidates = mergePotentIndustryCandidates(candidates, industryCandidates)
 	candidates = mergePremarketEpisodicCandidates(candidates, premarketCandidates)
 	candidates = mergePoliticalDisclosureCandidates(candidates, politicalCandidates)
-	promotionCapActive := s.Cfg.PromotionMaxPerIndustry > 0
-	if promotionCapActive {
-		if strings.TrimSpace(recorder.run.UniverseVersionID) == "" || !store.IsConnected() {
-			slog.Warn("scanner: point-in-time universe unavailable; continuing without industry cap")
-			// Diversification is optional. A transient taxonomy failure must not
-			// suppress the legacy movers/actives scan; leave the pool uncapped for
-			// this run and retain the error in logs for operational visibility.
-			promotionCapActive = false
-		} else {
-			hydratedCandidates, hydrateErr := s.hydrateCandidateTaxonomy(
-				ctx, candidates, recorder.run.UniverseVersionID, recorder.run.StartedAt,
-			)
-			if hydrateErr != nil {
-				slog.Warn("scanner: hydrate candidate taxonomy failed; continuing without industry cap",
-					"err", hydrateErr)
-				promotionCapActive = false
-			} else {
-				candidates = hydratedCandidates
-			}
-		}
-	}
-	promotionMaxPerIndustry := 0
-	if promotionCapActive {
-		promotionMaxPerIndustry = s.Cfg.PromotionMaxPerIndustry
-	}
 	recorder.register(candidates)
 
 	if len(candidates) == 0 {
@@ -412,7 +385,7 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 	// selection. Correlation mode takes one normalized exposure snapshot and
 	// reuses it for both same-ticker guards and pairwise selection.
 	var exposure promotionExposure
-	if s.Cfg.PromotionCorrelationEnabled {
+	if s.Cfg.PromotionCorrelationEnabled && store.IsConnected() {
 		exposure, err = loadPromotionExposure(ctx)
 		if err != nil {
 			return fmt.Errorf("load promotion exposure: %w", err)
@@ -444,158 +417,57 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 		return nil
 	}
 
-	// 4. Check how much headroom remains under the cap.
-	activeCount, err := store.CountActiveScannerItems(ctx)
-	if err != nil {
-		return fmt.Errorf("count active scanner items: %w", err)
-	}
-	cap := s.Cfg.CandidateCap
-	if cap <= 0 {
-		cap = 10
-	}
-	slots := cap - activeCount
-	if slots <= 0 {
-		for _, c := range candidates {
-			if snapshot := recorder.candidates[c.Ticker]; snapshot != nil {
-				snapshot.FinalStage = "candidate_cap"
-			}
-		}
-		s.markDiscoveryCandidates(ctx, candidates, nil,
-			"cap_suppressed", recorder.run.ID, "scanner candidate cap reached")
-		return nil // cap reached; nothing to add until items expire
-	}
-
-	// 5. Enrich new admissions after cap accounting. Active refresh candidates
+	// 4. Enrich new admissions after active-row accounting. The deterministic
+	// source rules below decide research qualification; the shared store-level
+	// research queue decides capacity atomically with the watchlist write.
+	// Active refresh candidates
 	// were enriched above and need not be included here because they were removed
 	// by the active-watchlist filter.
 	since := s.now().Add(-time.Duration(s.Cfg.NewsLookbackHours) * time.Hour)
 	candidates = s.enrichWithNews(ctx, candidates, since)
 	recorder.setEligible(candidates)
 
-	// 6. LLM-score each candidate. The completion metric is incremented per
-	// attempted score, so a cancelled cycle never reports skipped candidates as
-	// evaluated.
-	var scored []scoredCandidate
+	// 5. Every candidate reaching this point has already passed its source's
+	// deterministic qualification. The old generic LLM add/skip request was a
+	// second analyst and could veto a valid research candidate; it is removed.
+	// Keep a local deterministic score only for stable within-run ordering.
+	scored := make([]scoredCandidate, 0, len(candidates))
 	for _, c := range candidates {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
 		scanCandidatesEvaluated++
-		result, err := s.scoreCandidate(ctx, c)
-		recorder.scored(c, result, err, s.Cfg.MinConviction)
-		if err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			s.markDiscoveryCandidate(ctx, c, "failed", recorder.run.ID, err.Error())
-			slog.Warn("scanner: score candidate failed", "ticker", c.Ticker, "err", err)
-			continue
-		}
-		slog.Info("scanner: candidate scored",
-			"ticker", c.Ticker,
-			"action", result.Action,
-			"conviction", result.Conviction,
-			"setup", result.SetupType,
-			"reasoning", result.Reasoning,
-		)
-		if result.Action == "add" && result.Conviction >= s.Cfg.MinConviction {
-			scored = append(scored, scoredCandidate{candidate: c, score: result})
-		} else {
-			reason := fmt.Sprintf(
-				"normal scanner rejected candidate: action=%s conviction=%.3f threshold=%.3f",
-				result.Action, result.Conviction, s.Cfg.MinConviction,
-			)
-			s.markDiscoveryCandidate(ctx, c, "rejected", recorder.run.ID, reason)
+		scored = append(scored, scoredCandidate{candidate: c,
+			score: SwingScoreResult{Conviction: deterministicAdmissionScore(c)}})
+		recorder.deterministicQualification(c, researchQueueAdmission(c, s.Cfg.ResearchQueue))
+		if snapshot := recorder.candidates[c.Ticker]; snapshot != nil {
+			snapshot.FinalStage = "deterministically_qualified"
 		}
 	}
 
-	// 7. Sort by conviction descending, take only as many as available slots.
-	if err := s.enrichPromotionCorrelations(ctx, scored, start, exposure); err != nil {
-		return err
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	for _, candidate := range scored {
-		if len(candidate.correlationUnavailable) > 0 {
-			recorder.promotionCorrelationUnavailable(
-				candidate.candidate.Ticker, candidate.correlationUnavailable,
-			)
-		}
-	}
-	sortByConviction(scored)
-	var promotionRejections []PromotionRejection
-	correlationCapActive := s.Cfg.PromotionCorrelationEnabled && s.DailyBars != nil &&
-		s.Cfg.PromotionMaxAbsCorrelation > 0
-	if promotionCapActive || correlationCapActive {
-		promotionInput := scored
-		var rejected []PromotionRejection
-		maxCorrelation := 0.0
-		if correlationCapActive {
-			maxCorrelation = s.Cfg.PromotionMaxAbsCorrelation
-		}
-		scored, rejected = selectScoredForPromotionWithCorrelation(
-			scored, slots, promotionMaxPerIndustry, maxCorrelation,
-		)
-		for _, rejected := range rejected {
-			promotionRejections = append(promotionRejections, rejected)
-			reason := rejected.Reason
-			if rejected.ConflictKey != "" {
-				reason += ": " + rejected.ConflictKey
-			}
-			if rejected.Candidate.Index >= 0 && rejected.Candidate.Index < len(promotionInput) {
-				sc := promotionInput[rejected.Candidate.Index]
-				s.markDiscoveryCandidate(ctx, sc.candidate, "cap_suppressed", recorder.run.ID, reason)
-				recorder.promotionRejectedWithEvidence(sc.candidate.Ticker, rejected)
-			}
-		}
-	}
-	if len(scored) > slots {
-		for _, suppressed := range scored[slots:] {
-			s.markDiscoveryCandidate(
-				ctx, suppressed.candidate, "cap_suppressed", recorder.run.ID,
-				"candidate ranked beyond available scanner slots",
-			)
-		}
-		scored = scored[:slots]
-	}
+	// 6. Sort within each source bucket, then use that normalized rank to
+	// arbitrate shared overflow. Raw source scores are intentionally on
+	// incomparable scales (political freshness, market dollars, and normalized
+	// source scores), so using them globally would bias overflow by score units.
+	// The database queue allocator remains the sole shared admission limit.
+	sortByResearchQueuePriority(scored, s.Cfg.ResearchQueue)
 	recorder.selected(scored)
 
 	// 8. Add to watchlist and notify.
-	promotionState := append([]scoredCandidate(nil), scored...)
-	promotionActive := make([]bool, len(scored))
-	for index := range scored {
+	for index := 0; index < len(scored); {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		sc := scored[index]
 		now := s.now()
 		expiresAt := now.AddDate(0, 0, s.candidateTTLDays(sc.candidate))
-		// A claim-loss fallback may change the candidate's effective taxonomy.
-		// Re-check later candidates against peers that were actually admitted,
-		// without allowing unattempted lower-ranked candidates to consume the cap.
-		if conflict := promotionIndustryConflict(
-			sc.candidate,
-			activePromotionPeers(promotionState, promotionActive, index),
-			promotionMaxPerIndustry,
-		); conflict != "" {
-			reason := "industry_cap: " + conflict
-			s.markDiscoveryCandidate(ctx, sc.candidate, "cap_suppressed", recorder.run.ID, reason)
-			recorder.promotionRejected(sc.candidate.Ticker, reason)
-			promotionActive[index] = false
-			continue
-		}
-		timeframes := sc.score.Timeframes
-		if len(timeframes) == 0 {
-			timeframes = []string{"1H", "4H"}
-		}
-		strategies := scannerCandidateStrategies(sc.candidate, sc.score)
+		timeframes := []string{"1H", "4H"}
 		discoveryContext, executionProfile, profileErr := buildScannerTradeProfile(
-			sc.candidate, sc.score,
+			sc.candidate, SwingScoreResult{},
 		)
 		if profileErr != nil {
 			return fmt.Errorf("build scanner trade profile for %s: %w", sc.candidate.Ticker, profileErr)
 		}
+		strategies := scannerCandidateStrategies(sc.candidate, SwingScoreResult{
+			Strategy: executionProfile.RecommendedLens,
+		})
 		if err := recorder.setTradeProfile(
 			sc.candidate, discoveryContext, executionProfile,
 		); err != nil {
@@ -613,10 +485,8 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			Platform:   "stock",
 			Strategies: strategies,
 			Timeframes: timeframes,
-			// Persist scanner conviction in MinConfidence so downstream
-			// engine logic (#317 RSI loosen) can read it without going
-			// back to the scanner's in-memory state.
-			MinConfidence: sc.score.Conviction,
+			// Deterministic admission priority is audit metadata only.
+			MinConfidence: 0,
 			Source:        "scanner",
 			// Persist WHY this candidate was sourced (graph link / sympathy
 			// trigger) so the engine's deep-analysis prompt carries the origin
@@ -627,110 +497,33 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			ScannerRunID:                    recorder.run.ID,
 			ExpiresAt:                       &expiresAt,
 			SourceLeases:                    leases,
+			ResearchQueue:                   researchQueueAdmission(sc.candidate, s.Cfg.ResearchQueue),
 			PullbackRequalificationComplete: sc.candidate.PullbackQualificationKnown,
 		}
 		if err := s.renewScannerCycleBeforePromotion(ctx, cycleKey, cycleOwner, interval); err != nil {
 			return err
 		}
 		changedLeases, addErr := s.promoteDiscoveryCandidate(ctx, item, sc.candidate, cycleLease)
-		skipCandidate := false
-		for errors.Is(addErr, store.ErrScannerSourcePromotionClaimLost) {
+		if errors.Is(addErr, store.ErrScannerSourcePromotionClaimLost) {
 			var claimErr *store.ScannerSourcePromotionClaimError
 			source := ""
 			if errors.As(addErr, &claimErr) {
 				source = claimErr.Source
 			}
 			fallback, ok := candidateAfterPromotionClaimLoss(sc.candidate, source)
-			if !ok {
-				break
+			if ok {
+				// Losing a source claim can move the ticker into another bucket. Put
+				// that fallback back among the unattempted candidates and normalize
+				// its rank before it can consume the new bucket's reservation/overflow.
+				scanCandidatesEvaluated++
+				fallbackScore := SwingScoreResult{Conviction: deterministicAdmissionScore(fallback)}
+				recorder.deterministicFallback(fallback)
+				recorder.deterministicQualification(fallback, researchQueueAdmission(fallback, s.Cfg.ResearchQueue))
+				scored = requeueFallbackCandidate(scored, index, scoredCandidate{
+					candidate: fallback, score: fallbackScore,
+				}, s.Cfg.ResearchQueue)
+				continue
 			}
-			scanCandidatesEvaluated++
-			fallbackScore, scoreErr := s.scoreCandidate(ctx, fallback)
-			recorder.fallbackScored(
-				fallback, fallbackScore, scoreErr, s.Cfg.MinConviction,
-			)
-			fallbackDiscovery, fallbackProfile, fallbackProfileErr := buildScannerTradeProfile(
-				fallback, fallbackScore,
-			)
-			if fallbackProfileErr != nil {
-				return fmt.Errorf("build fallback scanner trade profile for %s: %w", fallback.Ticker, fallbackProfileErr)
-			}
-			if err := recorder.setTradeProfile(
-				fallback, fallbackDiscovery, fallbackProfile,
-			); err != nil {
-				return fmt.Errorf("record fallback scanner trade profile for %s: %w", fallback.Ticker, err)
-			}
-			if scoreErr != nil {
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
-				s.markDiscoveryCandidate(
-					ctx, fallback, "failed", recorder.run.ID, scoreErr.Error(),
-				)
-				slog.Warn("scanner: source fallback score failed",
-					"ticker", fallback.Ticker, "err", scoreErr)
-				promotionActive[index] = false
-				skipCandidate = true
-				break
-			}
-			if fallbackScore.Action != "add" ||
-				fallbackScore.Conviction < s.Cfg.MinConviction {
-				s.markDiscoveryCandidate(
-					ctx, fallback, "rejected", recorder.run.ID,
-					fmt.Sprintf(
-						"fallback rejected: action=%s conviction=%.3f threshold=%.3f",
-						fallbackScore.Action, fallbackScore.Conviction,
-						s.Cfg.MinConviction,
-					),
-				)
-				slog.Info("scanner: source fallback rejected after claim loss",
-					"ticker", fallback.Ticker,
-					"action", fallbackScore.Action,
-					"conviction", fallbackScore.Conviction)
-				promotionActive[index] = false
-				skipCandidate = true
-				break
-			}
-			timeframes = fallbackScore.Timeframes
-			if len(timeframes) == 0 {
-				timeframes = []string{"1H", "4H"}
-			}
-			strategies = scannerCandidateStrategies(fallback, fallbackScore)
-			item.Strategies = strategies
-			item.Timeframes = timeframes
-			item.MinConfidence = fallbackScore.Conviction
-			item.GraphContext = fallback.GraphContext
-			item.DiscoveryContext = fallbackDiscovery
-			item.ExecutionProfile = fallbackProfile
-			now = s.now()
-			item.SourceLeases = s.scannerSourceLeases(fallback, fallbackDiscovery, now)
-			item.PullbackRequalificationComplete =
-				fallback.PullbackQualificationKnown
-			sc = scoredCandidate{candidate: fallback, score: fallbackScore}
-			peers := activePromotionPeers(promotionState, promotionActive, index)
-			if conflict := promotionIndustryConflict(fallback, peers, promotionMaxPerIndustry); conflict != "" {
-				reason := "industry_cap: " + conflict
-				s.markDiscoveryCandidate(ctx, fallback, "cap_suppressed", recorder.run.ID, reason)
-				recorder.promotionRejected(fallback.Ticker, reason)
-				slog.Info("scanner: source fallback suppressed by promotion cap",
-					"ticker", fallback.Ticker, "conflict", conflict)
-				promotionActive[index] = false
-				skipCandidate = true
-				break
-			}
-			promotionState[index] = sc
-			scored[index] = sc
-			if len(item.SourceLeases) > 0 {
-				expiresAt = maxSourceLeaseExpiry(item.SourceLeases, item.SourceLeases[0].ExpiresAt)
-			}
-			item.ExpiresAt = &expiresAt
-			if err := s.renewScannerCycleBeforePromotion(ctx, cycleKey, cycleOwner, interval); err != nil {
-				return err
-			}
-			changedLeases, addErr = s.promoteDiscoveryFallback(ctx, item, fallback, cycleLease)
-		}
-		if skipCandidate {
-			continue
 		}
 		if errors.Is(addErr, store.ErrScannerCycleLeaseLost) {
 			return addErr
@@ -741,18 +534,25 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 					scanID, sc.candidate.Ticker, changedLeases,
 				))
 			}
-			promotionActive[index] = false
-			recorder.watchlistResult(sc.candidate, sc.score, strategies, addErr)
+			recorder.watchlistResult(sc.candidate, strategies, addErr)
 			slog.Info(
 				"scanner: source fallback lost to active watchlist item",
 				"ticker", sc.candidate.Ticker,
 			)
+			index++
 			continue
 		}
 		if addErr != nil {
-			promotionActive[index] = false
-			recorder.watchlistResult(sc.candidate, sc.score, strategies, addErr)
-			if !errors.Is(addErr, store.ErrScannerSourcePromotionClaimLost) {
+			recorder.watchlistResult(sc.candidate, strategies, addErr)
+			if errors.Is(addErr, store.ErrResearchQueueCapacity) {
+				if auditErr := store.RecordResearchQueueSuppression(ctx, item, *item.ResearchQueue); auditErr != nil {
+					slog.Warn("scanner: failed to record research queue suppression", "ticker", sc.candidate.Ticker, "err", auditErr)
+				}
+				// Leave upstream source claims in processing. The cycle's deferred
+				// release returns them to pending so a future free protected slot can
+				// admit the same qualified evidence; capacity is not a rejection.
+				recorder.researchQueueSuppressed(sc.candidate.Ticker, item.ResearchQueue)
+			} else if !errors.Is(addErr, store.ErrScannerSourcePromotionClaimLost) {
 				// Watchlist persistence failures are transient and must not
 				// terminalize discovery evidence. Each source owns its retry
 				// transition; political disclosures requeue this candidate's
@@ -764,26 +564,28 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			}
 			slog.Warn("scanner: failed to add watchlist item",
 				"ticker", sc.candidate.Ticker, "err", addErr)
+			index++
 			continue
 		}
 		// Only candidates that have actually been admitted to the watchlist
 		// may consume the industry cap for later fallback decisions. Keeping
 		// future candidates inactive prevents a lower-ranked, not-yet-attempted
 		// peer from suppressing a higher-ranked fallback.
-		promotionActive[index] = true
-		recorder.watchlistResult(sc.candidate, sc.score, strategies, nil)
-		slog.Info("scanner: added to watchlist", "ticker", sc.candidate.Ticker, "conviction", sc.score.Conviction, "setup", sc.score.SetupType, "strategy", sc.score.Strategy)
+		recorder.watchlistResult(sc.candidate, strategies, nil)
+		bucketPriority := deterministicBucketAdmissionScore(sc.candidate, item.ResearchQueue.Bucket)
+		slog.Info("scanner: added to research queue", "ticker", sc.candidate.Ticker,
+			"priority", bucketPriority, "bucket", item.ResearchQueue.Bucket)
 		scanItemsAdded++
 
 		if s.Bus != nil {
 			s.Bus.Publish(events.ScannerItemAdded, events.ScannerItemAddedPayload{
 				ScanID:                      scanID,
 				Ticker:                      sc.candidate.Ticker,
-				Conviction:                  sc.score.Conviction,
-				SetupType:                   sc.score.SetupType,
-				Strategy:                    sc.score.Strategy,
+				Conviction:                  0,
+				SetupType:                   "deterministic_research_admission",
+				Strategy:                    "",
 				Timeframes:                  timeframes,
-				Reasoning:                   sc.score.Reasoning,
+				Reasoning:                   "deterministic source qualification",
 				ExpiresAt:                   expiresAt.Format(time.RFC3339),
 				Sources:                     sc.candidate.Sources,
 				GraphContext:                sc.candidate.GraphContext,
@@ -791,8 +593,12 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 				PotentIndustryEvidence:      sc.candidate.PotentIndustryEvidence,
 				PremarketEpisodicEvidence:   sc.candidate.PremarketEpisodicEvidence,
 				PoliticalDisclosureEvidence: sc.candidate.PoliticalDisclosureEvidence,
+				ResearchBucket:              item.ResearchQueue.Bucket,
+				DeterministicPriority:       bucketPriority,
+				AdmissionReason:             "deterministic source qualification",
 			})
 		}
+		index++
 	}
 
 	durationMs := time.Since(start).Milliseconds()
@@ -906,7 +712,7 @@ func (s *MarketScanner) refreshActiveSourceLeases(
 			}
 			item := store.WatchlistItem{
 				Ticker: refreshCandidate.Ticker, Platform: "stock", Source: "scanner",
-				Strategies: scannerCandidateStrategies(refreshCandidate, SwingScoreResult{}),
+				Strategies: scannerCandidateStrategies(refreshCandidate, SwingScoreResult{Strategy: profile.RecommendedLens}),
 				Timeframes: []string{"1H", "4H"}, DiscoveryContext: discovery,
 				ExecutionProfile: profile, ScannerRunID: scannerRunID, ExpiresAt: &expiresAt,
 				GraphContext:                    refreshCandidate.GraphContext,
@@ -1260,10 +1066,20 @@ func (s *MarketScanner) renewScannerCycleBeforePromotion(
 func (s *MarketScanner) fetchCandidates(ctx context.Context) ([]SwingCandidate, error) {
 	byTicker := make(map[string]*SwingCandidate)
 
-	// Top movers (gainers + losers).
-	// 0 = no gap threshold and no price/volume floors: the swing scanner wants the
-	// full mover universe and does its own LLM filtering downstream.
-	movers, err := data.FetchGapMovers(ctx, s.AlpacaClient, data.GapScreen{MinGapPct: 0})
+	// Top movers (gainers + losers) must be tradeable and liquid enough for
+	// analyst research. These objective floors replace the retired LLM veto.
+	minPrice := s.Cfg.Universe.MinPrice
+	if minPrice <= 0 {
+		minPrice = 5
+	}
+	movers, err := data.FetchGapMovers(ctx, s.AlpacaClient, data.GapScreen{
+		// FetchGapMovers only has IEX snapshot volume. It must not influence a
+		// hard cutoff either as a floor or a rank: IEX is partial and can
+		// undercount genuinely liquid names, especially near the open. Keep the
+		// screener's native gap order until consolidated liquidity is available.
+		MinGapPct: 0, MinPrice: minPrice,
+		RankByLiquidity: false,
+	})
 	if err != nil {
 		slog.Warn("scanner: fetch movers failed", "err", err)
 	}
@@ -1280,7 +1096,11 @@ func (s *MarketScanner) fetchCandidates(ctx context.Context) ([]SwingCandidate, 
 			Price:     m.PreMarketLast,
 			ChangePct: m.GapPct,
 			Volume:    m.PreMarketVol,
-			Sources:   []string{"mover"},
+			// IEX premarket volume is partial: retain it as observation only, never
+			// as a queue-admission liquidity rank.
+			DollarVolume: 0,
+			Sources:      []string{"mover"},
+			SourceScores: map[string]float64{"mover": normalizedProviderRank(i)},
 			sourceMarketObservations: map[string]map[string]any{
 				"mover": moverMarketObservation(m.PreMarketLast, m.GapPct, m.PreMarketVol),
 			},
@@ -1296,7 +1116,13 @@ func (s *MarketScanner) fetchCandidates(ctx context.Context) ([]SwingCandidate, 
 	if err != nil {
 		slog.Warn("scanner: fetch most actives failed", "err", err)
 	}
+	eligibleActiveRank := 0
 	for _, a := range actives {
+		if a.Price < minPrice || a.Volume <= 0 {
+			continue
+		}
+		activeRank := eligibleActiveRank
+		eligibleActiveRank++
 		if existing, ok := byTicker[a.Ticker]; ok {
 			existing.Sources = append(existing.Sources, "active")
 			if existing.sourceMarketObservations == nil {
@@ -1309,13 +1135,22 @@ func (s *MarketScanner) fetchCandidates(ctx context.Context) ([]SwingCandidate, 
 			if existing.Price == 0 {
 				existing.Price = a.Price
 			}
+			if existing.SourceScores == nil {
+				existing.SourceScores = make(map[string]float64)
+			}
+			existing.SourceScores["active"] = normalizedProviderRank(activeRank)
 		} else {
 			byTicker[a.Ticker] = &SwingCandidate{
 				Ticker:     a.Ticker,
 				Price:      a.Price,
 				Volume:     a.Volume,
 				TradeCount: a.TradeCount,
-				Sources:    []string{"active"},
+				// The screener exposes current-session activity, not completed-session
+				// median liquidity. Keep it in source observations, never as a
+				// completed-liquidity floor or research-queue ranking value.
+				DollarVolume: 0,
+				Sources:      []string{"active"},
+				SourceScores: map[string]float64{"active": normalizedProviderRank(activeRank)},
 				sourceMarketObservations: map[string]map[string]any{
 					"active": activeMarketObservation(a.Price, a.Volume, a.TradeCount),
 				},
@@ -1327,7 +1162,15 @@ func (s *MarketScanner) fetchCandidates(ctx context.Context) ([]SwingCandidate, 
 	for _, c := range byTicker {
 		candidates = append(candidates, *c)
 	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].Ticker < candidates[j].Ticker })
 	return candidates, nil
+}
+
+func normalizedProviderRank(index int) float64 {
+	if index < 0 {
+		index = 0
+	}
+	return 1 / float64(index+1)
 }
 
 // hydrateCandidateTaxonomy joins ordinary mover/active candidates to the
@@ -1423,6 +1266,12 @@ func (s *MarketScanner) filterExistingWatchlist(ctx context.Context, candidates 
 	existing := make(map[string]struct{}, len(items))
 	now := s.now()
 	for _, item := range items {
+		if item.Source == "earnings_watchlist" {
+			// Earnings is another scanner source. Let qualified scanner evidence
+			// attach to its active row; addWatchlistItem retains its context and
+			// the queue allocator recognizes the existing membership.
+			continue
+		}
 		// An additive context can keep an expired scanner row visible for engine
 		// analysis. It is no longer scanner-resident, so fresh scanner evidence
 		// must proceed through ordinary scoring and cap admission.
@@ -1794,14 +1643,21 @@ type scoredCandidate struct {
 // sortByConviction sorts in-place, highest conviction first.
 func sortByConviction(items []scoredCandidate) {
 	for i := 1; i < len(items); i++ {
-		for j := i; j > 0 && items[j].score.Conviction > items[j-1].score.Conviction; j-- {
+		for j := i; j > 0 && (items[j].score.Conviction > items[j-1].score.Conviction ||
+			(items[j].score.Conviction == items[j-1].score.Conviction && items[j].candidate.Ticker < items[j-1].candidate.Ticker)); j-- {
 			items[j], items[j-1] = items[j-1], items[j]
 		}
 	}
 }
 
 func scannerCandidateStrategies(candidate SwingCandidate, score SwingScoreResult) []string {
-	primary := score.Strategy
+	primary := strings.ToLower(strings.TrimSpace(score.Strategy))
+	if primary == "" {
+		// Deterministic admissions no longer obtain an LLM strategy. Persist the
+		// same source-owned default that the execution profile recommends so
+		// legacy consumers retain a meaningful primary strategy.
+		primary = scannerDefaultsForSources(candidate.Sources).lenses[0]
+	}
 	// pullback_strength is a qualified execution path, never a generic scanner
 	// score. The profile also removes this lens for an unqualified candidate,
 	// but the legacy strategies list independently drives engine admission and

@@ -365,10 +365,14 @@ func scannerAdmissionLine(payload events.ScannerItemAddedPayload) string {
 		scannerNotificationField(payload.Ticker, 32),
 		scannerNotificationField(scannerSourceSummary(payload.Sources), 256),
 	)
-	if payload.SetupType != "" {
+	if payload.ResearchBucket != "" {
+		line += fmt.Sprintf(" · %s", scannerNotificationField(strings.ReplaceAll(payload.ResearchBucket, "_", " "), 128))
+	} else if payload.SetupType != "" {
 		line += fmt.Sprintf(" · %s", scannerNotificationField(payload.SetupType, 128))
 	}
-	if payload.Conviction > 0 {
+	if payload.DeterministicPriority > 0 {
+		line += fmt.Sprintf(" · priority %.3f", payload.DeterministicPriority)
+	} else if payload.Conviction > 0 {
 		line += fmt.Sprintf(" · %.0f%%", payload.Conviction*100)
 	}
 	if detail := scannerAdmissionDetail(payload); detail != "" {

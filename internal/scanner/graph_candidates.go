@@ -120,7 +120,10 @@ func (s *MarketScanner) graphNeighborCandidates(ctx context.Context, existing []
 	for _, n := range best {
 		ranked = append(ranked, n)
 	}
-	sort.Slice(ranked, func(i, j int) bool { return ranked[i].Strength > ranked[j].Strength })
+	sort.Slice(ranked, func(i, j int) bool {
+		return ranked[i].Strength > ranked[j].Strength ||
+			(ranked[i].Strength == ranked[j].Strength && ranked[i].Ticker < ranked[j].Ticker)
+	})
 
 	// Build candidates. Graph neighbours carry no screener price/volume, so fetch a
 	// quote for a credible price; drop any we can't price (the scorer would otherwise
@@ -136,6 +139,10 @@ func (s *MarketScanner) graphNeighborCandidates(ctx context.Context, existing []
 	// until the budget fills.
 	var out []SwingCandidate
 	admissions := 0
+	minPrice := s.Cfg.Universe.MinPrice
+	if minPrice <= 0 {
+		minPrice = 5
+	}
 	for _, n := range ranked {
 		if ctx.Err() != nil {
 			break
@@ -144,7 +151,7 @@ func (s *MarketScanner) graphNeighborCandidates(ctx context.Context, existing []
 			continue
 		}
 		q, err := s.AlpacaClient.FetchQuote(ctx, n.Ticker)
-		if err != nil || q == nil || q.Last <= 0 {
+		if err != nil || q == nil || q.Last < minPrice {
 			slog.Warn("scanner: graph sourcing — skip unpriceable neighbor",
 				"ticker", n.Ticker, "err", err)
 			continue
@@ -153,6 +160,7 @@ func (s *MarketScanner) graphNeighborCandidates(ctx context.Context, existing []
 			Ticker:       n.Ticker,
 			Price:        q.Last,
 			Sources:      []string{"graph_neighbor"},
+			SourceScores: map[string]float64{"graph_neighbor": n.Strength},
 			GraphContext: graphLinkPhrase(n),
 		})
 		if !refreshable[strings.ToUpper(n.Ticker)] {

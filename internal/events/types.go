@@ -341,6 +341,9 @@ type ScannerItemAddedPayload struct {
 	PotentIndustryEvidence      string   `json:"potent_industry_evidence,omitempty"`
 	PremarketEpisodicEvidence   string   `json:"premarket_episodic_evidence,omitempty"`
 	PoliticalDisclosureEvidence string   `json:"political_disclosure_evidence,omitempty"`
+	ResearchBucket              string   `json:"research_bucket,omitempty"`
+	DeterministicPriority       float64  `json:"deterministic_priority,omitempty"`
+	AdmissionReason             string   `json:"admission_reason,omitempty"`
 }
 
 // ScannerSourceLeaseChangePayload identifies one source whose committed lease

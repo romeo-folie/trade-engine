@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/store"
@@ -26,19 +27,17 @@ func newScanRecorder(s *MarketScanner, startedAt time.Time) *scanRecorder {
 	if minMomentum <= 0 {
 		minMomentum = 30
 	}
-	cap := s.Cfg.CandidateCap
-	if cap <= 0 {
-		cap = 10
-	}
 	return &scanRecorder{
 		run: store.ScannerRun{
-			StartedAt:                        startedAt,
-			PullbackUniverseEnabled:          s.PullbackUniverseEnabled,
-			PullbackMinMomentumReturnPct:     minMomentum,
-			PullbackMinMarketCapMM:           pullbackMinMarketCapMM,
-			PullbackMinDollarVolume:          pullbackMinDollarVolume,
-			CandidateCap:                     cap,
-			MinConviction:                    s.Cfg.MinConviction,
+			StartedAt:                    startedAt,
+			PullbackUniverseEnabled:      s.PullbackUniverseEnabled,
+			PullbackMinMomentumReturnPct: minMomentum,
+			PullbackMinMarketCapMM:       pullbackMinMarketCapMM,
+			PullbackMinDollarVolume:      pullbackMinDollarVolume,
+			// These legacy run columns remain for historical readers. Scanner
+			// admission now uses the source-owned research queue instead.
+			CandidateCap:                     0,
+			MinConviction:                    0,
 			TTLDays:                          s.ttlDays(),
 			PromotionMaxPerIndustry:          s.Cfg.PromotionMaxPerIndustry,
 			PromotionCorrelationEnabled:      s.Cfg.PromotionCorrelationEnabled,
@@ -57,19 +56,22 @@ func newScanRecorder(s *MarketScanner, startedAt time.Time) *scanRecorder {
 	}
 }
 
-func (r *scanRecorder) begin(ctx context.Context) {
+func (r *scanRecorder) begin(ctx context.Context) error {
 	if !store.IsConnected() {
-		return
+		return nil
 	}
 	if err := r.resolveUniverseLineage(ctx); err != nil {
 		slog.Warn("scanner: resolve universe snapshot", "err", err)
 	}
 	id, err := store.BeginScannerRun(ctx, r.run)
 	if err != nil {
-		slog.Warn("scanner: begin universe snapshot", "err", err)
-		return
+		return fmt.Errorf("begin scanner run: %w", err)
 	}
 	r.run.ID = id
+	for _, snapshot := range r.candidates {
+		snapshot.ScannerRunID = id
+	}
+	return nil
 }
 
 func (r *scanRecorder) resolveUniverseLineage(ctx context.Context) error {
@@ -139,6 +141,27 @@ func (r *scanRecorder) register(candidates []SwingCandidate) {
 				FinalStage:         "sourced",
 			}
 			r.candidates[c.Ticker] = snapshot
+		}
+		if snapshot.FinalStage == "deterministically_rejected" &&
+			hasSource(snapshot.Sources, "political_disclosure") &&
+			!hasSource(c.Sources, "political_disclosure") {
+			// A rejected political filing must not poison independently qualified
+			// ordinary evidence for the same ticker. Retain that source outcome as
+			// audit history, then establish the live snapshot from the surviving
+			// source lineage so it matches the discovery context at persistence.
+			r.mergePromotionEvidence(snapshot, map[string]any{
+				"rejected_sources": map[string]any{
+					"political_disclosure": map[string]any{
+						"reason": snapshot.FailureReason,
+					},
+				},
+			})
+			snapshot.Sources = nil
+			snapshot.SourceScores = nil
+			snapshot.PoliticalDisclosureEvidence = ""
+			snapshot.FailureStage = ""
+			snapshot.FailureReason = ""
+			snapshot.FinalStage = "sourced"
 		}
 		snapshot.Sources = mergeSources(snapshot.Sources, c.Sources)
 		if snapshot.SourceScores == nil {
@@ -285,7 +308,7 @@ func (r *scanRecorder) setEligible(candidates []SwingCandidate) {
 	for _, c := range candidates {
 		if snapshot := r.candidates[c.Ticker]; snapshot != nil {
 			snapshot.EligibleForScoring = true
-			snapshot.FinalStage = "scoring"
+			snapshot.FinalStage = "deterministically_qualified"
 		}
 	}
 	r.run.EvaluatedCandidateCount = len(candidates)
@@ -324,42 +347,10 @@ func (r *scanRecorder) scored(c SwingCandidate, score SwingScoreResult, err erro
 func (r *scanRecorder) fallbackScored(
 	c SwingCandidate, score SwingScoreResult, err error, minConviction float64,
 ) {
-	snapshot := r.candidates[c.Ticker]
+	snapshot := r.replaceFallbackSourceLineage(c)
 	if snapshot == nil {
 		return
 	}
-	snapshot.Sources = append([]string(nil), c.Sources...)
-	snapshot.SourceScores = make(map[string]float64, len(c.SourceScores))
-	for source, sourceScore := range c.SourceScores {
-		snapshot.SourceScores[source] = sourceScore
-	}
-	snapshot.GraphContext = c.GraphContext
-	snapshot.WeeklyLeaderEvidence = c.WeeklyLeaderEvidence
-	snapshot.PotentIndustryEvidence = c.PotentIndustryEvidence
-	snapshot.PremarketEpisodicEvidence = c.PremarketEpisodicEvidence
-	snapshot.PoliticalDisclosureEvidence = c.PoliticalDisclosureEvidence
-	snapshot.Price = c.Price
-	snapshot.ChangePct = c.ChangePct
-	snapshot.Volume = c.Volume
-	snapshot.TradeCount = c.TradeCount
-	snapshot.DollarVolume = c.DollarVolume
-	snapshot.MarketCapMM = c.MarketCapMM
-	snapshot.Return1M = c.Return1M
-	snapshot.Return3M = c.Return3M
-	snapshot.Return6M = c.Return6M
-	snapshot.UniverseMember = nil
-	if c.UniverseMember != nil {
-		member := *c.UniverseMember
-		snapshot.UniverseMember = &member
-	}
-	snapshot.Sector = c.Sector
-	snapshot.Industry = c.Industry
-	snapshot.TaxonomyStatus = c.TaxonomyStatus
-	snapshot.TaxonomyAsOf = c.TaxonomyAsOf
-	snapshot.TaxonomyProvider = c.TaxonomyProvider
-	snapshot.TaxonomyEvidence = append(
-		snapshot.TaxonomyEvidence[:0], c.TaxonomyEvidence...,
-	)
 	snapshot.LLMError = ""
 	snapshot.FailureStage = ""
 	snapshot.FailureReason = ""
@@ -394,6 +385,68 @@ func (r *scanRecorder) fallbackScored(
 	} else {
 		snapshot.FinalStage = "below_conviction"
 	}
+}
+
+func (r *scanRecorder) replaceFallbackSourceLineage(c SwingCandidate) *store.ScannerCandidateSnapshot {
+	snapshot := r.candidates[c.Ticker]
+	if snapshot == nil {
+		return nil
+	}
+	snapshot.Sources = append([]string(nil), c.Sources...)
+	snapshot.SourceScores = make(map[string]float64, len(c.SourceScores))
+	for source, sourceScore := range c.SourceScores {
+		snapshot.SourceScores[source] = sourceScore
+	}
+	snapshot.GraphContext = c.GraphContext
+	snapshot.WeeklyLeaderEvidence = c.WeeklyLeaderEvidence
+	snapshot.PotentIndustryEvidence = c.PotentIndustryEvidence
+	snapshot.PremarketEpisodicEvidence = c.PremarketEpisodicEvidence
+	snapshot.PoliticalDisclosureEvidence = c.PoliticalDisclosureEvidence
+	snapshot.Price = c.Price
+	snapshot.ChangePct = c.ChangePct
+	snapshot.Volume = c.Volume
+	snapshot.TradeCount = c.TradeCount
+	snapshot.DollarVolume = c.DollarVolume
+	snapshot.MarketCapMM = c.MarketCapMM
+	snapshot.Return1M = c.Return1M
+	snapshot.Return3M = c.Return3M
+	snapshot.Return6M = c.Return6M
+	snapshot.UniverseMember = nil
+	if c.UniverseMember != nil {
+		member := *c.UniverseMember
+		snapshot.UniverseMember = &member
+	}
+	snapshot.Sector = c.Sector
+	snapshot.Industry = c.Industry
+	snapshot.TaxonomyStatus = c.TaxonomyStatus
+	snapshot.TaxonomyAsOf = c.TaxonomyAsOf
+	snapshot.TaxonomyProvider = c.TaxonomyProvider
+	snapshot.TaxonomyEvidence = append(
+		snapshot.TaxonomyEvidence[:0], c.TaxonomyEvidence...,
+	)
+	return snapshot
+}
+
+// deterministicFallback replaces the persisted source lineage after a claimed
+// source is lost. Deterministic admission has no LLM score to retain, but the
+// snapshot must still exactly match the fallback discovery context at run end.
+func (r *scanRecorder) deterministicFallback(c SwingCandidate) {
+	snapshot := r.replaceFallbackSourceLineage(c)
+	if snapshot == nil {
+		return
+	}
+	snapshot.LLMError = ""
+	snapshot.FailureStage = ""
+	snapshot.FailureReason = ""
+	snapshot.LLMAction = ""
+	snapshot.LLMConviction = 0
+	snapshot.LLMSetupType = ""
+	snapshot.LLMStrategy = ""
+	snapshot.LLMTimeframes = nil
+	snapshot.LLMReasoning = ""
+	snapshot.LLMRisks = nil
+	snapshot.PassedMinConviction = false
+	snapshot.FinalStage = "deterministically_qualified"
 }
 
 // setTradeProfile records the same canonical pair that will be promoted to the
@@ -433,7 +486,7 @@ func (r *scanRecorder) selected(selected []scoredCandidate) {
 		selectedTickers[normalizePromotionKey(sc.candidate.Ticker)] = struct{}{}
 		if snapshot := r.candidates[sc.candidate.Ticker]; snapshot != nil {
 			snapshot.CapSelected = true
-			snapshot.FinalStage = "selected"
+			snapshot.FinalStage = "deterministically_selected"
 		}
 	}
 	for _, snapshot := range r.candidates {
@@ -490,9 +543,7 @@ func (r *scanRecorder) mergePromotionEvidence(
 	}
 }
 
-func (r *scanRecorder) watchlistResult(
-	c SwingCandidate, score SwingScoreResult, strategies []string, err error,
-) {
+func (r *scanRecorder) watchlistResult(c SwingCandidate, strategies []string, err error) {
 	snapshot := r.candidates[c.Ticker]
 	if snapshot == nil {
 		return
@@ -506,8 +557,55 @@ func (r *scanRecorder) watchlistResult(
 		return
 	}
 	snapshot.WatchlistAdded = true
-	snapshot.FinalStage = "watchlist_added"
+	snapshot.FinalStage = "research_queue_admitted"
 	r.run.AddedCandidateCount++
+}
+
+func (r *scanRecorder) deterministicQualification(c SwingCandidate, admission *store.ResearchQueueAdmission) {
+	if admission == nil {
+		return
+	}
+	if snapshot := r.candidates[c.Ticker]; snapshot != nil {
+		r.mergePromotionEvidence(snapshot, map[string]any{
+			"research_queue": map[string]any{
+				"bucket": admission.Bucket, "priority": json.RawMessage(admission.Priority),
+				"outcome": "qualified", "reason": deterministicQualificationReason(c),
+			},
+		})
+	}
+}
+
+func (r *scanRecorder) deterministicRejected(c SwingCandidate, reason string) {
+	if snapshot := r.candidates[c.Ticker]; snapshot != nil {
+		snapshot.FailureStage = "deterministic_qualification"
+		snapshot.FailureReason = reason
+		snapshot.FinalStage = "deterministically_rejected"
+		r.mergePromotionEvidence(snapshot, map[string]any{
+			"research_queue": map[string]any{
+				"outcome": "rejected", "reason": reason,
+			},
+		})
+	}
+}
+
+func (r *scanRecorder) researchQueueSuppressed(ticker string, admission *store.ResearchQueueAdmission) {
+	if snapshot := r.candidates[ticker]; snapshot != nil {
+		snapshot.FailureStage = "research_queue"
+		snapshot.FailureReason = "source reservation and shared overflow are full"
+		snapshot.FinalStage = "capacity_suppressed"
+		if admission != nil {
+			r.mergePromotionEvidence(snapshot, map[string]any{
+				"research_queue": map[string]any{
+					"bucket": admission.Bucket, "priority": json.RawMessage(admission.Priority),
+					"outcome": "capacity_suppressed", "reason": snapshot.FailureReason,
+				},
+			})
+		}
+	}
+}
+
+func deterministicQualificationReason(candidate SwingCandidate) string {
+	return "deterministically qualified by source evidence: " + strings.Join(candidate.Sources, ", ")
 }
 
 func (r *scanRecorder) finish(scanErr error) {

@@ -28,6 +28,14 @@ suite, vet, build, applicable race tests, diff checks, and a final review-thread
 check. GitHub Codex review is a secondary safety net, not a substitute for this
 local gate.
 
+## Mandatory feature PR completion
+
+When implementation of any feature is complete, proceed without waiting for a
+separate prompt to prepare the branch for review and open its pull request.
+This includes completing the required local review and validation gates,
+committing the scoped changes, pushing the PR branch, creating the PR with a
+clear summary and test evidence, and then starting the required PR watcher.
+
 ## Mandatory PR watcher persistence
 
 Once a PR watcher is started, keep actively monitoring and handling its review

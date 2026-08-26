@@ -17,6 +17,27 @@ func TestDefaultsEngineMode(t *testing.T) {
 	}
 }
 
+func TestDefaultsResearchQueueIsBoundedAndFullyAllocated(t *testing.T) {
+	queue := Defaults().Scanner.ResearchQueue
+	if queue.Capacity != 30 || queue.Overflow != 6 || queue.Reservations.Total() != 24 {
+		t.Fatalf("research queue defaults = %+v, want capacity 30 / protected 24 / overflow 6", queue)
+	}
+	if errs := Validate(Defaults()); containsStr(errs, "scanner.research_queue") {
+		t.Fatalf("default research queue should validate: %v", errs)
+	}
+	if window := Defaults().Scanner.PoliticalDisclosures.TriggerWindowDays(); window != 50 {
+		t.Fatalf("political disclosure trigger window = %d, want 50 days", window)
+	}
+}
+
+func TestValidateResearchQueueRequiresExactCapacityAllocation(t *testing.T) {
+	cfg := Defaults()
+	cfg.Scanner.ResearchQueue.Overflow = 5
+	if errs := Validate(cfg); !containsStr(errs, "scanner.research_queue.capacity must equal") {
+		t.Fatalf("expected queue allocation error, got %v", errs)
+	}
+}
+
 func TestDefaultsMarkScannerNotificationCategoryConfigured(t *testing.T) {
 	cfg := Defaults()
 	if cfg.Notifications.Telegram.ScannerNotificationsConfigured == nil ||
@@ -151,26 +172,22 @@ func TestDefaultsPromotionCorrelationDisabled(t *testing.T) {
 	}
 }
 
-func TestValidatePromotionCorrelationRequiresScanner(t *testing.T) {
+func TestValidatePromotionCorrelationCompatibilitySettingsDoNotGateScanner(t *testing.T) {
 	cfg := Defaults()
+	cfg.Scanner.EarningsWatchlist.Enabled = false
 	cfg.Scanner.PromotionCorrelationEnabled = true
-	if errs := Validate(cfg); !containsStr(errs, "promotion_correlation_enabled") {
-		t.Fatalf("expected scanner dependency validation error, got %v", errs)
-	}
-	cfg.Scanner.Enabled = true
-	cfg.Scanner.PromotionCorrelationMinOverlap = cfg.Scanner.PromotionCorrelationLookbackDays + 1
-	if errs := Validate(cfg); !containsStr(errs, "promotion_correlation_min_overlap") {
-		t.Fatalf("expected overlap validation error, got %v", errs)
+	if errs := Validate(cfg); containsStr(errs, "promotion_correlation_") {
+		t.Fatalf("compatibility settings must not impose legacy selector validation: %v", errs)
 	}
 }
 
 func TestValidatePromotionCorrelationRequiresHistoricalFeed(t *testing.T) {
 	cfg := Defaults()
-	cfg.Scanner.Enabled = true
+	cfg.Scanner.EarningsWatchlist.Enabled = false
 	cfg.Scanner.PromotionCorrelationEnabled = true
 	cfg.Scanner.Universe.HistoricalFeed = ""
-	if errs := Validate(cfg); !containsStr(errs, "scanner.universe.historical_feed") {
-		t.Fatalf("missing correlation history feed accepted: %v", errs)
+	if errs := Validate(cfg); containsStr(errs, "scanner.universe.historical_feed") {
+		t.Fatalf("deprecated correlation selector should not require historical feed: %v", errs)
 	}
 	cfg.Scanner.Universe.HistoricalFeed = "sip"
 	cfg.Scanner.Universe.SIPRecentDataDelayMinutes = -1
@@ -416,8 +433,8 @@ func TestValidateScannerPromotionConstraints(t *testing.T) {
 
 	cfg = Defaults()
 	cfg.Scanner.PromotionMaxPerIndustry = 2
-	if !containsStr(Validate(cfg), "requires scanner.universe.enabled=true") {
-		t.Fatal("promotion cap should require point-in-time universe")
+	if errs := Validate(cfg); containsStr(errs, "requires scanner.universe.enabled=true") {
+		t.Fatalf("deprecated promotion cap should not require an unused universe: %v", errs)
 	}
 
 }
