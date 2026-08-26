@@ -181,6 +181,53 @@ func TestScannerSourceLeaseFingerprintIgnoresNewsOrdering(t *testing.T) {
 	}
 }
 
+func TestGraphNeighborLeaseFingerprintIsStableAcrossEqualStrengthEdges(t *testing.T) {
+	now := time.Date(2026, time.August, 26, 14, 0, 0, 0, time.UTC)
+	scanner := &MarketScanner{Cfg: config.ScannerConfig{TTLDays: 3}}
+	edges := []store.NeighborCandidate{
+		{SeedTicker: "LHX", Ticker: "LUNR", RelationshipType: "supplies_to", Direction: "inbound", Strength: 0.90},
+		{SeedTicker: "LHX", Ticker: "LUNR", RelationshipType: "partner_of", Direction: "outbound", Strength: 0.90},
+		{SeedTicker: "LHX", Ticker: "LUNR", RelationshipType: "partner_of", Direction: "inbound", Strength: 0.90},
+	}
+
+	leaseFor := func(order []int, at time.Time) store.WatchlistSourceLease {
+		t.Helper()
+		winner := edges[order[0]]
+		for _, index := range order[1:] {
+			if preferGraphNeighbor(edges[index], winner) {
+				winner = edges[index]
+			}
+		}
+		candidate := SwingCandidate{
+			Ticker: "LUNR", Sources: []string{"graph_neighbor"}, GraphContext: graphLinkPhrase(winner),
+		}
+		discovery, _, err := buildScannerTradeProfile(candidate, SwingScoreResult{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		leases := scanner.scannerSourceLeases(candidate, discovery, at)
+		if len(leases) != 1 {
+			t.Fatalf("leases = %#v, want one graph-neighbor lease", leases)
+		}
+		return leases[0]
+	}
+
+	first := leaseFor([]int{0, 1, 2}, now)
+	second := leaseFor([]int{2, 0, 1}, now.Add(time.Hour))
+	if first.EvidenceFingerprint != second.EvidenceFingerprint {
+		t.Fatalf("equal-strength edge order changed graph lease fingerprint: %q != %q", first.EvidenceFingerprint, second.EvidenceFingerprint)
+	}
+	if string(first.Evidence) != string(second.Evidence) {
+		t.Fatalf("equal-strength edge order changed graph lease evidence: %s != %s", first.Evidence, second.Evidence)
+	}
+
+	edges[0].Strength = 0.91
+	changed := leaseFor([]int{1, 2, 0}, now.Add(2*time.Hour))
+	if first.EvidenceFingerprint == changed.EvidenceFingerprint {
+		t.Fatal("stronger graph relationship did not produce a new lease fingerprint")
+	}
+}
+
 func TestSympathyTriggerDoesNotRenewOrdinarySourceLease(t *testing.T) {
 	now := time.Date(2026, time.August, 21, 14, 0, 0, 0, time.UTC)
 	scanner := &MarketScanner{Cfg: config.ScannerConfig{TTLDays: 3}}

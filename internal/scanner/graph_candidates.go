@@ -81,7 +81,11 @@ func (s *MarketScanner) graphNeighborCandidates(ctx context.Context, existing []
 		return nil
 	}
 
-	// Collect the best (highest-strength) edge per distinct neighbour ticker.
+	// Collect the best edge per distinct neighbour ticker. Equal-strength graph
+	// edges are common (for example, reciprocal partner and supply-chain
+	// relationships). Choose them by a total, stable ordering so a different
+	// database row order cannot change the relationship prose, renew the source
+	// lease, and emit a spurious rediscovery notification.
 	best := make(map[string]store.NeighborCandidate)
 	var eligibleEdges int
 	for _, seed := range seeds {
@@ -99,7 +103,7 @@ func (s *MarketScanner) graphNeighborCandidates(ctx context.Context, existing []
 			if _, seen := covered[key]; seen {
 				continue
 			}
-			if cur, ok := best[key]; !ok || n.Strength > cur.Strength {
+			if cur, ok := best[key]; !ok || preferGraphNeighbor(n, cur) {
 				best[key] = n
 			}
 		}
@@ -115,15 +119,15 @@ func (s *MarketScanner) graphNeighborCandidates(ctx context.Context, existing []
 		return nil
 	}
 
-	// Rank distinct neighbours by edge strength, strongest first.
+	// Rank distinct neighbours by edge strength, strongest first. Preserve the
+	// historical ticker tie-break here: the canonical edge tie-break above is for
+	// selecting the relationship prose for one ticker, not changing which
+	// equal-strength tickers fit within MaxPerScan.
 	ranked := make([]store.NeighborCandidate, 0, len(best))
 	for _, n := range best {
 		ranked = append(ranked, n)
 	}
-	sort.Slice(ranked, func(i, j int) bool {
-		return ranked[i].Strength > ranked[j].Strength ||
-			(ranked[i].Strength == ranked[j].Strength && ranked[i].Ticker < ranked[j].Ticker)
-	})
+	rankGraphNeighbors(ranked)
 
 	// Build candidates. Graph neighbours carry no screener price/volume, so fetch a
 	// quote for a credible price; drop any we can't price (the scorer would otherwise
@@ -168,6 +172,33 @@ func (s *MarketScanner) graphNeighborCandidates(ctx context.Context, existing []
 		}
 	}
 	return out
+}
+
+// preferGraphNeighbor reports whether candidate is the canonical winner over
+// current. Strength remains the sole ranking signal; the remaining fields only
+// make equal-strength selection stable. They are exactly the fields that shape
+// graphLinkPhrase, and therefore the persisted graph-neighbor lease evidence.
+func preferGraphNeighbor(candidate, current store.NeighborCandidate) bool {
+	if candidate.Strength != current.Strength {
+		return candidate.Strength > current.Strength
+	}
+	return graphNeighborIdentity(candidate) < graphNeighborIdentity(current)
+}
+
+func graphNeighborIdentity(candidate store.NeighborCandidate) string {
+	return strings.Join([]string{
+		strings.ToUpper(strings.TrimSpace(candidate.SeedTicker)),
+		strings.ToLower(strings.TrimSpace(candidate.RelationshipType)),
+		strings.ToLower(strings.TrimSpace(candidate.Direction)),
+		strings.ToUpper(strings.TrimSpace(candidate.Ticker)),
+	}, "\x00")
+}
+
+func rankGraphNeighbors(candidates []store.NeighborCandidate) {
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].Strength > candidates[j].Strength ||
+			(candidates[i].Strength == candidates[j].Strength && candidates[i].Ticker < candidates[j].Ticker)
+	})
 }
 
 // graphLinkPhrase renders a human-readable explanation of why a neighbour was

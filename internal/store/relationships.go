@@ -262,7 +262,11 @@ func EligibleNeighbors(ctx context.Context, ticker string, minConfidence float64
 		        r.auto_generated = FALSE
 		        OR (r.confidence >= $2 AND COALESCE(mc.cnt, 0) >= $3)
 		      )
-		ORDER BY r.strength DESC`,
+		ORDER BY r.strength DESC,
+			UPPER(CASE WHEN r.from_entity_id = seed.id THEN e_to.ticker ELSE e_from.ticker END),
+			r.relationship_type::text,
+			CASE WHEN r.from_entity_id = seed.id THEN 'outbound' ELSE 'inbound' END,
+			r.id`,
 		ticker, minConfidence, minCorroboration, minStrength,
 	)
 	if err != nil {
