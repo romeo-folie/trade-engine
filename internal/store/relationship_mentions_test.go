@@ -37,6 +37,7 @@ func TestEligibleNeighbors_And_Mentions(t *testing.T) {
 	uncorr := mustEntity(t, ctx, "GN Uncorr Corp", "company", "GN_UNCORR")   // auto, too few articles
 	weak := mustEntity(t, ctx, "GN Weak Corp", "company", "GN_WEAK")         // trusted but weak edge
 	inbound := mustEntity(t, ctx, "GN Inbound Corp", "company", "GN_INB")    // inbound edge
+	tie := mustEntity(t, ctx, "GN Tie Corp", "company", "GN_TIE")            // equal-strength edge ordering
 	idx := mustEntity(t, ctx, "GN Index", "index", "GN_IDX")                 // non-company
 	noTicker := mustEntity(t, ctx, "GN NoTicker Corp", "company", "")        // company, no ticker
 
@@ -53,6 +54,10 @@ func TestEligibleNeighbors_And_Mentions(t *testing.T) {
 	mustRel(t, ctx, seed, weak, "sector_member", 0.4, false, nil)
 	// Inbound: edge points neighbour → seed.
 	mustRel(t, ctx, inbound, seed, "supplies_to", 0.85, false, nil)
+	// Equal-strength edges to the same neighbour must have a stable order. The
+	// scanner applies the same canonical ordering when it selects one thesis.
+	mustRel(t, ctx, seed, tie, "supplies_to", 0.9, false, nil)
+	mustRel(t, ctx, tie, seed, "partner_of", 0.9, false, nil)
 	// Non-company neighbour (index) — excluded by entity_type filter.
 	mustRel(t, ctx, seed, idx, "sector_member", 0.9, false, nil)
 	// Company neighbour without a ticker — excluded by ticker filter.
@@ -91,7 +96,7 @@ func TestEligibleNeighbors_And_Mentions(t *testing.T) {
 		}
 	}
 
-	wantPresent := []string{"GN_TRUST", "GN_AUTOOK", "GN_INB"}
+	wantPresent := []string{"GN_TRUST", "GN_AUTOOK", "GN_INB", "GN_TIE"}
 	for _, tk := range wantPresent {
 		if _, ok := byTicker[tk]; !ok {
 			t.Errorf("expected %s to be eligible, missing from %v", tk, keys(byTicker))
@@ -116,6 +121,16 @@ func TestEligibleNeighbors_And_Mentions(t *testing.T) {
 	}
 	if n, ok := byTicker["GN_INB"]; ok && n.Direction != "inbound" {
 		t.Errorf("GN_INB direction = %q, want inbound", n.Direction)
+	}
+	var ties []store.NeighborCandidate
+	for _, n := range got {
+		if n.Ticker == "GN_TIE" {
+			ties = append(ties, n)
+		}
+	}
+	if len(ties) != 2 || ties[0].RelationshipType != "partner_of" || ties[0].Direction != "inbound" ||
+		ties[1].RelationshipType != "supplies_to" || ties[1].Direction != "outbound" {
+		t.Errorf("equal-strength neighbor order = %#v, want partner_of/inbound then supplies_to/outbound", ties)
 	}
 	// MentionCount surfaced and not double-counted.
 	if n, ok := byTicker["GN_AUTOOK"]; ok && n.MentionCount != 2 {
