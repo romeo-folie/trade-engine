@@ -31,7 +31,7 @@ func scannerPromotionEvidence(candidate SwingCandidate, source string) string {
 	case "political_disclosure":
 		return candidate.PoliticalDisclosureEvidence
 	case "graph_neighbor", "news_sympathy":
-		return candidate.GraphContext
+		return sourceGraphContext(candidate, source)
 	default:
 		return fmt.Sprintf("deterministic source score %.4g", candidate.SourceScores[source])
 	}

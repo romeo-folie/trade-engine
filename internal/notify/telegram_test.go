@@ -386,6 +386,60 @@ func TestTelegramBotStopBoundsScannerBatchFlush(t *testing.T) {
 	}
 }
 
+func TestTelegramBotStopCancelsInFlightScannerSend(t *testing.T) {
+	previousTimeout := scannerShutdownFlushTimeout
+	scannerShutdownFlushTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { scannerShutdownFlushTimeout = previousTimeout })
+
+	requestStarted := make(chan struct{})
+	requestCanceled := make(chan struct{})
+	var requests int
+	var requestsMu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestsMu.Lock()
+		requests++
+		request := requests
+		requestsMu.Unlock()
+		if request == 1 { // Start's synchronous online message.
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"ok":true}`))
+			return
+		}
+		close(requestStarted)
+		<-r.Context().Done()
+		close(requestCanceled)
+	}))
+	defer srv.Close()
+
+	bus := events.New()
+	bot := NewTelegramBot(config.TelegramConfig{
+		Enabled: true, BotToken: "test-token", ChatID: "123",
+		NotifyOn: []string{"scanner"}, BatchEnabled: true,
+		BatchWindowSec: 60, MaxItemsPerBatch: 1,
+	}, bus)
+	bot.apiBase = srv.URL + "/bot"
+	if err := bot.Start(context.Background()); err != nil {
+		t.Fatalf("start bot: %v", err)
+	}
+	bus.Publish(events.ScannerPromotionOutcome, scannerOutcome("NVDA"))
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("scanner send did not start")
+	}
+
+	started := time.Now()
+	bot.Stop()
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("stop took %s, want bounded scanner shutdown", elapsed)
+	}
+	select {
+	case <-requestCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("in-flight scanner send was not canceled")
+	}
+}
+
 func TestScannerCycleBatchesHonorItemAndTelegramMessageLimits(t *testing.T) {
 	state := &scannerCycleNotifications{}
 	for _, ticker := range []string{"AAA", "BBB", "CCC"} {

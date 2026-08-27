@@ -285,6 +285,24 @@ func TestPublishPromotionClaimLossOutcomeIsSourceScoped(t *testing.T) {
 	}
 }
 
+func TestScannerPromotionSourcesUseEachGraphFacetContext(t *testing.T) {
+	candidate := SwingCandidate{
+		Ticker: "MERGED", Sources: []string{"graph_neighbor", "news_sympathy"},
+		GraphContext: "sympathy context",
+		sourceGraphContexts: map[string]string{
+			"graph_neighbor": "graph relationship",
+			"news_sympathy":  "sympathy context",
+		},
+	}
+	var evidence = make(map[string]string)
+	for _, source := range scannerPromotionSources(candidate) {
+		evidence[source.Source] = source.Evidence
+	}
+	if evidence["graph_neighbor"] != "graph relationship" || evidence["news_sympathy"] != "sympathy context" {
+		t.Fatalf("source evidence=%+v", evidence)
+	}
+}
+
 func TestPromotionClaimLossFallbackRequiresRemainingSelectedSource(t *testing.T) {
 	ordinary := SwingCandidate{Ticker: "MERGED", Sources: []string{"mover"}}
 	candidate := SwingCandidate{

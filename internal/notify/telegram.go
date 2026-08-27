@@ -134,8 +134,17 @@ func (b *TelegramBot) Stop() {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), scannerShutdownFlushTimeout)
 	b.shutdownMu.Lock()
 	b.shutdownCtx = shutdownCtx
+	scannerCancel := b.scannerCancel
+	b.scannerCancel = nil
 	b.shutdownMu.Unlock()
 	defer shutdownCancel()
+	// An in-flight scanner send may still be using the independent scanner
+	// context captured before shutdownCtx was installed. Cancel it before
+	// waiting for the outcome consumer so a stalled Telegram request cannot
+	// extend shutdown beyond the configured flush deadline.
+	if scannerCancel != nil {
+		scannerCancel()
+	}
 	if b.cancel != nil {
 		b.cancel()
 	}
@@ -150,10 +159,6 @@ func (b *TelegramBot) Stop() {
 		b.scannerBatcher.Reset()
 	}
 	b.shutdownMu.Lock()
-	if b.scannerCancel != nil {
-		b.scannerCancel()
-		b.scannerCancel = nil
-	}
 	b.scannerCtx = nil
 	b.shutdownMu.Unlock()
 	for _, sub := range b.subs {
