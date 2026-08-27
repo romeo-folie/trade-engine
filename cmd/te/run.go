@@ -1089,6 +1089,7 @@ Modes:
 					}),
 					Cfg:           cfg.Scanner.EarningsWatchlist,
 					ResearchQueue: cfg.Scanner.ResearchQueue,
+					Bus:           eng.Bus(),
 				}
 				scheduler := &earnings.WatchlistScheduler{Cfg: cfg.Scanner.EarningsWatchlist, Job: feeder}
 				go func() {

@@ -348,7 +348,7 @@ func (r *PremarketEpisodicRunner) storeCandidates(
 			qualifiedRank++
 			rank = intPointer(qualifiedRank)
 			if r.Cfg.PromoteCandidates &&
-				qualifiedRank <= r.Cfg.MaxPromotionsPerRun {
+				qualifiedRank <= minPromotionAttemptLimit(r.Cfg.MaxPromotionsPerRun) {
 				promotionStatus = "pending"
 			}
 		}

@@ -279,7 +279,10 @@ func weeklyLeaderQualifications(
 	out := make([]store.WeeklyLeaderQualification, 0, len(evaluations))
 	maxPromotions := cfg.MaxPromotionsPerRun
 	if maxPromotions <= 0 {
-		maxPromotions = 20
+		maxPromotions = maxPromotionAttemptsPerSource
+	}
+	if maxPromotions > maxPromotionAttemptsPerSource {
+		maxPromotions = maxPromotionAttemptsPerSource
 	}
 	promotionIndexes := make(map[int]struct{})
 	if cfg.PromoteCandidates {

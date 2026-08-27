@@ -162,7 +162,37 @@ func (b *TelegramBot) subscribeEvents(ctx context.Context) {
 			}
 		}(sub, handler)
 	}
-	b.subscribeScannerEvents(ctx)
+	b.subscribeScannerPromotionOutcomes(ctx)
+}
+
+// subscribeScannerPromotionOutcomes consumes the shared committed outcome
+// contract. It is intentionally independent of MarketScanner's lifecycle so
+// after-close sources, including scheduled earnings, notify identically.
+func (b *TelegramBot) subscribeScannerPromotionOutcomes(ctx context.Context) {
+	if b.bus == nil || !scannerNotificationsEnabled(b.cfg, b.notifyOn) {
+		return
+	}
+	sub := b.bus.SubscribeLossless(events.ScannerPromotionOutcome)
+	b.subs = append(b.subs, sub)
+	b.wg.Add(1)
+	go func() {
+		defer b.wg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case ev, ok := <-sub.C:
+				if !ok {
+					return
+				}
+				payload, ok := ev.Payload.(events.ScannerPromotionOutcomePayload)
+				if !ok || len(payload.Sources) == 0 {
+					continue
+				}
+				b.sendScannerNotification(formatScannerPromotionOutcome(payload))
+			}
+		}
+	}()
 }
 
 // scannerCycleNotifications is deliberately separate from TickBatcher. Scanner
@@ -360,6 +390,40 @@ func formatScannerAdmission(payload events.ScannerItemAddedPayload) string {
 	return "🔍 *Scanner watchlist admission*\n" + scannerAdmissionLine(payload)
 }
 
+func formatScannerPromotionOutcome(payload events.ScannerPromotionOutcomePayload) string {
+	title := "🔍 *Scanner promotion admitted*"
+	if payload.Outcome == "rediscovered" {
+		title = "🔄 *Scanner promotion rediscovered*"
+	} else if payload.Outcome == "not_admitted" {
+		title = "⚠️ *Scanner promotion not admitted*"
+	}
+	var sb strings.Builder
+	sb.WriteString(title)
+	sb.WriteString("\n")
+	for _, source := range payload.Sources {
+		line := fmt.Sprintf("• *%s* — %s", scannerNotificationField(payload.Ticker, 32), scannerNotificationField(scannerSourceLabel(source.Source), 128))
+		if source.Rank > 0 {
+			line += fmt.Sprintf(" · rank %d", source.Rank)
+		}
+		if payload.QueueBucket != "" {
+			line += " · " + scannerNotificationField(strings.ReplaceAll(payload.QueueBucket, "_", " "), 128)
+		}
+		sb.WriteString(line)
+		if detail := scannerNotificationField(source.Evidence, 180); detail != "" {
+			sb.WriteString("\n  _" + detail + "_")
+		}
+		sb.WriteString("\n")
+	}
+	if payload.Reason != "" {
+		reason := payload.Reason
+		if payload.ReasonCode != "" {
+			reason = strings.ReplaceAll(payload.ReasonCode, "_", " ") + ": " + reason
+		}
+		sb.WriteString("_" + scannerNotificationField(reason, 300) + "_")
+	}
+	return sb.String()
+}
+
 func scannerAdmissionLine(payload events.ScannerItemAddedPayload) string {
 	line := fmt.Sprintf("• *%s* — %s",
 		scannerNotificationField(payload.Ticker, 32),
@@ -425,6 +489,8 @@ func scannerSourceLabel(source string) string {
 		return "News sympathy"
 	case "political_disclosure":
 		return "Political disclosure"
+	case "earnings_scheduled":
+		return "Scheduled earnings"
 	default:
 		return strings.ReplaceAll(source, "_", " ")
 	}

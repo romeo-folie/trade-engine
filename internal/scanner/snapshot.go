@@ -314,6 +314,35 @@ func (r *scanRecorder) setEligible(candidates []SwingCandidate) {
 	r.run.EvaluatedCandidateCount = len(candidates)
 }
 
+// sourceTopFiveExcluded records a source-local selection decision separately
+// from shared research-queue suppression. A ticker retained by another source
+// remains eligible; the evidence still tells operators which facet did not
+// attempt promotion.
+func (r *scanRecorder) sourceTopFiveExcluded(exclusions []sourcePromotionExclusion) {
+	for _, exclusion := range exclusions {
+		snapshot := r.candidates[exclusion.Ticker]
+		if snapshot == nil {
+			continue
+		}
+		r.mergePromotionEvidence(snapshot, map[string]any{
+			"source_top_five_excluded": appendSourceTopFiveExclusion(snapshot.PromotionEvidence, exclusion),
+		})
+		if snapshot.FinalStage == "sourced" {
+			snapshot.FinalStage = "source_top_five_excluded"
+			snapshot.RemovalStage = "source_top_five_excluded"
+		}
+	}
+}
+
+func appendSourceTopFiveExclusion(existing json.RawMessage, exclusion sourcePromotionExclusion) []map[string]any {
+	var evidence map[string]json.RawMessage
+	_ = json.Unmarshal(existing, &evidence)
+	var values []map[string]any
+	_ = json.Unmarshal(evidence["source_top_five_excluded"], &values)
+	values = append(values, map[string]any{"source": exclusion.Source, "rank": exclusion.Rank})
+	return values
+}
+
 func (r *scanRecorder) scored(c SwingCandidate, score SwingScoreResult, err error, minConviction float64) {
 	snapshot := r.candidates[c.Ticker]
 	if snapshot == nil {

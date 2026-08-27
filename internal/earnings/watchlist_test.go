@@ -13,6 +13,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/engine"
+	"github.com/romeo-folie/trade-engine/internal/events"
 	"github.com/romeo-folie/trade-engine/internal/logger"
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
@@ -35,6 +36,29 @@ func TestNextSessionReleasesUsesFinnhubCalendarDateWithoutTimezoneShift(t *testi
 		if len(got) != 1 || got[0].Symbol != "NVDA" || got[0].Hour != "amc" {
 			t.Fatalf("%s: releases = %+v", date, got)
 		}
+	}
+}
+
+func TestWatchlistFeederPublishesScheduledEarningsPromotionOutcome(t *testing.T) {
+	bus := events.New()
+	sub := bus.Subscribe(events.ScannerPromotionOutcome)
+	defer bus.Unsubscribe(sub)
+	feeder := WatchlistFeeder{Bus: bus}
+	feeder.publishPromotionOutcome("run-1", store.EarningsWatchlistCandidate{
+		Ticker: "NVDA", LiquidityRank: 2, MedianDollarVolume: 1_250_000,
+	}, "not_admitted", "queue_capacity", "source reservation and overflow unavailable")
+	select {
+	case event := <-sub.C:
+		payload, ok := event.Payload.(events.ScannerPromotionOutcomePayload)
+		if !ok {
+			t.Fatalf("payload type = %T", event.Payload)
+		}
+		if payload.Outcome != "not_admitted" || payload.ReasonCode != "queue_capacity" ||
+			len(payload.Sources) != 1 || payload.Sources[0].Source != "earnings_scheduled" || payload.Sources[0].Rank != 2 {
+			t.Fatalf("promotion outcome = %+v", payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("scheduled earnings promotion outcome was not published")
 	}
 }
 

@@ -432,7 +432,7 @@ func Defaults() *Config {
 			WeeklyLeader: WeeklyLeaderConfig{
 				Enabled:                 false,
 				PromoteCandidates:       false,
-				MaxPromotionsPerRun:     20,
+				MaxPromotionsPerRun:     5,
 				AfterCloseDelayMinutes:  15,
 				UniverseMaxAgeHours:     36,
 				HistoryCalendarDays:     420,
@@ -450,7 +450,7 @@ func Defaults() *Config {
 			PotentIndustry: PotentIndustryConfig{
 				Enabled:                false,
 				PromoteCandidates:      false,
-				MaxPromotionsPerRun:    20,
+				MaxPromotionsPerRun:    5,
 				AfterCloseDelayMinutes: 15,
 				UniverseMaxAgeHours:    36,
 				TaxonomyMaxAgeHours:    168,
@@ -496,7 +496,7 @@ func Defaults() *Config {
 				HistorySessions:     20,
 				NewsLookbackHours:   24,
 				MaxCandidatesPerRun: 50,
-				MaxPromotionsPerRun: 10,
+				MaxPromotionsPerRun: 5,
 				MinGapPct:           3,
 				MinPremarketVolume:  100_000,
 				MinTimeAdjustedRVOL: 2,

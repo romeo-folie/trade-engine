@@ -348,6 +348,17 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			"failed", recorder.run.ID, "pullback requalification evidence unavailable")
 	}
 
+	// Every source has now completed its deterministic qualification. Select its
+	// five ranked promotion attempts before active-row handling: a rediscovery
+	// remains a source promotion attempt and therefore must consume that source's
+	// run budget rather than allowing a sixth fresh ticker to bypass the cap.
+	selectedCandidates, topFiveExcluded := selectSourcePromotionCandidates(candidates)
+	recorder.sourceTopFiveExcluded(topFiveExcluded)
+	candidates = selectedCandidates
+	if len(candidates) == 0 {
+		return nil
+	}
+
 	// An active ticker is not a fresh promotion candidate, but it may carry
 	// genuinely new source evidence. Refresh its source lease before the normal
 	// active-watchlist exclusion and before cap accounting. This keeps a full
@@ -512,6 +523,12 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			}
 			fallback, ok := candidateAfterPromotionClaimLoss(sc.candidate, source)
 			if ok {
+				// A fallback may shed a stale claim, but it must never introduce
+				// a source that was outside this run's top-five selection.
+				fallback = retainPromotionSources(fallback, sc.candidate.promotionSourceRanks)
+				ok = len(fallback.Sources) > 0
+			}
+			if ok {
 				// Losing a source claim can move the ticker into another bucket. Put
 				// that fallback back among the unattempted candidates and normalize
 				// its rank before it can consume the new bucket's reservation/overflow.
@@ -535,6 +552,13 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 				))
 			}
 			recorder.watchlistResult(sc.candidate, strategies, addErr)
+			outcome := "not_admitted"
+			reasonCode := "active_duplicate"
+			reason := "active watchlist item already owns this ticker"
+			if len(changedLeases) > 0 {
+				outcome, reasonCode, reason = "rediscovered", "", "source evidence attached to active watchlist item"
+			}
+			s.publishPromotionOutcome(scanID, sc.candidate, outcome, item.ResearchQueue.Bucket, reasonCode, reason)
 			slog.Info(
 				"scanner: source fallback lost to active watchlist item",
 				"ticker", sc.candidate.Ticker,
@@ -564,6 +588,11 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			}
 			slog.Warn("scanner: failed to add watchlist item",
 				"ticker", sc.candidate.Ticker, "err", addErr)
+			reasonCode := "persistence_error"
+			if errors.Is(addErr, store.ErrResearchQueueCapacity) {
+				reasonCode = "queue_capacity"
+			}
+			s.publishPromotionOutcome(scanID, sc.candidate, "not_admitted", item.ResearchQueue.Bucket, reasonCode, addErr.Error())
 			index++
 			continue
 		}
@@ -576,6 +605,7 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 		slog.Info("scanner: added to research queue", "ticker", sc.candidate.Ticker,
 			"priority", bucketPriority, "bucket", item.ResearchQueue.Bucket)
 		scanItemsAdded++
+		s.publishPromotionOutcome(scanID, sc.candidate, "admitted", item.ResearchQueue.Bucket, "", "")
 
 		if s.Bus != nil {
 			s.Bus.Publish(events.ScannerItemAdded, events.ScannerItemAddedPayload{
@@ -755,6 +785,7 @@ func (s *MarketScanner) refreshActiveSourceLeases(
 				s.Bus.Publish(events.ScannerItemRediscovered, scannerRediscoveryPayload(
 					scannerRunID, refreshCandidate.Ticker, changedLeases,
 				))
+				s.publishPromotionOutcome(scannerRunID, refreshCandidate, "rediscovered", "", "", "source evidence attached to active watchlist item")
 			}
 			handled[normalizePromotionKey(candidate.Ticker)] = true
 			break

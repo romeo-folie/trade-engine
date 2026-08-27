@@ -264,7 +264,7 @@ func TestTradeClosedNotification(t *testing.T) {
 	}
 }
 
-func TestScannerCycleNotificationBatchesAdmissionsAndRediscoveries(t *testing.T) {
+func TestScannerPromotionOutcomesNotifyWithoutLifecycleFence(t *testing.T) {
 	srv, msgs := captureServer(t)
 	defer srv.Close()
 
@@ -283,24 +283,17 @@ func TestScannerCycleNotificationBatchesAdmissionsAndRediscoveries(t *testing.T)
 	time.Sleep(100 * time.Millisecond)
 	startCount := msgs.Len()
 
-	bus.Publish(events.ScanStarted, events.ScanStartedPayload{ScanID: "scan-1"})
-	bus.Publish(events.ScannerItemAdded, events.ScannerItemAddedPayload{
-		ScanID: "scan-1", Ticker: "NVDA", Conviction: 0.82, SetupType: "momentum",
-		Sources: []string{"mover", "news_sympathy"}, GraphContext: "Supplier sympathy",
+	bus.Publish(events.ScannerPromotionOutcome, events.ScannerPromotionOutcomePayload{
+		RunID: "scan-1", Ticker: "NVDA", Outcome: "admitted", QueueBucket: "market_activity",
+		Sources: []events.ScannerPromotionSourcePayload{{Source: "mover", Rank: 1, Evidence: "liquidity rank 1"}, {Source: "news_sympathy", Rank: 2, Evidence: "Supplier sympathy"}},
 	})
-	bus.Publish(events.ScannerItemRediscovered, events.ScannerItemRediscoveredPayload{
-		ScanID: "scan-1", Ticker: "AMD", ChangedSources: []events.ScannerSourceLeaseChangePayload{
-			{Source: "political_disclosure"}, {Source: "weekly_leader"},
-		},
-	})
-	bus.Publish(events.ScanCompleted, events.ScanCompletedPayload{ScanID: "scan-1"})
 
 	time.Sleep(200 * time.Millisecond)
 	if got := msgs.Len(); got != startCount+1 {
 		t.Fatalf("scanner messages = %d, want %d", got-startCount, 1)
 	}
 	text := msgs.At(startCount)["text"].(string)
-	for _, want := range []string{"Added (1)", "NVDA", "Mover, News sympathy", "Rediscovered (1)", "AMD", "Political disclosure, Weekly leader"} {
+	for _, want := range []string{"NVDA", "Mover", "News sympathy", "rank 1", "Supplier sympathy"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("scanner batch missing %q:\n%s", want, text)
 		}
@@ -366,9 +359,7 @@ func TestScannerNotificationsRespectCategory(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	startCount := msgs.Len()
 
-	bus.Publish(events.ScanStarted, events.ScanStartedPayload{ScanID: "scan-1"})
-	bus.Publish(events.ScannerItemAdded, events.ScannerItemAddedPayload{ScanID: "scan-1", Ticker: "NVDA", Sources: []string{"mover"}})
-	bus.Publish(events.ScanCompleted, events.ScanCompletedPayload{ScanID: "scan-1"})
+	bus.Publish(events.ScannerPromotionOutcome, events.ScannerPromotionOutcomePayload{Ticker: "NVDA", Outcome: "admitted", Sources: []events.ScannerPromotionSourcePayload{{Source: "mover", Rank: 1}}})
 	time.Sleep(150 * time.Millisecond)
 	if got := msgs.Len(); got != startCount {
 		t.Fatalf("disabled scanner category sent %d message(s)", got-startCount)
@@ -390,9 +381,7 @@ func TestLegacyTelegramNotifyOnKeepsScannerAdmissions(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	startCount := msgs.Len()
 
-	bus.Publish(events.ScannerItemAdded, events.ScannerItemAddedPayload{
-		Ticker: "NVDA", Sources: []string{"mover"},
-	})
+	bus.Publish(events.ScannerPromotionOutcome, events.ScannerPromotionOutcomePayload{Ticker: "NVDA", Outcome: "admitted", Sources: []events.ScannerPromotionSourcePayload{{Source: "mover", Rank: 1}}})
 	time.Sleep(200 * time.Millisecond)
 	if got := msgs.Len(); got != startCount+1 {
 		t.Fatalf("legacy notify_on sent %d scanner messages, want 1", got-startCount)
@@ -414,9 +403,7 @@ func TestLegacyCustomizedNotifyOnKeepsScannerAdmissions(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	startCount := msgs.Len()
 
-	bus.Publish(events.ScannerItemAdded, events.ScannerItemAddedPayload{
-		Ticker: "NVDA", Sources: []string{"mover"},
-	})
+	bus.Publish(events.ScannerPromotionOutcome, events.ScannerPromotionOutcomePayload{Ticker: "NVDA", Outcome: "admitted", Sources: []events.ScannerPromotionSourcePayload{{Source: "mover", Rank: 1}}})
 	time.Sleep(200 * time.Millisecond)
 	if got := msgs.Len(); got != startCount+1 {
 		t.Fatalf("custom legacy notify_on sent %d scanner messages, want 1", got-startCount)
@@ -444,9 +431,7 @@ func TestScannerCategoryExplicitOptOutOverridesLegacyCompatibility(t *testing.T)
 	time.Sleep(100 * time.Millisecond)
 	startCount := msgs.Len()
 
-	bus.Publish(events.ScannerItemAdded, events.ScannerItemAddedPayload{
-		Ticker: "NVDA", Sources: []string{"mover"},
-	})
+	bus.Publish(events.ScannerPromotionOutcome, events.ScannerPromotionOutcomePayload{Ticker: "NVDA", Outcome: "admitted", Sources: []events.ScannerPromotionSourcePayload{{Source: "mover", Rank: 1}}})
 	time.Sleep(150 * time.Millisecond)
 	if got := msgs.Len(); got != startCount {
 		t.Fatalf("explicit scanner opt-out sent %d message(s)", got-startCount)
@@ -472,10 +457,8 @@ func TestScannerNotificationsSendEachEventWhenBatchingDisabled(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	startCount := msgs.Len()
 
-	bus.Publish(events.ScannerItemAdded, events.ScannerItemAddedPayload{Ticker: "NVDA", Sources: []string{"mover"}})
-	bus.Publish(events.ScannerItemRediscovered, events.ScannerItemRediscoveredPayload{
-		Ticker: "AMD", ChangedSources: []events.ScannerSourceLeaseChangePayload{{Source: "graph_neighbor"}},
-	})
+	bus.Publish(events.ScannerPromotionOutcome, events.ScannerPromotionOutcomePayload{Ticker: "NVDA", Outcome: "admitted", Sources: []events.ScannerPromotionSourcePayload{{Source: "mover", Rank: 1}}})
+	bus.Publish(events.ScannerPromotionOutcome, events.ScannerPromotionOutcomePayload{Ticker: "AMD", Outcome: "rediscovered", Sources: []events.ScannerPromotionSourcePayload{{Source: "graph_neighbor", Rank: 1}}})
 	time.Sleep(200 * time.Millisecond)
 	if got := msgs.Len(); got != startCount+2 {
 		t.Fatalf("unbatched scanner messages = %d, want 2", got-startCount)
@@ -528,6 +511,7 @@ func TestScannerSourceLabelsCoverEveryDiscoverySource(t *testing.T) {
 		"graph_neighbor":       "Graph neighbor",
 		"news_sympathy":        "News sympathy",
 		"political_disclosure": "Political disclosure",
+		"earnings_scheduled":   "Scheduled earnings",
 	}
 	for source, label := range want {
 		if got := scannerSourceLabel(source); got != label {

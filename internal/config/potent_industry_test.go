@@ -12,7 +12,7 @@ func TestDefaultsPotentIndustryDisabled(t *testing.T) {
 	if got.Enabled || got.PromoteCandidates {
 		t.Fatal("potent industry discovery and promotion must default off")
 	}
-	if got.MaxPromotionsPerRun != 20 || got.AfterCloseDelayMinutes != 15 ||
+	if got.MaxPromotionsPerRun != 5 || got.AfterCloseDelayMinutes != 15 ||
 		got.UniverseMaxAgeHours != 36 || got.TaxonomyMaxAgeHours != 168 ||
 		got.HistoryCalendarDays != 420 || got.MinHistorySessions != 253 ||
 		got.MarketBenchmark != "SPY" || len(got.SectorBenchmarks) != 11 ||
