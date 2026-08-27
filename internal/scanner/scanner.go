@@ -348,6 +348,17 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			"failed", recorder.run.ID, "pullback requalification evidence unavailable")
 	}
 
+	// Every source has now completed its deterministic qualification. Select its
+	// five ranked promotion attempts before active-row handling: a rediscovery
+	// remains a source promotion attempt and therefore must consume that source's
+	// run budget rather than allowing a sixth fresh ticker to bypass the cap.
+	selectedCandidates, topFiveExcluded := selectSourcePromotionCandidates(candidates)
+	recorder.sourceTopFiveExcluded(selectedCandidates, topFiveExcluded)
+	candidates = selectedCandidates
+	if len(candidates) == 0 {
+		return nil
+	}
+
 	// An active ticker is not a fresh promotion candidate, but it may carry
 	// genuinely new source evidence. Refresh its source lease before the normal
 	// active-watchlist exclusion and before cap accounting. This keeps a full
@@ -398,11 +409,19 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 		recorder.markRemoved(beforeExposureFilter, candidates, "open_position")
 		s.markDiscoveryCandidates(ctx, beforeExposureFilter, candidates,
 			"open_position", recorder.run.ID, "ticker already has an open position")
+		s.publishRemovedPromotionOutcomes(
+			recorder.run.ID, beforeExposureFilter, candidates,
+			"open_position", "ticker already has an open position",
+		)
 		beforeWatchlistFilter := candidates
 		candidates = filterActiveCandidates(candidates, exposure.admissionGuard)
 		recorder.markRemoved(beforeWatchlistFilter, candidates, "active_watchlist")
 		s.markDiscoveryCandidates(ctx, beforeWatchlistFilter, candidates,
 			"active_watchlist", recorder.run.ID, "already active on watchlist")
+		s.publishRemovedPromotionOutcomes(
+			recorder.run.ID, beforeWatchlistFilter, candidates,
+			"active_duplicate", "ticker already has an active watchlist item",
+		)
 	} else {
 		beforeWatchlistFilter := candidates
 		candidates, err = s.filterExistingWatchlist(ctx, candidates)
@@ -412,6 +431,10 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 		recorder.markRemoved(beforeWatchlistFilter, candidates, "active_watchlist")
 		s.markDiscoveryCandidates(ctx, beforeWatchlistFilter, candidates,
 			"active_watchlist", recorder.run.ID, "already active on watchlist")
+		s.publishRemovedPromotionOutcomes(
+			recorder.run.ID, beforeWatchlistFilter, candidates,
+			"active_duplicate", "ticker already has an active watchlist item",
+		)
 	}
 	if len(candidates) == 0 {
 		return nil
@@ -510,8 +533,9 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			if errors.As(addErr, &claimErr) {
 				source = claimErr.Source
 			}
-			fallback, ok := candidateAfterPromotionClaimLoss(sc.candidate, source)
+			fallback, ok := promotionClaimLossFallback(sc.candidate, source)
 			if ok {
+				s.publishPromotionClaimLossOutcome(scanID, sc.candidate, source, addErr)
 				// Losing a source claim can move the ticker into another bucket. Put
 				// that fallback back among the unattempted candidates and normalize
 				// its rank before it can consume the new bucket's reservation/overflow.
@@ -535,6 +559,13 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 				))
 			}
 			recorder.watchlistResult(sc.candidate, strategies, addErr)
+			outcome := "not_admitted"
+			reasonCode := "active_duplicate"
+			reason := "active watchlist item already owns this ticker"
+			if len(changedLeases) > 0 {
+				outcome, reasonCode, reason = "rediscovered", "", "source evidence attached to active watchlist item"
+			}
+			s.publishPromotionOutcome(scanID, sc.candidate, outcome, item.ResearchQueue.Bucket, reasonCode, reason)
 			slog.Info(
 				"scanner: source fallback lost to active watchlist item",
 				"ticker", sc.candidate.Ticker,
@@ -564,6 +595,13 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			}
 			slog.Warn("scanner: failed to add watchlist item",
 				"ticker", sc.candidate.Ticker, "err", addErr)
+			reasonCode := "persistence_error"
+			if errors.Is(addErr, store.ErrResearchQueueCapacity) {
+				reasonCode = "queue_capacity"
+			} else if errors.Is(addErr, store.ErrScannerSourcePromotionClaimLost) {
+				reasonCode = "source_claim_lost"
+			}
+			s.publishPromotionOutcome(scanID, sc.candidate, "not_admitted", item.ResearchQueue.Bucket, reasonCode, addErr.Error())
 			index++
 			continue
 		}
@@ -576,6 +614,7 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 		slog.Info("scanner: added to research queue", "ticker", sc.candidate.Ticker,
 			"priority", bucketPriority, "bucket", item.ResearchQueue.Bucket)
 		scanItemsAdded++
+		s.publishPromotionOutcome(scanID, sc.candidate, "admitted", item.ResearchQueue.Bucket, "", "")
 
 		if s.Bus != nil {
 			s.Bus.Publish(events.ScannerItemAdded, events.ScannerItemAddedPayload{
@@ -737,13 +776,18 @@ func (s *MarketScanner) refreshActiveSourceLeases(
 			if errors.Is(err, store.ErrScannerSourcePromotionClaimLost) {
 				var claimErr *store.ScannerSourcePromotionClaimError
 				if errors.As(err, &claimErr) {
-					if fallback, ok := candidateAfterPromotionClaimLoss(refreshCandidate, claimErr.Source); ok {
+					if fallback, ok := promotionClaimLossFallback(refreshCandidate, claimErr.Source); ok {
+						s.publishPromotionClaimLossOutcome(scannerRunID, refreshCandidate, claimErr.Source, err)
 						refreshCandidate = fallback
 						continue
 					}
 				}
 				// No safe reduced provenance exists (for example, premarket data
 				// cannot be reconstructed). Keep the remaining claims retryable.
+				s.publishPromotionOutcome(
+					scannerRunID, refreshCandidate, "not_admitted", "",
+					"source_claim_lost", err.Error(),
+				)
 				handled[normalizePromotionKey(candidate.Ticker)] = true
 				slog.Info("scanner: active source refresh lost stale claim", "ticker", refreshCandidate.Ticker)
 				break
@@ -755,12 +799,33 @@ func (s *MarketScanner) refreshActiveSourceLeases(
 				s.Bus.Publish(events.ScannerItemRediscovered, scannerRediscoveryPayload(
 					scannerRunID, refreshCandidate.Ticker, changedLeases,
 				))
+				s.publishPromotionOutcome(scannerRunID, refreshCandidate, "rediscovered", "", "", "source evidence attached to active watchlist item")
+			} else if len(changedLeases) == 0 {
+				s.publishPromotionOutcome(
+					scannerRunID, refreshCandidate, "not_admitted", "",
+					"active_duplicate", "source evidence is already active on the watchlist",
+				)
 			}
 			handled[normalizePromotionKey(candidate.Ticker)] = true
 			break
 		}
 	}
 	return handled, nil
+}
+
+// promotionClaimLossFallback removes a stale source claim while preserving this
+// run's selected-source boundary. A false result means the caller must publish
+// only the candidate-wide terminal outcome, rather than a second lost-source
+// notification.
+func promotionClaimLossFallback(candidate SwingCandidate, source string) (SwingCandidate, bool) {
+	fallback, ok := candidateAfterPromotionClaimLoss(candidate, source)
+	if !ok {
+		return SwingCandidate{}, false
+	}
+	// A fallback may shed a stale claim, but it must never introduce a source
+	// that was outside this run's top-five selection.
+	fallback = retainPromotionSources(fallback, candidate.promotionSourceRanks)
+	return fallback, len(fallback.Sources) > 0
 }
 
 func scannerRediscoveryPayload(
@@ -1310,6 +1375,31 @@ func filterActiveCandidates(
 		}
 	}
 	return filtered
+}
+
+func (s *MarketScanner) publishRemovedPromotionOutcomes(
+	runID string, before, after []SwingCandidate, reasonCode, reason string,
+) {
+	retained := make(map[string]struct{}, len(after))
+	for _, candidate := range after {
+		retained[normalizePromotionKey(candidate.Ticker)] = struct{}{}
+	}
+	for _, candidate := range before {
+		if _, ok := retained[normalizePromotionKey(candidate.Ticker)]; !ok {
+			s.publishPromotionOutcome(runID, candidate, "not_admitted", "", reasonCode, reason)
+		}
+	}
+}
+
+func (s *MarketScanner) publishPromotionClaimLossOutcome(
+	runID string, candidate SwingCandidate, source string, cause error,
+) {
+	rank, ok := candidate.promotionSourceRanks[source]
+	if !ok || source == "" {
+		return
+	}
+	lostSource := retainPromotionSources(candidate, map[string]int{source: rank})
+	s.publishPromotionOutcome(runID, lostSource, "not_admitted", "", "source_claim_lost", cause.Error())
 }
 
 // qualifyPullbackUniverse applies the study's objective liquidity/strength

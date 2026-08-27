@@ -32,6 +32,8 @@ const (
 	retryDelay = 2 * time.Second
 )
 
+var scannerShutdownFlushTimeout = 5 * time.Second
+
 // CallbackHandler processes inline button callbacks.
 // Returns a response text to send back to the user.
 type CallbackHandler func(ctx context.Context, signalID, action string) (string, error)
@@ -47,8 +49,14 @@ type TelegramBot struct {
 	bus      *events.Bus
 	subs     []*events.Subscription
 
-	batcher         *TickBatcher
-	callbackHandler CallbackHandler
+	batcher           *TickBatcher
+	scannerBatcher    *scannerPromotionOutcomeBatcher
+	scannerOutcomeSub *events.Subscription
+	callbackHandler   CallbackHandler
+	shutdownMu        sync.RWMutex
+	shutdownCtx       context.Context
+	scannerCtx        context.Context
+	scannerCancel     context.CancelFunc
 
 	client *http.Client
 	ctx    context.Context
@@ -75,6 +83,9 @@ func NewTelegramBot(cfg config.TelegramConfig, bus *events.Bus) *TelegramBot {
 		bot.batcher = NewTickBatcher(cfg, func(text string) error {
 			return bot.sendMessage(text, nil)
 		})
+		bot.scannerBatcher = newScannerPromotionOutcomeBatcher(
+			cfg, bot.sendScannerNotificationWithContext, bot.scannerNotificationContext,
+		)
 	}
 	return bot
 }
@@ -96,6 +107,12 @@ func (b *TelegramBot) SetCallbackHandler(h CallbackHandler) {
 func (b *TelegramBot) Start(ctx context.Context) error {
 	ctx, b.cancel = context.WithCancel(ctx)
 	b.ctx = ctx
+	scannerCtx, scannerCancel := context.WithCancel(context.Background())
+	b.shutdownMu.Lock()
+	b.shutdownCtx = nil
+	b.scannerCtx = scannerCtx
+	b.scannerCancel = scannerCancel
+	b.shutdownMu.Unlock()
 
 	// Send startup message.
 	if err := b.sendMessage("🟢 *TradeEngine online*\nMode: notifications active", nil); err != nil {
@@ -114,11 +131,40 @@ func (b *TelegramBot) Start(ctx context.Context) error {
 
 // Stop gracefully shuts down the bot.
 func (b *TelegramBot) Stop() {
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), scannerShutdownFlushTimeout)
+	b.shutdownMu.Lock()
+	b.shutdownCtx = shutdownCtx
+	scannerCancel := b.scannerCancel
+	b.scannerCancel = nil
+	b.shutdownMu.Unlock()
+	defer shutdownCancel()
+	// An in-flight scanner send may still be using the independent scanner
+	// context captured before shutdownCtx was installed. Cancel it before
+	// waiting for the outcome consumer so a stalled Telegram request cannot
+	// extend shutdown beyond the configured flush deadline.
+	if scannerCancel != nil {
+		scannerCancel()
+	}
 	if b.cancel != nil {
 		b.cancel()
 	}
+	scannerSub := b.scannerOutcomeSub
+	if scannerSub != nil {
+		b.bus.DrainAndUnsubscribe(scannerSub)
+		b.scannerOutcomeSub = nil
+	}
 	b.wg.Wait()
+	if b.scannerBatcher != nil {
+		b.scannerBatcher.StopAndFlush(shutdownCtx)
+		b.scannerBatcher.Reset()
+	}
+	b.shutdownMu.Lock()
+	b.scannerCtx = nil
+	b.shutdownMu.Unlock()
 	for _, sub := range b.subs {
+		if sub == scannerSub {
+			continue
+		}
 		b.bus.Unsubscribe(sub)
 	}
 	logger.Info("telegram: bot stopped")
@@ -162,7 +208,37 @@ func (b *TelegramBot) subscribeEvents(ctx context.Context) {
 			}
 		}(sub, handler)
 	}
-	b.subscribeScannerEvents(ctx)
+	b.subscribeScannerPromotionOutcomes()
+}
+
+// subscribeScannerPromotionOutcomes consumes the shared committed outcome
+// contract. It is intentionally independent of MarketScanner's lifecycle so
+// after-close sources, including scheduled earnings, notify identically.
+func (b *TelegramBot) subscribeScannerPromotionOutcomes() {
+	if b.bus == nil || !scannerNotificationsEnabled(b.cfg, b.notifyOn) {
+		return
+	}
+	sub := b.bus.SubscribeLossless(events.ScannerPromotionOutcome)
+	b.subs = append(b.subs, sub)
+	b.scannerOutcomeSub = sub
+	b.wg.Add(1)
+	go func() {
+		defer b.wg.Done()
+		handle := func(ev events.Event) {
+			payload, ok := ev.Payload.(events.ScannerPromotionOutcomePayload)
+			if !ok || len(payload.Sources) == 0 {
+				return
+			}
+			if b.scannerBatcher != nil {
+				b.scannerBatcher.Add(payload)
+			} else {
+				b.sendScannerPromotionOutcome(payload)
+			}
+		}
+		for ev := range sub.C {
+			handle(ev)
+		}
+	}()
 }
 
 // scannerCycleNotifications is deliberately separate from TickBatcher. Scanner
@@ -278,8 +354,32 @@ func scannerNotificationsEnabled(cfg config.TelegramConfig, notifyOn map[string]
 }
 
 func (b *TelegramBot) sendScannerNotification(message string) {
-	if err := b.sendMessage(message, nil); err != nil {
+	b.sendScannerNotificationWithContext(b.scannerNotificationContext(), message)
+}
+
+func (b *TelegramBot) scannerNotificationContext() context.Context {
+	b.shutdownMu.RLock()
+	shutdownCtx := b.shutdownCtx
+	scannerCtx := b.scannerCtx
+	b.shutdownMu.RUnlock()
+	if shutdownCtx != nil {
+		return shutdownCtx
+	}
+	if scannerCtx != nil {
+		return scannerCtx
+	}
+	return context.Background()
+}
+
+func (b *TelegramBot) sendScannerNotificationWithContext(ctx context.Context, message string) {
+	if err := b.sendMessageCtx(ctx, message, nil); err != nil {
 		logger.Warn("telegram: send scanner notification failed", "error", err)
+	}
+}
+
+func (b *TelegramBot) sendScannerPromotionOutcome(payload events.ScannerPromotionOutcomePayload) {
+	for _, message := range splitScannerPromotionOutcome(formatScannerPromotionOutcome(payload)) {
+		b.sendScannerNotification(message)
 	}
 }
 
@@ -360,6 +460,40 @@ func formatScannerAdmission(payload events.ScannerItemAddedPayload) string {
 	return "🔍 *Scanner watchlist admission*\n" + scannerAdmissionLine(payload)
 }
 
+func formatScannerPromotionOutcome(payload events.ScannerPromotionOutcomePayload) string {
+	title := "🔍 *Scanner promotion admitted*"
+	if payload.Outcome == "rediscovered" {
+		title = "🔄 *Scanner promotion rediscovered*"
+	} else if payload.Outcome == "not_admitted" {
+		title = "⚠️ *Scanner promotion not admitted*"
+	}
+	var sb strings.Builder
+	sb.WriteString(title)
+	sb.WriteString("\n")
+	for _, source := range payload.Sources {
+		line := fmt.Sprintf("• *%s* — %s", scannerNotificationField(payload.Ticker, 32), scannerNotificationField(scannerSourceLabel(source.Source), 128))
+		if source.Rank > 0 {
+			line += fmt.Sprintf(" · rank %d", source.Rank)
+		}
+		if payload.QueueBucket != "" {
+			line += " · " + scannerNotificationField(strings.ReplaceAll(payload.QueueBucket, "_", " "), 128)
+		}
+		sb.WriteString(line)
+		if detail := scannerNotificationField(source.Evidence, 180); detail != "" {
+			sb.WriteString("\n  _" + detail + "_")
+		}
+		sb.WriteString("\n")
+	}
+	if payload.Reason != "" {
+		reason := payload.Reason
+		if payload.ReasonCode != "" {
+			reason = strings.ReplaceAll(payload.ReasonCode, "_", " ") + ": " + reason
+		}
+		sb.WriteString("_" + scannerNotificationField(reason, 300) + "_")
+	}
+	return sb.String()
+}
+
 func scannerAdmissionLine(payload events.ScannerItemAddedPayload) string {
 	line := fmt.Sprintf("• *%s* — %s",
 		scannerNotificationField(payload.Ticker, 32),
@@ -425,6 +559,8 @@ func scannerSourceLabel(source string) string {
 		return "News sympathy"
 	case "political_disclosure":
 		return "Political disclosure"
+	case "earnings_scheduled":
+		return "Scheduled earnings"
 	default:
 		return strings.ReplaceAll(source, "_", " ")
 	}

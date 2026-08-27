@@ -177,6 +177,12 @@ func cloneSwingCandidate(candidate SwingCandidate) SwingCandidate {
 			clone.SourceScores[source] = score
 		}
 	}
+	if candidate.promotionSourceRanks != nil {
+		clone.promotionSourceRanks = make(map[string]int, len(candidate.promotionSourceRanks))
+		for source, rank := range candidate.promotionSourceRanks {
+			clone.promotionSourceRanks[source] = rank
+		}
+	}
 	if candidate.sourceMarketObservations != nil {
 		clone.sourceMarketObservations = make(map[string]map[string]any, len(candidate.sourceMarketObservations))
 		for source, observation := range candidate.sourceMarketObservations {

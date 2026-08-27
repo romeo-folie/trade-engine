@@ -289,7 +289,10 @@ func markPotentIndustryPromotions(
 	}
 	limit := cfg.MaxPromotionsPerRun
 	if limit <= 0 {
-		limit = 20
+		limit = maxPromotionAttemptsPerSource
+	}
+	if limit > maxPromotionAttemptsPerSource {
+		limit = maxPromotionAttemptsPerSource
 	}
 	type rankedMember struct {
 		index       int

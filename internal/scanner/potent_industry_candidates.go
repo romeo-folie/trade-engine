@@ -56,6 +56,8 @@ func (s *MarketScanner) potentIndustryCandidates(
 			PotentIndustryGroupType:  row.GroupType,
 			PotentIndustryGroupKey:   row.GroupKey,
 			PotentIndustryClaimToken: row.PromotionClaimToken,
+			potentIndustryGroupRank:  row.GroupRank,
+			potentIndustryMemberRank: row.MemberRank,
 			PotentIndustryEvidence: fmt.Sprintf(
 				"%s %s (group rank %d, potency %.3f); member rank %d, score %.3f; 20d stock-vs-industry RS %+.1f%%",
 				row.GroupKey, row.GroupArchetype, row.GroupRank, row.GroupScore,
@@ -132,6 +134,8 @@ func mergePotentIndustryCandidates(
 		candidate.PotentIndustryGroupType = industry.PotentIndustryGroupType
 		candidate.PotentIndustryGroupKey = industry.PotentIndustryGroupKey
 		candidate.PotentIndustryClaimToken = industry.PotentIndustryClaimToken
+		candidate.potentIndustryGroupRank = industry.potentIndustryGroupRank
+		candidate.potentIndustryMemberRank = industry.potentIndustryMemberRank
 		candidate.PotentIndustryEvidence = industry.PotentIndustryEvidence
 		candidate.UniverseVersionID = industry.UniverseVersionID
 		candidate.UniverseAsOf = industry.UniverseAsOf

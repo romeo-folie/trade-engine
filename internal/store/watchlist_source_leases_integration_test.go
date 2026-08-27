@@ -379,7 +379,7 @@ func TestStaleEarningsCapacitySuppressionRollsBackCohort(t *testing.T) {
 		Version: tradeprofile.DiscoveryContextVersion, Sources: []string{"earnings_scheduled"}, Thesis: "Scheduled earnings.",
 		EvidenceBySource: map[string]json.RawMessage{"earnings_scheduled": json.RawMessage(`{"event":"earnings"}`)},
 	}
-	err = store.PublishEarningsWatchlistRun(ctx, target, staleAttempt, []store.EarningsWatchlistCandidate{{
+	_, err = store.PublishEarningsWatchlistRun(ctx, target, staleAttempt, []store.EarningsWatchlistCandidate{{
 		Ticker: candidateTicker, ContextKey: "earnings_scheduled:stale", Context: context, ExpiresAt: expiresAt,
 		ResearchQueue: &store.ResearchQueueAdmission{Capacity: 1, Bucket: "earnings_scheduled", Reservation: 1, Overflow: 0},
 	}})
@@ -395,6 +395,53 @@ func TestStaleEarningsCapacitySuppressionRollsBackCohort(t *testing.T) {
 	}
 	if contexts != 0 || decisions != 0 {
 		t.Fatalf("stale publish committed contexts=%d decisions=%d", contexts, decisions)
+	}
+}
+
+func TestEarningsPublicationAdmitsActiveManualItemWithoutQueueMembership(t *testing.T) {
+	ctx := context.Background()
+	var earningsRunsTable *string
+	if err := store.GetDB().QueryRow(ctx, `SELECT to_regclass('public.earnings_watchlist_runs')::text`).Scan(&earningsRunsTable); err != nil {
+		t.Fatalf("check earnings watchlist schema: %v", err)
+	}
+	if earningsRunsTable == nil {
+		t.Skip("earnings watchlist schema is unavailable in this integration database")
+	}
+	const ticker = "EARNINGS_MANUAL_ADMISSION_RT"
+	target := time.Date(2035, time.January, 10, 0, 0, 0, 0, time.UTC)
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), `DELETE FROM earnings_watchlist_runs WHERE target_session_date=$1::date`, target)
+		_, _ = store.GetDB().Exec(context.Background(), "DELETE FROM watchlist WHERE ticker=$1", ticker)
+	})
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	expiresAt := now.Add(24 * time.Hour)
+	if err := store.AddWatchlistItem(ctx, store.WatchlistItem{
+		Ticker: ticker, Platform: "stock", Source: "manual", Active: true,
+		Strategies: []string{"momentum"}, Timeframes: []string{"4H"},
+	}); err != nil {
+		t.Fatalf("add manual item: %v", err)
+	}
+	var baselineMemberships int
+	if err := store.GetDB().QueryRow(ctx, `SELECT COUNT(*) FROM research_queue_memberships`).Scan(&baselineMemberships); err != nil {
+		t.Fatalf("count queue memberships: %v", err)
+	}
+	attemptID, claimed, err := store.ClaimEarningsWatchlistRun(ctx, target, now)
+	if err != nil || !claimed {
+		t.Fatalf("claim attempt=%q claimed=%v err=%v", attemptID, claimed, err)
+	}
+	discovery := tradeprofile.DiscoveryContext{
+		Version: tradeprofile.DiscoveryContextVersion, Sources: []string{"earnings_scheduled"}, Thesis: "Scheduled earnings.",
+		EvidenceBySource: map[string]json.RawMessage{"earnings_scheduled": json.RawMessage(`{"event":"earnings"}`)},
+	}
+	publications, err := store.PublishEarningsWatchlistRun(ctx, target, attemptID, []store.EarningsWatchlistCandidate{{
+		Ticker: ticker, ContextKey: "earnings_scheduled:manual", Context: discovery, ExpiresAt: expiresAt,
+		ResearchQueue: &store.ResearchQueueAdmission{Capacity: baselineMemberships + 1, Bucket: "earnings_scheduled", Reservation: baselineMemberships + 1, Overflow: 0},
+	}})
+	if err != nil {
+		t.Fatalf("publish earnings watchlist run: %v", err)
+	}
+	if len(publications) != 1 || publications[0].Disposition != "admitted" {
+		t.Fatalf("publications=%+v, want one admitted publication", publications)
 	}
 }
 
@@ -438,7 +485,7 @@ func TestEarningsCapacitySuppressionPreservesLiquidityOrderAndRollsBackCohort(t 
 			Reservation: baselineMemberships + 1, Overflow: 0, Priority: priority,
 		}
 	}
-	err = store.PublishEarningsWatchlistRun(ctx, target, attemptID, []store.EarningsWatchlistCandidate{
+	_, err = store.PublishEarningsWatchlistRun(ctx, target, attemptID, []store.EarningsWatchlistCandidate{
 		// The feeder supplies liquidity order. Canonical lock order must not
 		// change it, so this first Z ticker claims the final slot and A is the
 		// durable capacity suppression.

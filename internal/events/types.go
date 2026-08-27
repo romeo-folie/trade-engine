@@ -45,6 +45,11 @@ const (
 	// lease receives materially new evidence. Retried or duplicate evidence does
 	// not emit this event.
 	ScannerItemRediscovered Type = "scanner.item_rediscovered"
+	// ScannerPromotionOutcome is emitted after a scanner source's selected
+	// promotion attempt has committed or reached a terminal admission outcome.
+	// Unlike the legacy scanner lifecycle events, it is shared by post-session
+	// producers such as the scheduled-earnings feeder.
+	ScannerPromotionOutcome Type = "scanner.promotion_outcome"
 )
 
 // Event is the envelope delivered to subscribers.
@@ -365,4 +370,26 @@ type ScannerItemRediscoveredPayload struct {
 	ScanID         string                            `json:"scan_id"`
 	Ticker         string                            `json:"ticker"`
 	ChangedSources []ScannerSourceLeaseChangePayload `json:"changed_sources"`
+}
+
+// ScannerPromotionSourcePayload carries source-local ranking and deterministic
+// evidence. Multiple source entries may describe one merged ticker attempt.
+type ScannerPromotionSourcePayload struct {
+	Source   string `json:"source"`
+	Rank     int    `json:"rank"`
+	Evidence string `json:"evidence,omitempty"`
+}
+
+// ScannerPromotionOutcomePayload describes a committed scanner-promotion
+// outcome. Outcome is admitted, rediscovered, or not_admitted; ReasonCode is
+// stable operator-facing classification such as queue_capacity,
+// active_duplicate, or persistence_error.
+type ScannerPromotionOutcomePayload struct {
+	RunID       string                          `json:"run_id,omitempty"`
+	Ticker      string                          `json:"ticker"`
+	Outcome     string                          `json:"outcome"`
+	Sources     []ScannerPromotionSourcePayload `json:"sources"`
+	QueueBucket string                          `json:"queue_bucket,omitempty"`
+	ReasonCode  string                          `json:"reason_code,omitempty"`
+	Reason      string                          `json:"reason,omitempty"`
 }

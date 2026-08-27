@@ -963,7 +963,7 @@ scanner:
   weekly_leader:
     enabled: false                         # Full-universe after-close leadership lens; default off
     promote_candidates: false              # When true, qualified leaders enter the normal LLM/watchlist gate
-    max_promotions_per_run: 20             # Bound qualified names sent through the paid LLM gate
+    max_promotions_per_run: 5              # Compatibility setting; no source may attempt more than five promotions
     after_close_delay_minutes: 15          # Minimum delay; shared universe delay must be at least this long
     universe_max_age_hours: 36             # Maximum age of the completed point-in-time universe
     history_calendar_days: 420             # Fetch window supporting 253 sessions plus weekends, holidays, and buffer
@@ -980,7 +980,7 @@ scanner:
   potent_industry:
     enabled: false                         # Full-universe industry-rotation lens; default off
     promote_candidates: false              # Add top members to normal scanner scoring; keep false for observation only
-    max_promotions_per_run: 20             # Global promotion cap; excluded from scoring-history compatibility
+    max_promotions_per_run: 5              # Compatibility setting; no source may attempt more than five promotions
     after_close_delay_minutes: 15          # Minimum delay; shared universe delay must be at least this long
     universe_max_age_hours: 36             # Maximum age of the immutable universe snapshot
     taxonomy_max_age_hours: 168            # Maximum age of taxonomy used to form a group
@@ -1024,7 +1024,7 @@ scanner:
     history_sessions: 20                   # Same-clock premarket volume sessions used by RVOL
     news_lookback_hours: 24                # Catalyst freshness window ending at the checkpoint
     max_candidates_per_run: 50             # Detailed-evidence shortlist cap
-    max_promotions_per_run: 10             # Paid LLM/watchlist funnel cap
+    max_promotions_per_run: 5              # Compatibility setting; no source may attempt more than five promotions
     min_gap_pct: 3.0                       # Absolute premarket gap from completed prior close
     min_premarket_volume: 100000            # Consolidated shares through the checkpoint
     min_time_adjusted_rvol: 2.0            # Same-clock volume / historical same-clock median

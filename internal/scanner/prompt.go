@@ -33,14 +33,18 @@ type SwingCandidate struct {
 	Sources                    []string // includes mover, active, graph, weekly, industry, and premarket sources
 	// SourceScores retains each discovery source's independent score, including
 	// an explicit zero. It is evidence/lineage rather than an aggregate rank.
-	SourceScores     map[string]float64
-	UniverseMember   *bool
-	Sector           string
-	Industry         string
-	TaxonomyStatus   string
-	TaxonomyAsOf     *time.Time
-	TaxonomyProvider string
-	TaxonomyEvidence json.RawMessage
+	SourceScores map[string]float64
+	// promotionSourceRanks is assigned by the source-local promotion selector.
+	// It is intentionally transient: ranks are audit/notification metadata for
+	// this run, not durable candidate state.
+	promotionSourceRanks map[string]int
+	UniverseMember       *bool
+	Sector               string
+	Industry             string
+	TaxonomyStatus       string
+	TaxonomyAsOf         *time.Time
+	TaxonomyProvider     string
+	TaxonomyEvidence     json.RawMessage
 	// promotionTaxonomyExcluded means this candidate's source taxonomy was not
 	// present in the scanner run's selected universe. Keep the source evidence
 	// for audit/prompting, but do not use it for this run's cap.
@@ -62,6 +66,11 @@ type SwingCandidate struct {
 	PotentIndustryGroupKey   string
 	PotentIndustryClaimToken string
 	PotentIndustryEvidence   string
+	// Potent-industry attempts are selected in group/member ranking order, not
+	// by member score alone. These transient values keep the shared source cap
+	// and operator outcome ranks aligned with that source's durable ordering.
+	potentIndustryGroupRank  int
+	potentIndustryMemberRank int
 	potentIndustryFallback   *SwingCandidate
 	potentIndustrySource     *SwingCandidate
 	// PremarketEpisodic lineage token-fences a consolidated, catalyst-aware

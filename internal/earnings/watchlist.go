@@ -3,6 +3,7 @@ package earnings
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -12,6 +13,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/engine"
+	"github.com/romeo-folie/trade-engine/internal/events"
 	"github.com/romeo-folie/trade-engine/internal/store"
 	"github.com/romeo-folie/trade-engine/internal/tradeprofile"
 )
@@ -28,6 +30,7 @@ type WatchlistFeeder struct {
 	Cfg           config.EarningsWatchlistConfig
 	ResearchQueue config.ResearchQueueConfig
 	Now           func() time.Time
+	Bus           interface{ Publish(events.Type, any) }
 }
 
 type rankedRelease struct {
@@ -153,6 +156,9 @@ func (f *WatchlistFeeder) RunSession(ctx context.Context, completed engine.USMar
 	}
 	ranked := rankReleases(unique, barResult.Bars)
 	cap := f.Cfg.CandidateCap
+	if cap > 5 {
+		cap = 5
+	}
 	if cap > len(ranked) {
 		cap = len(ranked)
 	}
@@ -183,8 +189,27 @@ func (f *WatchlistFeeder) RunSession(ctx context.Context, completed engine.USMar
 		})
 	}
 	stage = "publish"
-	if err := store.PublishEarningsWatchlistRun(ctx, target.Date, attemptID, candidates); err != nil {
+	publications, err := store.PublishEarningsWatchlistRun(ctx, target.Date, attemptID, candidates)
+	if err != nil {
+		reasonCode := "persistence_error"
+		if errors.Is(err, store.ErrResearchQueueCapacity) {
+			reasonCode = "queue_capacity"
+		}
+		for _, candidate := range candidates {
+			f.publishPromotionOutcome(attemptID, candidate, "not_admitted", reasonCode, err.Error())
+		}
 		return err
+	}
+	dispositions := make(map[string]string, len(publications))
+	for _, publication := range publications {
+		dispositions[strings.ToUpper(strings.TrimSpace(publication.Ticker))] = publication.Disposition
+	}
+	for _, candidate := range candidates {
+		outcome := "admitted"
+		if dispositions[strings.ToUpper(strings.TrimSpace(candidate.Ticker))] == "rediscovered" {
+			outcome = "rediscovered"
+		}
+		f.publishPromotionOutcome(attemptID, candidate, outcome, "", "")
 	}
 	slog.Info("earnings watchlist run published",
 		"target_session_date", target.Date.Format("2006-01-02"),
@@ -193,6 +218,22 @@ func (f *WatchlistFeeder) RunSession(ctx context.Context, completed engine.USMar
 		"expires_at", expires,
 	)
 	return nil
+}
+
+func (f *WatchlistFeeder) publishPromotionOutcome(
+	runID string, candidate store.EarningsWatchlistCandidate, outcome, reasonCode, reason string,
+) {
+	if f.Bus == nil {
+		return
+	}
+	f.Bus.Publish(events.ScannerPromotionOutcome, events.ScannerPromotionOutcomePayload{
+		RunID: runID, Ticker: candidate.Ticker, Outcome: outcome,
+		QueueBucket: "earnings_scheduled", ReasonCode: reasonCode, Reason: reason,
+		Sources: []events.ScannerPromotionSourcePayload{{
+			Source: "earnings_scheduled", Rank: candidate.LiquidityRank,
+			Evidence: fmt.Sprintf("scheduled earnings; liquidity rank %d; median dollar volume %.0f", candidate.LiquidityRank, candidate.MedianDollarVolume),
+		}},
+	})
 }
 
 func nextSessionReleases(releases []data.EarningsRelease, target time.Time) []data.EarningsRelease {

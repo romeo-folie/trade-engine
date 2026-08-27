@@ -148,7 +148,7 @@ func TestDefaultsWeeklyLeaderDisabled(t *testing.T) {
 		t.Fatal("weekly leader discovery and promotion must default off")
 	}
 	if leader.AfterCloseDelayMinutes != 15 ||
-		leader.MaxPromotionsPerRun != 20 ||
+		leader.MaxPromotionsPerRun != 5 ||
 		leader.UniverseMaxAgeHours != 36 ||
 		leader.HistoryCalendarDays != 420 ||
 		leader.MinHistorySessions != 253 ||

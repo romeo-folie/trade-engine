@@ -86,6 +86,34 @@ func TestSubscribeLosslessRetainsLifecycleBurst(t *testing.T) {
 	}
 }
 
+func TestDrainAndUnsubscribeDeliversAcceptedLosslessEvents(t *testing.T) {
+	bus := New()
+	sub := bus.SubscribeLossless(ScannerItemAdded)
+	const count = DefaultBufferSize + 32
+	for i := 0; i < count; i++ {
+		bus.Publish(ScannerItemAdded, ScannerItemAddedPayload{Ticker: "BURST"})
+	}
+
+	received := make(chan int, 1)
+	go func() {
+		seen := 0
+		for range sub.C {
+			seen++
+		}
+		received <- seen
+	}()
+	bus.DrainAndUnsubscribe(sub)
+
+	select {
+	case seen := <-received:
+		if seen != count {
+			t.Fatalf("received=%d, want %d accepted events", seen, count)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("lossless drain did not close after delivery")
+	}
+}
+
 func TestSubscriberCountCountsMultiTypeSubscriptionOnce(t *testing.T) {
 	bus := New()
 	scanner := bus.SubscribeLossless(ScanStarted, ScannerItemAdded, ScanCompleted)
