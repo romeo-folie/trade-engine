@@ -26,6 +26,7 @@ type Subscription struct {
 	lossless       bool
 	pendingMu      sync.Mutex
 	pending        []Event
+	draining       bool
 	wake           chan struct{}
 	done           chan struct{}
 	dispatcherDone chan struct{}
@@ -101,7 +102,12 @@ func (s *Subscription) dispatchLossless() {
 		for {
 			s.pendingMu.Lock()
 			if len(s.pending) == 0 {
+				draining := s.draining
 				s.pendingMu.Unlock()
+				if draining {
+					close(s.ch)
+					return
+				}
 				break
 			}
 			ev := s.pending[0]
@@ -114,6 +120,16 @@ func (s *Subscription) dispatchLossless() {
 			case s.ch <- ev:
 			}
 		}
+	}
+}
+
+func (s *Subscription) beginLosslessDrain() {
+	s.pendingMu.Lock()
+	s.draining = true
+	s.pendingMu.Unlock()
+	select {
+	case s.wake <- struct{}{}:
+	default:
 	}
 }
 
@@ -136,8 +152,31 @@ func (b *Bus) SubscribeAll() *Subscription {
 // Unsubscribe removes a subscription and closes its channel.
 func (b *Bus) Unsubscribe(sub *Subscription) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
+	b.removeSubscriptionLocked(sub)
+	b.mu.Unlock()
+	if sub.lossless {
+		close(sub.done)
+		<-sub.dispatcherDone
+	}
+	close(sub.ch)
+}
 
+// DrainAndUnsubscribe stops accepting new publishes, then closes a lossless
+// subscription only after its dispatcher has delivered every event it already
+// accepted. The subscriber must continue reading C until it closes.
+func (b *Bus) DrainAndUnsubscribe(sub *Subscription) {
+	if !sub.lossless {
+		b.Unsubscribe(sub)
+		return
+	}
+	b.mu.Lock()
+	b.removeSubscriptionLocked(sub)
+	b.mu.Unlock()
+	sub.beginLosslessDrain()
+	<-sub.dispatcherDone
+}
+
+func (b *Bus) removeSubscriptionLocked(sub *Subscription) {
 	for _, evType := range sub.evTypes {
 		subs := b.subs[evType]
 		for i, s := range subs {
@@ -147,11 +186,6 @@ func (b *Bus) Unsubscribe(sub *Subscription) {
 			}
 		}
 	}
-	if sub.lossless {
-		close(sub.done)
-		<-sub.dispatcherDone
-	}
-	close(sub.ch)
 }
 
 // Publish sends an event to all subscribers of its type and all wildcard subscribers.

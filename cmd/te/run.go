@@ -938,6 +938,19 @@ Modes:
 			fmt.Printf("🌐 Web UI: http://localhost:%s\n", runWebPort)
 		}
 
+		// Promotion outcomes are consumed by Telegram during shutdown. Keep the
+		// scanner and earnings publisher goroutines joined until after the engine
+		// context is cancelled, so Telegram can drain every outcome they emit
+		// before its lossless subscription is detached.
+		var promotionPublisherWG sync.WaitGroup
+		// This defer also covers startup failures after a publisher has started.
+		// It is registered after Telegram's Stop defer, so publishers are joined
+		// before that subscriber begins its final drain.
+		defer func() {
+			cancel()
+			promotionPublisherWG.Wait()
+		}()
+
 		// Start autonomous market scanner if enabled (non-ORB modes only).
 		if cfg.Scanner.Enabled {
 			alpacaClient, ok := marketProvider.(*data.AlpacaClient)
@@ -1055,7 +1068,9 @@ Modes:
 				} else if cfg.Scanner.PremarketEpisodic.Enabled {
 					logger.Warn("premarket episodic scanner requested but DB not connected; skipping startup")
 				}
+				promotionPublisherWG.Add(1)
 				go func() {
+					defer promotionPublisherWG.Done()
 					if err := mscanner.Run(ctx); err != nil && err != context.Canceled {
 						logger.Warn("market scanner stopped with error", "err", err.Error())
 					}
@@ -1092,7 +1107,9 @@ Modes:
 					Bus:           eng.Bus(),
 				}
 				scheduler := &earnings.WatchlistScheduler{Cfg: cfg.Scanner.EarningsWatchlist, Job: feeder}
+				promotionPublisherWG.Add(1)
 				go func() {
+					defer promotionPublisherWG.Done()
 					if err := scheduler.Run(ctx); err != nil && err != context.Canceled {
 						logger.Warn("earnings watchlist feeder stopped", "err", err.Error())
 					}
@@ -1199,8 +1216,9 @@ Modes:
 			}
 		}
 
-		if err := eng.Run(ctx); err != nil {
-			return err
+		runErr := eng.Run(ctx)
+		if runErr != nil {
+			return runErr
 		}
 		fmt.Println("TradeEngine stopped.")
 		return nil

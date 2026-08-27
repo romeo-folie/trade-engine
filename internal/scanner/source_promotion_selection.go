@@ -52,6 +52,15 @@ func selectSourcePromotionCandidates(candidates []SwingCandidate) ([]SwingCandid
 	var excluded []sourcePromotionExclusion
 	for source, facets := range bySource {
 		sort.SliceStable(facets, func(i, j int) bool {
+			if source == "potent_industry" {
+				left, right := candidates[facets[i].candidate], candidates[facets[j].candidate]
+				if left.potentIndustryGroupRank != right.potentIndustryGroupRank {
+					return left.potentIndustryGroupRank < right.potentIndustryGroupRank
+				}
+				if left.potentIndustryMemberRank != right.potentIndustryMemberRank {
+					return left.potentIndustryMemberRank < right.potentIndustryMemberRank
+				}
+			}
 			left, right := promotionScore(facets[i].score), promotionScore(facets[j].score)
 			if left != right {
 				return left > right
@@ -119,6 +128,7 @@ func retainPromotionSources(candidate SwingCandidate, ranks map[string]int) Swin
 	if _, ok := ranks["potent_industry"]; !ok {
 		clone.PotentIndustryRunID, clone.PotentIndustryGroupType, clone.PotentIndustryGroupKey = "", "", ""
 		clone.PotentIndustryClaimToken, clone.PotentIndustryEvidence = "", ""
+		clone.potentIndustryGroupRank, clone.potentIndustryMemberRank = 0, 0
 	}
 	if _, ok := ranks["premarket_episodic"]; !ok {
 		clone.PremarketEpisodicRunID, clone.PremarketEpisodicClaimToken, clone.PremarketEpisodicEvidence = "", "", ""
@@ -127,10 +137,11 @@ func retainPromotionSources(candidate SwingCandidate, ranks map[string]int) Swin
 		clone.PoliticalDisclosureClaimToken, clone.PoliticalDisclosureEvidence = "", ""
 		clone.PoliticalDisclosureClaimReportIDs, clone.PoliticalDisclosureFacts = nil, nil
 	}
-	if _, graphSelected := ranks["graph_neighbor"]; !graphSelected {
-		if _, sympathySelected := ranks["news_sympathy"]; sympathySelected {
-			return clone
-		}
+	if _, sympathySelected := ranks["news_sympathy"]; sympathySelected {
+		clone.GraphContext = sourceGraphContext(candidate, "news_sympathy")
+	} else if _, graphSelected := ranks["graph_neighbor"]; graphSelected {
+		clone.GraphContext = sourceGraphContext(candidate, "graph_neighbor")
+	} else {
 		clone.GraphContext = ""
 	}
 	return clone

@@ -66,6 +66,11 @@ type SwingCandidate struct {
 	PotentIndustryGroupKey   string
 	PotentIndustryClaimToken string
 	PotentIndustryEvidence   string
+	// Potent-industry attempts are selected in group/member ranking order, not
+	// by member score alone. These transient values keep the shared source cap
+	// and operator outcome ranks aligned with that source's durable ordering.
+	potentIndustryGroupRank  int
+	potentIndustryMemberRank int
 	potentIndustryFallback   *SwingCandidate
 	potentIndustrySource     *SwingCandidate
 	// PremarketEpisodic lineage token-fences a consolidated, catalyst-aware

@@ -32,6 +32,8 @@ const (
 	retryDelay = 2 * time.Second
 )
 
+var scannerShutdownFlushTimeout = 5 * time.Second
+
 // CallbackHandler processes inline button callbacks.
 // Returns a response text to send back to the user.
 type CallbackHandler func(ctx context.Context, signalID, action string) (string, error)
@@ -47,8 +49,14 @@ type TelegramBot struct {
 	bus      *events.Bus
 	subs     []*events.Subscription
 
-	batcher         *TickBatcher
-	callbackHandler CallbackHandler
+	batcher           *TickBatcher
+	scannerBatcher    *scannerPromotionOutcomeBatcher
+	scannerOutcomeSub *events.Subscription
+	callbackHandler   CallbackHandler
+	shutdownMu        sync.RWMutex
+	shutdownCtx       context.Context
+	scannerCtx        context.Context
+	scannerCancel     context.CancelFunc
 
 	client *http.Client
 	ctx    context.Context
@@ -75,6 +83,9 @@ func NewTelegramBot(cfg config.TelegramConfig, bus *events.Bus) *TelegramBot {
 		bot.batcher = NewTickBatcher(cfg, func(text string) error {
 			return bot.sendMessage(text, nil)
 		})
+		bot.scannerBatcher = newScannerPromotionOutcomeBatcher(
+			cfg, bot.sendScannerNotificationWithContext, bot.scannerNotificationContext,
+		)
 	}
 	return bot
 }
@@ -96,6 +107,12 @@ func (b *TelegramBot) SetCallbackHandler(h CallbackHandler) {
 func (b *TelegramBot) Start(ctx context.Context) error {
 	ctx, b.cancel = context.WithCancel(ctx)
 	b.ctx = ctx
+	scannerCtx, scannerCancel := context.WithCancel(context.Background())
+	b.shutdownMu.Lock()
+	b.shutdownCtx = nil
+	b.scannerCtx = scannerCtx
+	b.scannerCancel = scannerCancel
+	b.shutdownMu.Unlock()
 
 	// Send startup message.
 	if err := b.sendMessage("🟢 *TradeEngine online*\nMode: notifications active", nil); err != nil {
@@ -114,11 +131,35 @@ func (b *TelegramBot) Start(ctx context.Context) error {
 
 // Stop gracefully shuts down the bot.
 func (b *TelegramBot) Stop() {
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), scannerShutdownFlushTimeout)
+	b.shutdownMu.Lock()
+	b.shutdownCtx = shutdownCtx
+	b.shutdownMu.Unlock()
+	defer shutdownCancel()
 	if b.cancel != nil {
 		b.cancel()
 	}
+	scannerSub := b.scannerOutcomeSub
+	if scannerSub != nil {
+		b.bus.DrainAndUnsubscribe(scannerSub)
+		b.scannerOutcomeSub = nil
+	}
 	b.wg.Wait()
+	if b.scannerBatcher != nil {
+		b.scannerBatcher.StopAndFlush(shutdownCtx)
+		b.scannerBatcher.Reset()
+	}
+	b.shutdownMu.Lock()
+	if b.scannerCancel != nil {
+		b.scannerCancel()
+		b.scannerCancel = nil
+	}
+	b.scannerCtx = nil
+	b.shutdownMu.Unlock()
 	for _, sub := range b.subs {
+		if sub == scannerSub {
+			continue
+		}
 		b.bus.Unsubscribe(sub)
 	}
 	logger.Info("telegram: bot stopped")
@@ -162,35 +203,35 @@ func (b *TelegramBot) subscribeEvents(ctx context.Context) {
 			}
 		}(sub, handler)
 	}
-	b.subscribeScannerPromotionOutcomes(ctx)
+	b.subscribeScannerPromotionOutcomes()
 }
 
 // subscribeScannerPromotionOutcomes consumes the shared committed outcome
 // contract. It is intentionally independent of MarketScanner's lifecycle so
 // after-close sources, including scheduled earnings, notify identically.
-func (b *TelegramBot) subscribeScannerPromotionOutcomes(ctx context.Context) {
+func (b *TelegramBot) subscribeScannerPromotionOutcomes() {
 	if b.bus == nil || !scannerNotificationsEnabled(b.cfg, b.notifyOn) {
 		return
 	}
 	sub := b.bus.SubscribeLossless(events.ScannerPromotionOutcome)
 	b.subs = append(b.subs, sub)
+	b.scannerOutcomeSub = sub
 	b.wg.Add(1)
 	go func() {
 		defer b.wg.Done()
-		for {
-			select {
-			case <-ctx.Done():
+		handle := func(ev events.Event) {
+			payload, ok := ev.Payload.(events.ScannerPromotionOutcomePayload)
+			if !ok || len(payload.Sources) == 0 {
 				return
-			case ev, ok := <-sub.C:
-				if !ok {
-					return
-				}
-				payload, ok := ev.Payload.(events.ScannerPromotionOutcomePayload)
-				if !ok || len(payload.Sources) == 0 {
-					continue
-				}
-				b.sendScannerNotification(formatScannerPromotionOutcome(payload))
 			}
+			if b.scannerBatcher != nil {
+				b.scannerBatcher.Add(payload)
+			} else {
+				b.sendScannerPromotionOutcome(payload)
+			}
+		}
+		for ev := range sub.C {
+			handle(ev)
 		}
 	}()
 }
@@ -308,8 +349,32 @@ func scannerNotificationsEnabled(cfg config.TelegramConfig, notifyOn map[string]
 }
 
 func (b *TelegramBot) sendScannerNotification(message string) {
-	if err := b.sendMessage(message, nil); err != nil {
+	b.sendScannerNotificationWithContext(b.scannerNotificationContext(), message)
+}
+
+func (b *TelegramBot) scannerNotificationContext() context.Context {
+	b.shutdownMu.RLock()
+	shutdownCtx := b.shutdownCtx
+	scannerCtx := b.scannerCtx
+	b.shutdownMu.RUnlock()
+	if shutdownCtx != nil {
+		return shutdownCtx
+	}
+	if scannerCtx != nil {
+		return scannerCtx
+	}
+	return context.Background()
+}
+
+func (b *TelegramBot) sendScannerNotificationWithContext(ctx context.Context, message string) {
+	if err := b.sendMessageCtx(ctx, message, nil); err != nil {
 		logger.Warn("telegram: send scanner notification failed", "error", err)
+	}
+}
+
+func (b *TelegramBot) sendScannerPromotionOutcome(payload events.ScannerPromotionOutcomePayload) {
+	for _, message := range splitScannerPromotionOutcome(formatScannerPromotionOutcome(payload)) {
+		b.sendScannerNotification(message)
 	}
 }
 

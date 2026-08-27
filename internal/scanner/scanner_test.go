@@ -11,9 +11,23 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/analysis"
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
+	"github.com/romeo-folie/trade-engine/internal/events"
 	"github.com/romeo-folie/trade-engine/internal/store"
 	"github.com/romeo-folie/trade-engine/internal/tradeprofile"
 )
+
+type capturedScannerEvents struct {
+	payloads []events.ScannerPromotionOutcomePayload
+}
+
+func (b *capturedScannerEvents) Publish(evType events.Type, payload any) {
+	if evType != events.ScannerPromotionOutcome {
+		return
+	}
+	if outcome, ok := payload.(events.ScannerPromotionOutcomePayload); ok {
+		b.payloads = append(b.payloads, outcome)
+	}
+}
 
 func TestCandidateTTLDaysUsesSourcePolicy(t *testing.T) {
 	scanner := &MarketScanner{Cfg: config.ScannerConfig{
@@ -228,5 +242,67 @@ func TestScannerDiscoveryNewsRestoresPersistedNews(t *testing.T) {
 	restoreActiveRefreshNews(&candidate, store.WatchlistItem{DiscoveryContext: discovery})
 	if len(candidate.News) != 1 || candidate.News[0].Headline != "Prior catalyst" {
 		t.Fatalf("provider-disabled refresh lost persisted news: %#v", candidate.News)
+	}
+}
+
+func TestPublishRemovedPromotionOutcomesReportsEachSelectedDuplicate(t *testing.T) {
+	bus := &capturedScannerEvents{}
+	scanner := &MarketScanner{Bus: bus}
+	before := []SwingCandidate{
+		{Ticker: "HELD", Sources: []string{"mover"}, promotionSourceRanks: map[string]int{"mover": 1}},
+		{Ticker: "KEEP", Sources: []string{"active"}, promotionSourceRanks: map[string]int{"active": 1}},
+	}
+	scanner.publishRemovedPromotionOutcomes(
+		"scan-1", before, before[1:], "open_position", "ticker already has an open position",
+	)
+	if len(bus.payloads) != 1 {
+		t.Fatalf("outcomes=%+v, want one duplicate outcome", bus.payloads)
+	}
+	outcome := bus.payloads[0]
+	if outcome.Ticker != "HELD" || outcome.Outcome != "not_admitted" ||
+		outcome.ReasonCode != "open_position" || len(outcome.Sources) != 1 ||
+		outcome.Sources[0].Rank != 1 {
+		t.Fatalf("duplicate outcome=%+v", outcome)
+	}
+}
+
+func TestPublishPromotionClaimLossOutcomeIsSourceScoped(t *testing.T) {
+	bus := &capturedScannerEvents{}
+	scanner := &MarketScanner{Bus: bus}
+	candidate := SwingCandidate{
+		Ticker: "MERGED", Sources: []string{"mover", "weekly_leader"},
+		SourceScores:         map[string]float64{"mover": .9, "weekly_leader": .8},
+		promotionSourceRanks: map[string]int{"mover": 1, "weekly_leader": 2},
+	}
+	scanner.publishPromotionClaimLossOutcome("scan-1", candidate, "weekly_leader", store.ErrScannerSourcePromotionClaimLost)
+	if len(bus.payloads) != 1 {
+		t.Fatalf("outcomes=%+v, want one claim-loss outcome", bus.payloads)
+	}
+	outcome := bus.payloads[0]
+	if outcome.ReasonCode != "source_claim_lost" || len(outcome.Sources) != 1 ||
+		outcome.Sources[0].Source != "weekly_leader" || outcome.Sources[0].Rank != 2 {
+		t.Fatalf("claim-loss outcome=%+v", outcome)
+	}
+}
+
+func TestPromotionClaimLossFallbackRequiresRemainingSelectedSource(t *testing.T) {
+	ordinary := SwingCandidate{Ticker: "MERGED", Sources: []string{"mover"}}
+	candidate := SwingCandidate{
+		Ticker:                 "MERGED",
+		Sources:                []string{"mover", "weekly_leader"},
+		WeeklyLeaderRunID:      "weekly-run",
+		WeeklyLeaderClaimToken: "weekly-token",
+		weeklyLeaderFallback:   &ordinary,
+		promotionSourceRanks:   map[string]int{"mover": 1, "weekly_leader": 2},
+	}
+	fallback, ok := promotionClaimLossFallback(candidate, "weekly_leader")
+	if !ok || len(fallback.Sources) != 1 || fallback.Sources[0] != "mover" {
+		t.Fatalf("fallback=%+v, ok=%t; want selected mover fallback", fallback, ok)
+	}
+	if _, ok := promotionClaimLossFallback(SwingCandidate{
+		Ticker: "ONLY", Sources: []string{"weekly_leader"},
+		promotionSourceRanks: map[string]int{"weekly_leader": 1},
+	}, "weekly_leader"); ok {
+		t.Fatal("single-source claim loss must not produce a fallback")
 	}
 }

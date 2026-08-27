@@ -72,3 +72,48 @@ func TestSelectSourcePromotionCandidatesKeepsFewerThanFive(t *testing.T) {
 		t.Fatalf("stable rank selection=%+v", selected)
 	}
 }
+
+func TestSelectSourcePromotionCandidatesPreservesPotentIndustrySourceOrder(t *testing.T) {
+	selected, excluded := selectSourcePromotionCandidates([]SwingCandidate{
+		{
+			Ticker: "GROUP_TWO", Sources: []string{"potent_industry"},
+			SourceScores:            map[string]float64{"potent_industry": .99},
+			potentIndustryGroupRank: 2, potentIndustryMemberRank: 1,
+		},
+		{
+			Ticker: "GROUP_ONE", Sources: []string{"potent_industry"},
+			SourceScores:            map[string]float64{"potent_industry": .10},
+			potentIndustryGroupRank: 1, potentIndustryMemberRank: 2,
+		},
+	})
+	if len(excluded) != 0 || len(selected) != 2 {
+		t.Fatalf("selected/excluded=%d/%d, want 2/0", len(selected), len(excluded))
+	}
+	for _, candidate := range selected {
+		want := 2
+		if candidate.Ticker == "GROUP_ONE" {
+			want = 1
+		}
+		if got := candidate.promotionSourceRanks["potent_industry"]; got != want {
+			t.Fatalf("%s potent-industry rank=%d, want %d", candidate.Ticker, got, want)
+		}
+	}
+}
+
+func TestRetainPromotionSourcesUsesTheSelectedGraphFacetContext(t *testing.T) {
+	candidate := SwingCandidate{
+		Ticker: "OVERLAP", Sources: []string{"news_sympathy", "graph_neighbor"},
+		GraphContext: "sympathy context",
+		sourceGraphContexts: map[string]string{
+			"news_sympathy":  "sympathy context",
+			"graph_neighbor": "graph context",
+		},
+	}
+	retained := retainPromotionSources(candidate, map[string]int{"graph_neighbor": 1})
+	if retained.GraphContext != "graph context" {
+		t.Fatalf("retained graph context=%q, want graph context", retained.GraphContext)
+	}
+	if len(retained.Sources) != 1 || retained.Sources[0] != "graph_neighbor" {
+		t.Fatalf("retained sources=%v, want graph_neighbor", retained.Sources)
+	}
+}

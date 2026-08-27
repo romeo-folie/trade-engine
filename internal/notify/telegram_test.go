@@ -271,7 +271,7 @@ func TestScannerPromotionOutcomesNotifyWithoutLifecycleFence(t *testing.T) {
 	bus := events.New()
 	bot := NewTelegramBot(config.TelegramConfig{
 		Enabled: true, BotToken: "test-token", ChatID: "123",
-		NotifyOn: []string{"scanner"}, BatchEnabled: true,
+		NotifyOn: []string{"scanner"}, BatchEnabled: false,
 	}, bus)
 	bot.apiBase = srv.URL + "/bot"
 	ctx, cancel := context.WithCancel(context.Background())
@@ -297,6 +297,92 @@ func TestScannerPromotionOutcomesNotifyWithoutLifecycleFence(t *testing.T) {
 		if !strings.Contains(text, want) {
 			t.Fatalf("scanner batch missing %q:\n%s", want, text)
 		}
+	}
+}
+
+func TestTelegramBotStopFlushesPendingScannerPromotionOutcomes(t *testing.T) {
+	srv, msgs := captureServer(t)
+	defer srv.Close()
+
+	bus := events.New()
+	bot := NewTelegramBot(config.TelegramConfig{
+		Enabled: true, BotToken: "test-token", ChatID: "123",
+		NotifyOn: []string{"scanner"}, BatchEnabled: true,
+		BatchWindowSec: 60, MaxItemsPerBatch: 10,
+	}, bus)
+	bot.apiBase = srv.URL + "/bot"
+	if err := bot.Start(context.Background()); err != nil {
+		t.Fatalf("start bot: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	startCount := msgs.Len()
+	bus.Publish(events.ScannerPromotionOutcome, events.ScannerPromotionOutcomePayload{
+		Ticker: "NVDA", Outcome: "admitted",
+		Sources: []events.ScannerPromotionSourcePayload{{Source: "mover", Rank: 1}},
+	})
+	time.Sleep(100 * time.Millisecond)
+	bot.Stop()
+	if got := msgs.Len(); got != startCount+1 {
+		t.Fatalf("scanner messages=%d, want 1 flush on stop", got-startCount)
+	}
+}
+
+func TestTelegramBotDeliversScannerBatchAfterParentCancellation(t *testing.T) {
+	srv, msgs := captureServer(t)
+	defer srv.Close()
+
+	bus := events.New()
+	bot := NewTelegramBot(config.TelegramConfig{
+		Enabled: true, BotToken: "test-token", ChatID: "123",
+		NotifyOn: []string{"scanner"}, BatchEnabled: true,
+		BatchWindowSec: 60, MaxItemsPerBatch: 1,
+	}, bus)
+	bot.apiBase = srv.URL + "/bot"
+	parent, cancel := context.WithCancel(context.Background())
+	if err := bot.Start(parent); err != nil {
+		t.Fatalf("start bot: %v", err)
+	}
+	defer bot.Stop()
+	time.Sleep(100 * time.Millisecond)
+	startCount := msgs.Len()
+
+	// Engine shutdown cancels its parent before the deferred Telegram Stop.
+	// Scanner delivery remains live until Stop has drained its lossless queue.
+	cancel()
+	bus.Publish(events.ScannerPromotionOutcome, events.ScannerPromotionOutcomePayload{
+		Ticker: "NVDA", Outcome: "admitted",
+		Sources: []events.ScannerPromotionSourcePayload{{Source: "mover", Rank: 1}},
+	})
+
+	deadline := time.After(time.Second)
+	for msgs.Len() < startCount+1 {
+		select {
+		case <-deadline:
+			t.Fatalf("scanner batch was discarded after parent cancellation")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+}
+
+func TestTelegramBotStopBoundsScannerBatchFlush(t *testing.T) {
+	previousTimeout := scannerShutdownFlushTimeout
+	scannerShutdownFlushTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { scannerShutdownFlushTimeout = previousTimeout })
+
+	bot := NewTelegramBot(config.TelegramConfig{
+		Enabled: true, BotToken: "test-token", ChatID: "123",
+		NotifyOn: []string{"scanner"}, BatchEnabled: true,
+		BatchWindowSec: 60, MaxItemsPerBatch: 10,
+	}, events.New())
+	bot.apiBase = "http://127.0.0.1:1/bot"
+	bot.ctx, bot.cancel = context.WithCancel(context.Background())
+	bot.scannerBatcher.Add(scannerOutcome("NVDA"))
+
+	started := time.Now()
+	bot.Stop()
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("stop took %s, want bounded scanner flush", elapsed)
 	}
 }
 

@@ -80,6 +80,30 @@ func TestDeterministicSnapshotMetadataRefreshesAfterFallback(t *testing.T) {
 	}
 }
 
+func TestSourceTopFiveExclusionUsesSelectedSnapshotLineage(t *testing.T) {
+	recorder := &scanRecorder{candidates: make(map[string]*store.ScannerCandidateSnapshot)}
+	candidate := SwingCandidate{
+		Ticker: "TEST", Sources: []string{"mover", "graph_neighbor"},
+		SourceScores: map[string]float64{"mover": .9, "graph_neighbor": .8},
+		GraphContext: "graph-only context",
+	}
+	recorder.register([]SwingCandidate{candidate})
+	selected := retainPromotionSources(candidate, map[string]int{"mover": 1})
+	recorder.sourceTopFiveExcluded([]SwingCandidate{selected}, []sourcePromotionExclusion{{
+		Ticker: "TEST", Source: "graph_neighbor", Rank: 6,
+	}})
+
+	snapshot := recorder.candidates["TEST"]
+	if !reflect.DeepEqual(snapshot.Sources, []string{"mover"}) ||
+		!reflect.DeepEqual(snapshot.SourceScores, map[string]float64{"mover": .9}) ||
+		snapshot.GraphContext != "" || snapshot.FinalStage != "sourced" {
+		t.Fatalf("selected snapshot lineage=%+v", snapshot)
+	}
+	if !strings.Contains(string(snapshot.PromotionEvidence), `"graph_neighbor"`) {
+		t.Fatalf("missing excluded-facet evidence: %s", snapshot.PromotionEvidence)
+	}
+}
+
 func TestPoliticalRejectionDoesNotPoisonIndependentSourceSnapshot(t *testing.T) {
 	recorder := &scanRecorder{candidates: make(map[string]*store.ScannerCandidateSnapshot)}
 	political := SwingCandidate{Ticker: "TEST", Sources: []string{"political_disclosure"}, PoliticalDisclosureEvidence: "rejected filing"}

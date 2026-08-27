@@ -318,7 +318,28 @@ func (r *scanRecorder) setEligible(candidates []SwingCandidate) {
 // from shared research-queue suppression. A ticker retained by another source
 // remains eligible; the evidence still tells operators which facet did not
 // attempt promotion.
-func (r *scanRecorder) sourceTopFiveExcluded(exclusions []sourcePromotionExclusion) {
+func (r *scanRecorder) sourceTopFiveExcluded(selected []SwingCandidate, exclusions []sourcePromotionExclusion) {
+	retained := make(map[string]struct{}, len(selected))
+	for _, candidate := range selected {
+		retained[candidate.Ticker] = struct{}{}
+		snapshot := r.candidates[candidate.Ticker]
+		if snapshot == nil {
+			continue
+		}
+		// The snapshot must use the same selected facets as the promotion
+		// contract and resulting discovery context. Retaining excluded facets
+		// here would violate the store's snapshot lineage invariant.
+		snapshot.Sources = append([]string(nil), candidate.Sources...)
+		snapshot.SourceScores = make(map[string]float64, len(candidate.SourceScores))
+		for source, score := range candidate.SourceScores {
+			snapshot.SourceScores[source] = score
+		}
+		snapshot.GraphContext = candidate.GraphContext
+		snapshot.WeeklyLeaderEvidence = candidate.WeeklyLeaderEvidence
+		snapshot.PotentIndustryEvidence = candidate.PotentIndustryEvidence
+		snapshot.PremarketEpisodicEvidence = candidate.PremarketEpisodicEvidence
+		snapshot.PoliticalDisclosureEvidence = candidate.PoliticalDisclosureEvidence
+	}
 	for _, exclusion := range exclusions {
 		snapshot := r.candidates[exclusion.Ticker]
 		if snapshot == nil {
@@ -327,7 +348,7 @@ func (r *scanRecorder) sourceTopFiveExcluded(exclusions []sourcePromotionExclusi
 		r.mergePromotionEvidence(snapshot, map[string]any{
 			"source_top_five_excluded": appendSourceTopFiveExclusion(snapshot.PromotionEvidence, exclusion),
 		})
-		if snapshot.FinalStage == "sourced" {
+		if _, selected := retained[exclusion.Ticker]; !selected && snapshot.FinalStage == "sourced" {
 			snapshot.FinalStage = "source_top_five_excluded"
 			snapshot.RemovalStage = "source_top_five_excluded"
 		}

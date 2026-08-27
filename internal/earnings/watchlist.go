@@ -189,7 +189,8 @@ func (f *WatchlistFeeder) RunSession(ctx context.Context, completed engine.USMar
 		})
 	}
 	stage = "publish"
-	if err := store.PublishEarningsWatchlistRun(ctx, target.Date, attemptID, candidates); err != nil {
+	publications, err := store.PublishEarningsWatchlistRun(ctx, target.Date, attemptID, candidates)
+	if err != nil {
 		reasonCode := "persistence_error"
 		if errors.Is(err, store.ErrResearchQueueCapacity) {
 			reasonCode = "queue_capacity"
@@ -199,8 +200,16 @@ func (f *WatchlistFeeder) RunSession(ctx context.Context, completed engine.USMar
 		}
 		return err
 	}
+	dispositions := make(map[string]string, len(publications))
+	for _, publication := range publications {
+		dispositions[strings.ToUpper(strings.TrimSpace(publication.Ticker))] = publication.Disposition
+	}
 	for _, candidate := range candidates {
-		f.publishPromotionOutcome(attemptID, candidate, "admitted", "", "")
+		outcome := "admitted"
+		if dispositions[strings.ToUpper(strings.TrimSpace(candidate.Ticker))] == "rediscovered" {
+			outcome = "rediscovered"
+		}
+		f.publishPromotionOutcome(attemptID, candidate, outcome, "", "")
 	}
 	slog.Info("earnings watchlist run published",
 		"target_session_date", target.Date.Format("2006-01-02"),

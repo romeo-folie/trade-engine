@@ -60,6 +60,18 @@ func TestWatchlistFeederPublishesScheduledEarningsPromotionOutcome(t *testing.T)
 	case <-time.After(time.Second):
 		t.Fatal("scheduled earnings promotion outcome was not published")
 	}
+	feeder.publishPromotionOutcome("run-1", store.EarningsWatchlistCandidate{
+		Ticker: "AMD", LiquidityRank: 1, MedianDollarVolume: 2_000_000,
+	}, "rediscovered", "", "existing research membership retained")
+	select {
+	case event := <-sub.C:
+		payload, ok := event.Payload.(events.ScannerPromotionOutcomePayload)
+		if !ok || payload.Outcome != "rediscovered" || payload.Ticker != "AMD" {
+			t.Fatalf("rediscovery outcome = %+v", event.Payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("scheduled earnings rediscovery outcome was not published")
+	}
 }
 
 func TestRankReleasesUsesMedianDollarVolumeAndDeterministicTie(t *testing.T) {
