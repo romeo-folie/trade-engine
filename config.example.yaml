@@ -913,8 +913,10 @@ scanner:
   candidate_cap: 10            # Legacy compatibility only; research_queue governs admission
   ttl_days: 3                  # Default source-lease duration; expire only after every scanner source lease ends
   min_conviction: 0.65         # Legacy compatibility only; no longer used for admission
+  # Legacy key retained for compatibility. It controls scanner admission
+  # allocations for entries retained on the main watchlist, not staging work.
   research_queue:
-    capacity: 30               # Total concurrent scanner research rows, including earnings
+    capacity: 30               # Total scanner/earnings allocations on the main watchlist
     overflow: 6                # Shared capacity after protected source reservations
     reservations:
       political_disclosure: 4
@@ -925,6 +927,11 @@ scanner:
       graph_neighbor: 2
       news_sympathy: 2
       earnings_scheduled: 6
+  # Short-lived staging before admission to the main watchlist. These rows
+  # release their slot once admitted; they do not own the source allocations.
+  research_staging:
+    capacity: 30
+    lease_minutes: 15
   news_lookback_hours: 24      # News window when enriching candidates before scoring
   top_movers: 20               # Top gainers+losers fetched per scan
   top_actives: 20              # Most-active-by-volume fetched per scan

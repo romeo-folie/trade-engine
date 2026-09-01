@@ -25,12 +25,14 @@ type MarketCalendarFetcher interface {
 // WatchlistFeeder selects liquid, next-session earnings names and attaches an
 // independently expiring context to the ordinary watchlist funnel.
 type WatchlistFeeder struct {
-	Calendar      MarketCalendarFetcher
-	Bars          data.BulkDailyBarsProvider
-	Cfg           config.EarningsWatchlistConfig
-	ResearchQueue config.ResearchQueueConfig
-	Now           func() time.Time
-	Bus           interface{ Publish(events.Type, any) }
+	Calendar           MarketCalendarFetcher
+	Bars               data.BulkDailyBarsProvider
+	Cfg                config.EarningsWatchlistConfig
+	ResearchQueue      config.ResearchQueueConfig
+	ResearchStaging    config.ResearchStagingConfig
+	MaxActiveWatchlist int
+	Now                func() time.Time
+	Bus                interface{ Publish(events.Type, any) }
 }
 
 type rankedRelease struct {
@@ -186,7 +188,69 @@ func (f *WatchlistFeeder) RunSession(ctx context.Context, completed engine.USMar
 				Capacity: f.ResearchQueue.Capacity, Bucket: "earnings_scheduled", Reservation: f.ResearchQueue.Reservations.EarningsScheduled,
 				Overflow: f.ResearchQueue.Overflow, Priority: priority,
 			},
+			MaxActiveWatchlist: f.MaxActiveWatchlist,
 		})
+	}
+	stage = "research_staging"
+	stagingCapacity := f.ResearchStaging.Capacity
+	if stagingCapacity <= 0 {
+		stagingCapacity = 30
+	}
+	stagingLease := time.Duration(f.ResearchStaging.LeaseMinutes) * time.Minute
+	if stagingLease <= 0 {
+		stagingLease = 15 * time.Minute
+	}
+	stagingIDs := make([]string, 0, len(candidates))
+	releaseStaging := func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		for _, id := range stagingIDs {
+			if releaseErr := store.ReleaseResearchCandidate(cleanupCtx, id); releaseErr != nil {
+				slog.Warn("earnings watchlist: release research staging candidate", "err", releaseErr)
+			}
+		}
+	}
+	defer releaseStaging()
+	for index := range candidates {
+		candidate := &candidates[index]
+		id, _, queueErr := store.QueueResearchCandidate(ctx, store.ResearchStagingRequest{
+			RunID: attemptID, Ticker: candidate.Ticker, Platform: "stock",
+			Bucket: "earnings_scheduled", Priority: candidate.ResearchQueue.Priority,
+			Capacity: stagingCapacity, Lease: stagingLease,
+		})
+		if queueErr != nil {
+			remaining := stagingIDs[:0]
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			for _, queuedID := range stagingIDs {
+				if releaseErr := store.ReleaseResearchCandidate(cleanupCtx, queuedID); releaseErr != nil {
+					slog.Warn("earnings watchlist: release research staging candidate", "err", releaseErr)
+					remaining = append(remaining, queuedID)
+				}
+			}
+			cancel()
+			stagingIDs = remaining
+			if errors.Is(queueErr, store.ErrResearchStagingCapacity) {
+				for _, deferred := range candidates {
+					f.publishPromotionOutcome(attemptID, deferred, "not_admitted", "staging_capacity", queueErr.Error())
+				}
+			}
+			return queueErr
+		}
+		// Only an exact retry for this attempt can reuse a row. A concurrent
+		// attempt owns its own bounded staging reservation.
+		stagingIDs = append(stagingIDs, id)
+		candidate.ResearchStagingID = id
+		candidate.ResearchStagingLease = stagingLease
+	}
+	for _, id := range stagingIDs {
+		if err := store.RenewResearchCandidate(ctx, id, stagingLease); err != nil {
+			if errors.Is(err, store.ErrResearchStagingReservationLost) {
+				for _, deferred := range candidates {
+					f.publishPromotionOutcome(attemptID, deferred, "not_admitted", "staging_capacity", err.Error())
+				}
+			}
+			return fmt.Errorf("renew research staging candidate: %w", err)
+		}
 	}
 	stage = "publish"
 	publications, err := store.PublishEarningsWatchlistRun(ctx, target.Date, attemptID, candidates)
@@ -194,6 +258,10 @@ func (f *WatchlistFeeder) RunSession(ctx context.Context, completed engine.USMar
 		reasonCode := "persistence_error"
 		if errors.Is(err, store.ErrResearchQueueCapacity) {
 			reasonCode = "queue_capacity"
+		} else if errors.Is(err, store.ErrResearchStagingCapacity) || errors.Is(err, store.ErrResearchStagingReservationLost) {
+			reasonCode = "staging_capacity"
+		} else if errors.Is(err, store.ErrWatchlistCapacity) {
+			reasonCode = "watchlist_capacity"
 		}
 		for _, candidate := range candidates {
 			f.publishPromotionOutcome(attemptID, candidate, "not_admitted", reasonCode, err.Error())

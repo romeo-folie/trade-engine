@@ -55,18 +55,21 @@ type CompanyFundamentalsProvider interface {
 // MarketScanner discovers swing-trade candidates and manages a time-bounded
 // watchlist of scanner-sourced tickers.
 type MarketScanner struct {
-	AlpacaClient    *data.AlpacaClient
-	StockAssets     data.AssetUniverseProvider
-	StockSnapshots  data.BulkStockSnapshotProvider
-	Analyzer        *analysis.Analyzer
-	News            data.NewsProvider
-	Fundamentals    CompanyFundamentalsProvider
-	DailyBars       data.BulkDailyBarsProvider // optional; required only for correlation-aware promotion
-	Bus             bus
-	Cfg             config.ScannerConfig
-	Now             func() time.Time // injectable for tests; defaults to time.Now
-	CycleOwnerToken string           // optional stable process token for regular-scan leases
-	cycleOwnerMu    sync.Mutex
+	AlpacaClient   *data.AlpacaClient
+	StockAssets    data.AssetUniverseProvider
+	StockSnapshots data.BulkStockSnapshotProvider
+	Analyzer       *analysis.Analyzer
+	News           data.NewsProvider
+	Fundamentals   CompanyFundamentalsProvider
+	DailyBars      data.BulkDailyBarsProvider // optional; required only for correlation-aware promotion
+	Bus            bus
+	Cfg            config.ScannerConfig
+	// MaxActiveWatchlist is the global main-watchlist limit. It is kept outside
+	// ScannerConfig because manual, scanner, and earnings admissions share it.
+	MaxActiveWatchlist int
+	Now                func() time.Time // injectable for tests; defaults to time.Now
+	CycleOwnerToken    string           // optional stable process token for regular-scan leases
+	cycleOwnerMu       sync.Mutex
 	// PullbackUniverseEnabled applies the research universe before LLM scoring:
 	// >$100M market cap, >$1M dollar volume, >=30% on a 1/3/6-month horizon,
 	// then retain the top momentum quartile.
@@ -472,7 +475,59 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 	// The database queue allocator remains the sole shared admission limit.
 	sortByResearchQueuePriority(scored, s.Cfg.ResearchQueue)
 	recorder.selected(scored)
-
+	stagingCapacity := s.Cfg.ResearchStaging.Capacity
+	if stagingCapacity <= 0 {
+		stagingCapacity = 30
+	}
+	stagingLease := time.Duration(s.Cfg.ResearchStaging.LeaseMinutes) * time.Minute
+	if stagingLease <= 0 {
+		stagingLease = 15 * time.Minute
+	}
+	stagingIDs := make(map[string]string, len(scored))
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		for _, id := range stagingIDs {
+			if err := store.ReleaseResearchCandidate(cleanupCtx, id); err != nil {
+				slog.Warn("scanner: release remaining research staging candidate", "err", err)
+			}
+		}
+	}()
+	staged := scored[:0]
+	for _, sc := range scored {
+		admission := researchQueueAdmission(sc.candidate, s.Cfg.ResearchQueue)
+		id, _, err := store.QueueResearchCandidate(ctx, store.ResearchStagingRequest{
+			RunID: scanID, Ticker: sc.candidate.Ticker, Platform: "stock",
+			Bucket: admission.Bucket, Priority: admission.Priority,
+			Capacity: stagingCapacity, Lease: stagingLease,
+		})
+		if errors.Is(err, store.ErrResearchStagingCapacity) {
+			recorder.researchStagingSuppressed(sc.candidate.Ticker, admission)
+			s.publishPromotionOutcome(scanID, sc.candidate, "not_admitted", admission.Bucket,
+				"staging_capacity", err.Error())
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("queue research candidate %s: %w", sc.candidate.Ticker, err)
+		}
+		// Only an exact retry for this same scan can reuse a row. It still owns
+		// and must fence/release that reservation; a concurrent scan has its own.
+		stagingIDs[normalizePromotionKey(sc.candidate.Ticker)] = id
+		staged = append(staged, sc)
+	}
+	scored = staged
+	releaseStaging := func(candidate SwingCandidate) {
+		key := normalizePromotionKey(candidate.Ticker)
+		id, ok := stagingIDs[key]
+		if !ok {
+			return
+		}
+		if err := store.ReleaseResearchCandidate(ctx, id); err != nil {
+			slog.Warn("scanner: release research staging candidate", "ticker", candidate.Ticker, "err", err)
+			return
+		}
+		delete(stagingIDs, key)
+	}
 	// 8. Add to watchlist and notify.
 	for index := 0; index < len(scored); {
 		if err := ctx.Err(); err != nil {
@@ -521,7 +576,23 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			ExpiresAt:                       &expiresAt,
 			SourceLeases:                    leases,
 			ResearchQueue:                   researchQueueAdmission(sc.candidate, s.Cfg.ResearchQueue),
+			MaxActiveWatchlist:              s.MaxActiveWatchlist,
 			PullbackRequalificationComplete: sc.candidate.PullbackQualificationKnown,
+		}
+		if id, ownsReservation := stagingIDs[normalizePromotionKey(sc.candidate.Ticker)]; ownsReservation {
+			if err := store.RenewResearchCandidate(ctx, id, stagingLease); err != nil {
+				if errors.Is(err, store.ErrResearchStagingReservationLost) {
+					delete(stagingIDs, normalizePromotionKey(sc.candidate.Ticker))
+					recorder.researchStagingSuppressed(sc.candidate.Ticker, item.ResearchQueue)
+					s.publishPromotionOutcome(scanID, sc.candidate, "not_admitted", item.ResearchQueue.Bucket,
+						"staging_capacity", err.Error())
+					index++
+					continue
+				}
+				return fmt.Errorf("renew research staging candidate %s: %w", sc.candidate.Ticker, err)
+			}
+			item.ResearchStagingID = id
+			item.ResearchStagingLease = stagingLease
 		}
 		if err := s.renewScannerCycleBeforePromotion(ctx, cycleKey, cycleOwner, interval); err != nil {
 			return err
@@ -570,11 +641,17 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 				"scanner: source fallback lost to active watchlist item",
 				"ticker", sc.candidate.Ticker,
 			)
+			releaseStaging(sc.candidate)
 			index++
 			continue
 		}
 		if addErr != nil {
 			recorder.watchlistResult(sc.candidate, strategies, addErr)
+			if errors.Is(addErr, store.ErrWatchlistCapacity) {
+				recorder.mainWatchlistSuppressed(sc.candidate.Ticker)
+			} else if errors.Is(addErr, store.ErrResearchStagingReservationLost) {
+				recorder.researchStagingSuppressed(sc.candidate.Ticker, item.ResearchQueue)
+			}
 			if errors.Is(addErr, store.ErrResearchQueueCapacity) {
 				if auditErr := store.RecordResearchQueueSuppression(ctx, item, *item.ResearchQueue); auditErr != nil {
 					slog.Warn("scanner: failed to record research queue suppression", "ticker", sc.candidate.Ticker, "err", auditErr)
@@ -583,7 +660,8 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 				// release returns them to pending so a future free protected slot can
 				// admit the same qualified evidence; capacity is not a rejection.
 				recorder.researchQueueSuppressed(sc.candidate.Ticker, item.ResearchQueue)
-			} else if !errors.Is(addErr, store.ErrScannerSourcePromotionClaimLost) {
+			} else if !errors.Is(addErr, store.ErrScannerSourcePromotionClaimLost) &&
+				!errors.Is(addErr, store.ErrWatchlistCapacity) && !errors.Is(addErr, store.ErrResearchStagingReservationLost) {
 				// Watchlist persistence failures are transient and must not
 				// terminalize discovery evidence. Each source owns its retry
 				// transition; political disclosures requeue this candidate's
@@ -598,20 +676,25 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			reasonCode := "persistence_error"
 			if errors.Is(addErr, store.ErrResearchQueueCapacity) {
 				reasonCode = "queue_capacity"
+			} else if errors.Is(addErr, store.ErrResearchStagingReservationLost) {
+				reasonCode = "staging_capacity"
+			} else if errors.Is(addErr, store.ErrWatchlistCapacity) {
+				reasonCode = "watchlist_capacity"
 			} else if errors.Is(addErr, store.ErrScannerSourcePromotionClaimLost) {
 				reasonCode = "source_claim_lost"
 			}
 			s.publishPromotionOutcome(scanID, sc.candidate, "not_admitted", item.ResearchQueue.Bucket, reasonCode, addErr.Error())
+			releaseStaging(sc.candidate)
 			index++
 			continue
 		}
-		// Only candidates that have actually been admitted to the watchlist
+		// Only candidates that have actually been admitted to the main watchlist
 		// may consume the industry cap for later fallback decisions. Keeping
 		// future candidates inactive prevents a lower-ranked, not-yet-attempted
 		// peer from suppressing a higher-ranked fallback.
 		recorder.watchlistResult(sc.candidate, strategies, nil)
 		bucketPriority := deterministicBucketAdmissionScore(sc.candidate, item.ResearchQueue.Bucket)
-		slog.Info("scanner: added to research queue", "ticker", sc.candidate.Ticker,
+		slog.Info("scanner: added to main watchlist", "ticker", sc.candidate.Ticker,
 			"priority", bucketPriority, "bucket", item.ResearchQueue.Bucket)
 		scanItemsAdded++
 		s.publishPromotionOutcome(scanID, sc.candidate, "admitted", item.ResearchQueue.Bucket, "", "")
@@ -637,6 +720,7 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 				AdmissionReason:             "deterministic source qualification",
 			})
 		}
+		releaseStaging(sc.candidate)
 		index++
 	}
 
@@ -756,6 +840,7 @@ func (s *MarketScanner) refreshActiveSourceLeases(
 				ExecutionProfile: profile, ScannerRunID: scannerRunID, ExpiresAt: &expiresAt,
 				GraphContext:                    refreshCandidate.GraphContext,
 				SourceLeases:                    leases,
+				MaxActiveWatchlist:              s.MaxActiveWatchlist,
 				PullbackRequalificationComplete: refreshCandidate.PullbackQualificationKnown,
 			}
 			claims := scannerSourcePromotionClaims(refreshCandidate)

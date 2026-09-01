@@ -273,7 +273,7 @@ type EmbeddingsConfig struct {
 type EngineConfig struct {
 	Mode            string  `yaml:"mode"`              // manual | auto | paper
 	TickIntervalSec int     `yaml:"tick_interval_sec"` // default 3600 (60 min)
-	MaxWatchlist    int     `yaml:"max_watchlist"`
+	MaxWatchlist    int     `yaml:"max_watchlist"`     // maximum active main-watchlist entries
 	DryRun          bool    `yaml:"dry_run"`
 	InitialCapital  float64 `yaml:"initial_capital"`  // starting cash for paper trading (default 100000)
 	LogTimezone     string  `yaml:"log_timezone"`     // IANA timezone for display (default "UTC")
@@ -1269,11 +1269,15 @@ type ScannerConfig struct {
 	// admission is deterministic and never reads this value.
 	MinConviction float64 `yaml:"min_conviction"`
 
-	// ResearchQueue bounds all scanner-originated analyst work, including the
-	// scheduled earnings scanner. Source reservations preserve research coverage
-	// while Overflow provides shared capacity once a source's own reservation is
-	// full.
+	// ResearchQueue is the legacy configuration key for the durable scanner
+	// admission allocation on the main watchlist, including scheduled earnings.
+	// Source reservations preserve coverage while Overflow provides shared
+	// capacity once a source's own reservation is full.
 	ResearchQueue ResearchQueueConfig `yaml:"research_queue"`
+	// ResearchStaging is the short-lived scanner candidate queue ahead of main
+	// watchlist admission. Unlike ResearchQueue, it does not reserve a source
+	// allocation after a candidate has been admitted.
+	ResearchStaging ResearchStagingConfig `yaml:"research_staging"`
 
 	// NewsLookbackHours controls how far back to fetch news when enriching
 	// screener candidates before LLM scoring. Default: 24.
@@ -1343,6 +1347,14 @@ type ResearchQueueConfig struct {
 	Capacity     int                       `yaml:"capacity"`
 	Overflow     int                       `yaml:"overflow"`
 	Reservations ResearchQueueReservations `yaml:"reservations"`
+}
+
+// ResearchStagingConfig bounds pending scanner work before it is admitted to
+// the main watchlist. Queue rows are retried only while their short lease is
+// live; source allocations remain owned by ResearchQueue.
+type ResearchStagingConfig struct {
+	Capacity     int `yaml:"capacity"`
+	LeaseMinutes int `yaml:"lease_minutes"`
 }
 
 type ResearchQueueReservations struct {
@@ -2430,6 +2442,9 @@ const delayedSIPSnapshotDelayMinutes = 16
 
 func Validate(cfg *Config) []string {
 	var errs []string
+	if cfg.Engine.MaxWatchlist <= 0 {
+		errs = append(errs, "engine.max_watchlist must be > 0")
+	}
 	queue := cfg.Scanner.ResearchQueue
 	if queue.Capacity <= 0 {
 		errs = append(errs, "scanner.research_queue.capacity must be > 0")
@@ -2453,6 +2468,15 @@ func Validate(cfg *Config) []string {
 	}
 	if queue.Capacity > 0 && queue.Reservations.Total()+queue.Overflow != queue.Capacity {
 		errs = append(errs, "scanner.research_queue.capacity must equal reservations plus overflow")
+	}
+	staging := cfg.Scanner.ResearchStaging
+	if staging.Capacity <= 0 {
+		errs = append(errs, "scanner.research_staging.capacity must be > 0")
+	}
+	if staging.LeaseMinutes <= 0 {
+		errs = append(errs, "scanner.research_staging.lease_minutes must be > 0")
+	} else if !durationConfigFits(staging.LeaseMinutes, time.Minute) {
+		errs = append(errs, "scanner.research_staging.lease_minutes must be a safe positive duration")
 	}
 	if cfg.Scanner.PromotionMaxPerIndustry < 0 {
 		errs = append(errs, "scanner.max_promotions_per_industry must be >= 0")
@@ -2957,6 +2981,20 @@ func Validate(cfg *Config) []string {
 		} {
 			if value <= 0 {
 				errs = append(errs, prefix+"."+field+" must be > 0")
+			}
+		}
+		if earnings.CandidateCap > 0 {
+			effectiveCandidateCap := earnings.CandidateCap
+			if effectiveCandidateCap > 5 {
+				effectiveCandidateCap = 5
+			}
+			if cfg.Engine.MaxWatchlist < effectiveCandidateCap {
+				errs = append(errs, fmt.Sprintf(
+					"engine.max_watchlist must be >= effective earnings candidate cap (%d) when scanner.earnings_watchlist.enabled=true", effectiveCandidateCap))
+			}
+			if cfg.Scanner.ResearchStaging.Capacity < effectiveCandidateCap {
+				errs = append(errs, fmt.Sprintf(
+					"scanner.research_staging.capacity must be >= effective earnings candidate cap (%d) when scanner.earnings_watchlist.enabled=true", effectiveCandidateCap))
 			}
 		}
 	}

@@ -518,6 +518,6 @@ func (s *MarketScanner) promoteDiscoveryFallback(
 }
 
 const (
-	deterministicAdmissionPromotionReason = "deterministic source qualification admitted to research queue"
+	deterministicAdmissionPromotionReason = "deterministic source qualification admitted to main watchlist"
 	deterministicFallbackPromotionReason  = "remaining deterministic source evidence qualified after another source claim was lost"
 )

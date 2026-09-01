@@ -17,13 +17,16 @@ var ErrEarningsWatchlistRunLeased = fmt.Errorf("earnings watchlist run is leased
 // EarningsWatchlistCandidate is one fully prepared member of a run cohort.
 // PublishEarningsWatchlistRun writes the complete cohort atomically.
 type EarningsWatchlistCandidate struct {
-	Ticker             string
-	ContextKey         string
-	Context            tradeprofile.DiscoveryContext
-	ExpiresAt          time.Time
-	LiquidityRank      int
-	MedianDollarVolume float64
-	ResearchQueue      *ResearchQueueAdmission
+	Ticker               string
+	ContextKey           string
+	Context              tradeprofile.DiscoveryContext
+	ExpiresAt            time.Time
+	LiquidityRank        int
+	MedianDollarVolume   float64
+	ResearchQueue        *ResearchQueueAdmission
+	MaxActiveWatchlist   int
+	ResearchStagingID    string
+	ResearchStagingLease time.Duration
 }
 
 // EarningsWatchlistPublication records whether a committed candidate created a
@@ -118,10 +121,10 @@ func PublishEarningsWatchlistRun(ctx context.Context, target time.Time, attemptI
 	publications := make([]EarningsWatchlistPublication, 0, len(candidates))
 	for _, candidate := range candidates {
 		disposition, publishErr := publishEarningsCandidate(ctx, tx, candidate)
-		if publishErr != nil && !errors.Is(publishErr, ErrResearchQueueCapacity) {
+		if publishErr != nil && !errors.Is(publishErr, ErrResearchQueueCapacity) && !errors.Is(publishErr, ErrWatchlistCapacity) && !errors.Is(publishErr, ErrResearchStagingReservationLost) {
 			return nil, publishErr
 		}
-		if errors.Is(publishErr, ErrResearchQueueCapacity) {
+		if errors.Is(publishErr, ErrResearchQueueCapacity) || errors.Is(publishErr, ErrWatchlistCapacity) || errors.Is(publishErr, ErrResearchStagingReservationLost) {
 			if candidate.ResearchQueue == nil {
 				return nil, publishErr
 			}
@@ -131,7 +134,7 @@ func PublishEarningsWatchlistRun(ctx context.Context, target time.Time, attemptI
 			if err := tx.Rollback(ctx); err != nil {
 				return nil, err
 			}
-			return nil, recordEarningsCapacityFailure(ctx, target, attemptID, candidate)
+			return nil, recordEarningsCapacityFailure(ctx, target, attemptID, candidate, publishErr)
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO earnings_watchlist_candidates (target_session_date,ticker,liquidity_rank,median_dollar_volume) VALUES ($1::date,$2,$3,$4) ON CONFLICT (target_session_date,ticker) DO NOTHING`, target, candidate.Ticker, candidate.LiquidityRank, candidate.MedianDollarVolume); err != nil {
 			return nil, err
@@ -154,20 +157,22 @@ func PublishEarningsWatchlistRun(ctx context.Context, target time.Time, attemptI
 // recordEarningsCapacityFailure preserves the suppression decision without
 // committing a partial cohort, then releases the run for a later full retry.
 func recordEarningsCapacityFailure(
-	ctx context.Context, target time.Time, attemptID string, candidate EarningsWatchlistCandidate,
+	ctx context.Context, target time.Time, attemptID string, candidate EarningsWatchlistCandidate, cause error,
 ) error {
 	tx, err := GetDB().Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
-	if candidate.ResearchQueue == nil {
-		return ErrResearchQueueCapacity
+	if errors.Is(cause, ErrResearchQueueCapacity) {
+		if candidate.ResearchQueue == nil {
+			return cause
+		}
+		if err := recordResearchQueueSuppressionTx(ctx, tx, WatchlistItem{Ticker: candidate.Ticker, Platform: "stock"}, *candidate.ResearchQueue); err != nil {
+			return err
+		}
 	}
-	if err := recordResearchQueueSuppressionTx(ctx, tx, WatchlistItem{Ticker: candidate.Ticker, Platform: "stock"}, *candidate.ResearchQueue); err != nil {
-		return err
-	}
-	tag, err := tx.Exec(ctx, `UPDATE earnings_watchlist_runs SET status='failed', last_error=$3, updated_at=NOW() WHERE target_session_date=$1::date AND status='running' AND attempt_id=$2::uuid`, target, attemptID, ErrResearchQueueCapacity.Error())
+	tag, err := tx.Exec(ctx, `UPDATE earnings_watchlist_runs SET status='failed', last_error=$3, updated_at=NOW() WHERE target_session_date=$1::date AND status='running' AND attempt_id=$2::uuid`, target, attemptID, cause.Error())
 	if err != nil {
 		return err
 	}
@@ -177,7 +182,7 @@ func recordEarningsCapacityFailure(
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
-	return ErrResearchQueueCapacity
+	return cause
 }
 
 func orderedEarningsWatchlistCandidates(candidates []EarningsWatchlistCandidate) []EarningsWatchlistCandidate {
@@ -204,13 +209,29 @@ func publishEarningsCandidate(ctx context.Context, tx pgx.Tx, candidate Earnings
 	if candidate.ResearchQueue == nil && err == nil && active && (expiresAt == nil || expiresAt.After(time.Now())) {
 		disposition = "rediscovered"
 	}
+	// An earnings row can remain physically active after its last context has
+	// expired. Reserving here, before either a row write or a context revival,
+	// applies the global main-watchlist limit to that otherwise invisible path.
+	if err := reserveMainWatchlistSlotTx(ctx, tx, WatchlistItem{
+		Ticker: ticker, Platform: "stock",
+	}, candidate.MaxActiveWatchlist); err != nil {
+		return "", err
+	}
+	if candidate.ResearchStagingID != "" || candidate.ResearchStagingLease != 0 {
+		if err := renewResearchCandidateTx(ctx, tx, candidate.ResearchStagingID, candidate.ResearchStagingLease); err != nil {
+			return "", err
+		}
+	}
 	queueRecorded := false
 	if isNoRows(err) || !active || (expiresAt != nil && !expiresAt.After(time.Now())) {
 		if err := addWatchlistItem(ctx, tx, WatchlistItem{
 			Ticker: ticker, Platform: "stock", Source: "earnings_watchlist",
 			Strategies: []string{"trend_following", "momentum", "news_sentiment"},
 			Timeframes: []string{"1D", "4H", "1H"}, GraphContext: "Scheduled earnings watchlist candidate.",
-			ResearchQueue: candidate.ResearchQueue,
+			ResearchQueue:        candidate.ResearchQueue,
+			MaxActiveWatchlist:   candidate.MaxActiveWatchlist,
+			ResearchStagingID:    candidate.ResearchStagingID,
+			ResearchStagingLease: candidate.ResearchStagingLease,
 		}, true, nil); err != nil && !errors.Is(err, ErrWatchlistActiveItemExists) {
 			return "", err
 		} else if err == nil && candidate.ResearchQueue != nil {

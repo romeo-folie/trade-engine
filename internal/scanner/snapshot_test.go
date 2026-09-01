@@ -132,6 +132,22 @@ func TestScanRecorderPreservesPromotionSuppressionReason(t *testing.T) {
 	}
 }
 
+func TestScanRecorderPersistsResearchStagingDeferral(t *testing.T) {
+	recorder := &scanRecorder{candidates: make(map[string]*store.ScannerCandidateSnapshot)}
+	candidate := SwingCandidate{Ticker: "STAGED"}
+	recorder.register([]SwingCandidate{candidate})
+	recorder.selected([]scoredCandidate{{candidate: candidate}})
+	recorder.researchStagingSuppressed(candidate.Ticker, &store.ResearchQueueAdmission{
+		Bucket: "market_activity", Priority: json.RawMessage(`{"rank":1}`),
+	})
+
+	got := recorder.candidates[candidate.Ticker]
+	if got.FinalStage != "staging_capacity_suppressed" || got.FailureStage != "research_staging" ||
+		!strings.Contains(string(got.PromotionEvidence), `"research_staging"`) {
+		t.Fatalf("staging deferral snapshot=%+v", got)
+	}
+}
+
 func TestScanRecorderMergesCorrelationAvailabilityEvidence(t *testing.T) {
 	recorder := &scanRecorder{candidates: make(map[string]*store.ScannerCandidateSnapshot)}
 	candidate := SwingCandidate{Ticker: "MERGE"}
