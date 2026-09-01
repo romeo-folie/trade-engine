@@ -2,6 +2,8 @@ package notify
 
 import (
 	"context"
+	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -25,6 +27,10 @@ type scannerPromotionOutcomeBatcher struct {
 	timer       *time.Timer
 	timerDone   chan struct{}
 	timerActive map[chan struct{}]struct{}
+}
+
+type deferredKey struct {
+	runID, bucket, reason string
 }
 
 func newScannerPromotionOutcomeBatcher(
@@ -162,6 +168,7 @@ func formatScannerPromotionOutcomeBatches(outcomes []events.ScannerPromotionOutc
 	}
 	var batches []string
 	var current []string
+	deferred := make(map[deferredKey]int)
 	flush := func() {
 		if len(current) == 0 {
 			return
@@ -170,6 +177,11 @@ func formatScannerPromotionOutcomeBatches(outcomes []events.ScannerPromotionOutc
 		current = nil
 	}
 	for _, outcome := range outcomes {
+		if scannerPromotionDeferred(outcome) {
+			key := deferredKey{runID: outcome.RunID, bucket: outcome.QueueBucket, reason: outcome.ReasonCode}
+			deferred[key]++
+			continue
+		}
 		parts := splitScannerPromotionOutcome(formatScannerPromotionOutcome(outcome))
 		if len(parts) > 1 {
 			flush()
@@ -184,7 +196,63 @@ func formatScannerPromotionOutcomeBatches(outcomes []events.ScannerPromotionOutc
 		current = append(current, message)
 	}
 	flush()
+	keys := make([]deferredKey, 0, len(deferred))
+	for key := range deferred {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].runID != keys[j].runID {
+			return keys[i].runID < keys[j].runID
+		}
+		if keys[i].bucket != keys[j].bucket {
+			return keys[i].bucket < keys[j].bucket
+		}
+		return keys[i].reason < keys[j].reason
+	})
+	appendDeferredSummaries(&batches, keys, deferred)
 	return batches
+}
+
+// scannerPromotionDeferred identifies expected, retryable admission pressure.
+// These outcomes must never produce one Telegram alert per ticker: operators
+// receive one compact batch summary instead.
+func scannerPromotionDeferred(outcome events.ScannerPromotionOutcomePayload) bool {
+	return outcome.Outcome == "not_admitted" &&
+		(outcome.ReasonCode == "staging_capacity" || outcome.ReasonCode == "queue_capacity" || outcome.ReasonCode == "watchlist_capacity")
+}
+
+func appendDeferredSummaries(batches *[]string, keys []deferredKey, deferred map[deferredKey]int) {
+	const header = "⏳ *Scanner promotion deferrals*"
+	current := header
+	for _, key := range keys {
+		line := formatScannerPromotionDeferredLine(key.bucket, key.reason, deferred[key])
+		if len(current)+1+len(line) > telegramMessageMaxLength {
+			*batches = append(*batches, current)
+			current = header
+		}
+		current += "\n" + line
+	}
+	if current != header {
+		*batches = append(*batches, current)
+	}
+}
+
+func formatScannerPromotionDeferredLine(bucket, reason string, count int) string {
+	label := "scanner admission allocation capacity"
+	if reason == "staging_capacity" {
+		label = "research staging capacity"
+	} else if reason == "watchlist_capacity" {
+		label = "main watchlist capacity"
+	}
+	line := fmt.Sprintf("• %d candidate", count)
+	if count != 1 {
+		line += "s"
+	}
+	line += " deferred: " + label
+	if bucket != "" {
+		line += " · " + scannerNotificationField(strings.ReplaceAll(bucket, "_", " "), 128)
+	}
+	return line
 }
 
 func splitScannerPromotionOutcome(message string) []string {

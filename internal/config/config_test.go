@@ -38,6 +38,40 @@ func TestValidateResearchQueueRequiresExactCapacityAllocation(t *testing.T) {
 	}
 }
 
+func TestValidateRequiresMainWatchlistAndResearchStagingCapacity(t *testing.T) {
+	cfg := Defaults()
+	cfg.Engine.MaxWatchlist = 0
+	cfg.Scanner.ResearchStaging.Capacity = 0
+	cfg.Scanner.ResearchStaging.LeaseMinutes = 0
+	errs := Validate(cfg)
+	for _, want := range []string{
+		"engine.max_watchlist must be > 0",
+		"scanner.research_staging.capacity must be > 0",
+		"scanner.research_staging.lease_minutes must be > 0",
+	} {
+		if !containsStr(errs, want) {
+			t.Fatalf("missing %q in validation errors: %v", want, errs)
+		}
+	}
+}
+
+func TestValidateEarningsCohortFitsStagingAndMainWatchlist(t *testing.T) {
+	cfg := Defaults()
+	cfg.Scanner.EarningsWatchlist.Enabled = true
+	cfg.Scanner.EarningsWatchlist.CandidateCap = 5
+	cfg.Scanner.ResearchStaging.Capacity = 4
+	cfg.Engine.MaxWatchlist = 4
+	errs := Validate(cfg)
+	for _, want := range []string{
+		"scanner.research_staging.capacity must be >= effective earnings candidate cap (5)",
+		"engine.max_watchlist must be >= effective earnings candidate cap (5) when scanner.earnings_watchlist.enabled=true",
+	} {
+		if !containsStr(errs, want) {
+			t.Fatalf("missing %q in validation errors: %v", want, errs)
+		}
+	}
+}
+
 func TestDefaultsMarkScannerNotificationCategoryConfigured(t *testing.T) {
 	cfg := Defaults()
 	if cfg.Notifications.Telegram.ScannerNotificationsConfigured == nil ||

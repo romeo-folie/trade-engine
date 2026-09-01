@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
@@ -54,7 +55,11 @@ func FetchWatchlistData(ctx context.Context) WatchlistData {
 // ToggleWatchlistItem enables or disables a watchlist item by ticker.
 func ToggleWatchlistItem(ctx context.Context, ticker string, active bool) error {
 	if active {
-		return store.ReactivateWatchlistItem(ctx, ticker, "stock")
+		cfg, err := config.Load()
+		if err != nil {
+			return fmt.Errorf("load config: %w", err)
+		}
+		return store.ReactivateWatchlistItemWithLimit(ctx, ticker, "stock", cfg.Engine.MaxWatchlist)
 	}
 	// Disable (soft delete) — default to stock platform
 	return store.RemoveWatchlistItem(ctx, ticker, "stock")

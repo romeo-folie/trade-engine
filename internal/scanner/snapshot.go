@@ -654,6 +654,33 @@ func (r *scanRecorder) researchQueueSuppressed(ticker string, admission *store.R
 	}
 }
 
+// researchStagingSuppressed records a retryable short-lived staging deferral.
+// It is deliberately distinct from a durable scanner admission allocation
+// suppression: source reservations may still have room.
+func (r *scanRecorder) researchStagingSuppressed(ticker string, admission *store.ResearchQueueAdmission) {
+	if snapshot := r.candidates[ticker]; snapshot != nil {
+		snapshot.FailureStage = "research_staging"
+		snapshot.FailureReason = "short-lived research staging capacity is full"
+		snapshot.FinalStage = "staging_capacity_suppressed"
+		if admission != nil {
+			r.mergePromotionEvidence(snapshot, map[string]any{
+				"research_staging": map[string]any{
+					"bucket": admission.Bucket, "priority": json.RawMessage(admission.Priority),
+					"outcome": "capacity_suppressed", "reason": snapshot.FailureReason,
+				},
+			})
+		}
+	}
+}
+
+func (r *scanRecorder) mainWatchlistSuppressed(ticker string) {
+	if snapshot := r.candidates[ticker]; snapshot != nil {
+		snapshot.FailureStage = "main_watchlist"
+		snapshot.FailureReason = "main watchlist capacity is full"
+		snapshot.FinalStage = "capacity_suppressed"
+	}
+}
+
 func deterministicQualificationReason(candidate SwingCandidate) string {
 	return "deterministically qualified by source evidence: " + strings.Join(candidate.Sources, ", ")
 }

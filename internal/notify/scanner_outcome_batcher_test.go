@@ -116,6 +116,44 @@ func TestScannerPromotionOutcomeBatcherSplitsOversizedOutcome(t *testing.T) {
 	}
 }
 
+func TestFormatScannerPromotionOutcomeBatchesSummarizesCapacityDeferrals(t *testing.T) {
+	outcomes := []events.ScannerPromotionOutcomePayload{
+		{RunID: "run-1", Ticker: "AAA", Outcome: "not_admitted", QueueBucket: "market_activity", ReasonCode: "queue_capacity"},
+		{RunID: "run-1", Ticker: "BBB", Outcome: "not_admitted", QueueBucket: "market_activity", ReasonCode: "queue_capacity"},
+		{RunID: "run-1", Ticker: "CCC", Outcome: "admitted", Sources: []events.ScannerPromotionSourcePayload{{Source: "mover", Rank: 1}}},
+	}
+	batches := formatScannerPromotionOutcomeBatches(outcomes, 20)
+	if len(batches) != 2 {
+		t.Fatalf("batch count = %d, want 2", len(batches))
+	}
+	if !strings.Contains(strings.Join(batches, "\n"), "2 candidates deferred: scanner admission allocation capacity · market activity") {
+		t.Fatalf("missing aggregate capacity summary: %q", batches)
+	}
+	if strings.Contains(strings.Join(batches, "\n"), "AAA") || strings.Contains(strings.Join(batches, "\n"), "BBB") {
+		t.Fatalf("capacity summary leaked individual tickers: %q", batches)
+	}
+}
+
+func TestFormatScannerPromotionOutcomeBatchesSeparatesStagingDeferrals(t *testing.T) {
+	batches := formatScannerPromotionOutcomeBatches([]events.ScannerPromotionOutcomePayload{
+		{RunID: "run-1", Ticker: "AAA", Outcome: "not_admitted", QueueBucket: "market_activity", ReasonCode: "staging_capacity"},
+	}, 20)
+	if len(batches) != 1 || !strings.Contains(batches[0], "research staging capacity") {
+		t.Fatalf("staging deferral summary = %q, want research staging capacity", batches)
+	}
+}
+
+func TestFormatScannerPromotionOutcomeBatchesCombinesDeferredSummaries(t *testing.T) {
+	batches := formatScannerPromotionOutcomeBatches([]events.ScannerPromotionOutcomePayload{
+		{RunID: "run-1", Ticker: "AAA", Outcome: "not_admitted", QueueBucket: "market_activity", ReasonCode: "staging_capacity"},
+		{RunID: "run-2", Ticker: "BBB", Outcome: "not_admitted", QueueBucket: "earnings_scheduled", ReasonCode: "queue_capacity"},
+		{RunID: "run-3", Ticker: "CCC", Outcome: "not_admitted", QueueBucket: "weekly_leader", ReasonCode: "watchlist_capacity"},
+	}, 20)
+	if len(batches) != 1 || strings.Count(batches[0], "deferred:") != 3 {
+		t.Fatalf("deferred summaries=%q, want one message with three lines", batches)
+	}
+}
+
 func containsScannerOutcomeText(message string, values ...string) bool {
 	for _, value := range values {
 		if !strings.Contains(message, value) {

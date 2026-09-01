@@ -10,10 +10,10 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-var ErrResearchQueueCapacity = errors.New("research queue capacity is unavailable")
+var ErrResearchQueueCapacity = errors.New("scanner admission allocation capacity is unavailable")
 
-// ResearchQueueAdmission carries deterministic source-owned allocation data.
-// Priority is audit-only and is never execution confidence.
+// ResearchQueueAdmission carries deterministic source-owned main-watchlist
+// allocation data. Priority is audit-only and is never execution confidence.
 type ResearchQueueAdmission struct {
 	Capacity    int
 	Bucket      string
@@ -87,11 +87,12 @@ func lockResearchQueueTx(ctx context.Context, tx pgx.Tx) error {
 	return nil
 }
 
-// releaseInactiveResearchQueueMemberships frees a queue slot as soon as its
-// final research-retaining reason disappears. A watchlist row may remain active
-// for manual/config ownership after an earnings context expires, but it must no
-// longer consume scanner research capacity. Legacy lease-less scanner rows with
-// a NULL expiry retain their established indefinite-liveness behavior.
+// releaseInactiveResearchQueueMemberships frees a scanner admission allocation
+// as soon as its final source/context reason disappears. A main-watchlist row
+// may remain active for manual/config ownership after an earnings context
+// expires, but it must no longer consume scanner admission capacity. Legacy
+// lease-less scanner rows with a NULL expiry retain their established
+// indefinite-liveness behavior.
 func releaseInactiveResearchQueueMemberships(ctx context.Context, db watchlistExecer) error {
 	_, err := db.Exec(ctx, `
 		DELETE FROM research_queue_memberships q
@@ -134,9 +135,9 @@ func recordResearchQueueAdmissionTx(
 		return err
 	}
 	decision := "admitted"
-	reason := "deterministic source qualification admitted to research queue"
+	reason := "deterministic source qualification admitted to main watchlist"
 	if reservation.existing {
-		decision, reason = "already_member", "active research row retained; source evidence attached without another slot"
+		decision, reason = "already_member", "active main-watchlist entry retained; source evidence attached without another allocation"
 		// The source lease has already been refreshed by addWatchlistItem. Rebuild
 		// the lane from all live evidence so a lower-precedence incoming context
 		// (for example, earnings on a political row) cannot downgrade coverage.
@@ -176,7 +177,7 @@ func recordResearchQueueSuppressionTx(
 		INSERT INTO research_queue_decisions (ticker,bucket,decision,reason,priority)
 		VALUES ($1,$2,'capacity_suppressed',$3,$4::jsonb)`,
 		strings.ToUpper(strings.TrimSpace(item.Ticker)), request.Bucket,
-		"source reservation and shared overflow are full", priority)
+		"source allocation and shared overflow are full", priority)
 	return err
 }
 

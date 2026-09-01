@@ -34,6 +34,10 @@ var watchlistAddCmd = &cobra.Command{
 		if len(timeframes) == 0 {
 			timeframes = []string{"1d"}
 		}
+		cfg, err := config.Load()
+		if err != nil {
+			return fmt.Errorf("load config: %w", err)
+		}
 
 		ctx := context.Background()
 		if err := store.Connect(ctx); err != nil {
@@ -42,11 +46,12 @@ var watchlistAddCmd = &cobra.Command{
 		defer store.Close()
 
 		item := store.WatchlistItem{
-			Ticker:     ticker,
-			Platform:   "stock",
-			Strategies: strategies,
-			Timeframes: timeframes,
-			Source:     "manual",
+			Ticker:             ticker,
+			Platform:           "stock",
+			Strategies:         strategies,
+			Timeframes:         timeframes,
+			Source:             "manual",
+			MaxActiveWatchlist: cfg.Engine.MaxWatchlist,
 		}
 		if err := store.AddWatchlistItem(ctx, item); err != nil {
 			return fmt.Errorf("add to watchlist: %w", err)
@@ -55,11 +60,6 @@ var watchlistAddCmd = &cobra.Command{
 			ticker, strings.Join(strategies, ","), strings.Join(timeframes, ","))
 
 		// Backfill history if Alpaca is configured.
-		cfg, err := config.Load()
-		if err != nil {
-			fmt.Println("⚠  Config unavailable — skipping backfill.")
-			return nil
-		}
 		if cfg.Markets.Stocks.APIKey == "" {
 			fmt.Println("⚠  ALPACA_API_KEY not set — skipping backfill. Set it and re-run te watchlist add.")
 			return nil

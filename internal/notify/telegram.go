@@ -83,10 +83,10 @@ func NewTelegramBot(cfg config.TelegramConfig, bus *events.Bus) *TelegramBot {
 		bot.batcher = NewTickBatcher(cfg, func(text string) error {
 			return bot.sendMessage(text, nil)
 		})
-		bot.scannerBatcher = newScannerPromotionOutcomeBatcher(
-			cfg, bot.sendScannerNotificationWithContext, bot.scannerNotificationContext,
-		)
 	}
+	bot.scannerBatcher = newScannerPromotionOutcomeBatcher(
+		cfg, bot.sendScannerNotificationWithContext, bot.scannerNotificationContext,
+	)
 	return bot
 }
 
@@ -229,7 +229,7 @@ func (b *TelegramBot) subscribeScannerPromotionOutcomes() {
 			if !ok || len(payload.Sources) == 0 {
 				return
 			}
-			if b.scannerBatcher != nil {
+			if b.scannerBatcher != nil && (b.cfg.BatchEnabled || scannerPromotionDeferred(payload)) {
 				b.scannerBatcher.Add(payload)
 			} else {
 				b.sendScannerPromotionOutcome(payload)

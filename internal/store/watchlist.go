@@ -25,8 +25,12 @@ var (
 	ErrWatchlistRefreshNotActive = errors.New("watchlist item is no longer active for refresh")
 	// ErrWatchlistResearchReactivationRequiresAdmission prevents a direct UI
 	// toggle from making scanner-owned research visible without first reserving
-	// a deterministic research-queue membership.
+	// a deterministic scanner admission allocation.
 	ErrWatchlistResearchReactivationRequiresAdmission = errors.New("research-owned watchlist item requires fresh scanner or earnings admission")
+	// ErrWatchlistCapacity means a new entry would exceed the configured main
+	// watchlist limit. Refreshing an existing active entry never consumes a new
+	// slot.
+	ErrWatchlistCapacity = errors.New("watchlist capacity is unavailable")
 )
 
 // WatchlistItem represents a row in the watchlist table.
@@ -70,6 +74,16 @@ type WatchlistItem struct {
 	// deliberately separate from MinConfidence: queue priority never changes
 	// execution, sizing, or downstream analysis thresholds.
 	ResearchQueue *ResearchQueueAdmission
+	// MaxActiveWatchlist is the configured global limit for the main watchlist.
+	// It is supplied by command/runtime wiring so the store can enforce the
+	// limit atomically with an admission. Zero preserves callers that do not
+	// opt into a limit (primarily legacy tests and maintenance tooling).
+	MaxActiveWatchlist int
+	// ResearchStagingID fences a scanner candidate's short-lived staging
+	// reservation inside the same transaction that admits it. It is empty for
+	// manual/config rows and active-row refreshes.
+	ResearchStagingID    string
+	ResearchStagingLease time.Duration
 	// PullbackRequalificationRequired quarantines legacy scanner rows whose
 	// pullback-universe status was not persisted before migration 055.
 	PullbackRequalificationRequired bool
@@ -370,6 +384,7 @@ func addWatchlistItem(
 	if item.Platform == "" {
 		item.Platform = "stock"
 	}
+	item.Ticker = strings.ToUpper(strings.TrimSpace(item.Ticker))
 	if item.Source == "" {
 		item.Source = "manual"
 	}
@@ -378,6 +393,24 @@ func addWatchlistItem(
 	}
 	if err := validateWatchlistSourceLeases(item.SourceLeases); err != nil {
 		return err
+	}
+	if item.ResearchStagingID != "" || item.ResearchStagingLease != 0 {
+		tx, ok := db.(pgx.Tx)
+		if !ok {
+			return errors.New("research staging admission requires a transaction")
+		}
+		if err := renewResearchCandidateTx(ctx, tx, item.ResearchStagingID, item.ResearchStagingLease); err != nil {
+			return err
+		}
+	}
+	if item.MaxActiveWatchlist > 0 {
+		tx, ok := db.(pgx.Tx)
+		if !ok {
+			return errors.New("watchlist capacity admission requires a transaction")
+		}
+		if err := reserveMainWatchlistSlotTx(ctx, tx, item, item.MaxActiveWatchlist); err != nil {
+			return err
+		}
 	}
 	var queueReservation researchQueueReservation
 	if item.ResearchQueue != nil {
@@ -845,6 +878,7 @@ func RemoveWatchlistItem(ctx context.Context, ticker, platform string) error {
 	if platform == "" {
 		platform = "stock"
 	}
+	ticker = strings.ToUpper(strings.TrimSpace(ticker))
 	tx, err := GetDB().Begin(ctx)
 	if err != nil {
 		return err
@@ -869,10 +903,17 @@ func RemoveWatchlistItem(ctx context.Context, ticker, platform string) error {
 }
 
 // ReactivateWatchlistItem restores a manual/config row that an operator
-// previously disabled. Research-owned rows must instead return through their
-// scanner or earnings admission path, which has the source-specific queue
-// capacity and priority required to recreate a membership safely.
+// previously disabled. It remains a compatibility wrapper for callers that do
+// not have the configured main-watchlist limit available.
 func ReactivateWatchlistItem(ctx context.Context, ticker, platform string) error {
+	return ReactivateWatchlistItemWithLimit(ctx, ticker, platform, 0)
+}
+
+// ReactivateWatchlistItemWithLimit restores a manual/config row without
+// exceeding the configured main-watchlist limit. Research-owned rows must
+// instead return through their scanner or earnings admission path, which has
+// the source-specific allocation and priority required to recreate safely.
+func ReactivateWatchlistItemWithLimit(ctx context.Context, ticker, platform string, maxActiveWatchlist int) error {
 	if platform == "" {
 		platform = "stock"
 	}
@@ -908,6 +949,9 @@ func ReactivateWatchlistItem(ctx context.Context, ticker, platform string) error
 	}
 	if researchOwned {
 		return ErrWatchlistResearchReactivationRequiresAdmission
+	}
+	if err := reserveMainWatchlistSlotTx(ctx, tx, item, maxActiveWatchlist); err != nil {
+		return err
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE watchlist SET active=true, updated_at=NOW()

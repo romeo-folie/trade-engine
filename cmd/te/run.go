@@ -974,6 +974,7 @@ Modes:
 					News:                         newsProvider,
 					Bus:                          eng.Bus(),
 					Cfg:                          cfg.Scanner,
+					MaxActiveWatchlist:           cfg.Engine.MaxWatchlist,
 					PullbackUniverseEnabled:      cfg.Risk.EntryGates.PullbackStrengthEnabled,
 					PullbackMinMomentumReturnPct: cfg.Risk.EntryGates.PullbackMinMomentumReturnPct,
 				}
@@ -1102,9 +1103,11 @@ Modes:
 						Historical:         cfg.Scanner.Universe.HistoricalFeed,
 						SIPRecentDataDelay: time.Duration(cfg.Scanner.Universe.SIPRecentDataDelayMinutes) * time.Minute,
 					}),
-					Cfg:           cfg.Scanner.EarningsWatchlist,
-					ResearchQueue: cfg.Scanner.ResearchQueue,
-					Bus:           eng.Bus(),
+					Cfg:                cfg.Scanner.EarningsWatchlist,
+					ResearchQueue:      cfg.Scanner.ResearchQueue,
+					ResearchStaging:    cfg.Scanner.ResearchStaging,
+					MaxActiveWatchlist: cfg.Engine.MaxWatchlist,
+					Bus:                eng.Bus(),
 				}
 				scheduler := &earnings.WatchlistScheduler{Cfg: cfg.Scanner.EarningsWatchlist, Job: feeder}
 				promotionPublisherWG.Add(1)

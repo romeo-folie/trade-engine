@@ -393,6 +393,7 @@ func Defaults() *Config {
 					NewsSympathy: 2, EarningsScheduled: 6,
 				},
 			},
+			ResearchStaging:                  ResearchStagingConfig{Capacity: 30, LeaseMinutes: 15},
 			NewsLookbackHours:                24,
 			TopMovers:                        20,
 			TopActives:                       20,
