@@ -12,16 +12,20 @@ type RiskPolicy struct {
 	MaxTickerExposurePct float64
 	MaxPerTicker         int
 	MinRiskReward        float64
+	// Configured distinguishes active zero-valued limits from an omitted policy.
+	Configured bool
 }
 
 // Normalized preserves the historical prompt limits for direct callers that
 // do not supply an engine risk policy. The engine always supplies active config.
 func (p RiskPolicy) Normalized() RiskPolicy {
-	if p.MaxTickerExposurePct <= 0 {
-		p.MaxTickerExposurePct = 5
-	}
-	if p.MinRiskReward <= 0 {
-		p.MinRiskReward = 1.2
+	if !p.Configured {
+		if p.MaxTickerExposurePct <= 0 {
+			p.MaxTickerExposurePct = 5
+		}
+		if p.MinRiskReward <= 0 {
+			p.MinRiskReward = 1.2
+		}
 	}
 	if p.MaxPerTicker < 0 {
 		p.MaxPerTicker = 0
@@ -53,6 +57,10 @@ func RenderRiskPolicy(policy RiskPolicy) string {
 // RenderRRSelfFilter keeps the proposal's self-filter aligned with the active
 // deterministic minimum, including in the arbiter's custom prompt.
 func RenderRRSelfFilter(policy RiskPolicy) string {
-	minimum := riskNumber(policy.Normalized().MinRiskReward)
+	minimumValue := policy.Normalized().MinRiskReward
+	if minimumValue <= 0 {
+		return "R:R SELF-FILTER (MANDATORY): Compute R:R as: reward = abs(take_profit - signal_price); risk = abs(signal_price - stop_loss); R:R = reward / risk. No minimum R:R floor is configured; do not reject a BUY solely for R:R. A defined nonzero-risk stop is still required."
+	}
+	minimum := riskNumber(minimumValue)
 	return fmt.Sprintf("R:R SELF-FILTER (MANDATORY): Compute R:R as: reward = abs(take_profit - signal_price); risk = abs(signal_price - stop_loss); R:R = reward / risk. If R:R < %s, widen the take_profit toward the next structural target, or tighten the stop_loss to nearer structure — do not propose entry below %s. Only emit BUY if R:R >= %s.", minimum, minimum, minimum)
 }

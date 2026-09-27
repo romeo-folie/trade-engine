@@ -16,4 +16,7 @@ func TestPromptRiskPolicyUsesActiveRiskConfig(t *testing.T) {
 	if policy.MaxTickerExposurePct != 10 || policy.MaxPerTicker != 2 || policy.MinRiskReward != 1.5 {
 		t.Fatalf("prompt risk policy = %+v, want 10%% / 2 / 1.5", policy)
 	}
+	if !policy.Configured {
+		t.Fatal("active engine policy must be marked configured")
+	}
 }

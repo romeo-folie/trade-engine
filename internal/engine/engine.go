@@ -1489,6 +1489,7 @@ func promptRiskPolicy(cfg config.RiskConfig) prompts.RiskPolicy {
 		MaxTickerExposurePct: cfg.MaxPositionPct,
 		MaxPerTicker:         cfg.MaxPerTicker,
 		MinRiskReward:        cfg.MinRiskReward,
+		Configured:           true,
 	}
 }
 

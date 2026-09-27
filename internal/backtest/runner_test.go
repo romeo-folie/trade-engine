@@ -19,6 +19,22 @@ func TestCoversRange_Empty(t *testing.T) {
 	}
 }
 
+func TestBuildRequestUsesBacktestRiskConfig(t *testing.T) {
+	cfg := config.RiskConfig{MaxPositionPct: 10, MaxPerTicker: 2, MinRiskReward: 1.5}
+	req, err := buildRequest(RunOptions{Ticker: "AAPL", Timeframe: data.Timeframe1Day},
+		[]data.Candle{{Close: 100, High: 101, Low: 99, Volume: 1000}}, cfg)
+	if err != nil {
+		t.Fatalf("buildRequest: %v", err)
+	}
+	if got := req.RiskPolicy; !got.Configured || got.MaxTickerExposurePct != 10 || got.MaxPerTicker != 2 || got.MinRiskReward != 1.5 {
+		t.Fatalf("backtest request policy = %+v, want configured 10%% / 2 / 1.5", got)
+	}
+	zero, err := buildRequest(RunOptions{Ticker: "AAPL"}, nil, config.RiskConfig{})
+	if err != nil || !zero.RiskPolicy.Configured || zero.RiskPolicy.Normalized().MaxTickerExposurePct != 0 {
+		t.Fatalf("explicit-zero backtest policy was not preserved: policy=%+v err=%v", zero.RiskPolicy, err)
+	}
+}
+
 func TestCoversRange_ExactBoundary(t *testing.T) {
 	from := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
 	to := time.Date(2024, 1, 3, 0, 0, 0, 0, time.UTC)

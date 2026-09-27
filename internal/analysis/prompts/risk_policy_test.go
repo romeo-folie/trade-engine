@@ -73,3 +73,21 @@ func TestRiskPolicyFallbackForDirectCallers(t *testing.T) {
 		t.Error("zero-value policy must not invent an entry-count limit")
 	}
 }
+
+func TestRiskPolicyPreservesConfiguredZeroLimits(t *testing.T) {
+	system := buildSystem("", "", nil, RiskPolicy{Configured: true})
+	for _, want := range []string{
+		"size_pct is the proposed incremental BUY order size as a percentage of portfolio equity; it must be between 0 and 0",
+		"Combined long exposure in this ticker after the proposed BUY must not exceed 0%",
+		"No minimum R:R floor is configured",
+	} {
+		if !strings.Contains(system, want) {
+			t.Errorf("explicit-zero prompt missing %q", want)
+		}
+	}
+	for _, stale := range []string{"exceed 5%", "If R:R < 1.2"} {
+		if strings.Contains(system, stale) {
+			t.Errorf("explicit-zero prompt acquired fallback %q", stale)
+		}
+	}
+}
