@@ -81,7 +81,7 @@ func (c *AnthropicClient) Analyze(ctx context.Context, req AnalysisRequest) (Ana
 			toPromptSimilarSetups(req.SimilarAnalyses),
 			req.PerformanceContext,
 			req.MomentumPlay, req.DiscoveryContext, req.PullbackContext,
-			req.TimeframeRole, req.PrimaryThesisContext,
+			req.TimeframeRole, req.PrimaryThesisContext, req.RiskPolicy,
 		)
 		systemPrompt, userMessage = appendTimeframeContexts(systemPrompt, userMessage, req.TimeframeContexts)
 	}

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/romeo-folie/trade-engine/internal/analysis/prompts"
 	"github.com/romeo-folie/trade-engine/internal/config"
 )
 
@@ -97,6 +98,42 @@ func TestOpenAIClient_Analyze_Success(t *testing.T) {
 	}
 	if meta.InputTokens != 15 || meta.OutputTokens != 25 {
 		t.Errorf("token counts = %d/%d, want 15/25", meta.InputTokens, meta.OutputTokens)
+	}
+}
+
+func TestOpenAIClient_Analyze_ConfiguredRiskPrompt(t *testing.T) {
+	const payload = `{"action":"HOLD","confidence":0.5,"size_pct":0,"stop_loss":0,"take_profit":0,"reasoning":"no setup"}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Messages []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		if len(body.Messages) == 0 {
+			t.Error("missing messages")
+		} else {
+			system := body.Messages[0].Content
+			for _, want := range []string{"exceed 10%", "At most 2 open long positions", "If R:R < 1.5"} {
+				if !strings.Contains(system, want) {
+					t.Errorf("provider prompt missing %q", want)
+				}
+			}
+		}
+		json.NewEncoder(w).Encode(validOpenAIResp(payload))
+	}))
+	defer srv.Close()
+	c := NewOpenAIClient(config.ModelConfig{Model: "gpt-4o", APIKey: "test-key"})
+	c.baseURL = srv.URL
+	_, _, err := c.Analyze(context.Background(), AnalysisRequest{
+		Ticker: "AAPL", Strategy: "trend_following", Timeframe: "1d",
+		RiskPolicy: prompts.RiskPolicy{MaxTickerExposurePct: 10, MaxPerTicker: 2, MinRiskReward: 1.5},
+	})
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
 	}
 }
 

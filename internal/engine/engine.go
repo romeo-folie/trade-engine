@@ -1166,6 +1166,7 @@ func (e *Engine) runAnalysisWithProfile(
 
 	req := analysis.AnalysisRequest{
 		Ticker:             ticker,
+		RiskPolicy:         promptRiskPolicy(e.cfg.Risk),
 		Strategy:           strategy,
 		Strategies:         strategies,
 		DiscoveryContext:   discoveryContext,
@@ -1481,6 +1482,14 @@ func (e *Engine) runAnalysisWithProfile(
 		LastAnalysedAt:     time.Now(),
 	}
 	e.tickerStateMu.Unlock()
+}
+
+func promptRiskPolicy(cfg config.RiskConfig) prompts.RiskPolicy {
+	return prompts.RiskPolicy{
+		MaxTickerExposurePct: cfg.MaxPositionPct,
+		MaxPerTicker:         cfg.MaxPerTicker,
+		MinRiskReward:        cfg.MinRiskReward,
+	}
 }
 
 // lensSelectionTelemetry returns the scanner-owned recommendation and bounded

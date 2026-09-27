@@ -14,18 +14,6 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/tradeprofile"
 )
 
-// rrSelfFilter is the literal R:R guidance sentence required by PR #334.
-// Tests assert this exact string is present in every role prompt.
-// Threshold lowered from 1.5 → 1.2 to match the gate calibration in
-// config.yaml.risk.min_risk_reward (operator preference for risk-tolerant
-// trading; prompt-level filter must not exceed the gate or signals get
-// downgraded to WAIT at the source and never reach the gate).
-const rrSelfFilter = `R:R SELF-FILTER (MANDATORY): Compute R:R as: reward = abs(take_profit - signal_price); risk = abs(signal_price - stop_loss); R:R = reward / risk. If R:R < 1.2, widen the take_profit toward the next structural target, or tighten the stop_loss to nearer structure — do not propose entry below 1.2. Only emit BUY if R:R >= 1.2.`
-
-// RRSelfFilter exposes the verbatim R:R sentence for prompts built outside this
-// package (the arbiter in internal/analysis/ensemble.go).
-const RRSelfFilter = rrSelfFilter
-
 // roleOutputSchema is the shared JSON-schema block all role prompts emit.
 //
 // NB: this const is substituted via a %s verb (an argument, not a format
@@ -36,16 +24,14 @@ const RRSelfFilter = rrSelfFilter
 // It is the shared OutputSchema (stock.go) followed by ConfidenceAnchors and
 // PortfolioRules, so every role emits the same JSON contract — including the
 // lens-selection fields — and scores on the same calibrated scale.
-const roleOutputSchema = OutputSchema + `
-
-` + ConfidenceAnchors + `
-
-` + PortfolioRules
+func roleOutputSchema(policy RiskPolicy) string {
+	return OutputSchema + "\n\n" + RenderRiskPolicy(policy) + "\n\n" + ConfidenceAnchors + "\n\n" + PortfolioRules
+}
 
 // buildFundamentalSystem returns the specialist prompt for the fundamental analyst.
 // Focus: earnings, catalysts, sector context, business quality. Downweights
 // purely technical signals.
-func buildFundamentalSystem(contract, exitOverride string) string {
+func buildFundamentalSystem(contract, exitOverride string, policy RiskPolicy) string {
 	return fmt.Sprintf(`You are a fundamental research analyst contributing one vote in a 4-specialist debate.
 
 YOUR MANDATE: judge this trade on business and catalyst quality. Anchor on earnings outlook, sector tailwinds/headwinds, recent corporate news, and management guidance. Treat the technical indicator block as secondary context — do not let chart structure override a weak or strong fundamental story.
@@ -61,12 +47,12 @@ ROLE GUIDANCE:
 - SELL when fundamentals have deteriorated (downgrades, guidance cuts, sector breakdown) and an existing long should exit.
 - Cite specific news headlines, earnings cadence, or sector context in your reasoning. Do not list indicator readings.
 
-%s%s`, contract, roleOutputSchema, rrSelfFilter, exitOverride)
+%s%s`, contract, roleOutputSchema(policy), RenderRRSelfFilter(policy), exitOverride)
 }
 
 // buildTechnicalSystem returns the specialist prompt for the technical analyst.
 // Focus: indicators, structure, levels. Downweights catalyst noise.
-func buildTechnicalSystem(contract, exitOverride string) string {
+func buildTechnicalSystem(contract, exitOverride string, policy RiskPolicy) string {
 	return fmt.Sprintf(`You are a technical analyst contributing one vote in a 4-specialist debate.
 
 YOUR MANDATE: judge this trade on chart structure and indicator alignment. Anchor on trend (EMA stack, ADX), momentum (RSI, MACD, Stoch), volatility (ATR, Bollinger Bands), volume confirmation (VolRatio, OBV), and the full OHLCV candle history provided in the user message. Treat news as background — do not let a single headline override a clear technical setup or breakdown.
@@ -82,12 +68,12 @@ ROLE GUIDANCE:
 - HOLD when the chart is choppy, indicators conflict, or there is no actionable structure.
 - Cite specific indicator values, candle patterns, and price levels in your reasoning. Do not lead with news.
 
-%s%s`, contract, roleOutputSchema, rrSelfFilter, exitOverride)
+%s%s`, contract, roleOutputSchema(policy), RenderRRSelfFilter(policy), exitOverride)
 }
 
 // buildSentimentSystem returns the specialist prompt for the sentiment analyst.
 // Focus: news flow, catalyst quality, social/headline tone.
-func buildSentimentSystem(contract, exitOverride string) string {
+func buildSentimentSystem(contract, exitOverride string, policy RiskPolicy) string {
 	return fmt.Sprintf(`You are a sentiment analyst contributing one vote in a 4-specialist debate.
 
 YOUR MANDATE: judge this trade on news flow and catalyst quality. Anchor on the recency, source, and tone of the news block, the freshness of the catalyst (hours-old beats days-old), and whether sentiment is aligned with price action. Treat raw indicators as secondary — your edge is reading the narrative.
@@ -103,13 +89,13 @@ ROLE GUIDANCE:
 - HOLD when news is stale, neutral, or absent — there is no narrative edge to trade.
 - Cite specific headlines, sources, and the age of each catalyst in your reasoning. A bullish two-day-old headline is not a fresh signal.
 
-%s%s`, contract, roleOutputSchema, rrSelfFilter, exitOverride)
+%s%s`, contract, roleOutputSchema(policy), RenderRRSelfFilter(policy), exitOverride)
 }
 
 // buildRiskManagerSystem returns the mandatory final specialist-review prompt.
 // Unlike the three directional roles, this model receives their completed
 // findings and owns the final specialist outcome before deterministic controls.
-func buildRiskManagerSystem(contract, exitOverride string) string {
+func buildRiskManagerSystem(contract, exitOverride string, policy RiskPolicy) string {
 	return fmt.Sprintf(`You are the mandatory Risk Specialist reviewing three completed specialist analyses. You are the final analytical stage before deterministic portfolio risk controls.
 
 YOUR MANDATE: synthesize the fundamental, technical, and sentiment findings, then enforce risk discipline. Anchor on portfolio exposure, position sizing, R:R, correlation with existing open positions, ATR-relative stop distance, and drawdown vulnerability. You are explicitly allowed and expected to reject an otherwise attractive setup when risk discipline is violated.
@@ -123,9 +109,9 @@ ROLE GUIDANCE:
 - BUY or SELL only when the directional evidence is coherent and the trade clears the named discipline checks.
 - WAIT (or HOLD when the setup is dead) when the specialists conflict materially or when you can name a concrete discipline failure:
   - Stop distance exceeds 2.5x ATR (over-extended entry — name the ATR value)
-  - Position size implied by sizing rules would exceed the 5%% per-position cap (name the size)
+  - The proposed incremental size_pct would make combined ticker exposure exceed the BUY RISK POLICY cap (name the size and existing exposure)
   - Portfolio already holds the SAME ticker at full per-ticker cap, or a directly correlated long that would compound a named macro/sector risk
-  - R:R is below 1.2 (the self-filter forces a wider TP / tighter SL — emit WAIT only if neither is plausible)
+  - R:R is below the BUY RISK POLICY minimum (the self-filter forces a wider TP / tighter SL — emit WAIT only if neither is plausible)
   - Drawdown exceeds 10%% AND current equity is within 2%% of the daily loss limit
 - A vague concern ("conditions seem risky", "uncertainty is elevated", "let it settle") is not a valid rejection.
 - You are a safety circuit, not a permanent brake. Do not second-guess aligned directional evidence without a specific conflict or risk failure.
@@ -133,7 +119,7 @@ ROLE GUIDANCE:
 - HOLD when there is no actionable signal.
 - Your reasoning must summarize how the three findings support or conflict with the final action and name any discipline check that changed the outcome.
 
-%s%s`, contract, roleOutputSchema, rrSelfFilter, exitOverride)
+%s%s`, contract, roleOutputSchema(policy), RenderRRSelfFilter(policy), exitOverride)
 }
 
 // BuildRolePrompt returns (system, user) prompts for a single specialist role.
@@ -206,18 +192,23 @@ func BuildRolePromptWithAnalysisContext(
 	pullbackContext *pullback.PromptContext,
 	timeframeRole TimeframeRole,
 	primaryThesis *PrimaryThesisContext,
+	riskPolicies ...RiskPolicy,
 ) (systemPrompt, userMessage string) {
+	var riskPolicy RiskPolicy
+	if len(riskPolicies) > 0 {
+		riskPolicy = riskPolicies[0]
+	}
 	contract := lensContract(strategies)
 	exitOverride := ExitOnlyOverride(strategies)
 	switch role {
 	case "fundamental":
-		systemPrompt = buildFundamentalSystem(contract, exitOverride)
+		systemPrompt = buildFundamentalSystem(contract, exitOverride, riskPolicy)
 	case "technical":
-		systemPrompt = buildTechnicalSystem(contract, exitOverride)
+		systemPrompt = buildTechnicalSystem(contract, exitOverride, riskPolicy)
 	case "sentiment":
-		systemPrompt = buildSentimentSystem(contract, exitOverride)
+		systemPrompt = buildSentimentSystem(contract, exitOverride, riskPolicy)
 	case "risk_manager":
-		systemPrompt = buildRiskManagerSystem(contract, exitOverride)
+		systemPrompt = buildRiskManagerSystem(contract, exitOverride, riskPolicy)
 	default:
 		return "", ""
 	}
@@ -294,11 +285,12 @@ func BuildRiskManagerReviewPromptWithAnalysisContext(
 	pullbackContext *pullback.PromptContext,
 	timeframeRole TimeframeRole,
 	primaryThesis *PrimaryThesisContext,
+	riskPolicies ...RiskPolicy,
 ) (systemPrompt, userMessage string) {
 	systemPrompt, userMessage = BuildRolePromptWithAnalysisContext(
 		"risk_manager", ticker, strategies, timeframe, candles, ind, news,
 		portfolio, knowledgeContext, similarSetups, performanceContext, discoveryContext,
-		pullbackContext, timeframeRole, primaryThesis,
+		pullbackContext, timeframeRole, primaryThesis, riskPolicies...,
 	)
 	if systemPrompt == "" || userMessage == "" {
 		return "", ""

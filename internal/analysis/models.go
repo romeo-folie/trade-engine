@@ -42,6 +42,9 @@ const (
 // AnalysisRequest carries everything a model needs to produce a recommendation.
 type AnalysisRequest struct {
 	Ticker string
+	// RiskPolicy is the active deterministic BUY policy rendered into stock
+	// prompts. Zero values retain legacy prompt defaults for direct callers.
+	RiskPolicy prompts.RiskPolicy
 	// Strategy is the configured PRIMARY label (watchlist strategies[0]). It is
 	// retained for logging, persistence, and the history-window cap; it no
 	// longer decides how the analyst frames the setup.

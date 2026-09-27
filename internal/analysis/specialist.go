@@ -122,7 +122,7 @@ func (a *Analyzer) AnalyzeSpecialist(ctx context.Context, req AnalysisRequest, _
 			rp.role, req.Ticker, req.LensSet(), req.Timeframe,
 			promptCandles, promptInd, promptNews, promptPortfolio,
 			req.KnowledgeContext, promptSimilar, req.PerformanceContext, req.DiscoveryContext, req.PullbackContext,
-			req.TimeframeRole, req.PrimaryThesisContext,
+			req.TimeframeRole, req.PrimaryThesisContext, req.RiskPolicy,
 		)
 		sys, user = appendTimeframeContexts(sys, user, req.TimeframeContexts)
 		if sys == "" || user == "" {
@@ -207,7 +207,7 @@ func (a *Analyzer) AnalyzeSpecialist(ctx context.Context, req AnalysisRequest, _
 		promptCandles, promptInd, promptNews, promptPortfolio,
 		req.KnowledgeContext, promptSimilar, req.PerformanceContext,
 		formatDirectionalFindings(results), req.DiscoveryContext, req.PullbackContext,
-		req.TimeframeRole, req.PrimaryThesisContext,
+		req.TimeframeRole, req.PrimaryThesisContext, req.RiskPolicy,
 	)
 	sys, user = appendTimeframeContexts(sys, user, req.TimeframeContexts)
 	if sys == "" || user == "" {

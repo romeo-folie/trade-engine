@@ -6,6 +6,8 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/romeo-folie/trade-engine/internal/analysis/prompts"
 )
 
 // captureArbiter is a minimal ModelProvider used by tests to capture the
@@ -13,12 +15,14 @@ import (
 type captureArbiter struct {
 	captured       string
 	capturedSystem string
+	capturedPolicy prompts.RiskPolicy
 	response       AnalysisResponse
 }
 
 func (c *captureArbiter) Analyze(_ context.Context, req AnalysisRequest) (AnalysisResponse, ModelCallMeta, error) {
 	c.captured = req.CustomUserMessage
 	c.capturedSystem = req.CustomSystemPrompt
+	c.capturedPolicy = req.RiskPolicy
 	if c.response.Action != "" {
 		return c.response, ModelCallMeta{Provider: "test", Model: "arbiter"}, nil
 	}
@@ -472,7 +476,7 @@ func TestArbiterLabel_TwoLetterRollover(t *testing.T) {
 // TestArbiterSystemPrompt_Calibration guards the prompt-calibration bundle on
 // the arbiter: its confidence is what the entry gate reads on every arbitrated
 // signal, so it must share the analysts' anchors and R:R filter, cap size_pct
-// at the analyst/risk limit (5.0, was 10.0), and not leak raw format verbs
+// at the analyst/risk limit, and not leak raw format verbs
 // (the old plain-string prompt showed literal "%.2f" and "20%%+").
 func TestArbiterSystemPrompt_Calibration(t *testing.T) {
 	sys := arbiterSystemPrompt()
@@ -482,11 +486,32 @@ func TestArbiterSystemPrompt_Calibration(t *testing.T) {
 	if !strings.Contains(sys, "R:R SELF-FILTER (MANDATORY)") {
 		t.Error("arbiter prompt is missing the R:R self-filter")
 	}
-	if !strings.Contains(sys, `"size_pct": <0.0–5.0>`) {
-		t.Error("arbiter size_pct cap must be 5.0 to match the analyst schema and risk.max_position_pct")
+	if !strings.Contains(sys, "Combined long exposure in this ticker after the proposed BUY must not exceed 5%") {
+		t.Error("arbiter prompt is missing the fallback 5% combined ticker cap")
 	}
 	if strings.Contains(sys, "%.2f") || strings.Contains(sys, "%%") {
 		t.Error("arbiter prompt leaks raw format verbs")
+	}
+}
+
+func TestArbitratePropagatesConfiguredRiskPolicy(t *testing.T) {
+	policy := prompts.RiskPolicy{MaxTickerExposurePct: 10, MaxPerTicker: 2, MinRiskReward: 1.5}
+	provider := &captureArbiter{}
+	req := AnalysisRequest{Ticker: "TEST", RiskPolicy: policy}
+	results := []AnalystResult{makeResult(ActionBuy, .8, nil), makeResult(ActionWait, .7, nil)}
+	if _, err := Arbitrate(context.Background(), provider, req, results); err != nil {
+		t.Fatalf("Arbitrate: %v", err)
+	}
+	if provider.capturedPolicy != policy {
+		t.Errorf("arbiter request policy = %+v, want %+v", provider.capturedPolicy, policy)
+	}
+	for _, want := range []string{"exceed 10%", "At most 2 open long positions", "If R:R < 1.5"} {
+		if !strings.Contains(provider.capturedSystem, want) {
+			t.Errorf("arbiter prompt missing %q", want)
+		}
+	}
+	if strings.Contains(provider.capturedSystem, "R:R < 1.2") {
+		t.Error("arbiter prompt contains stale R:R floor")
 	}
 }
 
