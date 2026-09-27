@@ -275,7 +275,7 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 	recorder.run.ExpiredItemCount = len(expired)
 	scanItemsExpired = len(expired)
 
-	// 2. Fetch candidates from both screeners.
+	// 2. Fetch candidates from enabled market-activity screeners.
 	candidates, err := s.fetchCandidates(ctx)
 	if err != nil {
 		return fmt.Errorf("fetch candidates: %w", err)
@@ -1212,98 +1212,102 @@ func (s *MarketScanner) renewScannerCycleBeforePromotion(
 	return nil
 }
 
-// fetchCandidates pulls top movers and most-active stocks and merges them.
+// fetchCandidates pulls the enabled market-activity sources and merges them.
 func (s *MarketScanner) fetchCandidates(ctx context.Context) ([]SwingCandidate, error) {
 	byTicker := make(map[string]*SwingCandidate)
 
-	// Top movers (gainers + losers) must be tradeable and liquid enough for
-	// analyst research. These objective floors replace the retired LLM veto.
 	minPrice := s.Cfg.Universe.MinPrice
 	if minPrice <= 0 {
 		minPrice = 5
 	}
-	movers, err := data.FetchGapMovers(ctx, s.AlpacaClient, data.GapScreen{
-		// FetchGapMovers only has IEX snapshot volume. It must not influence a
-		// hard cutoff either as a floor or a rank: IEX is partial and can
-		// undercount genuinely liquid names, especially near the open. Keep the
-		// screener's native gap order until consolidated liquidity is available.
-		MinGapPct: 0, MinPrice: minPrice,
-		RankByLiquidity: false,
-	})
-	if err != nil {
-		slog.Warn("scanner: fetch movers failed", "err", err)
-	}
-	top := s.Cfg.TopMovers
-	if top <= 0 {
-		top = 20
-	}
-	for i, m := range movers {
-		if i >= top {
-			break
+	if s.Cfg.TopMoversEnabled {
+		// Top movers (gainers + losers) must be tradeable and liquid enough for
+		// analyst research. These objective floors replace the retired LLM veto.
+		movers, err := data.FetchGapMovers(ctx, s.AlpacaClient, data.GapScreen{
+			// FetchGapMovers only has IEX snapshot volume. It must not influence a
+			// hard cutoff either as a floor or a rank: IEX is partial and can
+			// undercount genuinely liquid names, especially near the open. Keep the
+			// screener's native gap order until consolidated liquidity is available.
+			MinGapPct: 0, MinPrice: minPrice,
+			RankByLiquidity: false,
+		})
+		if err != nil {
+			slog.Warn("scanner: fetch movers failed", "err", err)
 		}
-		byTicker[m.Ticker] = &SwingCandidate{
-			Ticker:    m.Ticker,
-			Price:     m.PreMarketLast,
-			ChangePct: m.GapPct,
-			Volume:    m.PreMarketVol,
-			// IEX premarket volume is partial: retain it as observation only, never
-			// as a queue-admission liquidity rank.
-			DollarVolume: 0,
-			Sources:      []string{"mover"},
-			SourceScores: map[string]float64{"mover": normalizedProviderRank(i)},
-			sourceMarketObservations: map[string]map[string]any{
-				"mover": moverMarketObservation(m.PreMarketLast, m.GapPct, m.PreMarketVol),
-			},
+		top := s.Cfg.TopMovers
+		if top <= 0 {
+			top = 20
+		}
+		for i, m := range movers {
+			if i >= top {
+				break
+			}
+			byTicker[m.Ticker] = &SwingCandidate{
+				Ticker:    m.Ticker,
+				Price:     m.PreMarketLast,
+				ChangePct: m.GapPct,
+				Volume:    m.PreMarketVol,
+				// IEX premarket volume is partial: retain it as observation only, never
+				// as a queue-admission liquidity rank.
+				DollarVolume: 0,
+				Sources:      []string{"mover"},
+				SourceScores: map[string]float64{"mover": normalizedProviderRank(i)},
+				sourceMarketObservations: map[string]map[string]any{
+					"mover": moverMarketObservation(m.PreMarketLast, m.GapPct, m.PreMarketVol),
+				},
+			}
 		}
 	}
 
-	// Most active by volume.
-	topActives := s.Cfg.TopActives
-	if topActives <= 0 {
-		topActives = 20
-	}
-	actives, err := data.FetchMostActive(ctx, s.AlpacaClient, topActives)
-	if err != nil {
-		slog.Warn("scanner: fetch most actives failed", "err", err)
-	}
-	eligibleActiveRank := 0
-	for _, a := range actives {
-		if a.Price < minPrice || a.Volume <= 0 {
-			continue
+	if s.Cfg.TopActivesEnabled {
+		// Most active by volume.
+		topActives := s.Cfg.TopActives
+		if topActives <= 0 {
+			topActives = 20
 		}
-		activeRank := eligibleActiveRank
-		eligibleActiveRank++
-		if existing, ok := byTicker[a.Ticker]; ok {
-			existing.Sources = append(existing.Sources, "active")
-			if existing.sourceMarketObservations == nil {
-				existing.sourceMarketObservations = make(map[string]map[string]any)
+		actives, err := data.FetchMostActive(ctx, s.AlpacaClient, topActives)
+		if err != nil {
+			slog.Warn("scanner: fetch most actives failed", "err", err)
+		}
+		eligibleActiveRank := 0
+		for _, a := range actives {
+			if a.Price < minPrice || a.Volume <= 0 {
+				continue
 			}
-			existing.sourceMarketObservations["active"] = activeMarketObservation(a.Price, a.Volume, a.TradeCount)
-			if a.Volume > existing.Volume {
-				existing.Volume = a.Volume
-			}
-			if existing.Price == 0 {
-				existing.Price = a.Price
-			}
-			if existing.SourceScores == nil {
-				existing.SourceScores = make(map[string]float64)
-			}
-			existing.SourceScores["active"] = normalizedProviderRank(activeRank)
-		} else {
-			byTicker[a.Ticker] = &SwingCandidate{
-				Ticker:     a.Ticker,
-				Price:      a.Price,
-				Volume:     a.Volume,
-				TradeCount: a.TradeCount,
-				// The screener exposes current-session activity, not completed-session
-				// median liquidity. Keep it in source observations, never as a
-				// completed-liquidity floor or research-queue ranking value.
-				DollarVolume: 0,
-				Sources:      []string{"active"},
-				SourceScores: map[string]float64{"active": normalizedProviderRank(activeRank)},
-				sourceMarketObservations: map[string]map[string]any{
-					"active": activeMarketObservation(a.Price, a.Volume, a.TradeCount),
-				},
+			activeRank := eligibleActiveRank
+			eligibleActiveRank++
+			if existing, ok := byTicker[a.Ticker]; ok {
+				existing.Sources = append(existing.Sources, "active")
+				if existing.sourceMarketObservations == nil {
+					existing.sourceMarketObservations = make(map[string]map[string]any)
+				}
+				existing.sourceMarketObservations["active"] = activeMarketObservation(a.Price, a.Volume, a.TradeCount)
+				if a.Volume > existing.Volume {
+					existing.Volume = a.Volume
+				}
+				if existing.Price == 0 {
+					existing.Price = a.Price
+				}
+				if existing.SourceScores == nil {
+					existing.SourceScores = make(map[string]float64)
+				}
+				existing.SourceScores["active"] = normalizedProviderRank(activeRank)
+			} else {
+				byTicker[a.Ticker] = &SwingCandidate{
+					Ticker:     a.Ticker,
+					Price:      a.Price,
+					Volume:     a.Volume,
+					TradeCount: a.TradeCount,
+					// The screener exposes current-session activity, not completed-session
+					// median liquidity. Keep it in source observations, never as a
+					// completed-liquidity floor or research-queue ranking value.
+					DollarVolume: 0,
+					Sources:      []string{"active"},
+					SourceScores: map[string]float64{"active": normalizedProviderRank(activeRank)},
+					sourceMarketObservations: map[string]map[string]any{
+						"active": activeMarketObservation(a.Price, a.Volume, a.TradeCount),
+					},
+				}
 			}
 		}
 	}

@@ -1286,10 +1286,17 @@ type ScannerConfig struct {
 	// TopMovers is the number of top movers (gainers + losers) to fetch per scan.
 	// Default: 20.
 	TopMovers int `yaml:"top_movers"`
+	// TopMoversEnabled controls whether the Alpaca movers screener contributes
+	// candidates. Default: true. Use this switch rather than setting TopMovers
+	// to zero, which retains its legacy fallback of 20.
+	TopMoversEnabled bool `yaml:"top_movers_enabled"`
 
 	// TopActives is the number of most-active-by-volume stocks to fetch per scan.
 	// Default: 20.
 	TopActives int `yaml:"top_actives"`
+	// TopActivesEnabled controls whether the Alpaca most-active screener
+	// contributes candidates. Default: true.
+	TopActivesEnabled bool `yaml:"top_actives_enabled"`
 
 	// PromotionMaxPerIndustry is retained for legacy configuration only. The
 	// deterministic research queue deliberately has no scanner-wide industry

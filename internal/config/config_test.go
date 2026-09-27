@@ -30,6 +30,36 @@ func TestDefaultsResearchQueueIsBoundedAndFullyAllocated(t *testing.T) {
 	}
 }
 
+func TestScannerMarketActivitySourceSwitchesLoad(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	path := ConfigPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, yamlText          string
+		wantMovers, wantActives bool
+	}{
+		{name: "omitted retain legacy sources", yamlText: "scanner:\n  enabled: true\n", wantMovers: true, wantActives: true},
+		{name: "explicitly disabled", yamlText: "scanner:\n  enabled: true\n  top_movers_enabled: false\n  top_actives_enabled: false\n"},
+		{name: "independent switches", yamlText: "scanner:\n  enabled: true\n  top_movers_enabled: false\n  top_actives_enabled: true\n", wantActives: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.WriteFile(path, []byte(tc.yamlText), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Scanner.TopMoversEnabled != tc.wantMovers || cfg.Scanner.TopActivesEnabled != tc.wantActives {
+				t.Fatalf("market source switches=%v/%v, want %v/%v", cfg.Scanner.TopMoversEnabled, cfg.Scanner.TopActivesEnabled, tc.wantMovers, tc.wantActives)
+			}
+		})
+	}
+}
+
 func TestValidateResearchQueueRequiresExactCapacityAllocation(t *testing.T) {
 	cfg := Defaults()
 	cfg.Scanner.ResearchQueue.Overflow = 5

@@ -1080,6 +1080,8 @@ Modes:
 					"interval_hours", cfg.Scanner.ScanIntervalHours,
 					"ttl_days", cfg.Scanner.TTLDays,
 					"candidate_cap", cfg.Scanner.CandidateCap,
+					"top_movers_enabled", cfg.Scanner.TopMoversEnabled,
+					"top_actives_enabled", cfg.Scanner.TopActivesEnabled,
 				)
 			}
 		}
