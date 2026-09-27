@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/analysis/depth"
+	"github.com/romeo-folie/trade-engine/internal/analysis/prompts"
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/events"
 )
@@ -16,6 +17,7 @@ import (
 type fakeRoleProvider struct {
 	provider string
 	model    string
+	request  AnalysisRequest
 }
 
 type captureRiskProvider struct {
@@ -34,7 +36,8 @@ func (p *captureRiskProvider) Analyze(_ context.Context, req AnalysisRequest) (A
 func (f *fakeRoleProvider) ProviderName() string { return f.provider }
 func (f *fakeRoleProvider) ModelName() string    { return f.model }
 func (f *fakeRoleProvider) IsAvailable() bool    { return true }
-func (f *fakeRoleProvider) Analyze(_ context.Context, _ AnalysisRequest) (AnalysisResponse, ModelCallMeta, error) {
+func (f *fakeRoleProvider) Analyze(_ context.Context, req AnalysisRequest) (AnalysisResponse, ModelCallMeta, error) {
+	f.request = req
 	return AnalysisResponse{
 			Action: ActionBuy, Confidence: 0.7,
 			SizePct: 1.0, StopLoss: 100, TakeProfit: 110,
@@ -194,17 +197,21 @@ func TestAnalyzeSpecialist_RejectsMissingDirectionalRole(t *testing.T) {
 }
 
 func TestAnalyzeSpecialist_RiskReviewerReceivesFindingsAndOwnsFinalOutcome(t *testing.T) {
+	policy := prompts.RiskPolicy{MaxTickerExposurePct: 10, MaxPerTicker: 2, MinRiskReward: 1.5}
 	risk := &captureRiskProvider{
 		response: AnalysisResponse{
 			Action: ActionWait, Confidence: 0.81,
 			Reasoning: "directional evidence conflicts with portfolio exposure",
 		},
 	}
+	directional := make(map[string]*fakeRoleProvider)
 	withSpecialistBuildProvider(t, func(c config.ModelConfig) ModelProvider {
 		if c.Model == "risk-model" {
 			return risk
 		}
-		return &fakeRoleProvider{provider: c.Provider, model: c.Model}
+		p := &fakeRoleProvider{provider: c.Provider, model: c.Model}
+		directional[c.Model] = p
+		return p
 	})
 
 	registry := config.ModelRegistry{
@@ -221,7 +228,7 @@ func TestAnalyzeSpecialist_RiskReviewerReceivesFindingsAndOwnsFinalOutcome(t *te
 	}
 
 	result, err := a.AnalyzeSpecialist(context.Background(), AnalysisRequest{
-		Ticker: "AAPL", Strategy: "momentum", Timeframe: "1h",
+		Ticker: "AAPL", Strategy: "momentum", Timeframe: "1h", RiskPolicy: policy,
 	}, depth.ImpactScore{})
 	if err != nil {
 		t.Fatalf("AnalyzeSpecialist returned error: %v", err)
@@ -242,6 +249,16 @@ func TestAnalyzeSpecialist_RiskReviewerReceivesFindingsAndOwnsFinalOutcome(t *te
 	}
 	if !strings.Contains(result.Response.Reasoning, "mandatory risk-manager review") {
 		t.Fatalf("final reasoning does not describe mandatory review: %q", result.Response.Reasoning)
+	}
+	for name, provider := range directional {
+		if provider.request.RiskPolicy != policy || !strings.Contains(provider.request.CustomSystemPrompt, "exceed 10%") ||
+			!strings.Contains(provider.request.CustomSystemPrompt, "If R:R < 1.5") {
+			t.Errorf("%s lost configured risk policy in directional request", name)
+		}
+	}
+	if risk.request.RiskPolicy != policy || !strings.Contains(risk.request.CustomSystemPrompt, "At most 2 open long positions") ||
+		!strings.Contains(risk.request.CustomSystemPrompt, "If R:R < 1.5") {
+		t.Error("risk reviewer lost configured risk policy")
 	}
 }
 

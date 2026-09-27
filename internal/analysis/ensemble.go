@@ -221,10 +221,13 @@ func Arbitrate(ctx context.Context, arbiter ModelProvider, req AnalysisRequest, 
 	}
 
 	arbReq := AnalysisRequest{
-		CustomSystemPrompt: arbiterSystemPrompt() + prompts.ExitOnlyOverride(req.LensSet()) + prompts.TimeframeRoleInstruction(req.TimeframeRole) + multiTimeframeArbiterInstruction(req.TimeframeContexts),
+		CustomSystemPrompt: arbiterSystemPrompt(req.RiskPolicy) + prompts.ExitOnlyOverride(req.LensSet()) + prompts.TimeframeRoleInstruction(req.TimeframeRole) + multiTimeframeArbiterInstruction(req.TimeframeContexts),
 		CustomUserMessage: buildArbiterUserMessage(req.Ticker, currentPrice, sb.String()) + "\n\n" +
+			prompts.RenderPortfolioContext(toPromptPortfolio(req.Portfolio, req.Ticker)) + "\n" +
 			prompts.RenderTimeframeWorkflow(req.TimeframeRole, req.PrimaryThesisContext) + RenderTimeframeContexts(req.TimeframeContexts),
 		Ticker:               req.Ticker,
+		RiskPolicy:           req.RiskPolicy,
+		Portfolio:            req.Portfolio,
 		TimeframeRole:        req.TimeframeRole,
 		PrimaryThesisContext: req.PrimaryThesisContext,
 		TimeframeContexts:    req.TimeframeContexts,
@@ -395,14 +398,13 @@ func consensusDecisiveReason(results []AnalystResult, action Action) string {
 
 // arbiterSystemPrompt builds the arbiter's system prompt.
 //
-// The arbiter's confidence is what the entry gate reads on every arbitrated
-// signal (the majority of trades), so it shares the analysts' calibration
-// anchors and R:R self-filter. size_pct is capped at 5.0 to match the analyst
-// schema and risk.max_position_pct — the previous 10.0 let the arbiter emit
-// sizes the risk layer would only clamp after the fact. This is a plain string
-// (not a Sprintf format), so percent signs are written singly; the earlier
-// version leaked raw "%.2f" / "20%%+" format verbs into the prompt text.
-func arbiterSystemPrompt() string {
+// The arbiter receives the same configured BUY policy as the analysts. Keep
+// confidence calibration separate so the entry threshold cannot anchor scores.
+func arbiterSystemPrompt(riskPolicies ...prompts.RiskPolicy) string {
+	var policy prompts.RiskPolicy
+	if len(riskPolicies) > 0 {
+		policy = riskPolicies[0]
+	}
 	return `You are an expert quantitative trading arbiter. You receive market analyses from several independent AI analyst models (labelled Model-A, Model-B, etc.) for a single ticker. The labels are anonymised.
 
 Your task:
@@ -416,12 +418,14 @@ Output ONLY a valid JSON object:
 {
   "action": "BUY" | "SELL" | "HOLD" | "WAIT",
   "confidence": <0.0–1.0>,
-  "size_pct": <0.0–5.0>,
+  "size_pct": <non-negative incremental BUY order size as percent of the BUY RISK POLICY sizing base>,
   "stop_loss": <price or 0>,
   "take_profit": <price or 0>,
   "decisive_reason": "<one concrete sentence naming the fact that determined the final action>",
   "reasoning": "<synthesis; include 'DISSENT: ...' if analysts disagreed>"
 }
+
+` + prompts.RenderRiskPolicy(policy) + `
 
 Action semantics:
 - BUY / SELL: directional catalyst is present and the trade can be structured
@@ -451,7 +455,7 @@ of evidence across analysts, not an average of their numbers: unanimous
 directional agreement with strong reasoning scores high; a synthesis you had
 to rescue from conflicting votes scores low.
 
-` + prompts.RRSelfFilter + `
+` + prompts.RenderRRSelfFilter(policy) + `
 
 Do not include any text outside the JSON object.`
 }

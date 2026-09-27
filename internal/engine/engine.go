@@ -846,20 +846,38 @@ func (e *Engine) processStockWithProfile(
 // uninitialized tracker: equity > 0 means the tracker received a real update.
 func buildPortfolioContext(state portfolio.State, positions []portfolio.ExecPosition, openTrades []store.Trade) analysis.PortfolioContext {
 	out := analysis.PortfolioContext{
-		CashAvailable: state.Cash,
-		CashKnown:     state.Cash > 0 || state.TotalValue > 0,
+		CashAvailable:   state.Cash,
+		PortfolioEquity: state.TotalValue,
+		CashKnown:       state.Cash > 0 || state.TotalValue > 0,
+	}
+	entryCounts := make(map[string]int, len(openTrades))
+	for _, trade := range openTrades {
+		if trade.Quantity != 0 {
+			entryCounts[strings.ToUpper(trade.Ticker)+"|"+strings.ToLower(trade.Direction)]++
+		}
 	}
 	for _, p := range positions {
 		if p.Quantity == 0 {
 			continue
 		}
+		side := p.Side
+		if side == "" {
+			side = "long"
+		}
+		count := entryCounts[strings.ToUpper(p.Ticker)+"|"+strings.ToLower(side)]
+		entryCountKnown := count > 0
+		if count == 0 {
+			count = 1 // broker-only holding: one entry is known, exact local lot count is not
+		}
 		out.OpenPositions = append(out.OpenPositions, analysis.PositionSummary{
-			Ticker:       p.Ticker,
-			Side:         p.Side,
-			Quantity:     p.Quantity,
-			AvgCostBasis: p.AvgCostBasis,
-			CurrentValue: p.CurrentValue,
-			UnrealizedPL: p.UnrealizedPL,
+			Ticker:          p.Ticker,
+			Side:            p.Side,
+			Quantity:        p.Quantity,
+			AvgCostBasis:    p.AvgCostBasis,
+			CurrentValue:    p.CurrentValue,
+			UnrealizedPL:    p.UnrealizedPL,
+			EntryCount:      count,
+			EntryCountKnown: entryCountKnown,
 		})
 	}
 	if len(out.OpenPositions) > 0 {
@@ -877,13 +895,14 @@ func buildPortfolioContext(state portfolio.State, positions []portfolio.ExecPosi
 		k := key{t.Ticker, t.Direction}
 		ps, ok := agg[k]
 		if !ok {
-			ps = &analysis.PositionSummary{Ticker: t.Ticker, Side: t.Direction}
+			ps = &analysis.PositionSummary{Ticker: t.Ticker, Side: t.Direction, EntryCountKnown: true}
 			agg[k] = ps
 			order = append(order, k)
 		}
 		// Weighted-average entry across pyramided rows.
 		totalCost := ps.AvgCostBasis*ps.Quantity + t.EntryPrice*t.Quantity
 		ps.Quantity += t.Quantity
+		ps.EntryCount++
 		if ps.Quantity != 0 {
 			ps.AvgCostBasis = totalCost / ps.Quantity
 		}
@@ -895,14 +914,15 @@ func buildPortfolioContext(state portfolio.State, positions []portfolio.ExecPosi
 }
 
 // portfolioContextForPrompt assembles the portfolio context for an analysis
-// request, loading the store's open trades as fallback only when the tracker
-// holds no positions (the paper executor reports none — Codex #392 P1). The
-// store query is skipped entirely in the common live-broker case.
+// request. When the per-ticker entry cap is enabled, load local trade rows even
+// if the broker tracker has positions so the model sees the actual pyramid lot
+// count. Otherwise the store is only needed when the tracker is empty (paper
+// mode — Codex #392 P1).
 func (e *Engine) portfolioContextForPrompt(ctx context.Context) analysis.PortfolioContext {
 	state := e.portfolio.CurrentState()
 	positions := e.portfolio.Positions()
 	var openTrades []store.Trade
-	if len(positions) == 0 && store.IsConnected() {
+	if (len(positions) == 0 || e.cfg.Risk.MaxPerTicker > 0) && store.IsConnected() {
 		if trades, err := store.GetOpenTrades(ctx); err == nil {
 			openTrades = trades
 		} else {
@@ -1166,6 +1186,7 @@ func (e *Engine) runAnalysisWithProfile(
 
 	req := analysis.AnalysisRequest{
 		Ticker:             ticker,
+		RiskPolicy:         promptRiskPolicy(e.cfg.Risk, brokerName(e.executor) == "alpaca"),
 		Strategy:           strategy,
 		Strategies:         strategies,
 		DiscoveryContext:   discoveryContext,
@@ -1481,6 +1502,20 @@ func (e *Engine) runAnalysisWithProfile(
 		LastAnalysedAt:     time.Now(),
 	}
 	e.tickerStateMu.Unlock()
+}
+
+func promptRiskPolicy(cfg config.RiskConfig, brokerAuthoritative bool) prompts.RiskPolicy {
+	basis := prompts.SizeBasisCash
+	if brokerAuthoritative {
+		basis = prompts.SizeBasisEquity
+	}
+	return prompts.RiskPolicy{
+		MaxTickerExposurePct: cfg.MaxPositionPct,
+		MaxPerTicker:         cfg.MaxPerTicker,
+		MinRiskReward:        cfg.MinRiskReward,
+		SizeBasis:            basis,
+		Configured:           true,
+	}
 }
 
 // lensSelectionTelemetry returns the scanner-owned recommendation and bounded

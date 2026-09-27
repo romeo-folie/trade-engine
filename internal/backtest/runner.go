@@ -14,6 +14,7 @@ import (
 
 	"github.com/romeo-folie/trade-engine/internal/analysis"
 	"github.com/romeo-folie/trade-engine/internal/analysis/depth"
+	"github.com/romeo-folie/trade-engine/internal/analysis/prompts"
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/execution/trailing"
@@ -361,7 +362,7 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions, progress ProgressFunc
 		}
 
 		window := candles[max(0, i-199) : i+1] // up to 200 candles, never look ahead
-		req, err := buildRequest(opts, window)
+		req, err := buildRequest(opts, window, r.cfg.Risk)
 		if err != nil {
 			continue // skip candles where indicator computation fails
 		}
@@ -753,7 +754,7 @@ func closePosition(pos *openPos, ts time.Time, price float64, reason string) Sim
 }
 
 // buildRequest converts a candle window into an AnalysisRequest.
-func buildRequest(opts RunOptions, window []data.Candle) (analysis.AnalysisRequest, error) {
+func buildRequest(opts RunOptions, window []data.Candle, riskCfg config.RiskConfig) (analysis.AnalysisRequest, error) {
 	set, err := indicators.Compute(window)
 	if err != nil {
 		return analysis.AnalysisRequest{}, err
@@ -776,6 +777,13 @@ func buildRequest(opts RunOptions, window []data.Candle) (analysis.AnalysisReque
 	}
 
 	return analysis.AnalysisRequest{
+		RiskPolicy: prompts.RiskPolicy{
+			MaxTickerExposurePct: riskCfg.MaxPositionPct,
+			MaxPerTicker:         riskCfg.MaxPerTicker,
+			MinRiskReward:        riskCfg.MinRiskReward,
+			SizeBasis:            prompts.SizeBasisCash,
+			Configured:           true,
+		},
 		Ticker:        opts.Ticker,
 		Strategy:      opts.Strategy,
 		Timeframe:     string(opts.Timeframe),

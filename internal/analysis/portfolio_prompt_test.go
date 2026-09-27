@@ -14,11 +14,14 @@ func TestToPromptPortfolio_PinSortCap(t *testing.T) {
 	for i := 0; i < maxPromptPositions+4; i++ { // 19 positions, ZZTOP last alphabetically
 		ctxPos = append(ctxPos, PositionSummary{Ticker: fmt.Sprintf("T%02d", i), Quantity: 1})
 	}
-	ctxPos = append(ctxPos, PositionSummary{Ticker: "ZZTOP", Quantity: 5})
+	ctxPos = append(ctxPos, PositionSummary{Ticker: "ZZTOP", Quantity: 5, EntryCount: 2, EntryCountKnown: true})
 
-	got := toPromptPortfolio(PortfolioContext{CashAvailable: 100, OpenPositions: ctxPos}, "ZZTOP")
+	got := toPromptPortfolio(PortfolioContext{CashAvailable: 100, PortfolioEquity: 1000, OpenPositions: ctxPos}, "ZZTOP")
 	if got.OpenPositions[0].Ticker != "ZZTOP" {
 		t.Fatalf("analyzed ticker not pinned first: got %q", got.OpenPositions[0].Ticker)
+	}
+	if got.PortfolioEquity != 1000 || got.OpenPositions[0].EntryCount != 2 || !got.OpenPositions[0].EntryCountKnown {
+		t.Fatalf("equity or entry count lost in prompt conversion: %+v", got)
 	}
 	if len(got.OpenPositions) != maxPromptPositions {
 		t.Fatalf("cap not applied: got %d positions", len(got.OpenPositions))

@@ -50,7 +50,8 @@ type NewsItem struct {
 // positions dropped by the conversion cap (toPromptPortfolio) so the prompt can
 // say "+N more" instead of silently understating exposure.
 type Portfolio struct {
-	CashAvailable float64
+	CashAvailable   float64
+	PortfolioEquity float64
 	// CashKnown distinguishes a real balance (including $0 fully deployed)
 	// from an unpopulated tracker; false renders a "not provided" marker.
 	CashKnown        bool
@@ -62,6 +63,8 @@ type Portfolio struct {
 type Position struct {
 	Ticker, Sentiment, Side                            string
 	Quantity, AvgCostBasis, CurrentValue, UnrealizedPL float64
+	EntryCount                                         int
+	EntryCountKnown                                    bool
 }
 
 // SimilarPastSetup represents a past analysis included in the "Similar Past
@@ -301,7 +304,7 @@ const OutputSchema = `OUTPUT FORMAT — respond with ONLY a valid JSON object an
   "selected_strategy":   "<the candidate lens you selected, or none>",
   "action":              "BUY" | "SELL" | "HOLD" | "WAIT",
   "confidence":          <float 0.0–1.0>,
-  "size_pct":            <float, recommended position size as % of portfolio>,
+  "size_pct":            <float, incremental BUY order size as % of the BUY RISK POLICY sizing base>,
   "stop_loss":           <float price, or 0 if HOLD/WAIT>,
   "take_profit":         <float price, or 0 if HOLD/WAIT>,
   "rejected_strategies": {"<lens>": "<one clause on why it does not fit>"},
@@ -315,7 +318,7 @@ RULES:
 - Keep "reasoning" under 150 words. Exceeding your output limit mid-sentence discards the entire response.
 - action must be exactly "BUY", "SELL", "HOLD", or "WAIT" (uppercase).
 - confidence must be between 0.0 and 1.0.
-- size_pct must be between 0.0 and 5.0 (max 5% of portfolio per position).
+- size_pct is the proposed incremental BUY order size; follow the BUY RISK POLICY for its limits.
 - selected_strategy must be exactly one of the candidate lenses listed above, or "none".
 - rejected_strategies must name every candidate lens you did not select, each with a one-clause reason. Use {} only when a single lens was offered and you selected it.
 - decisive_reason is mandatory. For WAIT, name the concrete blocker; never write a vague timing phrase.
@@ -348,7 +351,8 @@ const ConfidenceAnchors = `CONFIDENCE CALIBRATION:
 // re-introduce the WAIT/HOLD conservatism the prompts were de-biased of.
 const PortfolioRules = `USING PORTFOLIO CONTEXT:
 - SELL is only valid for this ticker if it appears in open positions as a long. Never propose SELL for a ticker not held — such signals are discarded by the engine.
-- If this ticker is already held long, a BUY is a pyramid add-on: judge it against the existing position's basis and unrealized P&L, and keep combined exposure within the 5% per-position cap.
+- If this ticker is already held long, a BUY is a pyramid add-on: judge it against the existing position's basis and unrealized P&L, and keep combined ticker exposure within the BUY RISK POLICY cap after this order.
+- If the displayed open-entry count for this ticker has reached the BUY RISK POLICY count limit, do not propose another BUY. If the count is unavailable, leave the final decision to deterministic risk checks.
 - Use the open-position list for correlation awareness: several same-direction positions in the same sector/theme argue for smaller size or lower confidence on a new correlated entry.
 - Unrealized losses on OTHER positions are NOT a reason to WAIT or HOLD on this setup — evaluate this ticker on its own merits.`
 
@@ -436,14 +440,19 @@ func BuildStockPromptWithAnalysisContext(
 	pullbackContext *pullback.PromptContext,
 	timeframeRole TimeframeRole,
 	primaryThesis *PrimaryThesisContext,
+	riskPolicies ...RiskPolicy,
 ) (systemPrompt, userMessage string) {
+	var riskPolicy RiskPolicy
+	if len(riskPolicies) > 0 {
+		riskPolicy = riskPolicies[0]
+	}
 	lenses := Lenses(strategies)
 	contract := lensContract(strategies)
 	exitOverride := ExitOnlyOverride(strategies)
 	if momentumPlay {
-		systemPrompt = buildMomentumSystem(contract, exitOverride, lenses)
+		systemPrompt = buildMomentumSystem(contract, exitOverride, lenses, riskPolicy)
 	} else {
-		systemPrompt = buildSystem(contract, exitOverride, lenses)
+		systemPrompt = buildSystem(contract, exitOverride, lenses, riskPolicy)
 	}
 	systemPrompt += timeframeRoleInstruction(timeframeRole)
 	userMessage = buildUserWithTimeframeContext(ticker, timeframe, candles, ind, news, portfolio, knowledgeContext, similarSetups, performanceContext, discoveryContext, pullbackContext, timeframeRole, primaryThesis)
@@ -453,10 +462,16 @@ func BuildStockPromptWithAnalysisContext(
 // buildMomentumSystem returns a system prompt for scanner-sourced tickers.
 // It reframes the question from "swing-trade evaluation" to "is this momentum
 // entry still valid?" — appropriate for intraday movers and news catalysts.
-func buildMomentumSystem(contract, exitOverride string, lenses []string) string {
+func buildMomentumSystem(contract, exitOverride string, lenses []string, riskPolicies ...RiskPolicy) string {
+	var policy RiskPolicy
+	if len(riskPolicies) > 0 {
+		policy = riskPolicies[0]
+	}
 	return fmt.Sprintf(`You are a short-term momentum trader evaluating a live entry opportunity.
 
 This ticker was flagged by an intraday screener (momentum move, news catalyst, or volume surge). Your job is to determine whether the entry is STILL valid given the current market data — the stock has already moved, so assess entry quality, not the original catalyst.
+
+%s
 
 %s
 
@@ -468,16 +483,17 @@ TIMEFRAME FOCUS:
 %s
 
 ENTRY DECISION GUIDE:
-- BUY: momentum is intact, price is consolidating or pulling back cleanly, volume confirms, risk/reward >= 1.2:1 with a clear stop below recent structure.
+- BUY: momentum is intact, price is consolidating or pulling back cleanly, volume confirms, risk/reward meets the BUY RISK POLICY minimum, and a clear stop sits below recent structure.
 - SELL: catalyst is negative, price shows exhaustion or a failed breakout, or a long position should exit.
 - WAIT: use ONLY when you can name a specific, concrete blocker (e.g. "price is $X above named resistance with no pullback", "earnings in under 4 hours", "gap >20%% with zero intraday range printed"). Vague timing language ("setup forming", "wait for clarity", "consolidation in progress") is NOT a valid blocker — propose BUY/SELL with reduced confidence instead, or HOLD if the setup is genuinely dead.
 - HOLD: the original momentum has faded, the catalyst is fully priced in, or the setup has failed. Remove this ticker from active consideration.
 
-R:R SELF-FILTER (MANDATORY): Compute R:R as: reward = abs(take_profit - signal_price); risk = abs(signal_price - stop_loss); R:R = reward / risk. If R:R < 1.2, widen the take_profit toward the next structural target, or tighten the stop_loss to nearer structure — do not propose entry below 1.2. Only emit BUY if R:R >= 1.2.
+%s
 
-SIZING: momentum trades carry higher short-term risk — keep size_pct conservative (1–3%% range) unless conviction is very high.
+SIZING: momentum trades carry higher short-term risk — keep size_pct conservative within the BUY RISK POLICY cap unless conviction is very high.
 
-%s%s%s`, contract, OutputSchema, ConfidenceAnchors, PortfolioRules,
+%s%s%s`, contract, OutputSchema, RenderRiskPolicy(policy), ConfidenceAnchors,
+		RenderRRSelfFilter(policy), PortfolioRules,
 		lensGuidance(lenses), exitOverride)
 }
 
@@ -489,10 +505,16 @@ SIZING: momentum trades carry higher short-term risk — keep size_pct conservat
 // entries — not merely penalized. This is intentional (the one ticker
 // currently qualifying, SBET, ran 20% over 5 trades); revisit the ceiling if
 // the gate ever moves.
-func buildSystem(contract, exitOverride string, lenses []string) string {
+func buildSystem(contract, exitOverride string, lenses []string, riskPolicies ...RiskPolicy) string {
+	var policy RiskPolicy
+	if len(riskPolicies) > 0 {
+		policy = riskPolicies[0]
+	}
 	return fmt.Sprintf(`You are a disciplined quantitative trading analyst.
 
 Your task is to analyse the provided market data and return a trade recommendation.
+
+%s
 
 %s
 
@@ -510,7 +532,7 @@ DECISION RULES:
   with reduced confidence rather than WAIT. Refusing to act has a cost too.
 - Use BUY or SELL when there is a directional catalyst and the trade can be
   structured with a defined stop and target. You do not need perfect timing.
-- R:R SELF-FILTER (MANDATORY): Compute R:R as: reward = abs(take_profit - signal_price); risk = abs(signal_price - stop_loss); R:R = reward / risk. If R:R < 1.2, widen the take_profit toward the next structural target, or tighten the stop_loss to nearer structure — do not propose entry below 1.2. Only emit BUY if R:R >= 1.2.
+- %s
 
 %s
 
@@ -526,8 +548,71 @@ USING SIMILAR PAST ANALYSES:
 - If the majority of setups with known outcomes were losses, treat this as a headwind — lower your confidence by at least 0.10.
 - If the majority of setups with known outcomes were gains, treat this as a tailwind — you may raise your confidence by up to 0.10.
 - Entries marked "outcome unknown" carry no weight.%s%s`,
-		contract, OutputSchema, ConfidenceAnchors, PortfolioRules,
+		contract, OutputSchema, RenderRiskPolicy(policy), RenderRRSelfFilter(policy),
+		ConfidenceAnchors, PortfolioRules,
 		lensGuidance(lenses), exitOverride)
+}
+
+// roundPromptDollars keeps small paper accounts legible without making every
+// minor equity or cash change produce a distinct prompt.
+func roundPromptDollars(value float64) float64 {
+	step := 1.0
+	switch {
+	case math.Abs(value) >= 10000:
+		step = 100
+	case math.Abs(value) >= 100:
+		step = 10
+	}
+	return math.Round(value/step) * step
+}
+
+// RenderPortfolioContext is shared by the stock analysts and the arbiter so
+// both stages see the same cash, equity, exposure, and recorded entry counts.
+func RenderPortfolioContext(portfolio Portfolio) string {
+	var b strings.Builder
+	// Stable buckets keep small paper accounts legible without letting every
+	// market tick churn the prompt cache.
+	b.WriteString("### PORTFOLIO CONTEXT\n")
+	if portfolio.PortfolioEquity > 0 {
+		b.WriteString(fmt.Sprintf("Portfolio equity: ≈$%.0f\n", roundPromptDollars(portfolio.PortfolioEquity)))
+	} else {
+		b.WriteString("Portfolio equity: (unknown — exact ticker capacity cannot be calculated)\n")
+	}
+	switch {
+	case portfolio.CashKnown && portfolio.CashAvailable <= 0:
+		b.WriteString("Cash available: ≈$0 (fully deployed — a new long entry requires freeing capital first)\n")
+	case portfolio.CashKnown || portfolio.CashAvailable > 0:
+		b.WriteString(fmt.Sprintf("Cash available: ≈$%.0f\n", roundPromptDollars(portfolio.CashAvailable)))
+	default:
+		b.WriteString("Cash available: (not provided — do not assume zero; apply sizing rules normally)\n")
+	}
+	if len(portfolio.OpenPositions) == 0 {
+		b.WriteString("Open positions: none\n")
+		return b.String()
+	}
+	b.WriteString("Open positions (side qty @ avg cost, unrealized P&L bucketed to 5%):\n")
+	for _, p := range portfolio.OpenPositions {
+		side := p.Side
+		if side == "" {
+			side = "long"
+		}
+		line := fmt.Sprintf("  %s: %s %.4f @ %.2f", p.Ticker, side, p.Quantity, p.AvgCostBasis)
+		// Store-fallback positions have no mark-to-market, so do not invent P&L.
+		if basis := p.Quantity * p.AvgCostBasis; basis != 0 && (p.UnrealizedPL != 0 || p.CurrentValue != 0) {
+			bucket := math.Round(p.UnrealizedPL/math.Abs(basis)*100/5) * 5
+			line += fmt.Sprintf("  unrealized≈%+.0f%%", bucket)
+		}
+		if p.EntryCountKnown {
+			line += fmt.Sprintf("  open entries=%d", p.EntryCount)
+		} else {
+			line += "  open entries=at least 1 (exact local lot count unavailable)"
+		}
+		b.WriteString(line + "\n")
+	}
+	if portfolio.OmittedPositions > 0 {
+		b.WriteString(fmt.Sprintf("  (+%d more open positions not listed)\n", portfolio.OmittedPositions))
+	}
+	return b.String()
 }
 
 // buildUser is retained for focused prompt tests and older package-local
@@ -612,53 +697,7 @@ func buildUserWithTimeframeContext(
 	b.WriteString(fmt.Sprintf("VWAP:                  %.2f\n", ind.VWAP))
 	b.WriteString(fmt.Sprintf("Volume SMA20 / ratio:  %.0f / %.2fx\n", ind.VolSMA20, ind.VolRatio))
 
-	// Portfolio context section. The live engine still passes an empty
-	// PortfolioContext (engine.go runAnalysis, "Phase 4"), so cash <= 0 almost
-	// always means "not wired", not "fully invested". Rendering it as $0.00
-	// would feed analysts a false zero-cash state and suppress BUY/sizing
-	// (Codex #391 P1) — keep an explicit unknown marker instead, worded so the
-	// model doesn't treat it as a constraint.
-	// Rendering is deliberately CACHE-STABLE: raw CurrentValue / UnrealizedPL
-	// change on every tick, which would make every prompt unique and neuter
-	// both analysis_cache and the material-change gate. So only stable fields
-	// (ticker, side, qty, avg cost) print exactly; cash rounds to the nearest
-	// $100 and unrealized P&L renders as a percentage bucketed to 5 points —
-	// the text only changes when something meaningful changes.
-	b.WriteString("\n### PORTFOLIO CONTEXT\n")
-	switch {
-	case portfolio.CashKnown && math.Round(portfolio.CashAvailable/100)*100 <= 0:
-		// Known non-positive balance: the account is fully deployed (or in a
-		// margin debit). Rendering this as "not provided" would invite BUY
-		// proposals the cash gates must then discard (Codex #392 P2).
-		b.WriteString("Cash available: ≈$0 (fully deployed — a new long entry requires freeing capital first)\n")
-	case portfolio.CashKnown || portfolio.CashAvailable > 0:
-		b.WriteString(fmt.Sprintf("Cash available: ≈$%.0f\n", math.Round(portfolio.CashAvailable/100)*100))
-	default:
-		b.WriteString("Cash available: (not provided — do not assume zero; apply sizing rules normally)\n")
-	}
-	if len(portfolio.OpenPositions) > 0 {
-		b.WriteString("Open positions (side qty @ avg cost, unrealized P&L bucketed to 5%):\n")
-		for _, p := range portfolio.OpenPositions {
-			side := p.Side
-			if side == "" {
-				side = "long"
-			}
-			line := fmt.Sprintf("  %s: %s %.4f @ %.2f", p.Ticker, side, p.Quantity, p.AvgCostBasis)
-			// Print the P&L bucket only when the source actually knows it:
-			// store-fallback positions (paper mode) carry no mark-to-market,
-			// and a fabricated ≈+0% would misinform.
-			if basis := p.Quantity * p.AvgCostBasis; basis != 0 && (p.UnrealizedPL != 0 || p.CurrentValue != 0) {
-				bucket := math.Round(p.UnrealizedPL/math.Abs(basis)*100/5) * 5
-				line += fmt.Sprintf("  unrealized≈%+.0f%%", bucket)
-			}
-			b.WriteString(line + "\n")
-		}
-		if portfolio.OmittedPositions > 0 {
-			b.WriteString(fmt.Sprintf("  (+%d more open positions not listed)\n", portfolio.OmittedPositions))
-		}
-	} else {
-		b.WriteString("Open positions: none\n")
-	}
+	b.WriteString("\n" + RenderPortfolioContext(portfolio))
 
 	// News section
 	b.WriteString("\n### RECENT NEWS (last 48h)\n")
