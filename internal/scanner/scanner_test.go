@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -71,7 +73,7 @@ func TestFetchCandidatesKeepsMoverWithPartialIEXVolume(t *testing.T) {
 		AlpacaClient: data.NewAlpacaClient("key", "secret", server.URL),
 		Cfg: config.ScannerConfig{Universe: config.UniverseConfig{
 			MinPrice: 5, MinMedianDollarVolume: 1_000_000,
-		}, TopMovers: 1},
+		}, TopMovers: 1, TopMoversEnabled: true},
 	}
 	candidates, err := scanner.fetchCandidates(context.Background())
 	if err != nil {
@@ -104,7 +106,7 @@ func TestFetchCandidatesKeepsIntradayActiveBelowCompletedSessionFloor(t *testing
 		AlpacaClient: data.NewAlpacaClient("key", "secret", server.URL),
 		Cfg: config.ScannerConfig{Universe: config.UniverseConfig{
 			MinPrice: 5, MinMedianDollarVolume: 1_000_000,
-		}, TopActives: 2},
+		}, TopActives: 2, TopActivesEnabled: true},
 	}
 	candidates, err := scanner.fetchCandidates(context.Background())
 	if err != nil {
@@ -120,6 +122,100 @@ func TestFetchCandidatesKeepsIntradayActiveBelowCompletedSessionFloor(t *testing
 	}
 	if candidates[0].SourceScores["active"] != 1 || candidates[0].SourceScores["active"] <= candidates[1].SourceScores["active"] {
 		t.Fatalf("provider ordinal scores = %+v, want rank one above rank two", candidates)
+	}
+}
+
+func TestFetchCandidatesSourceSwitches(t *testing.T) {
+	for _, tc := range []struct {
+		name                 string
+		movers, actives      bool
+		wantMovers, wantActs int32
+		wantSources          map[string][]string
+	}{
+		{name: "both", movers: true, actives: true, wantMovers: 1, wantActs: 1, wantSources: map[string][]string{
+			"BOTH": {"mover", "active"}, "MOVE": {"mover"}, "ACT": {"active"},
+		}},
+		{name: "movers only", movers: true, wantMovers: 1, wantSources: map[string][]string{
+			"BOTH": {"mover"}, "MOVE": {"mover"},
+		}},
+		{name: "actives only", actives: true, wantActs: 1, wantSources: map[string][]string{
+			"BOTH": {"active"}, "ACT": {"active"},
+		}},
+		{name: "neither", wantSources: map[string][]string{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var moverCalls, activeCalls, snapshotCalls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch r.URL.Path {
+				case "/v1beta1/screener/stocks/movers":
+					moverCalls.Add(1)
+					_, _ = w.Write([]byte(`{"gainers":[{"symbol":"MOVE","percent_change":8,"change":1,"price":20},{"symbol":"BOTH","percent_change":6,"change":1,"price":20}],"losers":[]}`))
+				case "/v1beta1/screener/stocks/most-actives":
+					activeCalls.Add(1)
+					_, _ = w.Write([]byte(`{"most_actives":[{"symbol":"BOTH","price":20,"volume":100,"trade_count":3},{"symbol":"ACT","price":15,"volume":80,"trade_count":2}]}`))
+				case "/v2/stocks/snapshots":
+					snapshotCalls.Add(1)
+					_, _ = w.Write([]byte(`{"MOVE":{"dailyBar":{"v":100}},"BOTH":{"dailyBar":{"v":100}}}`))
+				default:
+					http.Error(w, "unexpected path", http.StatusNotFound)
+				}
+			}))
+			defer server.Close()
+
+			scanner := &MarketScanner{
+				AlpacaClient: data.NewAlpacaClient("key", "secret", server.URL),
+				Cfg: config.ScannerConfig{
+					TopMoversEnabled: tc.movers, TopActivesEnabled: tc.actives,
+					TopMovers: 2, TopActives: 2, Universe: config.UniverseConfig{MinPrice: 5},
+				},
+			}
+			candidates, err := scanner.fetchCandidates(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if moverCalls.Load() != tc.wantMovers || activeCalls.Load() != tc.wantActs {
+				t.Fatalf("provider calls: movers=%d actives=%d, want %d/%d", moverCalls.Load(), activeCalls.Load(), tc.wantMovers, tc.wantActs)
+			}
+			if tc.movers && snapshotCalls.Load() == 0 || !tc.movers && snapshotCalls.Load() != 0 {
+				t.Fatalf("snapshot calls=%d with movers enabled=%v", snapshotCalls.Load(), tc.movers)
+			}
+			if len(candidates) != len(tc.wantSources) {
+				t.Fatalf("candidates=%+v, want sources=%v", candidates, tc.wantSources)
+			}
+			for _, candidate := range candidates {
+				want, ok := tc.wantSources[candidate.Ticker]
+				if !ok || !reflect.DeepEqual(candidate.Sources, want) {
+					t.Fatalf("candidate %q sources=%v, want %v", candidate.Ticker, candidate.Sources, want)
+				}
+				if len(candidate.SourceScores) != len(want) || len(candidate.sourceMarketObservations) != len(want) {
+					t.Fatalf("candidate %q has unexpected provenance: %+v", candidate.Ticker, candidate)
+				}
+				for _, source := range want {
+					if candidate.SourceScores[source] <= 0 || candidate.sourceMarketObservations[source] == nil {
+						t.Fatalf("candidate %q missing %q provenance: %+v", candidate.Ticker, source, candidate)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestDisabledMarketActivityRetainsPoliticalDisclosureCandidate(t *testing.T) {
+	scanner := &MarketScanner{Cfg: config.ScannerConfig{
+		TopMoversEnabled: false, TopActivesEnabled: false,
+	}}
+	marketCandidates, err := scanner.fetchCandidates(context.Background())
+	if err != nil || len(marketCandidates) != 0 {
+		t.Fatalf("disabled market sources returned candidates=%+v, err=%v", marketCandidates, err)
+	}
+	disclosure := SwingCandidate{
+		Ticker: "MSFT", Sources: []string{"political_disclosure"},
+		PoliticalDisclosureEvidence: "House purchase filing",
+	}
+	merged := mergePoliticalDisclosureCandidates(marketCandidates, []SwingCandidate{disclosure})
+	if len(merged) != 1 || merged[0].Ticker != "MSFT" || !reflect.DeepEqual(merged[0].Sources, disclosure.Sources) {
+		t.Fatalf("political disclosure candidate lost with market sources disabled: %+v", merged)
 	}
 }
 

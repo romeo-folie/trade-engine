@@ -907,6 +907,17 @@ disclosures:
 # most active), the knowledge graph, and news-sympathy triggers. Admission is
 # deterministic; LLMs enrich evidence and evaluate candidates only after they
 # enter the watchlist research queue.
+# Paper deployment with disclosure discovery but no market-activity chasing
+# (set these values in the scanner block below):
+# scanner:
+#   enabled: true
+#   top_movers_enabled: false
+#   top_actives_enabled: false
+#   political_disclosures:
+#     enabled: true
+#     promote_candidates: true
+#   earnings_watchlist:
+#     enabled: true  # Independent of scanner.enabled.
 scanner:
   enabled: false
   scan_interval_hours: 2       # Scan cadence during market hours (9:30–16:00 ET)
@@ -934,7 +945,13 @@ scanner:
     lease_minutes: 15
   news_lookback_hours: 24      # News window when enriching candidates before scoring
   top_movers: 20               # Top gainers+losers fetched per scan
+  top_movers_enabled: true      # Set false to omit mover candidates and skip the Alpaca movers request
   top_actives: 20              # Most-active-by-volume fetched per scan
+  top_actives_enabled: true     # Set false to omit most-active candidates and skip that Alpaca request
+  # Set both *_enabled switches false to keep the main scanner available for
+  # political disclosures and other enabled sources without market-activity
+  # sourcing. Zero counts do not disable a source (legacy fallback: 20).
+  # earnings_watchlist below runs independently of scanner.enabled.
   max_promotions_per_industry: 0 # Deprecated compatibility setting; source reservations own research capacity
   promotion_correlation_enabled: false # Compatibility: retains DB-backed duplicate guard only; no queue selection
   promotion_max_abs_correlation: 0.85    # Absolute daily-return Pearson ceiling
