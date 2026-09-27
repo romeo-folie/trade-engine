@@ -566,6 +566,55 @@ func roundPromptDollars(value float64) float64 {
 	return math.Round(value/step) * step
 }
 
+// RenderPortfolioContext is shared by the stock analysts and the arbiter so
+// both stages see the same cash, equity, exposure, and recorded entry counts.
+func RenderPortfolioContext(portfolio Portfolio) string {
+	var b strings.Builder
+	// Stable buckets keep small paper accounts legible without letting every
+	// market tick churn the prompt cache.
+	b.WriteString("### PORTFOLIO CONTEXT\n")
+	if portfolio.PortfolioEquity > 0 {
+		b.WriteString(fmt.Sprintf("Portfolio equity: ≈$%.0f\n", roundPromptDollars(portfolio.PortfolioEquity)))
+	} else {
+		b.WriteString("Portfolio equity: (unknown — exact ticker capacity cannot be calculated)\n")
+	}
+	switch {
+	case portfolio.CashKnown && portfolio.CashAvailable <= 0:
+		b.WriteString("Cash available: ≈$0 (fully deployed — a new long entry requires freeing capital first)\n")
+	case portfolio.CashKnown || portfolio.CashAvailable > 0:
+		b.WriteString(fmt.Sprintf("Cash available: ≈$%.0f\n", roundPromptDollars(portfolio.CashAvailable)))
+	default:
+		b.WriteString("Cash available: (not provided — do not assume zero; apply sizing rules normally)\n")
+	}
+	if len(portfolio.OpenPositions) == 0 {
+		b.WriteString("Open positions: none\n")
+		return b.String()
+	}
+	b.WriteString("Open positions (side qty @ avg cost, unrealized P&L bucketed to 5%):\n")
+	for _, p := range portfolio.OpenPositions {
+		side := p.Side
+		if side == "" {
+			side = "long"
+		}
+		line := fmt.Sprintf("  %s: %s %.4f @ %.2f", p.Ticker, side, p.Quantity, p.AvgCostBasis)
+		// Store-fallback positions have no mark-to-market, so do not invent P&L.
+		if basis := p.Quantity * p.AvgCostBasis; basis != 0 && (p.UnrealizedPL != 0 || p.CurrentValue != 0) {
+			bucket := math.Round(p.UnrealizedPL/math.Abs(basis)*100/5) * 5
+			line += fmt.Sprintf("  unrealized≈%+.0f%%", bucket)
+		}
+		if p.EntryCountKnown {
+			line += fmt.Sprintf("  open entries=%d", p.EntryCount)
+		} else {
+			line += "  open entries=at least 1 (exact local lot count unavailable)"
+		}
+		b.WriteString(line + "\n")
+	}
+	if portfolio.OmittedPositions > 0 {
+		b.WriteString(fmt.Sprintf("  (+%d more open positions not listed)\n", portfolio.OmittedPositions))
+	}
+	return b.String()
+}
+
 // buildUser is retained for focused prompt tests and older package-local
 // helpers. Timeframe-aware callers use buildUserWithTimeframeContext.
 func buildUser(
@@ -648,63 +697,7 @@ func buildUserWithTimeframeContext(
 	b.WriteString(fmt.Sprintf("VWAP:                  %.2f\n", ind.VWAP))
 	b.WriteString(fmt.Sprintf("Volume SMA20 / ratio:  %.0f / %.2fx\n", ind.VolSMA20, ind.VolRatio))
 
-	// Portfolio context section. The live engine still passes an empty
-	// PortfolioContext (engine.go runAnalysis, "Phase 4"), so cash <= 0 almost
-	// always means "not wired", not "fully invested". Rendering it as $0.00
-	// would feed analysts a false zero-cash state and suppress BUY/sizing
-	// (Codex #391 P1) — keep an explicit unknown marker instead, worded so the
-	// model doesn't treat it as a constraint.
-	// Rendering is deliberately CACHE-STABLE: raw CurrentValue / UnrealizedPL
-	// change on every tick, which would make every prompt unique and neuter
-	// both analysis_cache and the material-change gate. So only stable fields
-	// (ticker, side, qty, avg cost) print exactly; cash and equity use magnitude-
-	// aware dollar buckets and unrealized P&L buckets to 5 percentage points —
-	// the text only changes when something meaningful changes.
-	b.WriteString("\n### PORTFOLIO CONTEXT\n")
-	if portfolio.PortfolioEquity > 0 {
-		b.WriteString(fmt.Sprintf("Portfolio equity: ≈$%.0f\n", roundPromptDollars(portfolio.PortfolioEquity)))
-	} else {
-		b.WriteString("Portfolio equity: (unknown — exact ticker capacity cannot be calculated)\n")
-	}
-	switch {
-	case portfolio.CashKnown && portfolio.CashAvailable <= 0:
-		// Known non-positive balance: the account is fully deployed (or in a
-		// margin debit). Rendering this as "not provided" would invite BUY
-		// proposals the cash gates must then discard (Codex #392 P2).
-		b.WriteString("Cash available: ≈$0 (fully deployed — a new long entry requires freeing capital first)\n")
-	case portfolio.CashKnown || portfolio.CashAvailable > 0:
-		b.WriteString(fmt.Sprintf("Cash available: ≈$%.0f\n", roundPromptDollars(portfolio.CashAvailable)))
-	default:
-		b.WriteString("Cash available: (not provided — do not assume zero; apply sizing rules normally)\n")
-	}
-	if len(portfolio.OpenPositions) > 0 {
-		b.WriteString("Open positions (side qty @ avg cost, unrealized P&L bucketed to 5%):\n")
-		for _, p := range portfolio.OpenPositions {
-			side := p.Side
-			if side == "" {
-				side = "long"
-			}
-			line := fmt.Sprintf("  %s: %s %.4f @ %.2f", p.Ticker, side, p.Quantity, p.AvgCostBasis)
-			// Print the P&L bucket only when the source actually knows it:
-			// store-fallback positions (paper mode) carry no mark-to-market,
-			// and a fabricated ≈+0% would misinform.
-			if basis := p.Quantity * p.AvgCostBasis; basis != 0 && (p.UnrealizedPL != 0 || p.CurrentValue != 0) {
-				bucket := math.Round(p.UnrealizedPL/math.Abs(basis)*100/5) * 5
-				line += fmt.Sprintf("  unrealized≈%+.0f%%", bucket)
-			}
-			if p.EntryCountKnown {
-				line += fmt.Sprintf("  open entries=%d", p.EntryCount)
-			} else {
-				line += "  open entries=at least 1 (exact local lot count unavailable)"
-			}
-			b.WriteString(line + "\n")
-		}
-		if portfolio.OmittedPositions > 0 {
-			b.WriteString(fmt.Sprintf("  (+%d more open positions not listed)\n", portfolio.OmittedPositions))
-		}
-	} else {
-		b.WriteString("Open positions: none\n")
-	}
+	b.WriteString("\n" + RenderPortfolioContext(portfolio))
 
 	// News section
 	b.WriteString("\n### RECENT NEWS (last 48h)\n")

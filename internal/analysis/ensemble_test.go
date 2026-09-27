@@ -497,7 +497,10 @@ func TestArbiterSystemPrompt_Calibration(t *testing.T) {
 func TestArbitratePropagatesConfiguredRiskPolicy(t *testing.T) {
 	policy := prompts.RiskPolicy{MaxTickerExposurePct: 10, MaxPerTicker: 2, MinRiskReward: 1.5}
 	provider := &captureArbiter{}
-	req := AnalysisRequest{Ticker: "TEST", RiskPolicy: policy}
+	req := AnalysisRequest{Ticker: "TEST", RiskPolicy: policy, Portfolio: PortfolioContext{
+		CashAvailable: 200, CashKnown: true, PortfolioEquity: 1000,
+		OpenPositions: []PositionSummary{{Ticker: "TEST", Side: "long", Quantity: 1, AvgCostBasis: 95, EntryCount: 2, EntryCountKnown: true}},
+	}}
 	results := []AnalystResult{makeResult(ActionBuy, .8, nil), makeResult(ActionWait, .7, nil)}
 	if _, err := Arbitrate(context.Background(), provider, req, results); err != nil {
 		t.Fatalf("Arbitrate: %v", err)
@@ -512,6 +515,19 @@ func TestArbitratePropagatesConfiguredRiskPolicy(t *testing.T) {
 	}
 	if strings.Contains(provider.capturedSystem, "R:R < 1.2") {
 		t.Error("arbiter prompt contains stale R:R floor")
+	}
+	for _, want := range []string{"Portfolio equity: ≈$1000", "Cash available: ≈$200", "TEST: long 1.0000 @ 95.00  open entries=2"} {
+		if !strings.Contains(provider.captured, want) {
+			t.Errorf("arbiter user prompt missing %q", want)
+		}
+	}
+	if strings.Count(provider.captured, "### PORTFOLIO CONTEXT") != 1 {
+		t.Errorf("arbiter user prompt must contain one portfolio section")
+	}
+	for _, unwanted := range []string{"### TECHNICAL INDICATORS", "### RECENT NEWS"} {
+		if strings.Contains(provider.captured, unwanted) {
+			t.Errorf("arbiter user prompt unexpectedly contains %q", unwanted)
+		}
 	}
 }
 
