@@ -435,12 +435,14 @@ func toPromptPortfolio(p PortfolioContext, analyzedTicker string) prompts.Portfo
 	pos := make([]prompts.Position, len(p.OpenPositions))
 	for i, op := range p.OpenPositions {
 		pos[i] = prompts.Position{
-			Ticker:       op.Ticker,
-			Side:         op.Side,
-			Quantity:     op.Quantity,
-			AvgCostBasis: op.AvgCostBasis,
-			CurrentValue: op.CurrentValue,
-			UnrealizedPL: op.UnrealizedPL,
+			Ticker:          op.Ticker,
+			Side:            op.Side,
+			Quantity:        op.Quantity,
+			AvgCostBasis:    op.AvgCostBasis,
+			CurrentValue:    op.CurrentValue,
+			UnrealizedPL:    op.UnrealizedPL,
+			EntryCount:      op.EntryCount,
+			EntryCountKnown: op.EntryCountKnown,
 		}
 	}
 	sort.Slice(pos, func(i, j int) bool {
@@ -456,6 +458,7 @@ func toPromptPortfolio(p PortfolioContext, analyzedTicker string) prompts.Portfo
 	}
 	return prompts.Portfolio{
 		CashAvailable:    p.CashAvailable,
+		PortfolioEquity:  p.PortfolioEquity,
 		CashKnown:        p.CashKnown,
 		OpenPositions:    pos,
 		OmittedPositions: omitted,

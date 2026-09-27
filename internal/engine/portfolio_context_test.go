@@ -32,15 +32,27 @@ func TestBuildPortfolioContext(t *testing.T) {
 		{Ticker: "HIMS", Side: "long", Quantity: 10, AvgCostBasis: 42.5, CurrentValue: 430, UnrealizedPL: 5},
 		{Ticker: "GHOST", Quantity: 0}, // closed-out phantom — must be skipped
 	}, []store.Trade{{Ticker: "SHOULD_NOT_APPEAR", Direction: "long", Quantity: 1, EntryPrice: 1}})
-	if got.CashAvailable != 2500 || !got.CashKnown {
+	if got.CashAvailable != 2500 || got.PortfolioEquity != 10000 || !got.CashKnown {
 		t.Errorf("cash mapping wrong: %+v", got)
 	}
 	if len(got.OpenPositions) != 1 || got.OpenPositions[0].Ticker != "HIMS" {
 		t.Fatalf("expected only HIMS (no fallback when tracker populated), got %+v", got.OpenPositions)
 	}
 	p := got.OpenPositions[0]
-	if p.Side != "long" || p.Quantity != 10 || p.AvgCostBasis != 42.5 || p.UnrealizedPL != 5 {
+	if p.Side != "long" || p.Quantity != 10 || p.AvgCostBasis != 42.5 || p.UnrealizedPL != 5 || p.EntryCount != 1 || p.EntryCountKnown {
 		t.Errorf("field mapping wrong: %+v", p)
+	}
+}
+
+func TestBuildPortfolioContextTrackerUsesLocalEntryCount(t *testing.T) {
+	got := buildPortfolioContext(portfolio.State{Cash: 200, TotalValue: 1000}, []portfolio.ExecPosition{
+		{Ticker: "AAPL", Side: "long", Quantity: 2, AvgCostBasis: 100, CurrentValue: 210},
+	}, []store.Trade{
+		{Ticker: "AAPL", Direction: "long", Quantity: 1},
+		{Ticker: "aapl", Direction: "long", Quantity: 1},
+	})
+	if len(got.OpenPositions) != 1 || got.OpenPositions[0].EntryCount != 2 || !got.OpenPositions[0].EntryCountKnown {
+		t.Fatalf("tracker position lost local pyramid count: %+v", got.OpenPositions)
 	}
 }
 
@@ -61,7 +73,7 @@ func TestBuildPortfolioContext_StoreFallback(t *testing.T) {
 		t.Fatalf("expected 2 aggregated positions, got %+v", got.OpenPositions)
 	}
 	hims := got.OpenPositions[0]
-	if hims.Ticker != "HIMS" || hims.Quantity != 20 || hims.AvgCostBasis != 45 {
+	if hims.Ticker != "HIMS" || hims.Quantity != 20 || hims.AvgCostBasis != 45 || hims.EntryCount != 2 || !hims.EntryCountKnown {
 		t.Errorf("pyramid aggregation wrong: %+v", hims)
 	}
 	if hims.CurrentValue != 0 || hims.UnrealizedPL != 0 {

@@ -50,7 +50,8 @@ type NewsItem struct {
 // positions dropped by the conversion cap (toPromptPortfolio) so the prompt can
 // say "+N more" instead of silently understating exposure.
 type Portfolio struct {
-	CashAvailable float64
+	CashAvailable   float64
+	PortfolioEquity float64
 	// CashKnown distinguishes a real balance (including $0 fully deployed)
 	// from an unpopulated tracker; false renders a "not provided" marker.
 	CashKnown        bool
@@ -62,6 +63,8 @@ type Portfolio struct {
 type Position struct {
 	Ticker, Sentiment, Side                            string
 	Quantity, AvgCostBasis, CurrentValue, UnrealizedPL float64
+	EntryCount                                         int
+	EntryCountKnown                                    bool
 }
 
 // SimilarPastSetup represents a past analysis included in the "Similar Past
@@ -301,7 +304,7 @@ const OutputSchema = `OUTPUT FORMAT — respond with ONLY a valid JSON object an
   "selected_strategy":   "<the candidate lens you selected, or none>",
   "action":              "BUY" | "SELL" | "HOLD" | "WAIT",
   "confidence":          <float 0.0–1.0>,
-  "size_pct":            <float, recommended position size as % of portfolio>,
+  "size_pct":            <float, incremental BUY order size as % of the BUY RISK POLICY sizing base>,
   "stop_loss":           <float price, or 0 if HOLD/WAIT>,
   "take_profit":         <float price, or 0 if HOLD/WAIT>,
   "rejected_strategies": {"<lens>": "<one clause on why it does not fit>"},
@@ -349,6 +352,7 @@ const ConfidenceAnchors = `CONFIDENCE CALIBRATION:
 const PortfolioRules = `USING PORTFOLIO CONTEXT:
 - SELL is only valid for this ticker if it appears in open positions as a long. Never propose SELL for a ticker not held — such signals are discarded by the engine.
 - If this ticker is already held long, a BUY is a pyramid add-on: judge it against the existing position's basis and unrealized P&L, and keep combined ticker exposure within the BUY RISK POLICY cap after this order.
+- If the displayed open-entry count for this ticker has reached the BUY RISK POLICY count limit, do not propose another BUY. If the count is unavailable, leave the final decision to deterministic risk checks.
 - Use the open-position list for correlation awareness: several same-direction positions in the same sector/theme argue for smaller size or lower confidence on a new correlated entry.
 - Unrealized losses on OTHER positions are NOT a reason to WAIT or HOLD on this setup — evaluate this ticker on its own merits.`
 
@@ -549,6 +553,19 @@ USING SIMILAR PAST ANALYSES:
 		lensGuidance(lenses), exitOverride)
 }
 
+// roundPromptDollars keeps small paper accounts legible without making every
+// minor equity or cash change produce a distinct prompt.
+func roundPromptDollars(value float64) float64 {
+	step := 1.0
+	switch {
+	case math.Abs(value) >= 10000:
+		step = 100
+	case math.Abs(value) >= 100:
+		step = 10
+	}
+	return math.Round(value/step) * step
+}
+
 // buildUser is retained for focused prompt tests and older package-local
 // helpers. Timeframe-aware callers use buildUserWithTimeframeContext.
 func buildUser(
@@ -640,18 +657,23 @@ func buildUserWithTimeframeContext(
 	// Rendering is deliberately CACHE-STABLE: raw CurrentValue / UnrealizedPL
 	// change on every tick, which would make every prompt unique and neuter
 	// both analysis_cache and the material-change gate. So only stable fields
-	// (ticker, side, qty, avg cost) print exactly; cash rounds to the nearest
-	// $100 and unrealized P&L renders as a percentage bucketed to 5 points —
+	// (ticker, side, qty, avg cost) print exactly; cash and equity use magnitude-
+	// aware dollar buckets and unrealized P&L buckets to 5 percentage points —
 	// the text only changes when something meaningful changes.
 	b.WriteString("\n### PORTFOLIO CONTEXT\n")
+	if portfolio.PortfolioEquity > 0 {
+		b.WriteString(fmt.Sprintf("Portfolio equity: ≈$%.0f\n", roundPromptDollars(portfolio.PortfolioEquity)))
+	} else {
+		b.WriteString("Portfolio equity: (unknown — exact ticker capacity cannot be calculated)\n")
+	}
 	switch {
-	case portfolio.CashKnown && math.Round(portfolio.CashAvailable/100)*100 <= 0:
+	case portfolio.CashKnown && portfolio.CashAvailable <= 0:
 		// Known non-positive balance: the account is fully deployed (or in a
 		// margin debit). Rendering this as "not provided" would invite BUY
 		// proposals the cash gates must then discard (Codex #392 P2).
 		b.WriteString("Cash available: ≈$0 (fully deployed — a new long entry requires freeing capital first)\n")
 	case portfolio.CashKnown || portfolio.CashAvailable > 0:
-		b.WriteString(fmt.Sprintf("Cash available: ≈$%.0f\n", math.Round(portfolio.CashAvailable/100)*100))
+		b.WriteString(fmt.Sprintf("Cash available: ≈$%.0f\n", roundPromptDollars(portfolio.CashAvailable)))
 	default:
 		b.WriteString("Cash available: (not provided — do not assume zero; apply sizing rules normally)\n")
 	}
@@ -669,6 +691,11 @@ func buildUserWithTimeframeContext(
 			if basis := p.Quantity * p.AvgCostBasis; basis != 0 && (p.UnrealizedPL != 0 || p.CurrentValue != 0) {
 				bucket := math.Round(p.UnrealizedPL/math.Abs(basis)*100/5) * 5
 				line += fmt.Sprintf("  unrealized≈%+.0f%%", bucket)
+			}
+			if p.EntryCountKnown {
+				line += fmt.Sprintf("  open entries=%d", p.EntryCount)
+			} else {
+				line += "  open entries=at least 1 (exact local lot count unavailable)"
 			}
 			b.WriteString(line + "\n")
 		}

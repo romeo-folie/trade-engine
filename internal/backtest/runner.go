@@ -781,6 +781,7 @@ func buildRequest(opts RunOptions, window []data.Candle, riskCfg config.RiskConf
 			MaxTickerExposurePct: riskCfg.MaxPositionPct,
 			MaxPerTicker:         riskCfg.MaxPerTicker,
 			MinRiskReward:        riskCfg.MinRiskReward,
+			SizeBasis:            prompts.SizeBasisCash,
 			Configured:           true,
 		},
 		Ticker:        opts.Ticker,

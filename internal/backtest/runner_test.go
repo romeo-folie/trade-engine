@@ -26,7 +26,7 @@ func TestBuildRequestUsesBacktestRiskConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildRequest: %v", err)
 	}
-	if got := req.RiskPolicy; !got.Configured || got.MaxTickerExposurePct != 10 || got.MaxPerTicker != 2 || got.MinRiskReward != 1.5 {
+	if got := req.RiskPolicy; !got.Configured || got.MaxTickerExposurePct != 10 || got.MaxPerTicker != 2 || got.MinRiskReward != 1.5 || got.SizeBasis != "cash" {
 		t.Fatalf("backtest request policy = %+v, want configured 10%% / 2 / 1.5", got)
 	}
 	zero, err := buildRequest(RunOptions{Ticker: "AAPL"}, nil, config.RiskConfig{})

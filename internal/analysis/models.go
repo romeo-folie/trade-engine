@@ -284,7 +284,8 @@ type NewsSnippet struct {
 // PortfolioContext carries current portfolio state for the prompt.
 // Placeholder in Phase 3 — populated by Phase 4.
 type PortfolioContext struct {
-	CashAvailable float64
+	CashAvailable   float64
+	PortfolioEquity float64
 	// CashKnown distinguishes a real balance (including a fully-deployed $0)
 	// from an unpopulated tracker: with it false the prompt renders an
 	// explicit "not provided" marker instead of a false zero (Codex #392 P2).
@@ -302,6 +303,9 @@ type PositionSummary struct {
 	AvgCostBasis float64
 	CurrentValue float64
 	UnrealizedPL float64
+	EntryCount   int
+	// EntryCountKnown is false for broker-only holdings with no local lot rows.
+	EntryCountKnown bool
 }
 
 // ─── Phase 12 types ───────────────────────────────────────────────────────────

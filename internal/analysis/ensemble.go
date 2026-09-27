@@ -416,7 +416,7 @@ Output ONLY a valid JSON object:
 {
   "action": "BUY" | "SELL" | "HOLD" | "WAIT",
   "confidence": <0.0–1.0>,
-  "size_pct": <non-negative incremental BUY order size as percent of portfolio equity>,
+  "size_pct": <non-negative incremental BUY order size as percent of the BUY RISK POLICY sizing base>,
   "stop_loss": <price or 0>,
   "take_profit": <price or 0>,
   "decisive_reason": "<one concrete sentence naming the fact that determined the final action>",
