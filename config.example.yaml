@@ -907,6 +907,17 @@ disclosures:
 # most active), the knowledge graph, and news-sympathy triggers. Admission is
 # deterministic; LLMs enrich evidence and evaluate candidates only after they
 # enter the watchlist research queue.
+# Paper deployment with disclosure discovery but no market-activity chasing
+# (set these values in the scanner block below):
+# scanner:
+#   enabled: true
+#   top_movers_enabled: false
+#   top_actives_enabled: false
+#   political_disclosures:
+#     enabled: true
+#     promote_candidates: true
+#   earnings_watchlist:
+#     enabled: true  # Independent of scanner.enabled.
 scanner:
   enabled: false
   scan_interval_hours: 2       # Scan cadence during market hours (9:30–16:00 ET)
