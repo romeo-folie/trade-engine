@@ -7,6 +7,7 @@ import (
 
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/engine"
+	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
 type watchlistSessionJob interface {
@@ -16,10 +17,11 @@ type watchlistSessionJob interface {
 // WatchlistScheduler is an exchange-calendar-safe, one-shot after-close
 // scheduler. Startup catches up the most recently completed session once.
 type WatchlistScheduler struct {
-	Cfg   config.EarningsWatchlistConfig
-	Job   watchlistSessionJob
-	Now   func() time.Time
-	After func(time.Duration) <-chan time.Time
+	Cfg                 config.EarningsWatchlistConfig
+	Job                 watchlistSessionJob
+	Now                 func() time.Time
+	After               func(time.Duration) <-chan time.Time
+	FindRetryableTarget func(context.Context, time.Time) (time.Time, bool, error)
 }
 
 const watchlistFailureRetry = 5 * time.Minute
@@ -30,7 +32,7 @@ func (s *WatchlistScheduler) Run(ctx context.Context) error {
 	}
 	delay := time.Duration(s.Cfg.AfterCloseDelayMinutes) * time.Minute
 	now := s.now()
-	session := engine.MostRecentCompletedMarketSession(now, delay)
+	session := s.sessionFor(ctx, now, delay)
 	slog.Info("earnings watchlist scheduler initialized",
 		"completed_session_date", session.Date.Format("2006-01-02"),
 		"scheduled_for", session.Close.Add(delay),
@@ -68,10 +70,12 @@ func (s *WatchlistScheduler) Run(ctx context.Context) error {
 				"woke_at", wokeAt,
 				"lag_seconds", wokeAt.Sub(retryAt).Seconds(),
 			)
-			// A newer completed session wins over a stale retry; this prevents an
-			// extended outage from holding the feeder on Friday through Monday.
-			latest := engine.MostRecentCompletedMarketSession(wokeAt, delay)
-			if latest.Date.After(session.Date) {
+			// A live persisted cohort wins over a newer session, so deferred
+			// admissions keep retrying until their stored leases expire. If the
+			// outage happened before selection was persisted, the latest completed
+			// session still wins and prevents stale calendar work from blocking.
+			latest := s.sessionFor(ctx, wokeAt, delay)
+			if !latest.Date.Equal(session.Date) {
 				session = latest
 				failureCount = 0
 			}
@@ -82,6 +86,13 @@ func (s *WatchlistScheduler) Run(ctx context.Context) error {
 		}
 		failureCount = 0
 		waitingAt := s.now()
+		latest := s.sessionFor(ctx, waitingAt, delay)
+		if !latest.Date.Equal(session.Date) {
+			// A recovered older cohort must not strand the latest completed
+			// session until its next close. Process it immediately.
+			session = latest
+			continue
+		}
 		_, runAt := engine.NextMarketCloseRun(waitingAt, delay)
 		wait := runAt.Sub(waitingAt)
 		if wait < 0 {
@@ -106,8 +117,39 @@ func (s *WatchlistScheduler) Run(ctx context.Context) error {
 			"woke_at", wokeAt,
 			"lag_seconds", wokeAt.Sub(runAt).Seconds(),
 		)
-		session = engine.MostRecentCompletedMarketSession(wokeAt, delay)
+		session = s.sessionFor(ctx, wokeAt, delay)
 	}
+}
+
+func (s *WatchlistScheduler) sessionFor(ctx context.Context, now time.Time, delay time.Duration) engine.USMarketSession {
+	latest := engine.MostRecentCompletedMarketSession(now, delay)
+	findTarget := s.FindRetryableTarget
+	if findTarget == nil {
+		findTarget = store.OldestLiveEarningsWatchlistTarget
+	}
+	target, found, err := findTarget(ctx, now)
+	if err != nil {
+		loggerWarnRetryableTarget(err)
+		return latest
+	}
+	if !found {
+		return latest
+	}
+	// PostgreSQL DATE values arrive as midnight UTC. Keep the date components
+	// intact before passing them to the Eastern-time market calendar; interpreting
+	// UTC midnight directly can shift the target to the preceding ET date.
+	targetDate := time.Date(target.Year(), target.Month(), target.Day(), 12, 0, 0, 0, time.UTC)
+	for day := 1; day <= 14; day++ {
+		candidate := targetDate.AddDate(0, 0, -day)
+		if previous, ok := engine.MarketSessionForDate(candidate); ok {
+			return previous
+		}
+	}
+	return latest
+}
+
+func loggerWarnRetryableTarget(err error) {
+	slog.Warn("earnings watchlist scheduler could not locate persisted retry cohort", "err", err)
 }
 
 func (s *WatchlistScheduler) now() time.Time {

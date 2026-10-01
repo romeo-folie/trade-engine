@@ -85,15 +85,26 @@ func (f *WatchlistFeeder) RunSession(ctx context.Context, completed engine.USMar
 	}
 	now = f.now()
 	if !now.Before(target.Open) {
-		// Startup during the target session must not pre-publish tomorrow with
-		// yesterday's ranking data. The ordinary after-close run will use the
-		// completed session that actually precedes tomorrow.
-		slog.Info("earnings watchlist run skipped",
-			"reason", "target_session_started",
+		// A new startup catch-up must not pre-publish today's calendar using
+		// yesterday's ranking data. A previously selected, still-live cohort is
+		// different: keep retrying its deferred admissions until their stored
+		// session leases expire.
+		retryable, err := store.EarningsWatchlistRunHasLivePersistedCandidates(ctx, target.Date, now)
+		if err != nil {
+			return fmt.Errorf("check persisted earnings retry cohort: %w", err)
+		}
+		if !retryable {
+			slog.Info("earnings watchlist run skipped",
+				"reason", "target_session_started",
+				"completed_session_date", completed.Date.Format("2006-01-02"),
+				"target_session_date", target.Date.Format("2006-01-02"),
+			)
+			return nil
+		}
+		slog.Info("earnings watchlist retrying persisted cohort after target open",
 			"completed_session_date", completed.Date.Format("2006-01-02"),
 			"target_session_date", target.Date.Format("2006-01-02"),
 		)
-		return nil
 	}
 	stage = "claim"
 	attemptID, claimed, err := store.ClaimEarningsWatchlistRun(ctx, target.Date, now)

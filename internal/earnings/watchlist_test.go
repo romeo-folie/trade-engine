@@ -114,7 +114,9 @@ func TestWatchlistSchedulerRetriesTransientFailure(t *testing.T) {
 		}
 		cancel()
 		return nil
-	})}
+	}), FindRetryableTarget: func(context.Context, time.Time) (time.Time, bool, error) {
+		return time.Time{}, false, nil
+	}}
 	if err := s.Run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -133,6 +135,109 @@ func TestWatchlistSchedulerRetriesTransientFailure(t *testing.T) {
 		if !strings.Contains(logs.String(), want) {
 			t.Errorf("scheduler logs missing %q:\n%s", want, logs.String())
 		}
+	}
+}
+
+func TestWatchlistSchedulerKeepsPersistedCohortAcrossTargetOpen(t *testing.T) {
+	completed, ok := engine.MarketSessionForDate(time.Date(2026, time.August, 21, 12, 0, 0, 0, time.UTC))
+	if !ok {
+		t.Fatal("expected completed Friday session")
+	}
+	target := engine.NextMarketSession(completed.Date)
+	now := completed.Close.Add(5 * time.Minute)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	calls := 0
+	s := WatchlistScheduler{
+		Cfg: config.EarningsWatchlistConfig{Enabled: true, AfterCloseDelayMinutes: 5},
+		Now: func() time.Time { return now },
+		After: func(time.Duration) <-chan time.Time {
+			now = target.Open.Add(time.Minute)
+			ch := make(chan time.Time, 1)
+			ch <- now
+			return ch
+		},
+		FindRetryableTarget: func(context.Context, time.Time) (time.Time, bool, error) {
+			return target.Date, true, nil
+		},
+		Job: schedulerJob(func(_ context.Context, session engine.USMarketSession, _ time.Time) error {
+			calls++
+			if !session.Date.Equal(completed.Date) {
+				t.Fatalf("retry session=%s, want original completed session %s", session.Date, completed.Date)
+			}
+			if calls == 1 {
+				return errors.New("capacity unavailable")
+			}
+			cancel()
+			return nil
+		}),
+	}
+	if err := s.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("run attempts=%d, want a retry after target open", calls)
+	}
+}
+
+func TestWatchlistSchedulerProcessesLatestSessionAfterRetryingOlderCohort(t *testing.T) {
+	friday, ok := engine.MarketSessionForDate(time.Date(2026, time.August, 21, 12, 0, 0, 0, time.UTC))
+	if !ok {
+		t.Fatal("expected Friday market session")
+	}
+	target := engine.NextMarketSession(friday.Date)
+	now := target.Close.Add(10 * time.Minute)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var active bool = true
+	calls := 0
+	s := WatchlistScheduler{
+		Cfg: config.EarningsWatchlistConfig{Enabled: true, AfterCloseDelayMinutes: 5},
+		Now: func() time.Time { return now },
+		After: func(time.Duration) <-chan time.Time {
+			t.Fatal("scheduler waited for another close instead of processing the latest completed session")
+			return nil
+		},
+		FindRetryableTarget: func(context.Context, time.Time) (time.Time, bool, error) {
+			return target.Date, active, nil
+		},
+		Job: schedulerJob(func(_ context.Context, session engine.USMarketSession, _ time.Time) error {
+			calls++
+			if calls == 1 {
+				if !session.Date.Equal(friday.Date) {
+					t.Fatalf("first session=%s, want persisted cohort session %s", session.Date, friday.Date)
+				}
+				active = false
+				return nil
+			}
+			if !session.Date.Equal(target.Date) {
+				t.Fatalf("second session=%s, want latest completed session %s", session.Date, target.Date)
+			}
+			cancel()
+			return nil
+		}),
+	}
+	if err := s.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("run attempts=%d, want old retry then latest session", calls)
+	}
+}
+
+func TestWatchlistSchedulerPreservesUTCDateForPersistedTarget(t *testing.T) {
+	ctx := context.Background()
+	target := time.Date(2026, time.August, 27, 0, 0, 0, 0, time.UTC) // Thursday DATE from PostgreSQL.
+	scheduler := WatchlistScheduler{FindRetryableTarget: func(context.Context, time.Time) (time.Time, bool, error) {
+		return target, true, nil
+	}}
+	session := scheduler.sessionFor(ctx, target.Add(24*time.Hour), 5*time.Minute)
+	wednesday, ok := engine.MarketSessionForDate(time.Date(2026, time.August, 26, 12, 0, 0, 0, time.UTC))
+	if !ok {
+		t.Fatal("expected Wednesday market session")
+	}
+	if !session.Date.Equal(wednesday.Date) {
+		t.Fatalf("retry session=%s, want session before Thursday target: %s", session.Date, wednesday.Date)
 	}
 }
 
@@ -200,6 +305,63 @@ func TestWatchlistFeederSkipsClaimWhenExpiryCrossesTargetOpen(t *testing.T) {
 	}
 	if claimed != 0 {
 		t.Fatalf("claimed runs=%d, want 0", claimed)
+	}
+}
+
+func TestWatchlistFeederRetriesLivePersistedCohortAfterTargetOpen(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("store unavailable; skipping DB-backed earnings watchlist test")
+	}
+	ctx := context.Background()
+	completed, ok := engine.MarketSessionForDate(time.Date(2031, time.January, 7, 12, 0, 0, 0, time.UTC))
+	if !ok {
+		t.Fatal("expected completed session")
+	}
+	target := engine.NextMarketSession(completed.Date)
+	if _, err := store.GetDB().Exec(ctx, `DELETE FROM earnings_watchlist_runs WHERE target_session_date=$1::date`, target.Date); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), `DELETE FROM earnings_watchlist_runs WHERE target_session_date=$1::date`, target.Date)
+	})
+	attemptID, claimed, err := store.ClaimEarningsWatchlistRun(ctx, target.Date, target.Open.Add(-time.Hour))
+	if err != nil || !claimed {
+		t.Fatalf("claim setup run: claimed=%v err=%v", claimed, err)
+	}
+	expiresAt := engine.MarketSessionOffset(target.Date, 2).Close
+	candidate := store.EarningsWatchlistCandidate{
+		Ticker: "RETRYLIVE", ContextKey: "earnings_scheduled:" + target.Date.Format("2006-01-02"),
+		Context:   earningsDiscoveryContext(data.EarningsRelease{Symbol: "RETRYLIVE"}, target, 1, 1),
+		ExpiresAt: expiresAt, LiquidityRank: 1,
+	}
+	if _, err := store.PersistEarningsWatchlistCohort(ctx, target.Date, attemptID, []store.EarningsWatchlistCandidate{candidate}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordEarningsWatchlistCandidate(ctx, target.Date, candidate.Ticker, 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FailEarningsWatchlistRun(ctx, target.Date, attemptID, errors.New("capacity unavailable")); err != nil {
+		t.Fatal(err)
+	}
+	calendar := &watchlistCalendarStub{fetch: func(context.Context) ([]data.EarningsRelease, error) {
+		return nil, errors.New("calendar must not be refetched for persisted cohort")
+	}}
+	feeder := WatchlistFeeder{
+		Calendar: calendar, Bars: &watchlistBarsStub{},
+		Now: func() time.Time { return target.Open.Add(time.Minute) },
+	}
+	if err := feeder.RunSession(ctx, completed, completed.Close); err != nil {
+		t.Fatalf("retry persisted cohort after target open: %v", err)
+	}
+	if calendar.calls != 0 {
+		t.Fatalf("calendar calls=%d, want persisted cohort reuse", calendar.calls)
+	}
+	var status string
+	if err := store.GetDB().QueryRow(ctx, `SELECT status FROM earnings_watchlist_runs WHERE target_session_date=$1::date`, target.Date).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "completed" {
+		t.Fatalf("retry status=%q, want completed", status)
 	}
 }
 

@@ -78,6 +78,50 @@ func LoadEarningsWatchlistCohort(ctx context.Context, target time.Time) ([]Earni
 	return candidates, true, nil
 }
 
+// EarningsWatchlistRunHasLivePersistedCandidates reports whether an incomplete
+// run has at least one selected candidate whose stored lease has not elapsed.
+// It lets a post-open retry distinguish durable deferred work from a startup
+// catch-up that never claimed or selected the target session.
+func EarningsWatchlistRunHasLivePersistedCandidates(ctx context.Context, target, now time.Time) (bool, error) {
+	var live bool
+	err := GetDB().QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM earnings_watchlist_runs r
+			CROSS JOIN LATERAL jsonb_array_elements(
+				CASE WHEN jsonb_typeof(r.selected_candidates)='array' THEN r.selected_candidates ELSE '[]'::jsonb END
+			) candidate
+			WHERE r.target_session_date=$1::date
+			  AND r.status IN ('failed','running')
+			  AND NULLIF(candidate->>'expires_at','')::timestamptz > $2
+		)`, target, now).Scan(&live)
+	return live, err
+}
+
+// OldestLiveEarningsWatchlistTarget returns the oldest incomplete target with
+// at least one unexpired persisted candidate. Retrying it first prevents a
+// capacity deferral from being stranded by a later market session or restart.
+func OldestLiveEarningsWatchlistTarget(ctx context.Context, now time.Time) (time.Time, bool, error) {
+	var target time.Time
+	err := GetDB().QueryRow(ctx, `
+		SELECT r.target_session_date
+		FROM earnings_watchlist_runs r
+		WHERE r.status IN ('failed','running')
+		  AND EXISTS (
+			SELECT 1
+			FROM jsonb_array_elements(
+				CASE WHEN jsonb_typeof(r.selected_candidates)='array' THEN r.selected_candidates ELSE '[]'::jsonb END
+			) candidate
+			WHERE NULLIF(candidate->>'expires_at','')::timestamptz > $1
+		  )
+		ORDER BY r.target_session_date
+		LIMIT 1`, now).Scan(&target)
+	if isNoRows(err) {
+		return time.Time{}, false, nil
+	}
+	return target, err == nil, err
+}
+
 // PersistEarningsWatchlistCohort stores the first ranked cohort under the
 // current run claim. A retry reuses that original selection even if provider
 // data or liquidity ranking changes before the retry.

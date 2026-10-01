@@ -228,9 +228,6 @@ func (b *scannerPromotionOutcomeBatcher) StopAndFlush(ctx context.Context) {
 		b.timer, b.timerDone = nil, nil
 		outcomes = b.outcomes
 		b.outcomes = nil
-		if len(outcomes) > 0 {
-			seq = b.reserveBatchLocked()
-		}
 	} else if b.timerDone != nil {
 		waits = append(waits, b.timerDone)
 	}
@@ -239,10 +236,31 @@ func (b *scannerPromotionOutcomeBatcher) StopAndFlush(ctx context.Context) {
 		select {
 		case <-done:
 		case <-ctx.Done():
+			// The shutdown deadline can expire while another timer owns an
+			// earlier sequence. Return this unsent batch to the queue without
+			// reserving a sequence that would permanently block later sends.
+			if len(outcomes) > 0 {
+				b.mu.Lock()
+				b.outcomes = append(outcomes, b.outcomes...)
+				if b.timer == nil {
+					window := time.Duration(b.cfg.BatchWindowSec) * time.Second
+					if window <= 0 {
+						window = time.Minute
+					}
+					done := make(chan struct{})
+					b.timerDone = done
+					b.timer = time.AfterFunc(window, func() { b.flushTimer(done) })
+				}
+				b.mu.Unlock()
+			}
 			return
 		}
 	}
-	if seq > 0 {
+	if len(outcomes) > 0 {
+		b.mu.Lock()
+		outcomes = append(outcomes, b.takeLocked()...)
+		seq = b.reserveBatchLocked()
+		b.mu.Unlock()
 		b.sendBatch(ctx, outcomes, seq)
 	}
 	b.FlushWithContext(ctx)

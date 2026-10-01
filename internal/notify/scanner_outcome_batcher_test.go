@@ -158,6 +158,62 @@ func TestScannerPromotionOutcomeBatcherStopWaitsForTimerDelivery(t *testing.T) {
 	}
 }
 
+func TestScannerPromotionOutcomeBatcherTimeoutDoesNotLeaveSequenceGap(t *testing.T) {
+	cfg := config.TelegramConfig{BatchEnabled: true, BatchWindowSec: 60, MaxItemsPerBatch: 10}
+	started := make(chan string, 2)
+	release := make(chan struct{})
+	firstFinished := make(chan struct{})
+	delivered := make(chan string, 1)
+	batcher := newScannerPromotionOutcomeBatcher(cfg, func(_ context.Context, message string) {
+		started <- message
+		if containsScannerOutcomeText(message, "AAA") {
+			<-release
+			close(firstFinished)
+			return
+		}
+		delivered <- message
+	}, nil)
+	batcher.Add(scannerOutcome("AAA"))
+
+	batcher.mu.Lock()
+	done := batcher.timerDone
+	if batcher.timer == nil || !batcher.timer.Stop() {
+		batcher.mu.Unlock()
+		t.Fatal("failed to take control of first pending timer")
+	}
+	batcher.timer, batcher.timerDone = nil, nil
+	batcher.mu.Unlock()
+	go batcher.flushTimer(done)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first batch did not begin delivery")
+	}
+
+	batcher.Add(scannerOutcome("BBB"))
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	batcher.StopAndFlush(ctx)
+	batcher.Reset()
+	close(release)
+
+	select {
+	case <-firstFinished:
+	case <-time.After(time.Second):
+		t.Fatal("first in-flight batch did not finish")
+	}
+	batcher.Add(scannerOutcome("CCC"))
+	batcher.Flush()
+	select {
+	case message := <-delivered:
+		if !containsScannerOutcomeText(message, "CCC") {
+			t.Fatalf("post-reset batch=%q, want CCC", message)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("post-reset batch was blocked by a missing sequence")
+	}
+}
+
 func TestScannerPromotionOutcomeBatcherSplitsOversizedOutcome(t *testing.T) {
 	payload := scannerOutcome("AAA")
 	payload.Sources = nil
