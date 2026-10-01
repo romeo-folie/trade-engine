@@ -3563,6 +3563,10 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		Status:        execution.NormalizeOrderStatus(result.Status),
 		StockIntentID: stockIntentID,
 	}
+	if !result.FilledAt.IsZero() {
+		filledAt := result.FilledAt
+		entryOrder.FilledAt = &filledAt
+	}
 	if _, err := store.InsertOrder(ctx, entryOrder); err != nil {
 		logger.Warn("insert entry order", "tradeID", tradeID, "err", err)
 	}
@@ -3669,6 +3673,25 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 			}
 		}
 	}
+	discoveryResidencyRenewed := false
+	entryProtectionVerified := entryProtectionVerifiedForResidency(orderReq, result, initialProtectedQty)
+	if !result.FilledAt.IsZero() && entryProtectionVerified {
+		if err := e.RenewRecoveredEntryDiscoveryResidency(ctx, sig.Ticker, result.FilledAt); err != nil {
+			logger.Warn("renew discovery residency after protected stock entry", "ticker", sig.Ticker, "err", err)
+		} else {
+			discoveryResidencyRenewed = true
+			if stockIntentID != "" {
+				if err := store.MarkStockOrderIntentDiscoveryResidencyRenewed(ctx, stockIntentID); err != nil {
+					logger.Warn("mark discovery residency renewal complete", "ticker", sig.Ticker, "stock_intent_id", stockIntentID, "err", err)
+				}
+			}
+		}
+	} else if result.FilledAt.IsZero() {
+		logger.Debug("skip discovery residency renewal without authoritative fill timestamp", "ticker", sig.Ticker)
+	} else {
+		logger.Debug("defer discovery residency renewal until entry protection is verified",
+			"ticker", sig.Ticker, "filled_qty", result.FilledQty)
+	}
 	if strictBrokerVerificationPending {
 		e.verifyOrContainBrokerEntryAsync(tradeID, result.BrokerOrderID, sig.Ticker, orderReq.Quantity)
 		strictBrokerVerificationPending = false
@@ -3697,6 +3720,7 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 	if shouldPollEntryFill(result) {
 		brokerOrderID := result.BrokerOrderID
 		executor := e.executor
+		discoveryFillAt := result.FilledAt
 		go func() {
 			// 40 × 3s = 2 min: fractional market orders can fill in several
 			// parts; the old 24s window was part of how a partial got frozen.
@@ -3782,6 +3806,36 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 					if err == nil {
 						lastProtectedQty = nextProtectedQty
 					}
+				}
+				// A broker may accept the entry before it fills, so the initial
+				// response has no authoritative fill time. Renew discovery
+				// residency when polling first observes that fill, but only once
+				// the newly filled quantity is protected.
+				fillAt := status.FilledAt
+				if fillAt.IsZero() {
+					fillAt = discoveryFillAt
+				}
+				protectionConfirmed := entryProtectionVerifiedForResidency(orderReq, status, lastProtectedQty)
+				if !discoveryResidencyRenewed && status.FilledQty > 0 &&
+					!fillAt.IsZero() && protectionConfirmed {
+					renewCtx, renewCancel := context.WithTimeout(context.Background(), 5*time.Second)
+					if err := e.RenewRecoveredEntryDiscoveryResidency(
+						renewCtx, sig.Ticker, fillAt,
+					); err != nil {
+						logger.Warn("fill poll: renew discovery residency after protected entry fill",
+							"trade_id", tradeID, "ticker", sig.Ticker, "err", err)
+					} else {
+						discoveryResidencyRenewed = true
+						if stockIntentID != "" {
+							if err := store.MarkStockOrderIntentDiscoveryResidencyRenewed(
+								renewCtx, stockIntentID,
+							); err != nil {
+								logger.Warn("fill poll: mark discovery residency renewal complete",
+									"ticker", sig.Ticker, "stock_intent_id", stockIntentID, "err", err)
+							}
+						}
+					}
+					renewCancel()
 				}
 				if execution.IsTerminalOrderStatus(status.Status) {
 					if status.FilledQty == 0 && lastRecordedQty == 0 {
@@ -3935,6 +3989,13 @@ func (e *Engine) placeMarketExitWithTerminalRetries(
 	return res, req.IntentKey, false, nil
 }
 
+func entryProtectionVerifiedForResidency(req execution.OrderRequest, result execution.OrderResult, installedStopQty float64) bool {
+	uncappedStopVerified := !req.UncappedTakeProfit || installedStopQty+1e-9 >= result.FilledQty
+	bracketVerified := req.OrderClass != "bracket" || !req.RequireBrokerProtection ||
+		brokerBracketProtectionVerified(result, result.FilledQty)
+	return uncappedStopVerified && bracketVerified
+}
+
 func stockIntentIDForAcceptedOrderWithLookup(
 	ctx context.Context,
 	executor execution.Executor,
@@ -4033,6 +4094,15 @@ func (e *Engine) emitRecoveredEntryEffects(ctx context.Context, intentKey string
 		})
 	}
 	return true
+}
+
+// RenewRecoveredEntryDiscoveryResidency implements the stock-order recovery
+// hook and is also used immediately after a normal filled entry is persisted.
+// The source context is only extended while it is still live; position
+// monitoring remains independent from discovery residency.
+func (e *Engine) RenewRecoveredEntryDiscoveryResidency(ctx context.Context, ticker string, executedAt time.Time) error {
+	expiresAt := MarketSessionOffset(executedAt, 2).Close
+	return store.RenewDiscoveryResidencyAfterTrade(ctx, ticker, expiresAt)
 }
 
 // RecoveredStockEntry implements stockorders.RecoveryObserver.

@@ -75,6 +75,77 @@ func TestWatchlistSourceLeaseRefreshIsEvidenceGatedAndPreservesAdmission(t *test
 	}
 }
 
+func TestTradeRenewsOnlyLiveEarningsAndPoliticalDiscoveryResidency(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	const earningsTicker = "TRADE_RENEW_EARNINGS_RT"
+	const politicalTicker = "TRADE_RENEW_POLITICAL_RT"
+	const expiredTicker = "TRADE_RENEW_EXPIRED_RT"
+	tickers := []string{earningsTicker, politicalTicker, expiredTicker}
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(ctx, `DELETE FROM watchlist WHERE ticker=ANY($1::text[])`, tickers)
+	})
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	initialExpiry := now.Add(24 * time.Hour)
+	newExpiry := now.Add(72 * time.Hour)
+	if err := store.AddWatchlistItem(ctx, store.WatchlistItem{
+		Ticker: earningsTicker, Platform: "stock", Source: "earnings_watchlist", Active: true,
+		Strategies: []string{"momentum"}, Timeframes: []string{"1D"},
+	}); err != nil {
+		t.Fatalf("add earnings item: %v", err)
+	}
+	discovery := tradeprofile.DiscoveryContext{
+		Version: tradeprofile.DiscoveryContextVersion, Sources: []string{"earnings_scheduled"},
+		Thesis: "Scheduled earnings.", EvidenceBySource: map[string]json.RawMessage{"earnings_scheduled": json.RawMessage(`{"event":"earnings"}`)},
+	}
+	if err := store.UpsertWatchlistDiscoveryContext(ctx, earningsTicker, "stock", "earnings_scheduled:test", discovery, &initialExpiry); err != nil {
+		t.Fatalf("add earnings context: %v", err)
+	}
+	for _, ticker := range []string{politicalTicker, expiredTicker} {
+		if err := store.AddWatchlistItem(ctx, store.WatchlistItem{
+			Ticker: ticker, Platform: "stock", Source: "scanner", Active: true,
+			Strategies: []string{"momentum"}, Timeframes: []string{"1D"}, ExpiresAt: &initialExpiry,
+			SourceLeases: []store.WatchlistSourceLease{{
+				Source: "political_disclosure", EvidenceFingerprint: ticker, QualifiedAt: now,
+				ObservedAt: now, EffectiveAt: now, ExpiresAt: initialExpiry,
+				Evidence: json.RawMessage(`{"report":"trade-renewal"}`),
+			}},
+		}); err != nil {
+			t.Fatalf("add political item %s: %v", ticker, err)
+		}
+	}
+	expiredAt := now.Add(-time.Hour)
+	if _, err := store.GetDB().Exec(ctx, `UPDATE watchlist_source_leases l SET expires_at=$2 FROM watchlist w WHERE l.watchlist_id=w.id AND w.ticker=$1`, expiredTicker, expiredAt); err != nil {
+		t.Fatalf("expire test lease: %v", err)
+	}
+	if err := store.RenewDiscoveryResidencyAfterTrade(ctx, earningsTicker, newExpiry); err != nil {
+		t.Fatalf("renew earnings context: %v", err)
+	}
+	if err := store.RenewDiscoveryResidencyAfterTrade(ctx, politicalTicker, newExpiry); err != nil {
+		t.Fatalf("renew political lease: %v", err)
+	}
+	// A delayed recovery must not revive discovery residency that had already
+	// expired by the time recovery ran, even if a trade renewed live peers.
+	if err := store.RenewDiscoveryResidencyAfterTrade(ctx, expiredTicker, newExpiry); err != nil {
+		t.Fatalf("renew expired political lease: %v", err)
+	}
+	var earningsExpiry, politicalExpiry, unchangedExpiry time.Time
+	if err := store.GetDB().QueryRow(ctx, `SELECT c.expires_at FROM watchlist_discovery_contexts c JOIN watchlist w ON w.id=c.watchlist_id WHERE w.ticker=$1 AND c.source='earnings_scheduled'`, earningsTicker).Scan(&earningsExpiry); err != nil {
+		t.Fatalf("read renewed earnings expiry: %v", err)
+	}
+	if err := store.GetDB().QueryRow(ctx, `SELECT l.expires_at FROM watchlist_source_leases l JOIN watchlist w ON w.id=l.watchlist_id WHERE w.ticker=$1`, politicalTicker).Scan(&politicalExpiry); err != nil {
+		t.Fatalf("read renewed political expiry: %v", err)
+	}
+	if err := store.GetDB().QueryRow(ctx, `SELECT l.expires_at FROM watchlist_source_leases l JOIN watchlist w ON w.id=l.watchlist_id WHERE w.ticker=$1`, expiredTicker).Scan(&unchangedExpiry); err != nil {
+		t.Fatalf("read expired political expiry: %v", err)
+	}
+	if !earningsExpiry.Equal(newExpiry) || !politicalExpiry.Equal(newExpiry) || !unchangedExpiry.Equal(expiredAt) {
+		t.Fatalf("renewed earnings=%s political=%s expired=%s; want %s, %s, unchanged %s", earningsExpiry, politicalExpiry, unchangedExpiry, newExpiry, newExpiry, expiredAt)
+	}
+}
+
 func TestActiveWatchlistRaceReclassifiesResearchQueueMembership(t *testing.T) {
 	ctx := context.Background()
 	const ticker = "LEASE_QUEUE_RECLASSIFY_RT"
@@ -379,7 +450,7 @@ func TestStaleEarningsCapacitySuppressionRollsBackCohort(t *testing.T) {
 		Version: tradeprofile.DiscoveryContextVersion, Sources: []string{"earnings_scheduled"}, Thesis: "Scheduled earnings.",
 		EvidenceBySource: map[string]json.RawMessage{"earnings_scheduled": json.RawMessage(`{"event":"earnings"}`)},
 	}
-	_, err = store.PublishEarningsWatchlistRun(ctx, target, staleAttempt, []store.EarningsWatchlistCandidate{{
+	_, _, err = store.PublishEarningsWatchlistRun(ctx, target, staleAttempt, []store.EarningsWatchlistCandidate{{
 		Ticker: candidateTicker, ContextKey: "earnings_scheduled:stale", Context: context, ExpiresAt: expiresAt,
 		ResearchQueue: &store.ResearchQueueAdmission{Capacity: 1, Bucket: "earnings_scheduled", Reservation: 1, Overflow: 0},
 	}})
@@ -433,11 +504,11 @@ func TestEarningsPublicationAdmitsActiveManualItemWithoutQueueMembership(t *test
 		Version: tradeprofile.DiscoveryContextVersion, Sources: []string{"earnings_scheduled"}, Thesis: "Scheduled earnings.",
 		EvidenceBySource: map[string]json.RawMessage{"earnings_scheduled": json.RawMessage(`{"event":"earnings"}`)},
 	}
-	publications, err := store.PublishEarningsWatchlistRun(ctx, target, attemptID, []store.EarningsWatchlistCandidate{{
+	publications, deferrals, err := store.PublishEarningsWatchlistRun(ctx, target, attemptID, []store.EarningsWatchlistCandidate{{
 		Ticker: ticker, ContextKey: "earnings_scheduled:manual", Context: discovery, ExpiresAt: expiresAt,
 		ResearchQueue: &store.ResearchQueueAdmission{Capacity: baselineMemberships + 1, Bucket: "earnings_scheduled", Reservation: baselineMemberships + 1, Overflow: 0},
 	}})
-	if err != nil {
+	if err != nil || len(deferrals) != 0 {
 		t.Fatalf("publish earnings watchlist run: %v", err)
 	}
 	if len(publications) != 1 || publications[0].Disposition != "admitted" {
@@ -445,7 +516,7 @@ func TestEarningsPublicationAdmitsActiveManualItemWithoutQueueMembership(t *test
 	}
 }
 
-func TestEarningsCapacitySuppressionPreservesLiquidityOrderAndRollsBackCohort(t *testing.T) {
+func TestEarningsCapacitySuppressionPartiallyCommitsInLiquidityOrder(t *testing.T) {
 	ctx := context.Background()
 	var earningsRunsTable *string
 	if err := store.GetDB().QueryRow(ctx, `SELECT to_regclass('public.earnings_watchlist_runs')::text`).Scan(&earningsRunsTable); err != nil {
@@ -485,15 +556,13 @@ func TestEarningsCapacitySuppressionPreservesLiquidityOrderAndRollsBackCohort(t 
 			Reservation: baselineMemberships + 1, Overflow: 0, Priority: priority,
 		}
 	}
-	_, err = store.PublishEarningsWatchlistRun(ctx, target, attemptID, []store.EarningsWatchlistCandidate{
-		// The feeder supplies liquidity order. Canonical lock order must not
-		// change it, so this first Z ticker claims the final slot and A is the
-		// durable capacity suppression.
+	publications, deferrals, err := store.PublishEarningsWatchlistRun(ctx, target, attemptID, []store.EarningsWatchlistCandidate{
+		// The feeder supplies liquidity order, which must control the last slot.
 		{Ticker: firstTicker, ContextKey: "earnings_scheduled:first", Context: context, ExpiresAt: now.Add(24 * time.Hour), LiquidityRank: 1, ResearchQueue: queue(1)},
 		{Ticker: suppressedTicker, ContextKey: "earnings_scheduled:suppressed", Context: context, ExpiresAt: now.Add(24 * time.Hour), LiquidityRank: 2, ResearchQueue: queue(2)},
 	})
-	if !errors.Is(err, store.ErrResearchQueueCapacity) {
-		t.Fatalf("publish error=%v, want research queue capacity", err)
+	if err != nil || len(publications) != 1 || len(deferrals) != 1 || !errors.Is(deferrals[0].Reason, store.ErrResearchQueueCapacity) {
+		t.Fatalf("publications=%+v deferrals=%+v err=%v, want one admitted and one capacity-deferred candidate", publications, deferrals, err)
 	}
 	var contexts, memberships, audits, firstDecisions, suppressedDecisions int
 	if err := store.GetDB().QueryRow(ctx, `
@@ -507,8 +576,11 @@ func TestEarningsCapacitySuppressionPreservesLiquidityOrderAndRollsBackCohort(t 
 	).Scan(&contexts, &memberships, &audits, &firstDecisions, &suppressedDecisions); err != nil {
 		t.Fatalf("read rollback state: %v", err)
 	}
-	if contexts != 0 || memberships != 0 || audits != 0 || firstDecisions != 0 || suppressedDecisions != 1 {
-		t.Fatalf("capacity rollback contexts=%d memberships=%d audits=%d first_decisions=%d suppressed_decisions=%d", contexts, memberships, audits, firstDecisions, suppressedDecisions)
+	if contexts != 1 || memberships != 1 || audits != 1 || firstDecisions != 1 || suppressedDecisions != 1 {
+		t.Fatalf("partial admission contexts=%d memberships=%d audits=%d first_decisions=%d suppressed_decisions=%d", contexts, memberships, audits, firstDecisions, suppressedDecisions)
+	}
+	if err := store.FailEarningsWatchlistRun(ctx, target, attemptID, deferrals[0].Reason); err != nil {
+		t.Fatalf("persist retryable partial run: %v", err)
 	}
 	var status string
 	if err := store.GetDB().QueryRow(ctx, `SELECT status FROM earnings_watchlist_runs WHERE target_session_date=$1::date`, target).Scan(&status); err != nil {

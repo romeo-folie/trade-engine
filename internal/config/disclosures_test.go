@@ -64,12 +64,21 @@ func TestPoliticalDisclosureTimingSplitFallsBackForLegacyConfigAndValidatesExpli
 	if legacy.TriggerWindowDays() != 7 || legacy.EvidenceHorizonDays() != 7 || legacy.WatchlistLeaseWindowDays() != 7 {
 		t.Fatalf("legacy timing fallback = %+v", legacy)
 	}
+	if Defaults().Scanner.PoliticalDisclosures.WatchlistLeaseWindowSessions() != 3 {
+		t.Fatal("new defaults should use a three-session political-disclosure lease")
+	}
 	loaded := Defaults()
 	loaded.Scanner.PoliticalDisclosures.TTLDays = 9
 	migratePoliticalDisclosureTimingConfig(loaded, []byte("scanner:\n  political_disclosures:\n    ttl_days: 9\n"))
 	if got := loaded.Scanner.PoliticalDisclosures; got.TriggerLookbackDays != 9 ||
-		got.AnalystEvidenceHorizonDays != 9 || got.WatchlistLeaseDays != 9 {
+		got.AnalystEvidenceHorizonDays != 9 || got.WatchlistLeaseDays != 9 || got.WatchlistLeaseSessions != 0 {
 		t.Fatalf("legacy config migration = %+v, want all timing values 9", got)
+	}
+	sessionConfig := Defaults()
+	sessionConfig.Scanner.PoliticalDisclosures.WatchlistLeaseSessions = 3
+	migratePoliticalDisclosureTimingConfig(sessionConfig, []byte("scanner:\n  political_disclosures:\n    watchlist_lease_sessions: 3\n"))
+	if got := sessionConfig.Scanner.PoliticalDisclosures; got.WatchlistLeaseWindowSessions() != 3 {
+		t.Fatalf("explicit session lease = %+v, want three sessions", got)
 	}
 	cfg := Defaults()
 	cfg.Scanner.Enabled = true

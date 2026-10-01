@@ -516,6 +516,61 @@ func TestVerifyBrokerEntry_TransientSnapshotsActivateWithoutContainment(t *testi
 	}
 }
 
+func TestVerifyBrokerEntry_ProtectedSnapshotCompletesDiscoveryRenewal(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, _, _ := insertBracketFixture(t, "VERIFY_RENEWAL", 2)
+	intentID := "51515151-5151-4151-8151-515151515151"
+	intentKey := "entry:verify-renewal-" + tradeID[:8]
+	req := execution.OrderRequest{
+		Ticker: "VERIFY_RENEWAL", Side: execution.OrderSideBuy, Type: execution.OrderTypeMarket,
+		Quantity: 2, TradeID: tradeID, OrderClass: "bracket", RequireBrokerProtection: true,
+		IntentKey: intentKey, ClientOrderID: "verify-renewal-" + tradeID[:8],
+	}
+	payload, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateStockOrderIntent(ctx, store.StockOrderIntent{
+		ID: intentID, IdempotencyKey: intentKey, ClientOrderID: req.ClientOrderID,
+		TradeID: tradeID, Ticker: req.Ticker, Side: "buy", OrderType: "market",
+		RequestedQty: 2, RequestPayload: payload, PayloadHash: "verify-renewal",
+		Status: "filled", BrokerOrderID: "verify-renewal-parent",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateStockOrderIntentBroker(ctx, req.ClientOrderID, "verify-renewal-parent", "filled", 100, 2, "", "", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AttachStockOrderIntentTradeByKey(ctx, intentKey, tradeID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), `DELETE FROM stock_order_intents WHERE id=$1::uuid`, intentID)
+		_, _ = store.GetDB().Exec(context.Background(), `DELETE FROM trades WHERE id=$1::uuid`, tradeID)
+	})
+	exec := &fakeBracketExec{statuses: map[string]execution.OrderResult{
+		"verify-renewal-parent": {Status: "filled", Quantity: 2, FilledQty: 2,
+			FilledAt: time.Now(), ChildOrders: []execution.OrderLeg{{Type: "stop", Status: "accepted", Quantity: 2, RemainingQty: 2}}},
+	}}
+	e := newBracketTestEngine(exec)
+	e.verifyOrContainBrokerEntryAsync(tradeID, "verify-renewal-parent", req.Ticker, 2)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		var renewedAt *time.Time
+		if err := store.GetDB().QueryRow(ctx, `SELECT discovery_residency_renewed_at FROM stock_order_intents WHERE id=$1::uuid`, intentID).Scan(&renewedAt); err != nil {
+			t.Fatal(err)
+		}
+		if renewedAt != nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("verified broker protection did not complete discovery residency renewal")
+}
+
 func TestVerifyBrokerEntry_DirectWorkingStopPreventsContainment(t *testing.T) {
 	if !store.IsConnected() {
 		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")

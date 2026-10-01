@@ -4,7 +4,7 @@ import "testing"
 
 func TestEarningsWatchlistDefaultsAndValidation(t *testing.T) {
 	defaults := Defaults().Scanner.EarningsWatchlist
-	if !defaults.Enabled || defaults.AfterCloseDelayMinutes != 20 || defaults.CandidateCap != 5 || defaults.WatchlistSessions != 5 || defaults.BarBatchSize != 100 {
+	if !defaults.Enabled || defaults.AfterCloseDelayMinutes != 20 || defaults.CandidateCap != 5 || defaults.WatchlistSessions != 3 || defaults.BarBatchSize != 100 {
 		t.Fatalf("defaults = %+v", defaults)
 	}
 	for _, mutate := range []func(*Config){

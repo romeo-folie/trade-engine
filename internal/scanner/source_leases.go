@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/romeo-folie/trade-engine/internal/engine"
 	"github.com/romeo-folie/trade-engine/internal/store"
 	"github.com/romeo-folie/trade-engine/internal/tradeprofile"
 )
@@ -45,10 +46,20 @@ func (s *MarketScanner) scannerSourceLeases(
 		if observedAt.IsZero() {
 			observedAt = now
 		}
+		expiresAt := now.AddDate(0, 0, s.sourceLeaseTTLDays(source))
+		if source == "political_disclosure" {
+			if sessions := s.Cfg.PoliticalDisclosures.WatchlistLeaseWindowSessions(); sessions > 0 {
+				leaseStart := now
+				if current, ok := engine.MarketSessionForDate(now); ok && !now.Before(current.Close) {
+					leaseStart = engine.NextMarketSession(current.Date).Date
+				}
+				expiresAt = engine.MarketSessionOffset(leaseStart, sessions-1).Close
+			}
+		}
 		leases = append(leases, store.WatchlistSourceLease{
 			Source: source, EvidenceFingerprint: hex.EncodeToString(digest[:]),
 			QualifiedAt: now, ObservedAt: observedAt, EffectiveAt: observedAt,
-			ExpiresAt: now.AddDate(0, 0, s.sourceLeaseTTLDays(source)), Evidence: evidence,
+			ExpiresAt: expiresAt, Evidence: evidence,
 		})
 	}
 	return leases

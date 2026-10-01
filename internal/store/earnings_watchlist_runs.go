@@ -2,9 +2,9 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 
@@ -15,7 +15,8 @@ import (
 var ErrEarningsWatchlistRunLeased = fmt.Errorf("earnings watchlist run is leased by another worker")
 
 // EarningsWatchlistCandidate is one fully prepared member of a run cohort.
-// PublishEarningsWatchlistRun writes the complete cohort atomically.
+// Each candidate admission commits independently so capacity pressure cannot
+// roll back successful peers.
 type EarningsWatchlistCandidate struct {
 	Ticker               string
 	ContextKey           string
@@ -31,11 +32,155 @@ type EarningsWatchlistCandidate struct {
 
 // EarningsWatchlistPublication records whether a committed candidate created a
 // new research membership or attached earnings context to one already active.
-// Callers publish this distinction to operators after the enclosing cohort
-// transaction commits.
+// Callers publish this distinction to operators after that candidate commits.
 type EarningsWatchlistPublication struct {
 	Ticker      string
 	Disposition string // admitted or rediscovered
+}
+
+type EarningsWatchlistDeferral struct {
+	Candidate EarningsWatchlistCandidate
+	Reason    error
+}
+
+type earningsWatchlistCohortCandidate struct {
+	Ticker             string                        `json:"ticker"`
+	ContextKey         string                        `json:"context_key"`
+	Context            tradeprofile.DiscoveryContext `json:"context"`
+	ExpiresAt          time.Time                     `json:"expires_at"`
+	LiquidityRank      int                           `json:"liquidity_rank"`
+	MedianDollarVolume float64                       `json:"median_dollar_volume"`
+}
+
+// LoadEarningsWatchlistCohort returns the immutable selection for a target
+// session. A nil JSON value means selection has not yet been persisted; an
+// empty array is a durable empty cohort.
+func LoadEarningsWatchlistCohort(ctx context.Context, target time.Time) ([]EarningsWatchlistCandidate, bool, error) {
+	var raw []byte
+	if err := GetDB().QueryRow(ctx, `SELECT selected_candidates FROM earnings_watchlist_runs WHERE target_session_date=$1::date`, target).Scan(&raw); err != nil {
+		return nil, false, err
+	}
+	if raw == nil {
+		return nil, false, nil
+	}
+	var stored []earningsWatchlistCohortCandidate
+	if err := json.Unmarshal(raw, &stored); err != nil {
+		return nil, false, fmt.Errorf("decode earnings watchlist cohort: %w", err)
+	}
+	candidates := make([]EarningsWatchlistCandidate, 0, len(stored))
+	for _, item := range stored {
+		candidates = append(candidates, EarningsWatchlistCandidate{
+			Ticker: item.Ticker, ContextKey: item.ContextKey, Context: item.Context,
+			ExpiresAt: item.ExpiresAt, LiquidityRank: item.LiquidityRank,
+			MedianDollarVolume: item.MedianDollarVolume,
+		})
+	}
+	return candidates, true, nil
+}
+
+// EarningsWatchlistRunHasLivePersistedCandidates reports whether an incomplete
+// run has at least one selected candidate whose stored lease has not elapsed.
+// It lets a post-open retry distinguish durable deferred work from a startup
+// catch-up that never claimed or selected the target session.
+func EarningsWatchlistRunHasLivePersistedCandidates(ctx context.Context, target, now time.Time) (bool, error) {
+	var live bool
+	err := GetDB().QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM earnings_watchlist_runs r
+			CROSS JOIN LATERAL jsonb_array_elements(
+				CASE WHEN jsonb_typeof(r.selected_candidates)='array' THEN r.selected_candidates ELSE '[]'::jsonb END
+			) candidate
+			WHERE r.target_session_date=$1::date
+			  AND r.status IN ('failed','running')
+			  AND NULLIF(candidate->>'expires_at','')::timestamptz > $2
+		)`, target, now).Scan(&live)
+	return live, err
+}
+
+// OldestLiveEarningsWatchlistTarget returns the oldest incomplete target with
+// at least one unexpired persisted candidate. Retrying it first prevents a
+// capacity deferral from being stranded by a later market session or restart.
+func OldestLiveEarningsWatchlistTarget(ctx context.Context, now time.Time) (time.Time, bool, error) {
+	var target time.Time
+	err := GetDB().QueryRow(ctx, `
+		SELECT r.target_session_date
+		FROM earnings_watchlist_runs r
+		WHERE r.status IN ('failed','running')
+		  AND EXISTS (
+			SELECT 1
+			FROM jsonb_array_elements(
+				CASE WHEN jsonb_typeof(r.selected_candidates)='array' THEN r.selected_candidates ELSE '[]'::jsonb END
+			) candidate
+			WHERE NULLIF(candidate->>'expires_at','')::timestamptz > $1
+		  )
+		ORDER BY r.target_session_date
+		LIMIT 1`, now).Scan(&target)
+	if isNoRows(err) {
+		return time.Time{}, false, nil
+	}
+	return target, err == nil, err
+}
+
+// PersistEarningsWatchlistCohort stores the first ranked cohort under the
+// current run claim. A retry reuses that original selection even if provider
+// data or liquidity ranking changes before the retry.
+func PersistEarningsWatchlistCohort(ctx context.Context, target time.Time, attemptID string, candidates []EarningsWatchlistCandidate) ([]EarningsWatchlistCandidate, error) {
+	stored := make([]earningsWatchlistCohortCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		stored = append(stored, earningsWatchlistCohortCandidate{
+			Ticker: candidate.Ticker, ContextKey: candidate.ContextKey, Context: candidate.Context,
+			ExpiresAt: candidate.ExpiresAt, LiquidityRank: candidate.LiquidityRank,
+			MedianDollarVolume: candidate.MedianDollarVolume,
+		})
+	}
+	encoded, err := json.Marshal(stored)
+	if err != nil {
+		return nil, fmt.Errorf("encode earnings watchlist cohort: %w", err)
+	}
+	tx, err := GetDB().Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	var status, currentAttempt string
+	var existing []byte
+	err = tx.QueryRow(ctx, `SELECT status, attempt_id::text, selected_candidates FROM earnings_watchlist_runs WHERE target_session_date=$1::date FOR UPDATE`, target).Scan(&status, &currentAttempt, &existing)
+	if err != nil {
+		return nil, err
+	}
+	if status != "running" || currentAttempt != attemptID {
+		return nil, fmt.Errorf("persist earnings watchlist cohort %s: claim is no longer running", target.Format("2006-01-02"))
+	}
+	if existing != nil {
+		if err := tx.Commit(ctx); err != nil {
+			return nil, err
+		}
+		var persisted []earningsWatchlistCohortCandidate
+		if err := json.Unmarshal(existing, &persisted); err != nil {
+			return nil, fmt.Errorf("decode persisted earnings watchlist cohort: %w", err)
+		}
+		return cohortCandidates(persisted), nil
+	}
+	if _, err := tx.Exec(ctx, `UPDATE earnings_watchlist_runs SET selected_candidates=$3::jsonb, updated_at=NOW() WHERE target_session_date=$1::date AND attempt_id=$2::uuid`, target, attemptID, encoded); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return candidates, nil
+}
+
+func cohortCandidates(stored []earningsWatchlistCohortCandidate) []EarningsWatchlistCandidate {
+	candidates := make([]EarningsWatchlistCandidate, 0, len(stored))
+	for _, item := range stored {
+		candidates = append(candidates, EarningsWatchlistCandidate{
+			Ticker: item.Ticker, ContextKey: item.ContextKey, Context: item.Context,
+			ExpiresAt: item.ExpiresAt, LiquidityRank: item.LiquidityRank,
+			MedianDollarVolume: item.MedianDollarVolume,
+		})
+	}
+	return candidates
 }
 
 // ClaimEarningsWatchlistRun serializes one target-session selection. Completed
@@ -96,66 +241,77 @@ func RecordEarningsWatchlistCandidate(ctx context.Context, target time.Time, tic
 	return err
 }
 
-// PublishEarningsWatchlistRun attaches every selected context, records its
-// audit row, and completes the claim in one transaction. A full research queue
-// records a durable suppression decision but rolls back the entire cohort, so
-// a retry cannot mix a changed ranking with partially admitted earlier peers.
-func PublishEarningsWatchlistRun(ctx context.Context, target time.Time, attemptID string, candidates []EarningsWatchlistCandidate) ([]EarningsWatchlistPublication, error) {
-	tx, err := GetDB().Begin(ctx)
+// PublishedEarningsWatchlistCandidates returns names already committed from a
+// partially admitted run. Failed peers remain eligible for the next retry.
+func PublishedEarningsWatchlistCandidates(ctx context.Context, target time.Time) (map[string]struct{}, error) {
+	rows, err := GetDB().Query(ctx, `SELECT ticker FROM earnings_watchlist_candidates WHERE target_session_date=$1::date`, target)
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback(ctx) //nolint:errcheck
-	orderedCandidates := orderedEarningsWatchlistCandidates(candidates)
-	// Scanner admission locks a ticker before reserving a global research-queue
-	// slot. Lock the complete earnings cohort in ticker order before any member
-	// can acquire that queue lock, so a multi-candidate cohort cannot hold the
-	// queue while waiting for a scanner-held ticker lock.
-	for _, candidate := range orderedCandidates {
-		if err := lockScannerWatchlistItem(ctx, tx, WatchlistItem{
-			Ticker: candidate.Ticker, Platform: "stock",
-		}); err != nil {
+	defer rows.Close()
+	published := make(map[string]struct{})
+	for rows.Next() {
+		var ticker string
+		if err := rows.Scan(&ticker); err != nil {
 			return nil, err
 		}
+		published[strings.ToUpper(strings.TrimSpace(ticker))] = struct{}{}
 	}
+	return published, rows.Err()
+}
+
+// PublishEarningsWatchlistRun commits candidates independently in caller rank
+// order. A capacity-limited candidate is deferred while later candidates are
+// still attempted; previously admitted peers remain durable for retry.
+func PublishEarningsWatchlistRun(ctx context.Context, target time.Time, attemptID string, candidates []EarningsWatchlistCandidate) ([]EarningsWatchlistPublication, []EarningsWatchlistDeferral, error) {
 	publications := make([]EarningsWatchlistPublication, 0, len(candidates))
+	deferrals := make([]EarningsWatchlistDeferral, 0)
 	for _, candidate := range candidates {
-		disposition, publishErr := publishEarningsCandidate(ctx, tx, candidate)
-		if publishErr != nil && !errors.Is(publishErr, ErrResearchQueueCapacity) && !errors.Is(publishErr, ErrWatchlistCapacity) && !errors.Is(publishErr, ErrResearchStagingReservationLost) {
-			return nil, publishErr
+		tx, err := GetDB().Begin(ctx)
+		if err != nil {
+			return publications, deferrals, err
 		}
-		if errors.Is(publishErr, ErrResearchQueueCapacity) || errors.Is(publishErr, ErrWatchlistCapacity) || errors.Is(publishErr, ErrResearchStagingReservationLost) {
-			if candidate.ResearchQueue == nil {
-				return nil, publishErr
+		var status, currentAttempt string
+		err = tx.QueryRow(ctx, `SELECT status, attempt_id::text FROM earnings_watchlist_runs WHERE target_session_date=$1::date FOR UPDATE`, target).Scan(&status, &currentAttempt)
+		if err != nil || status != "running" || currentAttempt != attemptID {
+			_ = tx.Rollback(ctx)
+			if err != nil {
+				return publications, deferrals, err
 			}
-			// Do not expose a partial liquidity-ranked cohort. Rolling back keeps
-			// retries from mixing a newly fetched ranking with already-admitted
-			// peers from an earlier capacity-limited attempt.
-			if err := tx.Rollback(ctx); err != nil {
-				return nil, err
+			return publications, deferrals, fmt.Errorf("publish earnings watchlist run %s: claim is no longer running", target.Format("2006-01-02"))
+		}
+		if err := lockScannerWatchlistItem(ctx, tx, WatchlistItem{Ticker: candidate.Ticker, Platform: "stock"}); err != nil {
+			_ = tx.Rollback(ctx)
+			return publications, deferrals, err
+		}
+		disposition, publishErr := publishEarningsCandidate(ctx, tx, candidate)
+		if publishErr != nil {
+			_ = tx.Rollback(ctx)
+			if errors.Is(publishErr, ErrResearchQueueCapacity) || errors.Is(publishErr, ErrWatchlistCapacity) || errors.Is(publishErr, ErrResearchStagingReservationLost) {
+				if errors.Is(publishErr, ErrResearchQueueCapacity) && candidate.ResearchQueue != nil {
+					if err := RecordResearchQueueSuppression(ctx, WatchlistItem{Ticker: candidate.Ticker, Platform: "stock"}, *candidate.ResearchQueue); err != nil {
+						return publications, deferrals, err
+					}
+				}
+				deferrals = append(deferrals, EarningsWatchlistDeferral{Candidate: candidate, Reason: publishErr})
+				continue
 			}
-			return nil, recordEarningsCapacityFailure(ctx, target, attemptID, candidate, publishErr)
+			return publications, deferrals, publishErr
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO earnings_watchlist_candidates (target_session_date,ticker,liquidity_rank,median_dollar_volume) VALUES ($1::date,$2,$3,$4) ON CONFLICT (target_session_date,ticker) DO NOTHING`, target, candidate.Ticker, candidate.LiquidityRank, candidate.MedianDollarVolume); err != nil {
-			return nil, err
+			_ = tx.Rollback(ctx)
+			return publications, deferrals, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return publications, deferrals, err
 		}
 		publications = append(publications, EarningsWatchlistPublication{Ticker: candidate.Ticker, Disposition: disposition})
 	}
-	tag, err := tx.Exec(ctx, `UPDATE earnings_watchlist_runs SET status='completed', completed_at=NOW(), updated_at=NOW() WHERE target_session_date=$1::date AND status='running' AND attempt_id=$2::uuid`, target, attemptID)
-	if err != nil {
-		return nil, err
-	}
-	if tag.RowsAffected() != 1 {
-		return nil, fmt.Errorf("complete earnings watchlist run %s: claim is no longer running", target.Format("2006-01-02"))
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
-	}
-	return publications, nil
+	return publications, deferrals, nil
 }
 
-// recordEarningsCapacityFailure preserves the suppression decision without
-// committing a partial cohort, then releases the run for a later full retry.
+// recordEarningsCapacityFailure preserves a legacy suppression decision and
+// releases the run for a later retry.
 func recordEarningsCapacityFailure(
 	ctx context.Context, target time.Time, attemptID string, candidate EarningsWatchlistCandidate, cause error,
 ) error {
@@ -183,15 +339,6 @@ func recordEarningsCapacityFailure(
 		return err
 	}
 	return cause
-}
-
-func orderedEarningsWatchlistCandidates(candidates []EarningsWatchlistCandidate) []EarningsWatchlistCandidate {
-	ordered := append([]EarningsWatchlistCandidate(nil), candidates...)
-	sort.SliceStable(ordered, func(i, j int) bool {
-		return strings.ToUpper(strings.TrimSpace(ordered[i].Ticker)) <
-			strings.ToUpper(strings.TrimSpace(ordered[j].Ticker))
-	})
-	return ordered
 }
 
 func publishEarningsCandidate(ctx context.Context, tx pgx.Tx, candidate EarningsWatchlistCandidate) (string, error) {

@@ -65,9 +65,12 @@ func (b *projectionFailureBroker) PlaceOrder(ctx context.Context, req execution.
 }
 
 type recoveryEffectsRecorder struct {
-	entries  []string
-	closes   []store.TradeRealization
-	prepared []string
+	entries      []string
+	closes       []store.TradeRealization
+	prepared     []string
+	renewals     []string
+	renewalTimes []time.Time
+	renewalErr   error
 }
 
 func (r *recoveryEffectsRecorder) RecoveredStockEntry(_ context.Context, intentKey string) {
@@ -79,6 +82,12 @@ func (r *recoveryEffectsRecorder) PreparedStockEntryNeedsAdmission(_ context.Con
 
 func (r *recoveryEffectsRecorder) RecoveredStockExit(_ context.Context, realized store.TradeRealization) {
 	r.closes = append(r.closes, realized)
+}
+
+func (r *recoveryEffectsRecorder) RenewRecoveredEntryDiscoveryResidency(_ context.Context, ticker string, at time.Time) error {
+	r.renewals = append(r.renewals, ticker)
+	r.renewalTimes = append(r.renewalTimes, at)
+	return r.renewalErr
 }
 
 // cancellationFillRecoveryBroker models a stop that fills while its cancel is
@@ -739,12 +748,15 @@ func TestStockIntentRecoveryProjectsPurgedTerminalSnapshotWithoutReplay(t *testi
 	signalID := insertRecoverySignal(t, "RINTENTPURGEDTERMINAL")
 	broker := newRecoveryBroker(execution.OrderResult{BrokerOrderID: "purged-terminal-entry", Status: "accepted"})
 	coordinator := stockorders.New(broker)
+	effects := &recoveryEffectsRecorder{}
+	coordinator.SetRecoveryObserver(effects)
 	req := entryRequest(signalID, "RINTENTPURGEDTERMINAL", 2)
 	if _, err := coordinator.PlaceOrder(ctx, req); err != nil {
 		t.Fatal(err)
 	}
 	in := intentForKey(t, req.IntentKey)
-	if err := store.UpdateStockOrderIntentBroker(ctx, in.ClientOrderID, "purged-terminal-entry", "filled", 101, 2, "", "", true); err != nil {
+	fillAt := time.Date(2026, time.September, 30, 14, 35, 0, 0, time.UTC)
+	if err := store.UpdateStockOrderIntentBrokerWithFillTime(ctx, in.ClientOrderID, "purged-terminal-entry", "filled", 101, 2, "", "", true, fillAt); err != nil {
 		t.Fatal(err)
 	}
 	// Alpaca may purge terminal orders from both lookup endpoints. Recovery must
@@ -760,6 +772,22 @@ func TestStockIntentRecoveryProjectsPurgedTerminalSnapshotWithoutReplay(t *testi
 	}
 	if got := countForIntent(t, "trades", in.ID); got != 1 {
 		t.Fatalf("purged terminal recovery trades=%d, want 1", got)
+	}
+	var recoveredFillAt *time.Time
+	if err := store.GetDB().QueryRow(ctx, `SELECT filled_at FROM orders WHERE stock_intent_id=$1::uuid`, in.ID).Scan(&recoveredFillAt); err != nil {
+		t.Fatalf("read recovered order fill time: %v", err)
+	}
+	if recoveredFillAt == nil || !recoveredFillAt.Equal(fillAt) {
+		t.Fatalf("recovered fill time=%v, want %v", recoveredFillAt, fillAt)
+	}
+	if len(effects.renewalTimes) != 1 || !effects.renewalTimes[0].Equal(fillAt) {
+		t.Fatalf("recovered discovery renewal times=%v, want [%v]", effects.renewalTimes, fillAt)
+	}
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatalf("recover after discovery renewal completion: %v", err)
+	}
+	if len(effects.renewalTimes) != 1 {
+		t.Fatalf("completed discovery renewal replayed: %v", effects.renewalTimes)
 	}
 }
 
@@ -783,6 +811,9 @@ func TestStockIntentBracketParentCountsReplacementDescendant(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := store.UpdateStockOrderIntentBroker(ctx, parent.ClientOrderID, parent.BrokerOrderID, "filled", 100, 1, "", "", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkStockOrderIntentDiscoveryResidencyRenewed(ctx, parent.ID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.GetDB().Exec(ctx, `UPDATE trades SET stock_intent_id=$1::uuid WHERE id=$2::uuid`, parent.ID, tradeID); err != nil {
@@ -2959,6 +2990,11 @@ func TestStockIntentRecoveryDoesNotReemitExistingTradeProjection(t *testing.T) {
 		t.Fatal(err)
 	}
 	intent := intentForKey(t, req.IntentKey)
+	filledAt := time.Date(2026, time.September, 28, 14, 30, 0, 0, time.UTC)
+	broker.lookup[intent.ClientOrderID] = execution.OrderResult{
+		BrokerOrderID: "existing-effect-entry", Status: "filled", FilledPrice: 100,
+		FilledQty: 3, FilledAt: filledAt,
+	}
 
 	// This is the normal-path crash window: the trade and order were projected
 	// and their in-process effects were emitted, but attaching the convenience
@@ -2989,6 +3025,12 @@ func TestStockIntentRecoveryDoesNotReemitExistingTradeProjection(t *testing.T) {
 	}
 	if len(effects.entries) != 0 {
 		t.Fatalf("existing normal trade projection re-emitted recovery effects: %v", effects.entries)
+	}
+	if len(effects.renewals) != 1 || effects.renewals[0] != req.Ticker {
+		t.Fatalf("recovered existing trade discovery renewals=%v, want %s", effects.renewals, req.Ticker)
+	}
+	if len(effects.renewalTimes) != 1 || !effects.renewalTimes[0].Equal(filledAt) {
+		t.Fatalf("recovered discovery renewal times=%v, want broker fill time %s", effects.renewalTimes, filledAt)
 	}
 	if got := intentForKey(t, req.IntentKey).TradeID; got != tradeID {
 		t.Fatalf("recovery attached intent trade %q, want %q", got, tradeID)
@@ -3125,8 +3167,13 @@ func TestStockIntentRecoveryRestoresBracketAndUncappedPolicy(t *testing.T) {
 	}
 	uncappedIntent := intentForKey(t, uncapped.IntentKey)
 	broker.lookup[uncappedIntent.ClientOrderID] = execution.OrderResult{BrokerOrderID: "uncapped-entry", Status: "partially_filled", FilledPrice: 100, FilledQty: 3}
+	effects := &recoveryEffectsRecorder{renewalErr: errors.New("lease renewal unavailable")}
+	coordinator.SetRecoveryObserver(effects)
 	if err := coordinator.Recover(ctx); err != nil {
-		t.Fatal(err)
+		t.Fatalf("ancillary discovery renewal should not fail protected entry recovery: %v", err)
+	}
+	if len(effects.renewals) != 0 {
+		t.Fatalf("recovery without a broker or durable fill timestamp renewed at an invented time: %v", effects.renewals)
 	}
 	var takeProfit float64
 	if err := store.GetDB().QueryRow(ctx, `SELECT COALESCE(take_profit,0) FROM trades WHERE stock_intent_id=$1::uuid`, uncappedIntent.ID).Scan(&takeProfit); err != nil || takeProfit != 0 {
@@ -3165,6 +3212,72 @@ func TestStockIntentRecoveryRestoresBracketAndUncappedPolicy(t *testing.T) {
 	}
 }
 
+func TestStockIntentRecoveryClosedEntryUsesTerminalDurableSnapshot(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
+		t.Fatal(err)
+	}
+	signalID := insertRecoverySignal(t, "RINTENTCLOSEDPURGED")
+	ticker := "RINTENTCLOSEDPURGED"
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		SignalID: signalID, Ticker: ticker, Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 1, Status: "closed",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intentID := "16161616-1616-4161-8161-161616161616"
+	req := entryRequest(signalID, ticker, 1)
+	payload, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := store.StockOrderIntent{
+		ID: intentID, IdempotencyKey: req.IntentKey, ClientOrderID: req.ClientOrderID,
+		TradeID: tradeID, Ticker: ticker, Side: "buy", OrderType: "market",
+		RequestedQty: 1, RequestPayload: payload, PayloadHash: "closed-purged-entry",
+		BrokerOrderID: "closed-purged-entry", Status: "filled",
+	}
+	if err := store.CreateStockOrderIntent(ctx, intent); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateStockOrderIntentBroker(ctx, intent.ClientOrderID, intent.BrokerOrderID, "filled", 100, 1, "", "", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GetDB().Exec(ctx, `UPDATE trades SET stock_intent_id=$1::uuid WHERE id=$2::uuid`, intentID, tradeID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: intent.BrokerOrderID, Ticker: ticker,
+		Side: "buy", OrderType: "market", Quantity: 1, FilledPrice: 100,
+		FilledQty: 1, Status: "filled", StockIntentID: intentID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateSignalStatus(ctx, signalID, "executed", ""); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), `DELETE FROM trades WHERE id=$1::uuid`, tradeID)
+	})
+	// The broker has purged this already-terminal parent. Recovery must trust
+	// the durable terminal snapshot, avoid another cancel/status read, and still
+	// acknowledge the discovery-renewal step.
+	if err := stockorders.New(newRecoveryBroker(execution.OrderResult{})).Recover(ctx); err != nil {
+		t.Fatalf("recover closed purged entry: %v", err)
+	}
+	var renewedAt *time.Time
+	if err := store.GetDB().QueryRow(ctx, `SELECT discovery_residency_renewed_at FROM stock_order_intents WHERE id=$1::uuid`, intentID).Scan(&renewedAt); err != nil {
+		t.Fatal(err)
+	}
+	if renewedAt == nil {
+		t.Fatal("closed entry renewal was not acknowledged")
+	}
+	if isRecoverableIntent(t, intentID) {
+		t.Fatal("closed entry with acknowledged renewal remained recoverable")
+	}
+}
+
 func TestStockIntentRecoveryKeepsUncappedEntryRecoverableUntilStopIsDurable(t *testing.T) {
 	ctx := context.Background()
 	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
@@ -3194,6 +3307,9 @@ func TestStockIntentRecoveryKeepsUncappedEntryRecoverableUntilStopIsDurable(t *t
 		t.Fatal(err)
 	}
 	if err := store.UpdateSignalStatus(ctx, signalID, "executed", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkStockOrderIntentDiscoveryResidencyRenewed(ctx, entry.ID); err != nil {
 		t.Fatal(err)
 	}
 	if isRecoverableIntent(t, entry.ID) {

@@ -930,14 +930,14 @@ scanner:
     capacity: 30               # Total scanner/earnings allocations on the main watchlist
     overflow: 6                # Shared capacity after protected source reservations
     reservations:
-      political_disclosure: 4
-      weekly_leader: 2
-      potent_industry: 2
-      market_activity: 4       # Movers and most-active share this reservation
-      premarket_episodic: 2
-      graph_neighbor: 2
-      news_sympathy: 2
-      earnings_scheduled: 6
+      political_disclosure: 12   # Equal reserved capacity for disclosures and scheduled earnings
+      weekly_leader: 0
+      potent_industry: 0
+      market_activity: 0       # Movers and most-active share this reservation
+      premarket_episodic: 0
+      graph_neighbor: 0
+      news_sympathy: 0
+      earnings_scheduled: 12
   # Short-lived staging before admission to the main watchlist. These rows
   # release their slot once admitted; they do not own the source allocations.
   research_staging:
@@ -1065,17 +1065,18 @@ scanner:
     enabled: true                          # Add next-session earnings names to the ordinary analyst funnel
     after_close_delay_minutes: 20           # Runs after each US regular-session close; clears the default SIP delay
     candidate_cap: 5                       # Top names by prior-session dollar volume
-    watchlist_sessions: 5                  # Independent earnings context lifetime in trading sessions
+    watchlist_sessions: 3                  # Expires after three market sessions without renewal
     bar_batch_size: 100                    # Maximum symbols per Alpaca daily-bars request
   political_disclosures:
     enabled: false                         # Add persisted STOCK Act tickers to scanner sourcing
     promote_candidates: false              # Observation-only until explicitly enabled
     max_candidates_per_run: 20             # Bound filing-driven LLM reviews per scan
     claim_lease_minutes: 60                 # Reclaim a scanner cycle that crashed mid-review
-    ttl_days: 7                             # Legacy fallback for all three windows; retain when upgrading an existing config
+    ttl_days: 7                             # Legacy fallback for trigger/evidence windows and old calendar-day leases
     trigger_lookback_days: 50               # New/retried filing must be this recent to enter deterministic research admission
     analyst_evidence_horizon_days: 50       # Older completed filings retained in the analyst's disclosure context
-    watchlist_lease_days: 7                 # Meaningful new disclosure evidence renews this source's residency lease
+    watchlist_lease_days: 7                  # Legacy fallback for older configs; overridden by watchlist_lease_sessions
+    watchlist_lease_sessions: 3              # Three market sessions; new qualifying evidence renews the lease
   graph_neighbors:
     enabled: false             # Source candidates from knowledge-graph neighbors of manually-watched tickers
     max_per_scan: 5            # Cap graph candidates per scan so they don't crowd out screener picks

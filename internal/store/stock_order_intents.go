@@ -532,6 +532,13 @@ func ListUnprojectedStockStopIntents(ctx context.Context, tradeID string) ([]Sto
 }
 
 func UpdateStockOrderIntentBroker(ctx context.Context, clientOrderID, brokerOrderID, status string, filledPrice, filledQty float64, requestID, errText string, submitted bool) error {
+	return UpdateStockOrderIntentBrokerWithFillTime(ctx, clientOrderID, brokerOrderID, status,
+		filledPrice, filledQty, requestID, errText, submitted, time.Time{})
+}
+
+// UpdateStockOrderIntentBrokerWithFillTime atomically persists the broker
+// lifecycle snapshot and its authoritative first-fill timestamp.
+func UpdateStockOrderIntentBrokerWithFillTime(ctx context.Context, clientOrderID, brokerOrderID, status string, filledPrice, filledQty float64, requestID, errText string, submitted bool, filledAt time.Time) error {
 	_, err := GetDB().Exec(ctx, `
         UPDATE stock_order_intents
         SET broker_order_id=COALESCE(NULLIF($2,''), broker_order_id),
@@ -554,12 +561,27 @@ func UpdateStockOrderIntentBroker(ctx context.Context, clientOrderID, brokerOrde
                 ELSE $4
             END,
             filled_qty=GREATEST(filled_qty, $5),
+            filled_at=CASE WHEN $5 > 0 THEN COALESCE(filled_at,$9) ELSE filled_at END,
             broker_request_id=COALESCE(NULLIF($6,''), broker_request_id),
             broker_error=NULLIF($7,''),
             submitted_at=CASE WHEN $8 THEN COALESCE(submitted_at, NOW()) ELSE submitted_at END,
             last_checked_at=NOW(), updated_at=NOW()
         WHERE client_order_id=$1`,
-		clientOrderID, brokerOrderID, status, nullableFloat(filledPrice), filledQty, requestID, errText, submitted)
+		clientOrderID, brokerOrderID, status, nullableFloat(filledPrice), filledQty, requestID, errText, submitted, nullableTime(filledAt))
+	return err
+}
+
+func GetStockOrderIntentFillTime(ctx context.Context, intentID string) (*time.Time, error) {
+	var filledAt *time.Time
+	err := GetDB().QueryRow(ctx, `SELECT filled_at FROM stock_order_intents WHERE id=$1::uuid`, intentID).Scan(&filledAt)
+	return filledAt, err
+}
+
+func MarkStockOrderIntentDiscoveryResidencyRenewed(ctx context.Context, intentID string) error {
+	_, err := GetDB().Exec(ctx, `
+		UPDATE stock_order_intents
+		SET discovery_residency_renewed_at=COALESCE(discovery_residency_renewed_at,NOW()), updated_at=NOW()
+		WHERE id=$1::uuid`, intentID)
 	return err
 }
 
@@ -586,8 +608,8 @@ func ListRecoverableStockOrderIntents(ctx context.Context) ([]StockOrderIntent, 
                    -- Bracket children are broker-created projections, so only
                    -- their durable parent can restore a child row that was
                    -- lost after the parent projection otherwise completed.
-	                   OR (
-	                       COALESCE(stock_order_intents.request_payload->>'OrderClass','') = 'bracket'
+                   OR (
+                       COALESCE(stock_order_intents.request_payload->>'OrderClass','') = 'bracket'
                        AND (
                            SELECT COUNT(*)
                            FROM stock_order_intents child
@@ -606,6 +628,10 @@ func ListRecoverableStockOrderIntents(ctx context.Context) ([]StockOrderIntent, 
                              )
                        ) < 2
 	                   )
+	                   -- A filled entry remains recoverable until its source
+	                   -- residency renewal has either succeeded or been
+	                   -- acknowledged by the recovery observer.
+	                   OR stock_order_intents.discovery_residency_renewed_at IS NULL
 	                   -- An uncapped entry is not complete until its standalone
 	                   -- protective stop covers the durable position. Without
 	                   -- this, a crash after the entry projection but before stop

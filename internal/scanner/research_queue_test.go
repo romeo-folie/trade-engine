@@ -24,10 +24,10 @@ func TestResearchQueueAdmissionUsesProtectedSourceBucket(t *testing.T) {
 		bucket  string
 		slots   int
 	}{
-		{[]string{"mover", "active"}, "market_activity", 4},
-		{[]string{"weekly_leader"}, "weekly_leader", 2},
-		{[]string{"political_disclosure", "mover"}, "political_disclosure", 4},
-		{[]string{"news_sympathy"}, "news_sympathy", 2},
+		{[]string{"mover", "active"}, "market_activity", 0},
+		{[]string{"weekly_leader"}, "weekly_leader", 0},
+		{[]string{"political_disclosure", "mover"}, "political_disclosure", 12},
+		{[]string{"news_sympathy"}, "news_sympathy", 0},
 	} {
 		admission := researchQueueAdmission(SwingCandidate{Ticker: "TEST", Sources: test.sources}, cfg)
 		if admission.Bucket != test.bucket || admission.Reservation != test.slots || admission.Overflow != 6 {

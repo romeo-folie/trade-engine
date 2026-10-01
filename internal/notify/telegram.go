@@ -232,6 +232,9 @@ func (b *TelegramBot) subscribeScannerPromotionOutcomes() {
 			if b.scannerBatcher != nil && (b.cfg.BatchEnabled || scannerPromotionDeferred(payload)) {
 				b.scannerBatcher.Add(payload)
 			} else {
+				if b.scannerBatcher != nil {
+					b.scannerBatcher.ObserveAdmission(payload)
+				}
 				b.sendScannerPromotionOutcome(payload)
 			}
 		}
