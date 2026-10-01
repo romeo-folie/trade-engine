@@ -132,7 +132,7 @@ func TestTradeRenewsOnlyLiveEarningsAndPoliticalDiscoveryResidency(t *testing.T)
 		t.Fatalf("renew expired political lease: %v", err)
 	}
 	var earningsExpiry, politicalExpiry, unchangedExpiry time.Time
-	if err := store.GetDB().QueryRow(ctx, `SELECT expires_at FROM watchlist_discovery_contexts c JOIN watchlist w ON w.id=c.watchlist_id WHERE w.ticker=$1 AND c.source='earnings_scheduled'`, earningsTicker).Scan(&earningsExpiry); err != nil {
+	if err := store.GetDB().QueryRow(ctx, `SELECT c.expires_at FROM watchlist_discovery_contexts c JOIN watchlist w ON w.id=c.watchlist_id WHERE w.ticker=$1 AND c.source='earnings_scheduled'`, earningsTicker).Scan(&earningsExpiry); err != nil {
 		t.Fatalf("read renewed earnings expiry: %v", err)
 	}
 	if err := store.GetDB().QueryRow(ctx, `SELECT expires_at FROM watchlist_source_leases l JOIN watchlist w ON w.id=l.watchlist_id WHERE w.ticker=$1`, politicalTicker).Scan(&politicalExpiry); err != nil {

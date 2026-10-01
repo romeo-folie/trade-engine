@@ -813,6 +813,9 @@ func TestStockIntentBracketParentCountsReplacementDescendant(t *testing.T) {
 	if err := store.UpdateStockOrderIntentBroker(ctx, parent.ClientOrderID, parent.BrokerOrderID, "filled", 100, 1, "", "", true); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.MarkStockOrderIntentDiscoveryResidencyRenewed(ctx, parent.ID); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := store.GetDB().Exec(ctx, `UPDATE trades SET stock_intent_id=$1::uuid WHERE id=$2::uuid`, parent.ID, tradeID); err != nil {
 		t.Fatal(err)
 	}
@@ -3209,6 +3212,72 @@ func TestStockIntentRecoveryRestoresBracketAndUncappedPolicy(t *testing.T) {
 	}
 }
 
+func TestStockIntentRecoveryClosedEntryUsesTerminalDurableSnapshot(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
+		t.Fatal(err)
+	}
+	signalID := insertRecoverySignal(t, "RINTENTCLOSEDPURGED")
+	ticker := "RINTENTCLOSEDPURGED"
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		SignalID: signalID, Ticker: ticker, Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 1, Status: "closed",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intentID := "16161616-1616-4161-8161-161616161616"
+	req := entryRequest(signalID, ticker, 1)
+	payload, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := store.StockOrderIntent{
+		ID: intentID, IdempotencyKey: req.IntentKey, ClientOrderID: req.ClientOrderID,
+		TradeID: tradeID, Ticker: ticker, Side: "buy", OrderType: "market",
+		RequestedQty: 1, RequestPayload: payload, PayloadHash: "closed-purged-entry",
+		BrokerOrderID: "closed-purged-entry", Status: "filled",
+	}
+	if err := store.CreateStockOrderIntent(ctx, intent); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateStockOrderIntentBroker(ctx, intent.ClientOrderID, intent.BrokerOrderID, "filled", 100, 1, "", "", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GetDB().Exec(ctx, `UPDATE trades SET stock_intent_id=$1::uuid WHERE id=$2::uuid`, intentID, tradeID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: intent.BrokerOrderID, Ticker: ticker,
+		Side: "buy", OrderType: "market", Quantity: 1, FilledPrice: 100,
+		FilledQty: 1, Status: "filled", StockIntentID: intentID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateSignalStatus(ctx, signalID, "executed", ""); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), `DELETE FROM trades WHERE id=$1::uuid`, tradeID)
+	})
+	// The broker has purged this already-terminal parent. Recovery must trust
+	// the durable terminal snapshot, avoid another cancel/status read, and still
+	// acknowledge the discovery-renewal step.
+	if err := stockorders.New(newRecoveryBroker(execution.OrderResult{})).Recover(ctx); err != nil {
+		t.Fatalf("recover closed purged entry: %v", err)
+	}
+	var renewedAt *time.Time
+	if err := store.GetDB().QueryRow(ctx, `SELECT discovery_residency_renewed_at FROM stock_order_intents WHERE id=$1::uuid`, intentID).Scan(&renewedAt); err != nil {
+		t.Fatal(err)
+	}
+	if renewedAt == nil {
+		t.Fatal("closed entry renewal was not acknowledged")
+	}
+	if isRecoverableIntent(t, intentID) {
+		t.Fatal("closed entry with acknowledged renewal remained recoverable")
+	}
+}
+
 func TestStockIntentRecoveryKeepsUncappedEntryRecoverableUntilStopIsDurable(t *testing.T) {
 	ctx := context.Background()
 	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
@@ -3238,6 +3307,9 @@ func TestStockIntentRecoveryKeepsUncappedEntryRecoverableUntilStopIsDurable(t *t
 		t.Fatal(err)
 	}
 	if err := store.UpdateSignalStatus(ctx, signalID, "executed", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkStockOrderIntentDiscoveryResidencyRenewed(ctx, entry.ID); err != nil {
 		t.Fatal(err)
 	}
 	if isRecoverableIntent(t, entry.ID) {

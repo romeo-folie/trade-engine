@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/execution"
@@ -322,6 +323,9 @@ func (e *Engine) verifyOrContainBrokerEntryAsync(tradeID, entryBrokerOrderID, ti
 			heldQty := brokerCoverageHeldQty(trade.Quantity, status)
 			state := brokerBracketProtectionState(status, heldQty)
 			if state.UnprotectedQty <= 1e-9 {
+				if heldQty > 0 && trade.Status == "open" {
+					e.renewDiscoveryResidencyAfterVerifiedProtection(ctx, tradeID, status.FilledAt)
+				}
 				return
 			}
 			if attempt < brokerProtectionVerificationAttempts-1 {
@@ -352,6 +356,43 @@ func (e *Engine) verifyOrContainBrokerEntryAsync(tradeID, entryBrokerOrderID, ti
 		logger.Error("broker protection: verification remains uncertain; retaining broker ownership",
 			"trade_id", tradeID, "broker_order_id", entryBrokerOrderID)
 	}()
+}
+
+// renewDiscoveryResidencyAfterVerifiedProtection closes the brief gap where a
+// strict bracket's placement response omitted its active stop. The durable
+// entry stays recoverable until this fresh broker snapshot proves coverage;
+// complete the same fill-based residency renewal immediately instead of
+// waiting for the periodic recovery sweep.
+func (e *Engine) renewDiscoveryResidencyAfterVerifiedProtection(ctx context.Context, tradeID string, fillAt time.Time) {
+	intent, err := store.GetStockEntryOrderIntent(ctx, tradeID)
+	if err != nil {
+		logger.Warn("load entry intent for verified discovery renewal", "trade_id", tradeID, "err", err)
+		return
+	}
+	if intent == nil || intent.Side != "buy" || !strings.HasPrefix(intent.IdempotencyKey, "entry:") {
+		return
+	}
+	if fillAt.IsZero() {
+		persistedFillAt, err := store.GetStockOrderIntentFillTime(ctx, intent.ID)
+		if err != nil {
+			logger.Warn("load durable fill time for verified discovery renewal", "trade_id", tradeID, "intent_id", intent.ID, "err", err)
+			return
+		}
+		if persistedFillAt != nil {
+			fillAt = *persistedFillAt
+		}
+	}
+	if fillAt.IsZero() {
+		logger.Debug("skip verified discovery renewal without authoritative fill time", "trade_id", tradeID, "intent_id", intent.ID)
+		return
+	}
+	if err := e.RenewRecoveredEntryDiscoveryResidency(ctx, intent.Ticker, fillAt); err != nil {
+		logger.Warn("renew discovery residency after verified broker protection", "trade_id", tradeID, "intent_id", intent.ID, "filled_at", fillAt, "err", err)
+		return
+	}
+	if err := store.MarkStockOrderIntentDiscoveryResidencyRenewed(ctx, intent.ID); err != nil {
+		logger.Warn("mark verified discovery residency renewal complete", "trade_id", tradeID, "intent_id", intent.ID, "err", err)
+	}
 }
 
 func waitForBrokerProtectionRetry(ctx context.Context) bool {

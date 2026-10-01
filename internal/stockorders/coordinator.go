@@ -764,12 +764,16 @@ func (c *Coordinator) projectRecoveredEntry(ctx context.Context, intent store.St
 			// Once an exit owns this trade, a still-working entry must not be
 			// allowed to add shares behind that exit. Cancel first and use the
 			// terminal broker snapshot below, so no later fill can become an
-			// unprotected position.
-			terminal, err := c.cancelRecoveredEntryAfterExitOwnership(ctx, brokerID)
-			if err != nil {
-				return fmt.Errorf("cancel recovered entry after exit ownership: %w", err)
+			// unprotected position. A terminal durable snapshot is already proof
+			// that the parent cannot add fills; do not make closed-trade recovery
+			// depend on Alpaca retaining a purged terminal order.
+			if !execution.IsTerminalOrderStatusForTimeInForce(res.Status, req.TimeInForce) {
+				terminal, err := c.cancelRecoveredEntryAfterExitOwnership(ctx, brokerID)
+				if err != nil {
+					return fmt.Errorf("cancel recovered entry after exit ownership: %w", err)
+				}
+				res = terminal
 			}
-			res = terminal
 			if trade.Status == "closed" && res.FilledQty > recordedEntryQty+1e-9 {
 				return fmt.Errorf("recovered entry %s filled after its trade closed; cancellation confirmed but reconciliation is required", intent.ClientOrderID)
 			}
