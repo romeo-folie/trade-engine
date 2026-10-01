@@ -89,8 +89,8 @@ func (e *Engine) projectTimedOutStockIntentSnapshot(
 		return err
 	}
 	status := execution.NormalizeOrderStatus(snapshot.Status)
-	if err := store.UpdateStockOrderIntentBroker(ctx, intent.ClientOrderID, brokerOrderID,
-		status, snapshot.FilledPrice, snapshot.FilledQty, snapshot.RequestID, "", false); err != nil {
+	if err := store.UpdateStockOrderIntentBrokerWithFillTime(ctx, intent.ClientOrderID, brokerOrderID,
+		status, snapshot.FilledPrice, snapshot.FilledQty, snapshot.RequestID, "", false, snapshot.FilledAt); err != nil {
 		return err
 	}
 	if err := recoverer.Recover(ctx); err != nil {

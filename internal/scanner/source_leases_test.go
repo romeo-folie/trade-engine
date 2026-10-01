@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/config"
+	"github.com/romeo-folie/trade-engine/internal/engine"
 	"github.com/romeo-folie/trade-engine/internal/store"
 	"github.com/romeo-folie/trade-engine/internal/tradeprofile"
 )
@@ -50,6 +51,46 @@ func TestScannerSourceLeasesAreSourceSpecificAndRetryStable(t *testing.T) {
 	}
 	if first[1].EvidenceFingerprint != changed[1].EvidenceFingerprint {
 		t.Fatal("unrelated mover observation changed weekly-leader identity")
+	}
+}
+
+func TestPoliticalDisclosureLeaseUsesMarketSessionsWhenConfigured(t *testing.T) {
+	now := time.Date(2026, time.October, 2, 14, 0, 0, 0, time.UTC) // Friday, 10:00 ET
+	scanner := &MarketScanner{Cfg: config.ScannerConfig{PoliticalDisclosures: config.PoliticalDisclosureScannerConfig{
+		WatchlistLeaseSessions: 3,
+	}}}
+	candidate := SwingCandidate{Ticker: "LEASE", Sources: []string{"political_disclosure"}, PoliticalDisclosureClaimReportIDs: []string{"report-1"}}
+	discovery := &tradeprofile.DiscoveryContext{
+		Version: tradeprofile.DiscoveryContextVersion, Sources: []string{"political_disclosure"},
+		EvidenceBySource: map[string]json.RawMessage{"political_disclosure": json.RawMessage(`{"report":"report-1"}`)},
+	}
+	leases := scanner.scannerSourceLeases(candidate, discovery, now)
+	want := engine.MarketSessionOffset(now, 2).Close
+	if len(leases) != 1 || !leases[0].ExpiresAt.Equal(want) {
+		t.Fatalf("political lease = %+v, want third session close %s", leases, want)
+	}
+	if leases[0].ExpiresAt.In(time.FixedZone("ET", -4*60*60)).Weekday() != time.Tuesday {
+		t.Fatalf("three sessions from Friday should expire Tuesday, got %s", leases[0].ExpiresAt)
+	}
+}
+
+func TestPoliticalDisclosureLeaseStartedAfterCloseUsesNextSession(t *testing.T) {
+	now := time.Date(2026, time.October, 2, 21, 5, 0, 0, time.UTC) // Friday, 17:05 ET
+	scanner := &MarketScanner{Cfg: config.ScannerConfig{PoliticalDisclosures: config.PoliticalDisclosureScannerConfig{
+		WatchlistLeaseSessions: 3,
+	}}}
+	candidate := SwingCandidate{Ticker: "LEASE", Sources: []string{"political_disclosure"}, PoliticalDisclosureClaimReportIDs: []string{"report-1"}}
+	discovery := &tradeprofile.DiscoveryContext{
+		Version: tradeprofile.DiscoveryContextVersion, Sources: []string{"political_disclosure"},
+		EvidenceBySource: map[string]json.RawMessage{"political_disclosure": json.RawMessage(`{"report":"report-1"}`)},
+	}
+	leases := scanner.scannerSourceLeases(candidate, discovery, now)
+	want := engine.MarketSessionOffset(engine.NextMarketSession(now).Date, 2).Close
+	if len(leases) != 1 || !leases[0].ExpiresAt.Equal(want) {
+		t.Fatalf("after-close political lease = %+v, want third upcoming session close %s", leases, want)
+	}
+	if got := leases[0].ExpiresAt.In(time.FixedZone("ET", -4*60*60)).Weekday(); got != time.Wednesday {
+		t.Fatalf("three sessions after Friday close should expire Wednesday, got %s", got)
 	}
 }
 

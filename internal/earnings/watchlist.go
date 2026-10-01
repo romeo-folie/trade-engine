@@ -122,76 +122,110 @@ func (f *WatchlistFeeder) RunSession(ctx context.Context, completed engine.USMar
 		"target_session_date", target.Date.Format("2006-01-02"),
 		"attempt_id", attemptID,
 	)
-	stage = "calendar"
-	releases, err := f.Calendar.FetchMarketEarningsCalendar(ctx, target.Date, target.Date)
-	if err != nil {
-		return fmt.Errorf("fetch market earnings calendar for %s: %w", target.Date.Format("2006-01-02"), err)
+	watchlistSessions := f.Cfg.WatchlistSessions
+	if watchlistSessions <= 0 {
+		watchlistSessions = 3
 	}
-	unique := nextSessionReleases(releases, target.Date)
-	slog.Info("earnings watchlist calendar loaded",
-		"target_session_date", target.Date.Format("2006-01-02"),
-		"release_count", len(releases),
-		"eligible_unique_count", len(unique),
-	)
-	if len(unique) == 0 {
+	expires := engine.MarketSessionOffset(target.Date, watchlistSessions-1).Close
+	stage = "load_cohort"
+	candidates, hasCohort, err := store.LoadEarningsWatchlistCohort(ctx, target.Date)
+	if err != nil {
+		return fmt.Errorf("load persisted earnings candidate cohort: %w", err)
+	}
+	if !hasCohort {
+		stage = "calendar"
+		releases, err := f.Calendar.FetchMarketEarningsCalendar(ctx, target.Date, target.Date)
+		if err != nil {
+			return fmt.Errorf("fetch market earnings calendar for %s: %w", target.Date.Format("2006-01-02"), err)
+		}
+		unique := nextSessionReleases(releases, target.Date)
+		slog.Info("earnings watchlist calendar loaded",
+			"target_session_date", target.Date.Format("2006-01-02"),
+			"release_count", len(releases),
+			"eligible_unique_count", len(unique),
+		)
+		var selected []store.EarningsWatchlistCandidate
+		if len(unique) > 0 {
+			symbols := make([]string, 0, len(unique))
+			for _, release := range unique {
+				symbols = append(symbols, release.Symbol)
+			}
+			from := completed.Date.AddDate(0, 0, -35)
+			to := completed.Date.AddDate(0, 0, 1)
+			stage = "bars"
+			barResult, err := f.Bars.FetchDailyBars(ctx, symbols, from, to, f.Cfg.BarBatchSize)
+			if err != nil {
+				return fmt.Errorf("fetch ranking daily bars: %w", err)
+			}
+			ranked := rankReleases(unique, barResult.Bars)
+			cap := f.Cfg.CandidateCap
+			if cap > 5 {
+				cap = 5
+			}
+			if cap > len(ranked) {
+				cap = len(ranked)
+			}
+			slog.Info("earnings watchlist candidates ranked",
+				"target_session_date", target.Date.Format("2006-01-02"),
+				"eligible_unique_count", len(unique),
+				"bar_symbol_count", len(barResult.Bars),
+				"bar_failure_count", len(barResult.Failures),
+				"ranked_count", len(ranked),
+				"selected_count", cap,
+				"candidate_cap", f.Cfg.CandidateCap,
+			)
+			selected = make([]store.EarningsWatchlistCandidate, 0, cap)
+			for index, candidate := range ranked[:cap] {
+				selected = append(selected, store.EarningsWatchlistCandidate{
+					Ticker: candidate.release.Symbol, ContextKey: "earnings_scheduled:" + target.Date.Format("2006-01-02"),
+					Context: earningsDiscoveryContext(candidate.release, target, index+1, candidate.dollar), ExpiresAt: expires,
+					LiquidityRank: index + 1, MedianDollarVolume: candidate.dollar,
+				})
+			}
+		}
+		stage = "persist_cohort"
+		candidates, err = store.PersistEarningsWatchlistCohort(ctx, target.Date, attemptID, selected)
+		if err != nil {
+			return fmt.Errorf("persist earnings candidate cohort: %w", err)
+		}
+	}
+	if len(candidates) == 0 {
 		stage = "complete_empty"
 		if err := store.CompleteEarningsWatchlistRun(ctx, target.Date, attemptID); err != nil {
 			return err
 		}
-		slog.Info("earnings watchlist run published",
-			"target_session_date", target.Date.Format("2006-01-02"),
-			"attempt_id", attemptID,
-			"selected_count", 0,
-		)
+		slog.Info("earnings watchlist run published", "target_session_date", target.Date.Format("2006-01-02"), "attempt_id", attemptID, "selected_count", 0)
 		return nil
 	}
-	symbols := make([]string, 0, len(unique))
-	for _, release := range unique {
-		symbols = append(symbols, release.Symbol)
-	}
-	from := completed.Date.AddDate(0, 0, -35)
-	to := completed.Date.AddDate(0, 0, 1)
-	stage = "bars"
-	barResult, err := f.Bars.FetchDailyBars(ctx, symbols, from, to, f.Cfg.BarBatchSize)
-	if err != nil {
-		return fmt.Errorf("fetch ranking daily bars: %w", err)
-	}
-	ranked := rankReleases(unique, barResult.Bars)
-	cap := f.Cfg.CandidateCap
-	if cap > 5 {
-		cap = 5
-	}
-	if cap > len(ranked) {
-		cap = len(ranked)
-	}
-	slog.Info("earnings watchlist candidates ranked",
-		"target_session_date", target.Date.Format("2006-01-02"),
-		"eligible_unique_count", len(unique),
-		"bar_symbol_count", len(barResult.Bars),
-		"bar_failure_count", len(barResult.Failures),
-		"ranked_count", len(ranked),
-		"selected_count", cap,
-		"candidate_cap", f.Cfg.CandidateCap,
-	)
-	expires := engine.MarketSessionOffset(target.Date, f.Cfg.WatchlistSessions-1).Close
-	candidates := make([]store.EarningsWatchlistCandidate, 0, cap)
-	for index, candidate := range ranked[:cap] {
+	for index := range candidates {
+		candidate := &candidates[index]
 		priority, _ := json.Marshal(map[string]any{
-			"bucket": "earnings_scheduled", "liquidity_rank": index + 1,
-			"median_dollar_volume": candidate.dollar, "ticker": candidate.release.Symbol,
+			"bucket": "earnings_scheduled", "liquidity_rank": candidate.LiquidityRank,
+			"median_dollar_volume": candidate.MedianDollarVolume, "ticker": candidate.Ticker,
 		})
-		candidates = append(candidates, store.EarningsWatchlistCandidate{
-			Ticker: candidate.release.Symbol, ContextKey: "earnings_scheduled:" + target.Date.Format("2006-01-02"),
-			Context: earningsDiscoveryContext(candidate.release, target, index+1, candidate.dollar), ExpiresAt: expires,
-			LiquidityRank: index + 1, MedianDollarVolume: candidate.dollar,
-			ResearchQueue: &store.ResearchQueueAdmission{
-				Capacity: f.ResearchQueue.Capacity, Bucket: "earnings_scheduled", Reservation: f.ResearchQueue.Reservations.EarningsScheduled,
-				Overflow: f.ResearchQueue.Overflow, Priority: priority,
-			},
-			MaxActiveWatchlist: f.MaxActiveWatchlist,
-		})
+		candidate.ResearchQueue = &store.ResearchQueueAdmission{
+			Capacity: f.ResearchQueue.Capacity, Bucket: "earnings_scheduled", Reservation: f.ResearchQueue.Reservations.EarningsScheduled,
+			Overflow: f.ResearchQueue.Overflow, Priority: priority,
+		}
+		candidate.MaxActiveWatchlist = f.MaxActiveWatchlist
 	}
 	stage = "research_staging"
+	publishedTickers, err := store.PublishedEarningsWatchlistCandidates(ctx, target.Date)
+	if err != nil {
+		return fmt.Errorf("load previously admitted earnings candidates: %w", err)
+	}
+	pending := make([]store.EarningsWatchlistCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		if _, alreadyPublished := publishedTickers[strings.ToUpper(strings.TrimSpace(candidate.Ticker))]; alreadyPublished {
+			continue
+		}
+		// A delayed retry must never resurrect an earnings item after its
+		// intended market-session lifetime has already elapsed.
+		if !candidate.ExpiresAt.After(now) {
+			continue
+		}
+		pending = append(pending, candidate)
+	}
 	stagingCapacity := f.ResearchStaging.Capacity
 	if stagingCapacity <= 0 {
 		stagingCapacity = 30
@@ -200,7 +234,7 @@ func (f *WatchlistFeeder) RunSession(ctx context.Context, completed engine.USMar
 	if stagingLease <= 0 {
 		stagingLease = 15 * time.Minute
 	}
-	stagingIDs := make([]string, 0, len(candidates))
+	stagingIDs := make([]string, 0, len(pending))
 	releaseStaging := func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -211,78 +245,76 @@ func (f *WatchlistFeeder) RunSession(ctx context.Context, completed engine.USMar
 		}
 	}
 	defer releaseStaging()
-	for index := range candidates {
-		candidate := &candidates[index]
+	stagedCandidates := make([]store.EarningsWatchlistCandidate, 0, len(pending))
+	stagingDeferrals := make([]store.EarningsWatchlistDeferral, 0)
+	for _, candidate := range pending {
 		id, _, queueErr := store.QueueResearchCandidate(ctx, store.ResearchStagingRequest{
 			RunID: attemptID, Ticker: candidate.Ticker, Platform: "stock",
 			Bucket: "earnings_scheduled", Priority: candidate.ResearchQueue.Priority,
 			Capacity: stagingCapacity, Lease: stagingLease,
 		})
 		if queueErr != nil {
-			remaining := stagingIDs[:0]
-			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			for _, queuedID := range stagingIDs {
-				if releaseErr := store.ReleaseResearchCandidate(cleanupCtx, queuedID); releaseErr != nil {
-					slog.Warn("earnings watchlist: release research staging candidate", "err", releaseErr)
-					remaining = append(remaining, queuedID)
-				}
-			}
-			cancel()
-			stagingIDs = remaining
 			if errors.Is(queueErr, store.ErrResearchStagingCapacity) {
-				for _, deferred := range candidates {
-					f.publishPromotionOutcome(attemptID, deferred, "not_admitted", "staging_capacity", queueErr.Error())
-				}
+				stagingDeferrals = append(stagingDeferrals, store.EarningsWatchlistDeferral{Candidate: candidate, Reason: queueErr})
+				continue
 			}
-			return queueErr
+			return fmt.Errorf("stage earnings candidate %s: %w", candidate.Ticker, queueErr)
 		}
-		// Only an exact retry for this attempt can reuse a row. A concurrent
-		// attempt owns its own bounded staging reservation.
 		stagingIDs = append(stagingIDs, id)
 		candidate.ResearchStagingID = id
 		candidate.ResearchStagingLease = stagingLease
+		stagedCandidates = append(stagedCandidates, candidate)
 	}
-	for _, id := range stagingIDs {
-		if err := store.RenewResearchCandidate(ctx, id, stagingLease); err != nil {
+	stillStaged := stagedCandidates[:0]
+	for _, candidate := range stagedCandidates {
+		if err := store.RenewResearchCandidate(ctx, candidate.ResearchStagingID, stagingLease); err != nil {
 			if errors.Is(err, store.ErrResearchStagingReservationLost) {
-				for _, deferred := range candidates {
-					f.publishPromotionOutcome(attemptID, deferred, "not_admitted", "staging_capacity", err.Error())
-				}
+				stagingDeferrals = append(stagingDeferrals, store.EarningsWatchlistDeferral{Candidate: candidate, Reason: err})
+				continue
 			}
-			return fmt.Errorf("renew research staging candidate: %w", err)
+			return fmt.Errorf("renew research staging candidate %s: %w", candidate.Ticker, err)
 		}
+		stillStaged = append(stillStaged, candidate)
 	}
+	stagedCandidates = stillStaged
 	stage = "publish"
-	publications, err := store.PublishEarningsWatchlistRun(ctx, target.Date, attemptID, candidates)
-	if err != nil {
-		reasonCode := "persistence_error"
-		if errors.Is(err, store.ErrResearchQueueCapacity) {
-			reasonCode = "queue_capacity"
-		} else if errors.Is(err, store.ErrResearchStagingCapacity) || errors.Is(err, store.ErrResearchStagingReservationLost) {
-			reasonCode = "staging_capacity"
-		} else if errors.Is(err, store.ErrWatchlistCapacity) {
-			reasonCode = "watchlist_capacity"
-		}
-		for _, candidate := range candidates {
-			f.publishPromotionOutcome(attemptID, candidate, "not_admitted", reasonCode, err.Error())
-		}
-		return err
-	}
-	dispositions := make(map[string]string, len(publications))
+	publications, queueDeferrals, err := store.PublishEarningsWatchlistRun(ctx, target.Date, attemptID, stagedCandidates)
 	for _, publication := range publications {
-		dispositions[strings.ToUpper(strings.TrimSpace(publication.Ticker))] = publication.Disposition
-	}
-	for _, candidate := range candidates {
 		outcome := "admitted"
-		if dispositions[strings.ToUpper(strings.TrimSpace(candidate.Ticker))] == "rediscovered" {
+		if publication.Disposition == "rediscovered" {
 			outcome = "rediscovered"
 		}
-		f.publishPromotionOutcome(attemptID, candidate, outcome, "", "")
+		for _, candidate := range stagedCandidates {
+			if strings.EqualFold(strings.TrimSpace(candidate.Ticker), strings.TrimSpace(publication.Ticker)) {
+				f.publishPromotionOutcome(attemptID, candidate, outcome, "", "")
+				break
+			}
+		}
+	}
+	if err != nil {
+		return err
+	}
+	deferrals := append(stagingDeferrals, queueDeferrals...)
+	for _, deferred := range deferrals {
+		reasonCode := "queue_capacity"
+		if errors.Is(deferred.Reason, store.ErrResearchStagingCapacity) || errors.Is(deferred.Reason, store.ErrResearchStagingReservationLost) {
+			reasonCode = "staging_capacity"
+		} else if errors.Is(deferred.Reason, store.ErrWatchlistCapacity) {
+			reasonCode = "watchlist_capacity"
+		}
+		f.publishPromotionOutcome(attemptID, deferred.Candidate, "not_admitted", reasonCode, deferred.Reason.Error())
+	}
+	if len(deferrals) > 0 {
+		return fmt.Errorf("%d earnings candidates deferred by admission capacity: %w", len(deferrals), deferrals[0].Reason)
+	}
+	if err := store.CompleteEarningsWatchlistRun(ctx, target.Date, attemptID); err != nil {
+		return err
 	}
 	slog.Info("earnings watchlist run published",
 		"target_session_date", target.Date.Format("2006-01-02"),
 		"attempt_id", attemptID,
 		"selected_count", len(candidates),
+		"admitted_count", len(publications),
 		"expires_at", expires,
 	)
 	return nil

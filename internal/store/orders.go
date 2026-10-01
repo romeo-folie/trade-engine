@@ -197,6 +197,42 @@ func GetOrdersByStockIntent(ctx context.Context, intentID string) ([]Order, erro
 	return out, rows.Err()
 }
 
+// GetBracketStopProjectionForParent returns the deepest durable stop-order
+// projection in a bracket stop's replacement lineage. The parent snapshot may
+// be purged by the broker before recovery finishes.
+func GetBracketStopProjectionForParent(ctx context.Context, parentIntentID string) (*Order, error) {
+	row := GetDB().QueryRow(ctx, `
+		WITH RECURSIVE lineage(id, depth) AS (
+			SELECT id, 0 FROM stock_order_intents
+			WHERE idempotency_key='bracket-child:' || $1 || ':stop-loss'
+			UNION ALL
+			SELECT child.id, lineage.depth+1
+			FROM stock_order_intents child
+			JOIN lineage ON child.parent_intent_id=lineage.id
+		), latest AS (
+			SELECT o.*
+			FROM lineage
+			JOIN orders o ON o.stock_intent_id=lineage.id
+			WHERE o.is_stop_loss
+			ORDER BY lineage.depth DESC, o.updated_at DESC, o.created_at DESC
+			LIMIT 1
+		)
+		SELECT id::text, COALESCE(trade_id::text,''), COALESCE(broker_order_id,''),
+		       ticker, side, order_type, quantity, COALESCE(stop_price,0),
+		       COALESCE(filled_qty,0), status, is_stop_loss
+		FROM latest`, parentIntentID)
+	var order Order
+	if err := row.Scan(&order.ID, &order.TradeID, &order.BrokerOrderID, &order.Ticker,
+		&order.Side, &order.OrderType, &order.Quantity, &order.StopPrice,
+		&order.FilledQty, &order.Status, &order.IsStopLoss); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &order, nil
+}
+
 func GetOrderByBrokerOrderID(ctx context.Context, brokerOrderID string) (*Order, error) {
 	row := GetDB().QueryRow(ctx, `
 		SELECT id, COALESCE(trade_id::text,''), COALESCE(broker_order_id,''), ticker, side, order_type,

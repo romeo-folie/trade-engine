@@ -20,7 +20,10 @@ func TestDefaultsEngineMode(t *testing.T) {
 func TestDefaultsResearchQueueIsBoundedAndFullyAllocated(t *testing.T) {
 	queue := Defaults().Scanner.ResearchQueue
 	if queue.Capacity != 30 || queue.Overflow != 6 || queue.Reservations.Total() != 24 {
-		t.Fatalf("research queue defaults = %+v, want capacity 30 / protected 24 / overflow 6", queue)
+		t.Fatalf("research queue defaults = %+v, want capacity 30 / earnings and political reservations 12 each / overflow 6", queue)
+	}
+	if queue.Reservations.EarningsScheduled != 12 || queue.Reservations.PoliticalDisclosure != 12 {
+		t.Fatalf("research queue source reservations = %+v, want earnings and political disclosure at 12 each", queue.Reservations)
 	}
 	if errs := Validate(Defaults()); containsStr(errs, "scanner.research_queue") {
 		t.Fatalf("default research queue should validate: %v", errs)

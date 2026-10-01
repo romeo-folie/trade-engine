@@ -10,7 +10,11 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
-type unavailableStoreBroker struct{ mutations int }
+type unavailableStoreBroker struct {
+	mutations int
+	statuses  map[string]execution.OrderResult
+	statusErr error
+}
 
 func (b *unavailableStoreBroker) PlaceOrder(context.Context, execution.OrderRequest) (execution.OrderResult, error) {
 	b.mutations++
@@ -20,8 +24,11 @@ func (b *unavailableStoreBroker) CancelOrder(context.Context, string) error {
 	b.mutations++
 	return nil
 }
-func (b *unavailableStoreBroker) GetOrderStatus(context.Context, string) (execution.OrderResult, error) {
-	return execution.OrderResult{}, nil
+func (b *unavailableStoreBroker) GetOrderStatus(_ context.Context, id string) (execution.OrderResult, error) {
+	if b.statusErr != nil {
+		return execution.OrderResult{}, b.statusErr
+	}
+	return b.statuses[id], nil
 }
 func (*unavailableStoreBroker) GetPositions(context.Context) ([]execution.Position, error) {
 	return nil, nil
@@ -68,6 +75,39 @@ func TestCoordinatorFailsClosedWithoutDurableStore(t *testing.T) {
 	}
 	if broker.mutations != 0 {
 		t.Fatalf("durable-store failure mutated broker %d times", broker.mutations)
+	}
+}
+
+func TestRecoveredBracketProtectionRequiresFullWorkingStopCoverage(t *testing.T) {
+	parent := execution.OrderResult{
+		BrokerOrderID: "parent", Status: "filled", Quantity: 5, FilledQty: 5,
+		ChildOrderIDs: []string{"take-profit", "stop-loss"},
+	}
+	req := execution.OrderRequest{OrderClass: "bracket", TimeInForce: "gtc"}
+	broker := &unavailableStoreBroker{statuses: map[string]execution.OrderResult{
+		"stop-loss": {BrokerOrderID: "stop-loss", Status: "new", Quantity: 5, RemainingQty: 5},
+	}}
+	coordinator := New(broker)
+	verified, err := coordinator.recoveredBracketProtectionVerified(context.Background(), store.StockOrderIntent{}, req, parent)
+	if err != nil || !verified {
+		t.Fatalf("full working stop verified=%v err=%v, want true", verified, err)
+	}
+
+	broker.statuses["stop-loss"] = execution.OrderResult{Status: "new", Quantity: 4, RemainingQty: 4}
+	verified, err = coordinator.recoveredBracketProtectionVerified(context.Background(), store.StockOrderIntent{}, req, parent)
+	if err != nil || verified {
+		t.Fatalf("undersized working stop verified=%v err=%v, want false", verified, err)
+	}
+	broker.statuses["stop-loss"] = execution.OrderResult{Status: "filled", Quantity: 5, FilledQty: 5}
+	verified, err = coordinator.recoveredBracketProtectionVerified(context.Background(), store.StockOrderIntent{}, req, parent)
+	if err != nil || verified {
+		t.Fatalf("terminal stop verified=%v err=%v, want false", verified, err)
+	}
+	parent.Status = "partial"
+	broker.statuses["stop-loss"] = execution.OrderResult{Status: "new", Quantity: 5, RemainingQty: 5}
+	verified, err = coordinator.recoveredBracketProtectionVerified(context.Background(), store.StockOrderIntent{}, req, parent)
+	if err != nil || verified {
+		t.Fatalf("partial bracket parent protection verified=%v err=%v, want false", verified, err)
 	}
 }
 

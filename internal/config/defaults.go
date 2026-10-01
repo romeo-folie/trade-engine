@@ -388,9 +388,7 @@ func Defaults() *Config {
 			ResearchQueue: ResearchQueueConfig{
 				Capacity: 30, Overflow: 6,
 				Reservations: ResearchQueueReservations{
-					PoliticalDisclosure: 4, WeeklyLeader: 2, PotentIndustry: 2,
-					MarketActivity: 4, PremarketEpisodic: 2, GraphNeighbor: 2,
-					NewsSympathy: 2, EarningsScheduled: 6,
+					PoliticalDisclosure: 12, EarningsScheduled: 12,
 				},
 			},
 			ResearchStaging:                  ResearchStagingConfig{Capacity: 30, LeaseMinutes: 15},
@@ -515,7 +513,7 @@ func Defaults() *Config {
 			},
 			EarningsWatchlist: EarningsWatchlistConfig{
 				Enabled: true, AfterCloseDelayMinutes: 20, CandidateCap: 5,
-				WatchlistSessions: 5, BarBatchSize: 100,
+				WatchlistSessions: 3, BarBatchSize: 100,
 			},
 			PoliticalDisclosures: PoliticalDisclosureScannerConfig{
 				Enabled:                    false,
@@ -526,6 +524,7 @@ func Defaults() *Config {
 				TriggerLookbackDays:        50,
 				AnalystEvidenceHorizonDays: 50,
 				WatchlistLeaseDays:         7,
+				WatchlistLeaseSessions:     3,
 			},
 			GraphNeighbors: GraphNeighborsConfig{
 				Enabled:          false,

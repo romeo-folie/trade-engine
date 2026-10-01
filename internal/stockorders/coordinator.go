@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"strings"
 	"time"
@@ -45,6 +46,13 @@ type RecoveryObserver interface {
 // its one-time trade-open side effects.
 type ProtectionRecoveryObserver interface {
 	RecoveredStockEntryProtection(context.Context, string)
+}
+
+// DiscoveryTradeLeaseObserver renews any still-live source residency associated
+// with an actually filled trade. It is invoked on recovery replays as well, so
+// a crash after the trade projection cannot permanently skip the renewal.
+type DiscoveryTradeLeaseObserver interface {
+	RenewRecoveredEntryDiscoveryResidency(context.Context, string, time.Time) error
 }
 
 type Coordinator struct {
@@ -712,6 +720,15 @@ func (c *Coordinator) projectRecoveredEntry(ctx context.Context, intent store.St
 	if err != nil {
 		return fmt.Errorf("load recovered stock order projection: %w", err)
 	}
+	if res.FilledAt.IsZero() {
+		filledAt, err := store.GetStockOrderIntentFillTime(ctx, intent.ID)
+		if err != nil {
+			return fmt.Errorf("load durable stock entry fill time: %w", err)
+		}
+		if filledAt != nil {
+			res.FilledAt = *filledAt
+		}
+	}
 	recordedEntryQty := 0.0
 	if order != nil {
 		recordedEntryQty = order.FilledQty
@@ -726,6 +743,7 @@ func (c *Coordinator) projectRecoveredEntry(ctx context.Context, intent store.St
 			Side: string(req.Side), OrderType: string(req.Type), Quantity: req.Quantity,
 			FilledPrice: res.FilledPrice, FilledQty: res.FilledQty,
 			Status: execution.NormalizeOrderStatusForTimeInForce(res.Status, req.TimeInForce), StockIntentID: intent.ID,
+			FilledAt: filledAtPtr(res.FilledAt),
 		}); err != nil {
 			return fmt.Errorf("project recovered stock order: %w", err)
 		}
@@ -773,6 +791,59 @@ func (c *Coordinator) projectRecoveredEntry(ctx context.Context, intent store.St
 	}
 	if newProjection && c.observer != nil {
 		c.observer.RecoveredStockEntry(ctx, intent.IdempotencyKey)
+	}
+	if observer, ok := c.observer.(DiscoveryTradeLeaseObserver); ok {
+		fillAt := res.FilledAt
+		if fillAt.IsZero() && order != nil && order.FilledAt != nil {
+			fillAt = *order.FilledAt
+		}
+		protectionConfirmed := !exitOwned
+		if protectionConfirmed && req.OrderClass == "bracket" && req.RequireBrokerProtection {
+			var verifyErr error
+			protectionConfirmed, verifyErr = c.recoveredBracketProtectionVerified(ctx, intent, req, res)
+			if verifyErr != nil {
+				slog.Warn("verify recovered bracket protection before discovery renewal",
+					"ticker", sig.Ticker, "intent_id", intent.ID, "err", verifyErr)
+			}
+		}
+		if !protectionConfirmed {
+			slog.Info("defer discovery residency renewal until recovered entry protection is verified",
+				"ticker", sig.Ticker, "intent_id", intent.ID)
+			if exitOwned {
+				// The trade is already exiting or closed; its order recovery must
+				// not be held open solely for a residency extension that no longer
+				// protects a live position.
+				if err := store.MarkStockOrderIntentDiscoveryResidencyRenewed(ctx, intent.ID); err != nil {
+					slog.Warn("acknowledge discovery renewal for exit-owned trade",
+						"ticker", sig.Ticker, "intent_id", intent.ID, "err", err)
+				}
+			}
+		} else if fillAt.IsZero() {
+			slog.Info("skip discovery residency renewal without authoritative fill timestamp", "ticker", sig.Ticker)
+			if err := store.MarkStockOrderIntentDiscoveryResidencyRenewed(ctx, intent.ID); err != nil {
+				slog.Warn("mark unavailable discovery fill time acknowledged",
+					"ticker", sig.Ticker, "intent_id", intent.ID, "err", err)
+			}
+		} else if err := observer.RenewRecoveredEntryDiscoveryResidency(ctx, sig.Ticker, fillAt); err != nil {
+			// Discovery residency is ancillary. The broker-confirmed fill, order,
+			// and protective exits above are already durable; a lease write must
+			// not make recovery appear incomplete or gate a protected position.
+			slog.Warn("renew discovery residency after recovered stock entry",
+				"ticker", sig.Ticker, "filled_at", fillAt, "err", err)
+		} else if err := store.MarkStockOrderIntentDiscoveryResidencyRenewed(ctx, intent.ID); err != nil {
+			// Keep the intent recoverable if the completion marker cannot be
+			// committed; renewal is idempotent and recovery can safely retry it.
+			slog.Warn("mark recovered discovery residency renewal complete",
+				"ticker", sig.Ticker, "intent_id", intent.ID, "err", err)
+		}
+	} else {
+		// Without the optional engine observer there is no lease owner capable
+		// of performing this ancillary action. Acknowledge it so generic
+		// coordinator users do not replay an otherwise-complete entry forever.
+		if err := store.MarkStockOrderIntentDiscoveryResidencyRenewed(ctx, intent.ID); err != nil {
+			slog.Warn("mark discovery residency renewal acknowledged without observer",
+				"ticker", sig.Ticker, "intent_id", intent.ID, "err", err)
+		}
 	}
 	return nil
 }
@@ -885,6 +956,67 @@ func recoveredBracketChild(children []execution.OrderLeg, brokerOrderID string) 
 		}
 	}
 	return nil
+}
+
+func (c *Coordinator) recoveredBracketProtectionVerified(
+	ctx context.Context, parentIntent store.StockOrderIntent, req execution.OrderRequest, parent execution.OrderResult,
+) (bool, error) {
+	if parent.FilledQty <= 1e-9 || !execution.IsTerminalOrderStatusForTimeInForce(parent.Status, req.TimeInForce) {
+		return false, nil
+	}
+	stopID := ""
+	if parentIntent.ID != "" {
+		projection, err := store.GetBracketStopProjectionForParent(ctx, parentIntent.ID)
+		if err != nil {
+			return false, fmt.Errorf("load durable recovered stop projection: %w", err)
+		}
+		if projection != nil {
+			stopID = projection.BrokerOrderID
+		}
+	}
+	if stopID == "" {
+		for _, child := range parent.ChildOrders {
+			if child.Type == "stop" || child.Type == "stop_limit" {
+				stopID = child.BrokerOrderID
+				break
+			}
+		}
+	}
+	if stopID == "" && len(parent.ChildOrderIDs) >= 2 {
+		// Alpaca's bracket result contract orders children [take-profit, stop-loss].
+		stopID = parent.ChildOrderIDs[1]
+	}
+	if stopID == "" {
+		return false, nil
+	}
+	stop, err := c.inner.GetOrderStatus(ctx, stopID)
+	if err != nil {
+		return false, fmt.Errorf("load recovered stop %s: %w", stopID, err)
+	}
+	if execution.IsTerminalOrderStatusForTimeInForce(stop.Status, "gtc") {
+		return false, nil
+	}
+	remaining := stop.RemainingQty
+	if remaining <= 0 && stop.Quantity > 0 {
+		remaining = math.Max(0, stop.Quantity-stop.FilledQty)
+	}
+	// Bracket children may already have filled part of the position. The parent
+	// retains its cumulative entry fill, while the active stop only needs to
+	// cover the residual quantity still held by the trade.
+	heldQty := parent.FilledQty
+	if parentIntent.TradeID != "" {
+		trade, err := store.GetTradeByID(ctx, parentIntent.TradeID)
+		if err != nil {
+			return false, fmt.Errorf("load recovered bracket trade quantity: %w", err)
+		}
+		if trade != nil {
+			heldQty = trade.Quantity
+		}
+	}
+	if heldQty <= 1e-9 {
+		return true, nil
+	}
+	return remaining+1e-9 >= heldQty, nil
 }
 
 // ensureRecoveredProtectiveStop maintains one active protection lineage for an
@@ -1048,7 +1180,10 @@ func (c *Coordinator) record(ctx context.Context, intent store.StockOrderIntent,
 	if res.Status == "" {
 		status = intent.Status
 	}
-	if err := store.UpdateStockOrderIntentBroker(ctx, intent.ClientOrderID, res.BrokerOrderID, status, res.FilledPrice, res.FilledQty, res.RequestID, errText, submitted); err != nil {
+	if err := store.UpdateStockOrderIntentBrokerWithFillTime(
+		ctx, intent.ClientOrderID, res.BrokerOrderID, status,
+		res.FilledPrice, res.FilledQty, res.RequestID, errText, submitted, res.FilledAt,
+	); err != nil {
 		return err
 	}
 	return store.RecordStockOrderAttempt(ctx, intent.ID, operation, outcome, res.BrokerOrderID, res.RequestID, errText)

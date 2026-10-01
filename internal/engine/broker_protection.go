@@ -257,9 +257,9 @@ func (e *Engine) cancelLegacyBrokerHeldEntry(ctx context.Context, intentKey stri
 			"intent_key", intentKey, "broker_order_id", intent.BrokerOrderID)
 		return
 	}
-	if err := store.UpdateStockOrderIntentBroker(ctx, intent.ClientOrderID, intent.BrokerOrderID,
+	if err := store.UpdateStockOrderIntentBrokerWithFillTime(ctx, intent.ClientOrderID, intent.BrokerOrderID,
 		execution.NormalizeOrderStatusForTimeInForce(terminal.Status, timeInForce), terminal.FilledPrice, terminal.FilledQty,
-		terminal.RequestID, "", false); err != nil {
+		terminal.RequestID, "", false, terminal.FilledAt); err != nil {
 		logger.Error("broker protection: persist retired legacy entry", "intent_key", intentKey, "err", err)
 		return
 	}

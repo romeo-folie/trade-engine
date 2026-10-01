@@ -146,6 +146,22 @@ func TestBrokerBracketProtectionRequiresActiveWholeShareStop(t *testing.T) {
 	}
 }
 
+func TestEntryProtectionVerificationRespectsAppManagedBracketFallback(t *testing.T) {
+	result := execution.OrderResult{Status: "filled", Quantity: 5, FilledQty: 5}
+	appManaged := execution.OrderRequest{OrderClass: "bracket"}
+	if !entryProtectionVerifiedForResidency(appManaged, result, 0) {
+		t.Fatal("app-managed bracket fallback should not require broker child snapshots")
+	}
+	strict := execution.OrderRequest{OrderClass: "bracket", RequireBrokerProtection: true}
+	if entryProtectionVerifiedForResidency(strict, result, 0) {
+		t.Fatal("strict bracket without broker stop must remain unverified")
+	}
+	uncapped := execution.OrderRequest{UncappedTakeProfit: true}
+	if entryProtectionVerifiedForResidency(uncapped, result, 0) {
+		t.Fatal("uncapped entry without its standalone stop must remain unverified")
+	}
+}
+
 func TestBrokerBracketProtectionStateDistinguishesHeldPartialAndFilledCoverage(t *testing.T) {
 	partial := brokerBracketProtectionState(execution.OrderResult{
 		Status: "partial", Quantity: 5, RemainingQty: 3, FilledQty: 2,

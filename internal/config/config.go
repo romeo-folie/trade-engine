@@ -1393,11 +1393,13 @@ type PoliticalDisclosureScannerConfig struct {
 	TriggerLookbackDays        int `yaml:"trigger_lookback_days"`
 	AnalystEvidenceHorizonDays int `yaml:"analyst_evidence_horizon_days"`
 	WatchlistLeaseDays         int `yaml:"watchlist_lease_days"`
+	WatchlistLeaseSessions     int `yaml:"watchlist_lease_sessions"`
 	// These loader-only flags retain whether zero was explicitly written in
 	// YAML, distinct from a legacy config that omitted the newly split window.
 	explicitTriggerLookbackDays        bool
 	explicitAnalystEvidenceHorizonDays bool
 	explicitWatchlistLeaseDays         bool
+	explicitWatchlistLeaseSessions     bool
 }
 
 func (c PoliticalDisclosureScannerConfig) TriggerWindowDays() int {
@@ -1419,6 +1421,13 @@ func (c PoliticalDisclosureScannerConfig) WatchlistLeaseWindowDays() int {
 		return c.WatchlistLeaseDays
 	}
 	return c.TTLDays
+}
+
+func (c PoliticalDisclosureScannerConfig) WatchlistLeaseWindowSessions() int {
+	if c.WatchlistLeaseSessions > 0 {
+		return c.WatchlistLeaseSessions
+	}
+	return 0
 }
 
 // WeeklyLeaderConfig controls the point-in-time weekly-leadership lens. The
@@ -2179,6 +2188,13 @@ func migratePoliticalDisclosureTimingConfig(cfg *Config, raw []byte) {
 	_, political.explicitTriggerLookbackDays = values["trigger_lookback_days"]
 	_, political.explicitAnalystEvidenceHorizonDays = values["analyst_evidence_horizon_days"]
 	_, political.explicitWatchlistLeaseDays = values["watchlist_lease_days"]
+	_, political.explicitWatchlistLeaseSessions = values["watchlist_lease_sessions"]
+	if !political.explicitWatchlistLeaseSessions &&
+		(political.explicitWatchlistLeaseDays || values["ttl_days"] != nil) {
+		// Keep older operator files on their explicitly configured calendar-day
+		// lease until they opt into the session-based field.
+		political.WatchlistLeaseSessions = 0
+	}
 	if len(values) == 0 {
 		return
 	}
@@ -3029,6 +3045,7 @@ func Validate(cfg *Config) []string {
 			{"trigger_lookback_days", political.TriggerLookbackDays, political.explicitTriggerLookbackDays},
 			{"analyst_evidence_horizon_days", political.AnalystEvidenceHorizonDays, political.explicitAnalystEvidenceHorizonDays},
 			{"watchlist_lease_days", political.WatchlistLeaseDays, political.explicitWatchlistLeaseDays},
+			{"watchlist_lease_sessions", political.WatchlistLeaseSessions, political.explicitWatchlistLeaseSessions},
 		} {
 			if field.value < 0 || (field.explicit && field.value == 0) {
 				errs = append(errs, prefix+"."+field.name+" must be > 0 when set")
@@ -3040,8 +3057,8 @@ func Validate(cfg *Config) []string {
 		if political.EvidenceHorizonDays() <= 0 {
 			errs = append(errs, prefix+".analyst_evidence_horizon_days (or legacy ttl_days) must be > 0")
 		}
-		if political.WatchlistLeaseWindowDays() <= 0 {
-			errs = append(errs, prefix+".watchlist_lease_days (or legacy ttl_days) must be > 0")
+		if political.WatchlistLeaseWindowSessions() <= 0 && political.WatchlistLeaseWindowDays() <= 0 {
+			errs = append(errs, prefix+".watchlist_lease_sessions or watchlist_lease_days (or legacy ttl_days) must be > 0")
 		}
 	}
 

@@ -5,22 +5,51 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/romeo-folie/trade-engine/internal/tradeprofile"
 )
 
-func TestOrderedEarningsWatchlistCandidatesLocksTickersCanonically(t *testing.T) {
-	candidates := []EarningsWatchlistCandidate{
-		{Ticker: " zzz "}, {Ticker: "aaa"}, {Ticker: "BBB"},
+func TestEarningsWatchlistCohortIsImmutableAcrossRetry(t *testing.T) {
+	if !IsConnected() {
+		t.Skip("DATABASE_URL not set")
 	}
-	ordered := orderedEarningsWatchlistCandidates(candidates)
-	got := []string{ordered[0].Ticker, ordered[1].Ticker, ordered[2].Ticker}
-	want := []string{"aaa", "BBB", " zzz "}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("ordered tickers = %v, want %v", got, want)
-		}
+	ctx := context.Background()
+	target := time.Date(2046, time.June, 4, 0, 0, 0, 0, time.UTC)
+	_, _ = GetDB().Exec(ctx, `DELETE FROM earnings_watchlist_runs WHERE target_session_date=$1::date`, target)
+	t.Cleanup(func() {
+		_, _ = GetDB().Exec(ctx, `DELETE FROM earnings_watchlist_runs WHERE target_session_date=$1::date`, target)
+	})
+	now := time.Now()
+	attempt, claimed, err := ClaimEarningsWatchlistRun(ctx, target, now)
+	if err != nil || !claimed {
+		t.Fatalf("claim first attempt: id=%q claimed=%t err=%v", attempt, claimed, err)
 	}
-	if candidates[0].Ticker != " zzz " {
-		t.Fatalf("ordering mutated caller candidates: %v", candidates)
+	if _, found, err := LoadEarningsWatchlistCohort(ctx, target); err != nil || found {
+		t.Fatalf("initial cohort found=%t err=%v, want unset", found, err)
+	}
+	first := []EarningsWatchlistCandidate{
+		{Ticker: "COHORT_A", LiquidityRank: 1, MedianDollarVolume: 100},
+		{Ticker: "COHORT_B", LiquidityRank: 2, MedianDollarVolume: 50, Context: tradeprofile.DiscoveryContext{Thesis: "original"}},
+	}
+	if got, err := PersistEarningsWatchlistCohort(ctx, target, attempt, first); err != nil || len(got) != 2 || got[1].Ticker != "COHORT_B" {
+		t.Fatalf("persist first cohort=%+v err=%v", got, err)
+	}
+	if err := FailEarningsWatchlistRun(ctx, target, attempt, ErrResearchQueueCapacity); err != nil {
+		t.Fatal(err)
+	}
+	retryAt := now.Add(31 * time.Minute)
+	secondAttempt, claimed, err := ClaimEarningsWatchlistRun(ctx, target, retryAt)
+	if err != nil || !claimed || secondAttempt == attempt {
+		t.Fatalf("claim retry: id=%q claimed=%t err=%v", secondAttempt, claimed, err)
+	}
+	got, found, err := LoadEarningsWatchlistCohort(ctx, target)
+	if err != nil || !found || len(got) != 2 || got[0].Ticker != "COHORT_A" || got[1].Ticker != "COHORT_B" || got[1].Context.Thesis != "original" {
+		t.Fatalf("loaded retry cohort=%+v found=%t err=%v, want original ranked cohort", got, found, err)
+	}
+	changed := []EarningsWatchlistCandidate{{Ticker: "COHORT_C", LiquidityRank: 1, MedianDollarVolume: 1000}}
+	got, err = PersistEarningsWatchlistCohort(ctx, target, secondAttempt, changed)
+	if err != nil || len(got) != 2 || got[0].Ticker != "COHORT_A" || got[1].Ticker != "COHORT_B" {
+		t.Fatalf("retry replaced immutable cohort with %+v (err=%v)", got, err)
 	}
 }
 
