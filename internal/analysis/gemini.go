@@ -168,15 +168,12 @@ func (c *GeminiClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 	var lastTransientErr *geminiAPIError
 	for attempt := 0; ; attempt++ {
 		if err := c.limiter.wait(ctx); err != nil {
-			if lastTransientErr != nil {
-				return AnalysisResponse{}, ModelCallMeta{}, lastTransientErr
-			}
-			return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("gemini rate-limit wait: %w", err)
+			return AnalysisResponse{}, ModelCallMeta{}, preserveGeminiRetryError(lastTransientErr, fmt.Errorf("gemini rate-limit wait: %w", err))
 		}
 
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
 		if err != nil {
-			return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("gemini build request: %w", err)
+			return AnalysisResponse{}, ModelCallMeta{}, preserveGeminiRetryError(lastTransientErr, fmt.Errorf("gemini build request: %w", err))
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
 		httpReq.Header.Set("x-goog-api-key", c.apiKey)
@@ -185,12 +182,12 @@ func (c *GeminiClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 		resp, err := c.httpClient.Do(httpReq)
 		latencyMs = time.Since(start).Milliseconds()
 		if err != nil {
-			return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("gemini request: %w", err)
+			return AnalysisResponse{}, ModelCallMeta{}, preserveGeminiRetryError(lastTransientErr, fmt.Errorf("gemini request: %w", err))
 		}
 		respBytes, err = io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if err != nil {
-			return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("gemini read response: %w", err)
+			return AnalysisResponse{}, ModelCallMeta{}, preserveGeminiRetryError(lastTransientErr, fmt.Errorf("gemini read response: %w", err))
 		}
 
 		if resp.StatusCode < 400 {
@@ -211,6 +208,9 @@ func (c *GeminiClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 		lastTransientErr = apiErr
 		delay := parseRetryDelay(respBytes)
 		if !sleepWithinDeadline(ctx, delay) {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return AnalysisResponse{}, ModelCallMeta{}, preserveGeminiRetryError(apiErr, ctxErr)
+			}
 			return AnalysisResponse{}, ModelCallMeta{}, apiErr
 		}
 		if req.Ticker != "__extraction__" {
@@ -270,8 +270,9 @@ func (c *GeminiClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 			)
 		}
 		return AnalysisResponse{}, meta, fmt.Errorf(
-			"gemini truncated (finishReason=MAX_TOKENS): thinking %d + answer %d hit maxOutputTokens %d; increase output headroom or reduce thinking effort",
-			apiResp.UsageMetadata.ThoughtsTokenCount, apiResp.UsageMetadata.CandidatesTokenCount, maxOut)
+			"gemini truncated (finishReason=MAX_TOKENS): thinking %d + answer %d hit maxOutputTokens %d; %s",
+			apiResp.UsageMetadata.ThoughtsTokenCount, apiResp.UsageMetadata.CandidatesTokenCount, maxOut,
+			geminiTruncationGuidance(c.cfg))
 	}
 	analysis, err := extractAnalysisJSON(rawText)
 	if err != nil {
@@ -302,10 +303,30 @@ func (e *geminiAPIError) Error() string {
 	return fmt.Sprintf("gemini API %d: %s", e.StatusCode, e.Body)
 }
 
+func preserveGeminiRetryError(transientErr *geminiAPIError, retryErr error) error {
+	if transientErr == nil {
+		return retryErr
+	}
+	return fmt.Errorf("%w (retry failed: %w)", transientErr, retryErr)
+}
+
 func shouldUseGeminiFallback(err error) bool {
 	var apiErr *geminiAPIError
 	if !errors.As(err, &apiErr) {
 		return false
 	}
 	return apiErr.StatusCode == http.StatusTooManyRequests || apiErr.StatusCode == http.StatusServiceUnavailable
+}
+
+func geminiTruncationGuidance(cfg config.ModelConfig) string {
+	switch {
+	case cfg.ThinkingLevel != "":
+		return "increase max_tokens or thinking_output_headroom, or lower thinking_level"
+	case cfg.ThinkingBudget > 0:
+		return "increase max_tokens or thinking_budget"
+	case cfg.ThinkingBudget < 0:
+		return "increase max_tokens or lower thinking effort"
+	default:
+		return "increase max_tokens"
+	}
 }

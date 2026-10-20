@@ -145,6 +145,35 @@ func TestAnalyzeSpecialistRoleDoesNotFallbackForNonTransientError(t *testing.T) 
 	}
 }
 
+func TestAnalyzeSpecialistRolePreservesFallbackTimeout(t *testing.T) {
+	primary := &fallbackTestProvider{
+		provider: "google", model: "gemini-3.1-pro-preview",
+		err: &geminiAPIError{StatusCode: 503, Body: "temporarily unavailable"},
+	}
+	fallback := &fallbackTestProvider{
+		provider: "google", model: "gemini-2.5-flash",
+		err: context.DeadlineExceeded,
+	}
+	withSpecialistBuildProvider(t, func(c config.ModelConfig) ModelProvider {
+		if c.Model == fallback.model {
+			return fallback
+		}
+		t.Fatalf("unexpected fallback model config: %+v", c)
+		return nil
+	})
+
+	_, _, _, err := analyzeSpecialistRole(context.Background(), primary,
+		&config.ModelConfig{Provider: "google", Model: fallback.model, APIKey: "test"}, time.Second,
+		AnalysisRequest{Ticker: "AAPL"})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("fallback error = %v, want context.DeadlineExceeded to remain discoverable", err)
+	}
+	var apiErr *geminiAPIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != 503 {
+		t.Fatalf("primary transient error = %v, want original typed 503 to remain discoverable", err)
+	}
+}
+
 func TestAnalyzeSpecialistRoleDoesNotFallbackAfterParentCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

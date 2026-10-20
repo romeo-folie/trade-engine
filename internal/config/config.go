@@ -2478,6 +2478,9 @@ func validateThinkingOptions(path string, entry ModelConfig) []string {
 	if entry.Provider == "google" && entry.Model == "gemini-3.1-flash-lite-image" {
 		errs = append(errs, fmt.Sprintf("%s.model gemini-3.1-flash-lite-image does not support JSON structured outputs required by the Gemini analysis adapter", path))
 	}
+	if entry.Provider == "google" && entry.Model == "gemini-robotics-er-2-streaming-preview" {
+		errs = append(errs, fmt.Sprintf("%s.model gemini-robotics-er-2-streaming-preview requires the Live API and does not support JSON structured outputs required by the Gemini analysis adapter", path))
+	}
 	if entry.ThinkingLevel != "" {
 		switch entry.ThinkingLevel {
 		case "minimal", "low", "medium", "high":

@@ -1267,8 +1267,14 @@ func TestValidateGeminiThinkingLevelSettings(t *testing.T) {
 
 	entry.Model = "gemini-robotics-er-2-streaming-preview"
 	cfg.Models.Registry["analyst_mid"] = entry
-	if errs := Validate(cfg); !containsStr(errs, "thinking_level requires a supported Gemini 3/4 or Robotics ER 2 model") {
-		t.Fatalf("Robotics ER streaming should be rejected by the GenerateContent adapter, got %v", errs)
+	if errs := Validate(cfg); !containsStr(errs, "gemini-robotics-er-2-streaming-preview requires the Live API and does not support JSON structured outputs required by the Gemini analysis adapter") {
+		t.Fatalf("Robotics ER streaming should be rejected by the GenerateContent adapter even with thinking configured, got %v", errs)
+	}
+
+	entry.ThinkingLevel = ""
+	cfg.Models.Registry["analyst_mid"] = entry
+	if errs := Validate(cfg); !containsStr(errs, "gemini-robotics-er-2-streaming-preview requires the Live API and does not support JSON structured outputs required by the Gemini analysis adapter") {
+		t.Fatalf("Robotics ER streaming should be rejected by the GenerateContent adapter without thinking configured, got %v", errs)
 	}
 
 	entry.Model = "gemini-3-pro-preview"

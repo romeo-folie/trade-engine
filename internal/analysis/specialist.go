@@ -306,7 +306,7 @@ func analyzeSpecialistRole(
 	cancelFallback()
 	if fallbackErr != nil {
 		return fallback, fallbackResp, fallbackMeta,
-			fmt.Errorf("primary %s/%s failed: %w; fallback %s/%s failed: %v",
+			fmt.Errorf("primary %s/%s failed: %w; fallback %s/%s failed: %w",
 				primary.ProviderName(), primary.ModelName(), err,
 				fallback.ProviderName(), fallback.ModelName(), fallbackErr)
 	}
