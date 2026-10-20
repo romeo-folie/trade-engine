@@ -1183,7 +1183,7 @@ func TestValidateGeminiThinkingLevelSettings(t *testing.T) {
 	entry.MaxTokens = 65_536
 	entry.ThinkingOutputHeadroom = 0
 	cfg.Models.Registry["analyst_mid"] = entry
-	if errs := Validate(cfg); !containsStr(errs, "max_tokens + thinking_output_headroom (69632) exceeds gemini-3.1-pro-preview output limit (65536)") {
+	if errs := Validate(cfg); !containsStr(errs, "max_tokens plus configured thinking allowance (69632) exceeds gemini-3.1-pro-preview output limit (65536)") {
 		t.Fatalf("oversized Gemini response allowance should be rejected, got %v", errs)
 	}
 
@@ -1202,17 +1202,29 @@ func TestValidateGeminiThinkingLevelSettings(t *testing.T) {
 
 	entry.Model = "gemini-4-argon"
 	entry.ThinkingBudget = 0
+	entry.MaxTokens = 2048
 	cfg.Models.Registry["analyst_mid"] = entry
-	if errs := Validate(cfg); !containsStr(errs, "thinking_level is required for Gemini 4 models") {
-		t.Fatalf("Gemini 4 without thinking_level should be rejected, got %v", errs)
+	if errs := Validate(cfg); containsStr(errs, "thinking_level is required for Gemini 4 models") {
+		t.Fatalf("Gemini 4 should be allowed to use its default thinking level, got %v", errs)
 	}
 
+	entry.ThinkingBudget = 512
+	cfg.Models.Registry["analyst_mid"] = entry
+	if errs := Validate(cfg); containsStr(errs, "thinking_budget is not supported") {
+		t.Fatalf("legacy Gemini 4 thinking_budget should remain accepted, got %v", errs)
+	}
+	entry.ThinkingBudget = 0
 	entry.ThinkingLevel = "medium"
-	entry.MaxTokens = 61_440
-	entry.ThinkingOutputHeadroom = 4096
+	entry.MaxTokens = 28_672
+	entry.ThinkingOutputHeadroom = 0
 	cfg.Models.Registry["analyst_mid"] = entry
 	if errs := Validate(cfg); containsStr(errs, "exceeds gemini-4-argon output limit") {
-		t.Fatalf("Gemini 4 response allowance at 65,536 should be accepted, got %v", errs)
+		t.Fatalf("Gemini 4 non-streaming response allowance at 32,768 should be accepted, got %v", errs)
+	}
+	entry.MaxTokens = 28_673
+	cfg.Models.Registry["analyst_mid"] = entry
+	if errs := Validate(cfg); !containsStr(errs, "max_tokens plus configured thinking allowance (32769) exceeds gemini-4-argon output limit (32768)") {
+		t.Fatalf("Gemini 4 response allowance above 32,768 should be rejected, got %v", errs)
 	}
 
 	entry.Model = "gemini-3.1-flash-lite-image"
@@ -1227,19 +1239,31 @@ func TestValidateGeminiThinkingLevelSettings(t *testing.T) {
 	entry.MaxTokens = 4096
 	entry.ThinkingOutputHeadroom = 0
 	cfg.Models.Registry["analyst_mid"] = entry
-	if errs := Validate(cfg); !containsStr(errs, "exceeds gemini-3.1-flash-lite-image output limit (4096)") {
+	if errs := Validate(cfg); !containsStr(errs, "max_tokens plus configured thinking allowance (8192) exceeds gemini-3.1-flash-lite-image output limit (4096)") {
 		t.Fatalf("image model response allowance above 4,096 should be rejected, got %v", errs)
 	}
 
-	for _, model := range []string{"gemini-robotics-er-2-preview", "gemini-robotics-er-2-streaming-preview"} {
-		entry.Model = model
-		entry.ThinkingLevel = "minimal"
-		entry.MaxTokens = 2048
-		entry.ThinkingOutputHeadroom = 0
-		cfg.Models.Registry["analyst_mid"] = entry
-		if errs := Validate(cfg); containsStr(errs, "thinking_level") {
-			t.Errorf("Robotics ER model %s should accept minimal thinking, got %v", model, errs)
-		}
+	entry.Model = "gemini-robotics-er-2-preview"
+	entry.ThinkingLevel = "minimal"
+	entry.MaxTokens = 2048
+	entry.ThinkingOutputHeadroom = 0
+	cfg.Models.Registry["analyst_mid"] = entry
+	if errs := Validate(cfg); containsStr(errs, "thinking_level") {
+		t.Fatalf("Robotics ER 2 Preview should accept minimal thinking, got %v", errs)
+	}
+
+	entry.Model = "gemini-robotics-er-2-streaming-preview"
+	cfg.Models.Registry["analyst_mid"] = entry
+	if errs := Validate(cfg); !containsStr(errs, "thinking_level requires a supported Gemini 3/4 or Robotics ER 2 model") {
+		t.Fatalf("Robotics ER streaming should be rejected by the GenerateContent adapter, got %v", errs)
+	}
+
+	entry.Model = "gemini-3-pro-preview"
+	entry.ThinkingLevel = ""
+	entry.ThinkingBudget = 0
+	cfg.Models.Registry["analyst_mid"] = entry
+	if errs := Validate(cfg); !containsStr(errs, "gemini-3-pro-preview is shut down") {
+		t.Fatalf("shut-down Gemini Pro preview should be rejected, got %v", errs)
 	}
 }
 

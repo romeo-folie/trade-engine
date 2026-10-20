@@ -417,13 +417,13 @@ type ModelConfig struct {
 	//   > 0  → bounded thinking; client sends maxOutputTokens = max_tokens + budget
 	//   < 0  → dynamic thinking (-1); operator must size max_tokens generously
 	//   == 0 → unset; no thinkingConfig sent, so the model keeps its native
-	//          default. Gemini 3 still accepts this field for compatibility,
-	//          though thinking_level is recommended. Gemini 4 requires a level.
+	//          default. Gemini 3/4 accept this field for compatibility, though
+	//          Google recommends thinking_level for predictable reasoning effort.
 	// Ignored by non-Gemini providers.
 	ThinkingBudget int `yaml:"thinking_budget"`
 	// ThinkingLevel controls reasoning depth for Gemini 3/4 and Robotics ER 2.
 	// Values are model-dependent (minimal, low, medium, high); leave empty to
-	// use model defaults, except Gemini 4 which requires an explicit level.
+	// use model defaults (Gemini 4 Argon defaults to medium).
 	ThinkingLevel string `yaml:"thinking_level"`
 	// ThinkingOutputHeadroom adds room for hidden reasoning tokens to
 	// max_tokens when thinking_level is set. Zero defaults to 4096. max_tokens
@@ -2472,6 +2472,9 @@ const delayedSIPSnapshotDelayMinutes = 16
 
 func validateThinkingOptions(path string, entry ModelConfig) []string {
 	var errs []string
+	if entry.Provider == "google" && entry.Model == "gemini-3-pro-preview" {
+		errs = append(errs, fmt.Sprintf("%s.model gemini-3-pro-preview is shut down; use gemini-3.1-pro-preview", path))
+	}
 	if entry.ThinkingLevel != "" {
 		switch entry.ThinkingLevel {
 		case "minimal", "low", "medium", "high":
@@ -2488,21 +2491,26 @@ func validateThinkingOptions(path string, entry ModelConfig) []string {
 		if entry.ThinkingBudget != 0 {
 			errs = append(errs, fmt.Sprintf("%s cannot set both thinking_level and thinking_budget", path))
 		}
-		if outputLimit := geminiThinkingOutputLimit(entry.Model); outputLimit > 0 {
-			maxTokens := entry.MaxTokens
-			if maxTokens == 0 {
-				maxTokens = 4096 // GeminiClient default.
-			}
-			headroom := entry.ThinkingOutputHeadroom
-			if headroom == 0 {
-				headroom = 4096 // geminiDefaultThinkingOutputHeadroom.
-			}
-			if maxTokens+headroom > outputLimit {
-				errs = append(errs, fmt.Sprintf("%s max_tokens + thinking_output_headroom (%d) exceeds %s output limit (%d)", path, maxTokens+headroom, entry.Model, outputLimit))
-			}
+	}
+	if outputLimit := geminiThinkingOutputLimit(entry.Model); entry.Provider == "google" && outputLimit > 0 &&
+		(entry.ThinkingLevel != "" || entry.ThinkingBudget != 0) {
+		maxTokens := entry.MaxTokens
+		if maxTokens == 0 {
+			maxTokens = 4096 // GeminiClient default.
 		}
-	} else if entry.Provider == "google" && strings.HasPrefix(entry.Model, "gemini-4") {
-		errs = append(errs, fmt.Sprintf("%s.thinking_level is required for Gemini 4 models", path))
+		extra := entry.ThinkingOutputHeadroom
+		if entry.ThinkingLevel != "" {
+			if extra == 0 {
+				extra = 4096 // geminiDefaultThinkingOutputHeadroom.
+			}
+		} else if entry.ThinkingBudget > 0 {
+			extra = entry.ThinkingBudget
+		} else {
+			extra = 0 // Dynamic thinking shares maxOutputTokens.
+		}
+		if maxTokens+extra > outputLimit {
+			errs = append(errs, fmt.Sprintf("%s max_tokens plus configured thinking allowance (%d) exceeds %s output limit (%d)", path, maxTokens+extra, entry.Model, outputLimit))
+		}
 	}
 	if entry.ThinkingOutputHeadroom < 0 {
 		errs = append(errs, fmt.Sprintf("%s.thinking_output_headroom must be >= 0", path))
@@ -2512,7 +2520,7 @@ func validateThinkingOptions(path string, entry ModelConfig) []string {
 
 func isGeminiThinkingLevelModel(model string) bool {
 	return strings.HasPrefix(model, "gemini-3") || strings.HasPrefix(model, "gemini-4") ||
-		strings.HasPrefix(model, "gemini-robotics-er-2-")
+		model == "gemini-robotics-er-2-preview"
 }
 
 // geminiThinkingLevelSupported mirrors Google's model-specific Gemini 3/4
@@ -2523,8 +2531,6 @@ func geminiThinkingLevelSupported(model, level string) bool {
 	switch {
 	case strings.Contains(model, "gemini-3.1-pro"):
 		return level == "low" || level == "medium" || level == "high"
-	case strings.Contains(model, "gemini-3-pro-preview"):
-		return level == "low" || level == "high"
 	case strings.Contains(model, "gemini-3.8-flash"):
 		return level == "low" || level == "medium" || level == "high"
 	case strings.Contains(model, "gemini-3.7-flash"):
@@ -2537,7 +2543,7 @@ func geminiThinkingLevelSupported(model, level string) bool {
 		return level == "minimal" || level == "high"
 	case strings.Contains(model, "gemini-3.5-flash-lite"), strings.Contains(model, "gemini-3.1-flash-lite"):
 		return all
-	case strings.Contains(model, "gemini-3-flash"), strings.HasPrefix(model, "gemini-robotics-er-2-"):
+	case strings.Contains(model, "gemini-3-flash"), model == "gemini-robotics-er-2-preview":
 		return all
 	default:
 		return false
@@ -2546,14 +2552,15 @@ func geminiThinkingLevelSupported(model, level string) bool {
 
 // geminiThinkingOutputLimit returns the synchronous GenerateContent response
 // cap for models using thinkingLevel. Gemini 3 and Robotics ER 2 allow 65,536
-// output tokens; Gemini 4 Argon allows 65,536 for synchronous requests.
+// output tokens; this adapter uses a single non-streaming REST request, so
+// Gemini 4 Argon is capped at its 32,768-token non-streaming hop limit.
 func geminiThinkingOutputLimit(model string) int {
 	switch {
 	case strings.Contains(model, "gemini-4-argon"):
-		return 65_536
+		return 32_768
 	case strings.Contains(model, "gemini-3.1-flash-lite-image"):
 		return 4_096
-	case strings.HasPrefix(model, "gemini-robotics-er-2-"):
+	case model == "gemini-robotics-er-2-preview":
 		return 65_536
 	case strings.HasPrefix(model, "gemini-3"):
 		return 65_536
