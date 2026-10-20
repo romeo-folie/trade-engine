@@ -422,6 +422,14 @@ type ModelConfig struct {
 	//          and an int field can't distinguish explicit 0 from omitted.)
 	// Ignored by non-Gemini providers.
 	ThinkingBudget int `yaml:"thinking_budget"`
+	// ThinkingLevel controls reasoning depth for Gemini 3 models. Google
+	// recommends this over thinking_budget for Gemini 3. Values are model
+	// dependent (minimal, low, medium, high); leave empty to use model defaults.
+	ThinkingLevel string `yaml:"thinking_level"`
+	// ThinkingOutputHeadroom adds room for hidden reasoning tokens to
+	// max_tokens when thinking_level is set. Zero defaults to 4096. max_tokens
+	// remains the visible answer allowance; Gemini's API cap includes both kinds.
+	ThinkingOutputHeadroom int `yaml:"thinking_output_headroom"`
 	// ReasoningEffort controls how many hidden reasoning tokens OpenAI's gpt-5
 	// and o-series models spend before emitting the answer. These reasoning
 	// tokens count inside max_completion_tokens, so unbounded reasoning on a
@@ -2463,6 +2471,61 @@ func validUniverseHistoricalFeed(feed string) bool {
 
 const delayedSIPSnapshotDelayMinutes = 16
 
+func validateThinkingOptions(path string, entry ModelConfig) []string {
+	var errs []string
+	if entry.ThinkingLevel != "" {
+		switch entry.ThinkingLevel {
+		case "minimal", "low", "medium", "high":
+		default:
+			errs = append(errs, fmt.Sprintf("%s.thinking_level must be minimal, low, medium, or high", path))
+		}
+		if entry.Provider != "google" {
+			errs = append(errs, fmt.Sprintf("%s.thinking_level is only supported for the google provider", path))
+		} else if !strings.HasPrefix(entry.Model, "gemini-3") && !strings.HasPrefix(entry.Model, "gemini-4") {
+			errs = append(errs, fmt.Sprintf("%s.thinking_level requires a Gemini 3 or Gemini 4 model; use thinking_budget for Gemini 2.5", path))
+		} else if !geminiThinkingLevelSupported(entry.Model, entry.ThinkingLevel) {
+			errs = append(errs, fmt.Sprintf("%s.thinking_level %s is unsupported for model %s", path, entry.ThinkingLevel, entry.Model))
+		}
+		if entry.ThinkingBudget != 0 {
+			errs = append(errs, fmt.Sprintf("%s cannot set both thinking_level and thinking_budget", path))
+		}
+	} else if entry.Provider == "google" && entry.ThinkingBudget != 0 &&
+		(strings.HasPrefix(entry.Model, "gemini-3") || strings.HasPrefix(entry.Model, "gemini-4")) {
+		errs = append(errs, fmt.Sprintf("%s.thinking_budget is not supported for Gemini 3/4 models; use thinking_level", path))
+	}
+	if entry.ThinkingOutputHeadroom < 0 {
+		errs = append(errs, fmt.Sprintf("%s.thinking_output_headroom must be >= 0", path))
+	}
+	return errs
+}
+
+// geminiThinkingLevelSupported mirrors Google's model-specific Gemini 3/4
+// thinking-level matrix. Unknown models fail validation so a newly configured
+// model cannot silently receive a level the API rejects.
+func geminiThinkingLevelSupported(model, level string) bool {
+	all := level == "minimal" || level == "low" || level == "medium" || level == "high"
+	switch {
+	case strings.Contains(model, "gemini-3.1-pro"):
+		return level == "low" || level == "medium" || level == "high"
+	case strings.Contains(model, "gemini-3-pro-preview"):
+		return level == "low" || level == "high"
+	case strings.Contains(model, "gemini-3.8-flash"):
+		return level == "low" || level == "medium" || level == "high"
+	case strings.Contains(model, "gemini-3.6-flash"):
+		return all
+	case strings.Contains(model, "gemini-4-argon"):
+		return level == "low" || level == "medium" || level == "high"
+	case strings.Contains(model, "gemini-3.1-flash-lite-image"):
+		return level == "minimal" || level == "high"
+	case strings.Contains(model, "gemini-3.5-flash-lite"), strings.Contains(model, "gemini-3.1-flash-lite"):
+		return all
+	case strings.Contains(model, "gemini-3-flash"), strings.Contains(model, "gemini-3-robotics-er"):
+		return all
+	default:
+		return false
+	}
+}
+
 func Validate(cfg *Config) []string {
 	var errs []string
 	if cfg.Engine.MaxWatchlist <= 0 {
@@ -3192,6 +3255,7 @@ func Validate(cfg *Config) []string {
 			if entry.Model == "" {
 				errs = append(errs, fmt.Sprintf("models.registry.%s: model is required", key))
 			}
+			errs = append(errs, validateThinkingOptions("models.registry."+key, entry.ModelConfig)...)
 			// Validate fallback key exists if specified.
 			if entry.Fallback != "" {
 				if _, ok := cfg.Models.Registry[entry.Fallback]; !ok {
@@ -3241,9 +3305,19 @@ func Validate(cfg *Config) []string {
 			errs = append(errs, fmt.Sprintf("models.analysts has %d entries; ensemble works best with 3+ analysts", len(cfg.Models.Analysts)))
 		}
 		for i, a := range cfg.Models.Analysts {
+			errs = append(errs, validateThinkingOptions(fmt.Sprintf("models.analysts[%d]", i), a)...)
 			if a.APIKeyEnv != "" && os.Getenv(a.APIKeyEnv) == "" {
 				errs = append(errs, fmt.Sprintf("env var %s (models.analysts[%d].api_key_env) is not set", a.APIKeyEnv, i))
 			}
+		}
+		if len(cfg.Models.Analysts) == 0 && cfg.Models.Primary.Provider != "" {
+			errs = append(errs, validateThinkingOptions("models.primary", cfg.Models.Primary)...)
+			for i, secondary := range cfg.Models.Secondary {
+				errs = append(errs, validateThinkingOptions(fmt.Sprintf("models.secondary[%d]", i), secondary)...)
+			}
+		}
+		if cfg.Models.Arbiter.Provider != "" {
+			errs = append(errs, validateThinkingOptions("models.arbiter", cfg.Models.Arbiter)...)
 		}
 		// Legacy single-model validation.
 		if len(cfg.Models.Analysts) == 0 && cfg.Models.Primary.APIKeyEnv != "" && os.Getenv(cfg.Models.Primary.APIKeyEnv) == "" {

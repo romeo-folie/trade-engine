@@ -56,6 +56,7 @@ func (a *Analyzer) AnalyzeSpecialist(ctx context.Context, req AnalysisRequest, _
 		role        string
 		registryKey string
 		provider    ModelProvider
+		fallback    *config.ModelConfig
 	}
 	var directional []roleProvider
 	var riskReviewer *roleProvider
@@ -78,6 +79,9 @@ func (a *Analyzer) AnalyzeSpecialist(ctx context.Context, req AnalysisRequest, _
 			continue
 		}
 		rp := roleProvider{role: role, registryKey: key, provider: p}
+		if fallback, ok := a.cfg.ResolveFallback(key); ok {
+			rp.fallback = &fallback
+		}
 		if role == "risk_manager" {
 			riskReviewer = &rp
 		} else {
@@ -139,27 +143,23 @@ func (a *Analyzer) AnalyzeSpecialist(ctx context.Context, req AnalysisRequest, _
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			// Use the registry-aware helper: specialist roles map to registry
-			// keys that are typically NOT in models.roles.analysts, so the
-			// analysts-only modelTimeout() would silently fall back to 30s
-			// instead of honouring registry.<key>.timeout_sec.
+			// Use registry-aware timeout values independently for the primary
+			// and fallback calls. Both remain bounded by the overall analysis ctx.
 			timeout := modelTimeoutForRegistry(rp.registryKey, rp.provider, a.cfg)
-			mctx, cancel := context.WithTimeout(ctx, timeout)
-			defer cancel()
 			t0 := time.Now()
-			resp, meta, err := rp.provider.Analyze(mctx, roleReq)
+			provider, resp, meta, err := analyzeSpecialistRole(ctx, rp.provider, rp.fallback, timeout, roleReq)
 			lat := time.Since(t0).Milliseconds()
 			meta.LatencyMs = lat
 			if err != nil {
 				logger.Warn("specialist analyst failed",
 					"ticker", req.Ticker, "role", rp.role,
-					"provider", rp.provider.ProviderName(),
-					"model", rp.provider.ModelName(), "err", err)
+					"provider", provider.ProviderName(),
+					"model", provider.ModelName(), "err", err)
 			}
 			mu.Lock()
 			results = append(results, specialistResult{
 				Role:     rp.role,
-				Provider: rp.provider,
+				Provider: provider,
 				Response: resp,
 				Meta:     meta,
 				Err:      err,
@@ -218,21 +218,19 @@ func (a *Analyzer) AnalyzeSpecialist(ctx context.Context, req AnalysisRequest, _
 	riskReq.CustomSystemPrompt = sys
 	riskReq.CustomUserMessage = user
 	timeout := modelTimeoutForRegistry(riskReviewer.registryKey, riskReviewer.provider, a.cfg)
-	riskCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
 	t0 := time.Now()
-	riskResp, riskMeta, riskErr := riskReviewer.provider.Analyze(riskCtx, riskReq)
+	riskProvider, riskResp, riskMeta, riskErr := analyzeSpecialistRole(ctx, riskReviewer.provider, riskReviewer.fallback, timeout, riskReq)
 	riskMeta.LatencyMs = time.Since(t0).Milliseconds()
 	riskResult := specialistResult{
-		Role: "risk_manager", Provider: riskReviewer.provider,
+		Role: "risk_manager", Provider: riskProvider,
 		Response: riskResp, Meta: riskMeta, Err: riskErr,
 	}
 	results = append(results, riskResult)
 	if riskErr != nil {
 		logger.Warn("mandatory risk specialist failed",
 			"ticker", req.Ticker,
-			"provider", riskReviewer.provider.ProviderName(),
-			"model", riskReviewer.provider.ModelName(),
+			"provider", riskProvider.ProviderName(),
+			"model", riskProvider.ModelName(),
 			"err", riskErr)
 		return AnalyzeResult{AnalystResults: projectSpecialistResults(results)},
 			fmt.Errorf("specialist: mandatory risk-manager review failed: %w", riskErr)
@@ -264,7 +262,7 @@ func (a *Analyzer) AnalyzeSpecialist(ctx context.Context, req AnalysisRequest, _
 		"ticker", req.Ticker,
 		"action", string(final.Action),
 		"directional_successes", successes,
-		"risk_reviewer", riskReviewer.provider.ModelName(),
+		"risk_reviewer", riskProvider.ModelName(),
 	)
 	return AnalyzeResult{
 		Response:       final,
@@ -272,6 +270,61 @@ func (a *Analyzer) AnalyzeSpecialist(ctx context.Context, req AnalysisRequest, _
 		AnalystResults: projectSpecialistResults(results),
 		DecisionPolicy: policyAudit,
 	}, nil
+}
+
+// analyzeSpecialistRole tries the configured one-hop registry fallback only
+// after Gemini exhausts its own retries on HTTP 429/503. Other failures (for
+// example billing 4xx responses, timeouts, or MAX_TOKENS) remain visible and do
+// not silently switch models.
+func analyzeSpecialistRole(
+	ctx context.Context,
+	primary ModelProvider,
+	fallbackConfig *config.ModelConfig,
+	primaryTimeout time.Duration,
+	req AnalysisRequest,
+) (ModelProvider, AnalysisResponse, ModelCallMeta, error) {
+	primaryCtx, cancelPrimary := context.WithTimeout(ctx, primaryTimeout)
+	resp, meta, err := primary.Analyze(primaryCtx, req)
+	cancelPrimary()
+	if err == nil || fallbackConfig == nil || !shouldUseGeminiFallback(err) {
+		return primary, resp, meta, err
+	}
+
+	fallback := specialistBuildProvider(*fallbackConfig)
+	if !fallback.IsAvailable() {
+		return primary, resp, meta, fmt.Errorf("%w; configured fallback %s/%s is unavailable",
+			err, fallback.ProviderName(), fallback.ModelName())
+	}
+	fallbackTimeout := modelConfigTimeout(*fallbackConfig)
+	fallbackCtx, cancelFallback := context.WithTimeout(ctx, fallbackTimeout)
+	fallbackResp, fallbackMeta, fallbackErr := fallback.Analyze(fallbackCtx, req)
+	cancelFallback()
+	if fallbackErr != nil {
+		return fallback, fallbackResp, fallbackMeta,
+			fmt.Errorf("primary %s/%s failed: %w; fallback %s/%s failed: %v",
+				primary.ProviderName(), primary.ModelName(), err,
+				fallback.ProviderName(), fallback.ModelName(), fallbackErr)
+	}
+	logger.Warn("specialist model fallback succeeded",
+		"ticker", req.Ticker,
+		"primary_model", primary.ModelName(),
+		"fallback_model", fallback.ModelName())
+	return fallback, fallbackResp, fallbackMeta, nil
+}
+
+// modelConfigTimeout mirrors provider client defaults for a standalone config.
+// A fallback gets its own configured/default timeout rather than inheriting the
+// primary's possibly shorter timeout window.
+func modelConfigTimeout(cfg config.ModelConfig) time.Duration {
+	if cfg.TimeoutSec > 0 {
+		return time.Duration(cfg.TimeoutSec) * time.Second
+	}
+	switch cfg.Provider {
+	case "anthropic", "ollama":
+		return 60 * time.Second
+	default:
+		return 30 * time.Second
+	}
 }
 
 // resolveSpecialistRiskDecision gives the risk reviewer asymmetric authority:

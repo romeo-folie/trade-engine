@@ -3,6 +3,7 @@ package analysis
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -281,6 +282,65 @@ func TestGeminiClient_Analyze_ThinkingUnsetIsNative(t *testing.T) {
 	}
 	if _, present := gc["thinkingConfig"]; present {
 		t.Errorf("thinkingConfig should be absent when thinking_budget is unset, got %v", gc["thinkingConfig"])
+	}
+}
+
+func TestGeminiClient_Analyze_ThinkingLevelAddsOutputHeadroom(t *testing.T) {
+	payload := `{"action":"HOLD","confidence":0.5,"size_pct":0,"stop_loss":0,"take_profit":0,"reasoning":"ok"}`
+	srv, bodyCh := captureGeminiBody(t, geminiRespWithFinish(payload, "STOP", 0))
+	defer srv.Close()
+
+	cfg := config.ModelConfig{
+		Model: "gemini-3.1-pro-preview", APIKey: "test-key", MaxTokens: 2048,
+		ThinkingLevel: "low",
+	}
+	c := NewGeminiClient(cfg)
+	c.baseURL = srv.URL
+
+	if _, _, err := c.Analyze(context.Background(), AnalysisRequest{Ticker: "AAPL"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	gc := genConfigFrom(t, <-bodyCh)
+	if got := gc["maxOutputTokens"].(float64); got != 6144 {
+		t.Errorf("maxOutputTokens = %v, want 6144 (2048 answer + 4096 headroom)", got)
+	}
+	tc, ok := gc["thinkingConfig"].(map[string]any)
+	if !ok {
+		t.Fatalf("thinkingConfig missing: %T", gc["thinkingConfig"])
+	}
+	if got := tc["thinkingLevel"]; got != "LOW" {
+		t.Errorf("thinkingLevel = %v, want LOW", got)
+	}
+	if _, present := tc["thinkingBudget"]; present {
+		t.Errorf("thinkingBudget should not be sent with thinkingLevel: %v", tc)
+	}
+}
+
+func TestGeminiClient_Analyze_RetryExhaustionReturnsTypedFallbackStatus(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"code":429,"details":[{"retryDelay":"0.001s"}]}}`))
+	}))
+	defer srv.Close()
+
+	cfg := config.ModelConfig{Model: "gemini-3.1-pro-preview", APIKey: "test-key", RequestsPerMinute: 600000}
+	c := NewGeminiClient(cfg)
+	c.baseURL = srv.URL
+	_, _, err := c.Analyze(context.Background(), AnalysisRequest{Ticker: "AAPL"})
+	if err == nil {
+		t.Fatal("expected exhausted 429 error")
+	}
+	var apiErr *geminiAPIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("error = %T %v, want typed status 429", err, err)
+	}
+	if !shouldUseGeminiFallback(err) {
+		t.Fatal("exhausted 429 should permit configured fallback")
+	}
+	if calls != 2 {
+		t.Fatalf("server hit %d times, want 2 (initial + built-in retry)", calls)
 	}
 }
 

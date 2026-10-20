@@ -43,6 +43,12 @@ models:
       # the answer can never be crowded out. Omit/0 leaves the model's native
       # default (no override); -1 requests dynamic thinking.
       thinking_budget: 1024
+      # For Gemini 3, use thinking_level (minimal/low/medium/high) instead of
+      # thinking_budget. thinking_output_headroom is added to max_tokens because
+      # Gemini counts reasoning and visible answer tokens in the same output cap
+      # (0 defaults to 4096).
+      thinking_level: ""                # Gemini 3: set low/medium/high instead of thinking_budget
+      thinking_output_headroom: 0        # 0 = default 4096 tokens of Gemini 3 headroom
       fallback: gemini_flash            # fallback registry key on 429/503
     gemini_flash:
       provider: google
