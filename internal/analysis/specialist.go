@@ -289,6 +289,11 @@ func analyzeSpecialistRole(
 	if err == nil || fallbackConfig == nil || !shouldUseGeminiFallback(err) {
 		return primary, resp, meta, err
 	}
+	// A retryable provider response must not mask cancellation of the overall
+	// analysis. A primary-only timeout leaves ctx alive and still permits fallback.
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return primary, resp, meta, ctxErr
+	}
 
 	fallback := specialistBuildProvider(*fallbackConfig)
 	if !fallback.IsAvailable() {

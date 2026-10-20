@@ -2475,6 +2475,9 @@ func validateThinkingOptions(path string, entry ModelConfig) []string {
 	if entry.Provider == "google" && entry.Model == "gemini-3-pro-preview" {
 		errs = append(errs, fmt.Sprintf("%s.model gemini-3-pro-preview is shut down; use gemini-3.1-pro-preview", path))
 	}
+	if entry.Provider == "google" && entry.Model == "gemini-3.1-flash-lite-image" {
+		errs = append(errs, fmt.Sprintf("%s.model gemini-3.1-flash-lite-image does not support JSON structured outputs required by the Gemini analysis adapter", path))
+	}
 	if entry.ThinkingLevel != "" {
 		switch entry.ThinkingLevel {
 		case "minimal", "low", "medium", "high":
@@ -2492,21 +2495,19 @@ func validateThinkingOptions(path string, entry ModelConfig) []string {
 			errs = append(errs, fmt.Sprintf("%s cannot set both thinking_level and thinking_budget", path))
 		}
 	}
-	if outputLimit := geminiThinkingOutputLimit(entry.Model); entry.Provider == "google" && outputLimit > 0 &&
-		(entry.ThinkingLevel != "" || entry.ThinkingBudget != 0) {
+	if outputLimit := geminiOutputLimit(entry.Model); entry.Provider == "google" && outputLimit > 0 {
 		maxTokens := entry.MaxTokens
 		if maxTokens == 0 {
 			maxTokens = 4096 // GeminiClient default.
 		}
-		extra := entry.ThinkingOutputHeadroom
+		extra := 0
 		if entry.ThinkingLevel != "" {
+			extra = entry.ThinkingOutputHeadroom
 			if extra == 0 {
 				extra = 4096 // geminiDefaultThinkingOutputHeadroom.
 			}
 		} else if entry.ThinkingBudget > 0 {
 			extra = entry.ThinkingBudget
-		} else {
-			extra = 0 // Dynamic thinking shares maxOutputTokens.
 		}
 		if maxTokens+extra > outputLimit {
 			errs = append(errs, fmt.Sprintf("%s max_tokens plus configured thinking allowance (%d) exceeds %s output limit (%d)", path, maxTokens+extra, entry.Model, outputLimit))
@@ -2550,11 +2551,12 @@ func geminiThinkingLevelSupported(model, level string) bool {
 	}
 }
 
-// geminiThinkingOutputLimit returns the synchronous GenerateContent response
-// cap for models using thinkingLevel. Gemini 3 and Robotics ER 2 allow 65,536
-// output tokens; this adapter uses a single non-streaming REST request, so
-// Gemini 4 Argon is capped at its 32,768-token non-streaming hop limit.
-func geminiThinkingOutputLimit(model string) int {
+// geminiOutputLimit returns the synchronous GenerateContent response cap for
+// the model families whose output limits are validated here. Gemini 3 and
+// Robotics ER 2 allow 65,536 output tokens; this adapter uses a single
+// non-streaming REST request, so Gemini 4 Argon is capped at its 32,768-token
+// non-streaming hop limit.
+func geminiOutputLimit(model string) int {
 	switch {
 	case strings.Contains(model, "gemini-4-argon"):
 		return 32_768

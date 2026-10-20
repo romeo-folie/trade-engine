@@ -55,6 +55,7 @@ type fallbackTestProvider struct {
 	calls           int
 	waitFor         time.Duration
 	remainingAtCall time.Duration
+	onAnalyze       func()
 }
 
 func (p *fallbackTestProvider) ProviderName() string { return p.provider }
@@ -71,6 +72,9 @@ func (p *fallbackTestProvider) Analyze(ctx context.Context, _ AnalysisRequest) (
 		case <-ctx.Done():
 			return AnalysisResponse{}, ModelCallMeta{Provider: p.provider, Model: p.model}, ctx.Err()
 		}
+	}
+	if p.onAnalyze != nil {
+		p.onAnalyze()
 	}
 	if p.err != nil {
 		return AnalysisResponse{}, ModelCallMeta{Provider: p.provider, Model: p.model}, p.err
@@ -135,6 +139,31 @@ func TestAnalyzeSpecialistRoleDoesNotFallbackForNonTransientError(t *testing.T) 
 		AnalysisRequest{Ticker: "AAPL"})
 	if err == nil {
 		t.Fatal("expected primary error")
+	}
+	if used != primary || fallbackBuilds != 0 {
+		t.Fatalf("used=%v fallback builds=%d, want primary and no fallback", used, fallbackBuilds)
+	}
+}
+
+func TestAnalyzeSpecialistRoleDoesNotFallbackAfterParentCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	primary := &fallbackTestProvider{
+		provider: "google", model: "gemini-3.1-pro-preview",
+		err:       &geminiAPIError{StatusCode: 429, Body: "rate limited"},
+		onAnalyze: cancel,
+	}
+	fallbackBuilds := 0
+	withSpecialistBuildProvider(t, func(config.ModelConfig) ModelProvider {
+		fallbackBuilds++
+		return &fallbackTestProvider{provider: "google", model: "gemini-2.5-flash"}
+	})
+
+	used, _, _, err := analyzeSpecialistRole(ctx, primary,
+		&config.ModelConfig{Provider: "google", Model: "gemini-2.5-flash", APIKey: "test"}, time.Second,
+		AnalysisRequest{Ticker: "AAPL"})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want overall context cancellation", err)
 	}
 	if used != primary || fallbackBuilds != 0 {
 		t.Fatalf("used=%v fallback builds=%d, want primary and no fallback", used, fallbackBuilds)

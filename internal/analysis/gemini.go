@@ -165,8 +165,12 @@ func (c *GeminiClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 	// retryDelay, but only when that delay fits the remaining context deadline.
 	var respBytes []byte
 	var latencyMs int64
+	var lastTransientErr *geminiAPIError
 	for attempt := 0; ; attempt++ {
 		if err := c.limiter.wait(ctx); err != nil {
+			if lastTransientErr != nil {
+				return AnalysisResponse{}, ModelCallMeta{}, lastTransientErr
+			}
 			return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("gemini rate-limit wait: %w", err)
 		}
 
@@ -204,6 +208,7 @@ func (c *GeminiClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 		if !retryable || attempt >= geminiMaxRetries {
 			return AnalysisResponse{}, ModelCallMeta{}, apiErr
 		}
+		lastTransientErr = apiErr
 		delay := parseRetryDelay(respBytes)
 		if !sleepWithinDeadline(ctx, delay) {
 			return AnalysisResponse{}, ModelCallMeta{}, apiErr

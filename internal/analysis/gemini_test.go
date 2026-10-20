@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -150,6 +151,40 @@ func TestGeminiClient_Analyze_429GivesUpWhenDelayExceedsDeadline(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Errorf("server hit %d times, want 1 (no retry attempted)", calls)
+	}
+}
+
+func TestGeminiClient_Analyze_PreservesTransientErrorWhenRetryLimiterTimesOut(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"code":429,"details":[{"retryDelay":"0.01s"}]}}`))
+	}))
+	defer srv.Close()
+
+	// Use a unique limiter key: model limiters are shared process-wide and earlier
+	// tests may have registered the real Gemini model at a much higher RPM. The
+	// first call is immediate; after retryDelay, the six-second slot is still
+	// beyond this deadline, which exceeds retryMargin so the retry reaches wait().
+	cfg := config.ModelConfig{Model: "gemini-2.5-flash-limiter-timeout-test", APIKey: "test-key", RequestsPerMinute: 10}
+	c := NewGeminiClient(cfg)
+	c.baseURL = srv.URL
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, _, err := c.Analyze(ctx, AnalysisRequest{Ticker: "AAPL"})
+	if err == nil {
+		t.Fatal("expected error when retry limiter exceeds the primary deadline")
+	}
+	var apiErr *geminiAPIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("error = %T %v, want typed status 429", err, err)
+	}
+	if !shouldUseGeminiFallback(err) {
+		t.Fatalf("retry-limiter timeout must preserve fallback eligibility: %v", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("server hit %d times, want 1 (retry blocked by limiter)", got)
 	}
 }
 

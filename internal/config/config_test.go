@@ -1207,6 +1207,18 @@ func TestValidateGeminiThinkingLevelSettings(t *testing.T) {
 	if errs := Validate(cfg); containsStr(errs, "thinking_level is required for Gemini 4 models") {
 		t.Fatalf("Gemini 4 should be allowed to use its default thinking level, got %v", errs)
 	}
+	entry.ThinkingLevel = ""
+	entry.MaxTokens = 32_768
+	cfg.Models.Registry["analyst_mid"] = entry
+	if errs := Validate(cfg); containsStr(errs, "exceeds gemini-4-argon output limit") {
+		t.Fatalf("Gemini 4 default thinking should accept the exact non-streaming output cap, got %v", errs)
+	}
+	entry.MaxTokens = 32_769
+	cfg.Models.Registry["analyst_mid"] = entry
+	if errs := Validate(cfg); !containsStr(errs, "max_tokens plus configured thinking allowance (32769) exceeds gemini-4-argon output limit (32768)") {
+		t.Fatalf("Gemini 4 default thinking should reject a max_tokens value above the non-streaming cap, got %v", errs)
+	}
+	entry.MaxTokens = 2048
 
 	entry.ThinkingBudget = 512
 	cfg.Models.Registry["analyst_mid"] = entry
@@ -1232,15 +1244,16 @@ func TestValidateGeminiThinkingLevelSettings(t *testing.T) {
 	entry.MaxTokens = 2048
 	entry.ThinkingOutputHeadroom = 2048
 	cfg.Models.Registry["analyst_mid"] = entry
-	if errs := Validate(cfg); containsStr(errs, "exceeds gemini-3.1-flash-lite-image output limit") {
-		t.Fatalf("image model response allowance at 4,096 should be accepted, got %v", errs)
+	if errs := Validate(cfg); !containsStr(errs, "does not support JSON structured outputs required by the Gemini analysis adapter") {
+		t.Fatalf("image-only model should be rejected by the JSON-only analysis adapter, got %v", errs)
 	}
 
 	entry.MaxTokens = 4096
 	entry.ThinkingOutputHeadroom = 0
+	entry.ThinkingLevel = ""
 	cfg.Models.Registry["analyst_mid"] = entry
-	if errs := Validate(cfg); !containsStr(errs, "max_tokens plus configured thinking allowance (8192) exceeds gemini-3.1-flash-lite-image output limit (4096)") {
-		t.Fatalf("image model response allowance above 4,096 should be rejected, got %v", errs)
+	if errs := Validate(cfg); !containsStr(errs, "does not support JSON structured outputs required by the Gemini analysis adapter") {
+		t.Fatalf("image-only model should be rejected even when thinking is omitted, got %v", errs)
 	}
 
 	entry.Model = "gemini-robotics-er-2-preview"
