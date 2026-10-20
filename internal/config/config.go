@@ -2489,6 +2489,19 @@ func validateThinkingOptions(path string, entry ModelConfig) []string {
 		if entry.ThinkingBudget != 0 {
 			errs = append(errs, fmt.Sprintf("%s cannot set both thinking_level and thinking_budget", path))
 		}
+		if outputLimit := geminiThinkingOutputLimit(entry.Model); outputLimit > 0 {
+			maxTokens := entry.MaxTokens
+			if maxTokens == 0 {
+				maxTokens = 4096 // GeminiClient default.
+			}
+			headroom := entry.ThinkingOutputHeadroom
+			if headroom == 0 {
+				headroom = 4096 // geminiDefaultThinkingOutputHeadroom.
+			}
+			if maxTokens+headroom > outputLimit {
+				errs = append(errs, fmt.Sprintf("%s max_tokens + thinking_output_headroom (%d) exceeds %s output limit (%d)", path, maxTokens+headroom, entry.Model, outputLimit))
+			}
+		}
 	} else if entry.Provider == "google" && entry.ThinkingBudget != 0 &&
 		(strings.HasPrefix(entry.Model, "gemini-3") || strings.HasPrefix(entry.Model, "gemini-4")) {
 		errs = append(errs, fmt.Sprintf("%s.thinking_budget is not supported for Gemini 3/4 models; use thinking_level", path))
@@ -2511,7 +2524,9 @@ func geminiThinkingLevelSupported(model, level string) bool {
 		return level == "low" || level == "high"
 	case strings.Contains(model, "gemini-3.8-flash"):
 		return level == "low" || level == "medium" || level == "high"
-	case strings.Contains(model, "gemini-3.6-flash"):
+	case strings.Contains(model, "gemini-3.7-flash"):
+		return level == "low" || level == "medium" || level == "high"
+	case strings.Contains(model, "gemini-3.6-flash"), strings.Contains(model, "gemini-3.5-flash"):
 		return all
 	case strings.Contains(model, "gemini-4-argon"):
 		return level == "low" || level == "medium" || level == "high"
@@ -2523,6 +2538,20 @@ func geminiThinkingLevelSupported(model, level string) bool {
 		return all
 	default:
 		return false
+	}
+}
+
+// geminiThinkingOutputLimit returns the synchronous GenerateContent response
+// cap for models using thinkingLevel. Gemini 4 Argon has a 32K non-streaming
+// per-request cap; Gemini 3 models allow 65,536 output tokens.
+func geminiThinkingOutputLimit(model string) int {
+	switch {
+	case strings.Contains(model, "gemini-4-argon"):
+		return 32_768
+	case strings.HasPrefix(model, "gemini-3"):
+		return 65_536
+	default:
+		return 0
 	}
 }
 

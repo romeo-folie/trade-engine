@@ -1164,6 +1164,35 @@ func TestValidateGeminiThinkingLevelSettings(t *testing.T) {
 		t.Fatalf("Gemini 3.6 Flash minimal thinking should be accepted, got %v", errs)
 	}
 
+	entry.Model = "gemini-3.7-flash"
+	entry.ThinkingLevel = "low"
+	cfg.Models.Registry["analyst_mid"] = entry
+	if errs := Validate(cfg); containsStr(errs, "thinking_level low is unsupported") {
+		t.Fatalf("Gemini 3.7 Flash low thinking should be accepted, got %v", errs)
+	}
+
+	entry.Model = "gemini-3.5-flash"
+	entry.ThinkingLevel = "minimal"
+	cfg.Models.Registry["analyst_mid"] = entry
+	if errs := Validate(cfg); containsStr(errs, "thinking_level minimal is unsupported") {
+		t.Fatalf("Gemini 3.5 Flash minimal thinking should be accepted, got %v", errs)
+	}
+
+	entry.Model = "gemini-3.1-pro-preview"
+	entry.ThinkingLevel = "low"
+	entry.MaxTokens = 65_536
+	entry.ThinkingOutputHeadroom = 0
+	cfg.Models.Registry["analyst_mid"] = entry
+	if errs := Validate(cfg); !containsStr(errs, "max_tokens + thinking_output_headroom (69632) exceeds gemini-3.1-pro-preview output limit (65536)") {
+		t.Fatalf("oversized Gemini response allowance should be rejected, got %v", errs)
+	}
+
+	entry.MaxTokens = 61_440
+	cfg.Models.Registry["analyst_mid"] = entry
+	if errs := Validate(cfg); containsStr(errs, "exceeds gemini-3.1-pro-preview output limit") {
+		t.Fatalf("Gemini response allowance at the API limit should be accepted, got %v", errs)
+	}
+
 	entry.ThinkingLevel = ""
 	entry.ThinkingBudget = 512
 	cfg.Models.Registry["analyst_mid"] = entry
