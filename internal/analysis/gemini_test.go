@@ -3,9 +3,11 @@ package analysis
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -152,6 +154,91 @@ func TestGeminiClient_Analyze_429GivesUpWhenDelayExceedsDeadline(t *testing.T) {
 	}
 }
 
+func TestGeminiClient_Analyze_PreservesTransientErrorWhenRetryLimiterTimesOut(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"code":429,"details":[{"retryDelay":"0.01s"}]}}`))
+	}))
+	defer srv.Close()
+
+	// Use a unique limiter key: model limiters are shared process-wide and earlier
+	// tests may have registered the real Gemini model at a much higher RPM. The
+	// first call is immediate; after retryDelay, the six-second slot is still
+	// beyond this deadline, which exceeds retryMargin so the retry reaches wait().
+	cfg := config.ModelConfig{Model: "gemini-2.5-flash-limiter-timeout-test", APIKey: "test-key", RequestsPerMinute: 10}
+	c := NewGeminiClient(cfg)
+	c.baseURL = srv.URL
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, _, err := c.Analyze(ctx, AnalysisRequest{Ticker: "AAPL"})
+	if err == nil {
+		t.Fatal("expected error when retry limiter exceeds the primary deadline")
+	}
+	var apiErr *geminiAPIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("error = %T %v, want typed status 429", err, err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("retry-limiter error = %v, want context.DeadlineExceeded to remain discoverable", err)
+	}
+	if !shouldUseGeminiFallback(err) {
+		t.Fatalf("retry-limiter timeout must preserve fallback eligibility: %v", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("server hit %d times, want 1 (retry blocked by limiter)", got)
+	}
+}
+
+func TestGeminiClient_Analyze_PreservesTransientAndCancellationWhenRetryRequestIsCanceled(t *testing.T) {
+	var calls atomic.Int32
+	secondRequest := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":{"code":429,"details":[{"retryDelay":"0.01s"}]}}`))
+			return
+		}
+		close(secondRequest)
+		time.Sleep(100 * time.Millisecond)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	cfg := config.ModelConfig{Model: "gemini-2.5-flash-retry-cancel-test", APIKey: "test-key", RequestsPerMinute: 600000}
+	c := NewGeminiClient(cfg)
+	c.baseURL = srv.URL
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := c.Analyze(ctx, AnalysisRequest{Ticker: "AAPL"})
+		done <- err
+	}()
+
+	select {
+	case <-secondRequest:
+		cancel()
+	case <-time.After(2 * time.Second):
+		t.Fatal("retry request was not sent")
+	}
+	err := <-done
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("retry error = %v, want context.Canceled to remain discoverable", err)
+	}
+	var apiErr *geminiAPIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("retry error = %v, want initial typed status 429 to remain discoverable", err)
+	}
+	if !shouldUseGeminiFallback(err) {
+		t.Fatalf("retry cancellation must preserve fallback eligibility: %v", err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("server hit %d times, want 2 (initial + canceled retry)", got)
+	}
+}
+
 func TestGeminiClient_Analyze_HTTP4xx(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
@@ -284,6 +371,65 @@ func TestGeminiClient_Analyze_ThinkingUnsetIsNative(t *testing.T) {
 	}
 }
 
+func TestGeminiClient_Analyze_ThinkingLevelAddsOutputHeadroom(t *testing.T) {
+	payload := `{"action":"HOLD","confidence":0.5,"size_pct":0,"stop_loss":0,"take_profit":0,"reasoning":"ok"}`
+	srv, bodyCh := captureGeminiBody(t, geminiRespWithFinish(payload, "STOP", 0))
+	defer srv.Close()
+
+	cfg := config.ModelConfig{
+		Model: "gemini-3.1-pro-preview", APIKey: "test-key", MaxTokens: 2048,
+		ThinkingLevel: "low",
+	}
+	c := NewGeminiClient(cfg)
+	c.baseURL = srv.URL
+
+	if _, _, err := c.Analyze(context.Background(), AnalysisRequest{Ticker: "AAPL"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	gc := genConfigFrom(t, <-bodyCh)
+	if got := gc["maxOutputTokens"].(float64); got != 6144 {
+		t.Errorf("maxOutputTokens = %v, want 6144 (2048 answer + 4096 headroom)", got)
+	}
+	tc, ok := gc["thinkingConfig"].(map[string]any)
+	if !ok {
+		t.Fatalf("thinkingConfig missing: %T", gc["thinkingConfig"])
+	}
+	if got := tc["thinkingLevel"]; got != "LOW" {
+		t.Errorf("thinkingLevel = %v, want LOW", got)
+	}
+	if _, present := tc["thinkingBudget"]; present {
+		t.Errorf("thinkingBudget should not be sent with thinkingLevel: %v", tc)
+	}
+}
+
+func TestGeminiClient_Analyze_RetryExhaustionReturnsTypedFallbackStatus(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"code":429,"details":[{"retryDelay":"0.001s"}]}}`))
+	}))
+	defer srv.Close()
+
+	cfg := config.ModelConfig{Model: "gemini-3.1-pro-preview", APIKey: "test-key", RequestsPerMinute: 600000}
+	c := NewGeminiClient(cfg)
+	c.baseURL = srv.URL
+	_, _, err := c.Analyze(context.Background(), AnalysisRequest{Ticker: "AAPL"})
+	if err == nil {
+		t.Fatal("expected exhausted 429 error")
+	}
+	var apiErr *geminiAPIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("error = %T %v, want typed status 429", err, err)
+	}
+	if !shouldUseGeminiFallback(err) {
+		t.Fatal("exhausted 429 should permit configured fallback")
+	}
+	if calls != 2 {
+		t.Fatalf("server hit %d times, want 2 (initial + built-in retry)", calls)
+	}
+}
+
 // A negative thinking_budget requests dynamic thinking (-1) without adding
 // headroom — the operator owns sizing max_tokens.
 func TestGeminiClient_Analyze_ThinkingDynamic(t *testing.T) {
@@ -329,9 +475,31 @@ func TestGeminiClient_Analyze_MaxTokensTruncation(t *testing.T) {
 	if !strings.Contains(err.Error(), "MAX_TOKENS") {
 		t.Errorf("error = %q, want mention of MAX_TOKENS", err.Error())
 	}
+	if !strings.Contains(err.Error(), "increase max_tokens or thinking_budget") {
+		t.Errorf("error = %q, want guidance for legacy thinking_budget", err.Error())
+	}
 	// Meta is still returned for observability (raw response preserved).
 	if meta.RawResponse == "" {
 		t.Error("expected meta.RawResponse to be populated for diagnostics")
+	}
+}
+
+func TestGeminiTruncationGuidanceMatchesThinkingMode(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  config.ModelConfig
+		want string
+	}{
+		{name: "default", cfg: config.ModelConfig{}, want: "increase max_tokens"},
+		{name: "bounded thinking", cfg: config.ModelConfig{ThinkingBudget: 1024}, want: "increase max_tokens or thinking_budget"},
+		{name: "dynamic thinking", cfg: config.ModelConfig{ThinkingBudget: -1}, want: "increase max_tokens or lower thinking effort"},
+		{name: "thinking level", cfg: config.ModelConfig{ThinkingLevel: "low"}, want: "increase max_tokens or thinking_output_headroom, or lower thinking_level"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := geminiTruncationGuidance(tc.cfg); got != tc.want {
+				t.Errorf("geminiTruncationGuidance() = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 

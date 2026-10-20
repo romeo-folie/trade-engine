@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/analysis/prompts"
@@ -28,6 +30,11 @@ const geminiDefaultRPM = 10
 // attempts). Retries honour the server's retryDelay and are skipped when the
 // delay would not fit the remaining context deadline.
 const geminiMaxRetries = 1
+
+// Gemini 3's maxOutputTokens includes hidden reasoning as well as the answer.
+// Keep a modest default reserve when operators select a thinking level but do
+// not explicitly size the headroom.
+const geminiDefaultThinkingOutputHeadroom = 4096
 
 // GeminiClient implements ModelProvider using the Google Gemini REST API.
 type GeminiClient struct {
@@ -96,7 +103,7 @@ func (c *GeminiClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 		temperature = 0.7
 	}
 
-	// Gemini 2.5 counts thinking tokens inside maxOutputTokens. Left unbounded,
+	// Gemini counts thinking tokens inside maxOutputTokens. Left unbounded,
 	// a verbose thinking phase can consume the whole budget and leave too few
 	// tokens for the JSON answer, truncating it mid-string. When a thinking_budget
 	// is configured we send an explicit thinkingConfig and add headroom so the
@@ -108,6 +115,16 @@ func (c *GeminiClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 	thinkingBudget := c.cfg.ThinkingBudget
 	maxOut := maxTokens
 	switch {
+	case c.cfg.ThinkingLevel != "":
+		// Gemini 3 recommends thinkingLevel over the legacy thinkingBudget.
+		// Keep max_tokens as the answer allowance and reserve explicit headroom
+		// for internal reasoning, which counts against maxOutputTokens too.
+		headroom := c.cfg.ThinkingOutputHeadroom
+		if headroom == 0 {
+			headroom = geminiDefaultThinkingOutputHeadroom
+		}
+		maxOut = maxTokens + headroom
+		genConfig["thinkingConfig"] = map[string]any{"thinkingLevel": strings.ToUpper(c.cfg.ThinkingLevel)}
 	case thinkingBudget > 0:
 		// Bounded thinking + headroom: the answer (maxTokens) can never be
 		// crowded out because thinking has its own dedicated budget on top.
@@ -148,14 +165,15 @@ func (c *GeminiClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 	// retryDelay, but only when that delay fits the remaining context deadline.
 	var respBytes []byte
 	var latencyMs int64
+	var lastTransientErr *geminiAPIError
 	for attempt := 0; ; attempt++ {
 		if err := c.limiter.wait(ctx); err != nil {
-			return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("gemini rate-limit wait: %w", err)
+			return AnalysisResponse{}, ModelCallMeta{}, preserveGeminiRetryError(lastTransientErr, fmt.Errorf("gemini rate-limit wait: %w", err))
 		}
 
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
 		if err != nil {
-			return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("gemini build request: %w", err)
+			return AnalysisResponse{}, ModelCallMeta{}, preserveGeminiRetryError(lastTransientErr, fmt.Errorf("gemini build request: %w", err))
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
 		httpReq.Header.Set("x-goog-api-key", c.apiKey)
@@ -164,12 +182,12 @@ func (c *GeminiClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 		resp, err := c.httpClient.Do(httpReq)
 		latencyMs = time.Since(start).Milliseconds()
 		if err != nil {
-			return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("gemini request: %w", err)
+			return AnalysisResponse{}, ModelCallMeta{}, preserveGeminiRetryError(lastTransientErr, fmt.Errorf("gemini request: %w", err))
 		}
 		respBytes, err = io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if err != nil {
-			return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("gemini read response: %w", err)
+			return AnalysisResponse{}, ModelCallMeta{}, preserveGeminiRetryError(lastTransientErr, fmt.Errorf("gemini read response: %w", err))
 		}
 
 		if resp.StatusCode < 400 {
@@ -179,7 +197,7 @@ func (c *GeminiClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 		if len(snippet) > 512 {
 			snippet = snippet[:512]
 		}
-		apiErr := fmt.Errorf("gemini API %d: %s", resp.StatusCode, bytes.TrimSpace(snippet))
+		apiErr := &geminiAPIError{StatusCode: resp.StatusCode, Body: string(bytes.TrimSpace(snippet))}
 
 		// Retry only transient rate/availability errors, within budget, and only
 		// if the server's requested delay fits the caller's remaining deadline.
@@ -187,8 +205,12 @@ func (c *GeminiClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 		if !retryable || attempt >= geminiMaxRetries {
 			return AnalysisResponse{}, ModelCallMeta{}, apiErr
 		}
+		lastTransientErr = apiErr
 		delay := parseRetryDelay(respBytes)
 		if !sleepWithinDeadline(ctx, delay) {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return AnalysisResponse{}, ModelCallMeta{}, preserveGeminiRetryError(apiErr, ctxErr)
+			}
 			return AnalysisResponse{}, ModelCallMeta{}, apiErr
 		}
 		if req.Ticker != "__extraction__" {
@@ -248,8 +270,9 @@ func (c *GeminiClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 			)
 		}
 		return AnalysisResponse{}, meta, fmt.Errorf(
-			"gemini truncated (finishReason=MAX_TOKENS): thinking %d + answer %d hit maxOutputTokens %d; raise max_tokens or lower thinking_budget",
-			apiResp.UsageMetadata.ThoughtsTokenCount, apiResp.UsageMetadata.CandidatesTokenCount, maxOut)
+			"gemini truncated (finishReason=MAX_TOKENS): thinking %d + answer %d hit maxOutputTokens %d; %s",
+			apiResp.UsageMetadata.ThoughtsTokenCount, apiResp.UsageMetadata.CandidatesTokenCount, maxOut,
+			geminiTruncationGuidance(c.cfg))
 	}
 	analysis, err := extractAnalysisJSON(rawText)
 	if err != nil {
@@ -266,4 +289,44 @@ func (c *GeminiClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 		return AnalysisResponse{}, meta, fmt.Errorf("gemini extract JSON: %w", err)
 	}
 	return analysis, meta, nil
+}
+
+// geminiAPIError preserves the HTTP status after the client's built-in retry
+// budget is exhausted, so registry fallbacks can distinguish transient
+// availability/rate-limit failures from billing, request, and response errors.
+type geminiAPIError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *geminiAPIError) Error() string {
+	return fmt.Sprintf("gemini API %d: %s", e.StatusCode, e.Body)
+}
+
+func preserveGeminiRetryError(transientErr *geminiAPIError, retryErr error) error {
+	if transientErr == nil {
+		return retryErr
+	}
+	return fmt.Errorf("%w (retry failed: %w)", transientErr, retryErr)
+}
+
+func shouldUseGeminiFallback(err error) bool {
+	var apiErr *geminiAPIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	return apiErr.StatusCode == http.StatusTooManyRequests || apiErr.StatusCode == http.StatusServiceUnavailable
+}
+
+func geminiTruncationGuidance(cfg config.ModelConfig) string {
+	switch {
+	case cfg.ThinkingLevel != "":
+		return "increase max_tokens or thinking_output_headroom, or lower thinking_level"
+	case cfg.ThinkingBudget > 0:
+		return "increase max_tokens or thinking_budget"
+	case cfg.ThinkingBudget < 0:
+		return "increase max_tokens or lower thinking effort"
+	default:
+		return "increase max_tokens"
+	}
 }

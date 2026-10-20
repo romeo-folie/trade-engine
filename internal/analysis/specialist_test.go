@@ -2,6 +2,7 @@ package analysis
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -47,6 +48,41 @@ func (f *fakeRoleProvider) Analyze(_ context.Context, req AnalysisRequest) (Anal
 		nil
 }
 
+type fallbackTestProvider struct {
+	provider        string
+	model           string
+	err             error
+	calls           int
+	waitFor         time.Duration
+	remainingAtCall time.Duration
+	onAnalyze       func()
+}
+
+func (p *fallbackTestProvider) ProviderName() string { return p.provider }
+func (p *fallbackTestProvider) ModelName() string    { return p.model }
+func (p *fallbackTestProvider) IsAvailable() bool    { return true }
+func (p *fallbackTestProvider) Analyze(ctx context.Context, _ AnalysisRequest) (AnalysisResponse, ModelCallMeta, error) {
+	p.calls++
+	if deadline, ok := ctx.Deadline(); ok {
+		p.remainingAtCall = time.Until(deadline)
+	}
+	if p.waitFor > 0 {
+		select {
+		case <-time.After(p.waitFor):
+		case <-ctx.Done():
+			return AnalysisResponse{}, ModelCallMeta{Provider: p.provider, Model: p.model}, ctx.Err()
+		}
+	}
+	if p.onAnalyze != nil {
+		p.onAnalyze()
+	}
+	if p.err != nil {
+		return AnalysisResponse{}, ModelCallMeta{Provider: p.provider, Model: p.model}, p.err
+	}
+	return AnalysisResponse{Action: ActionHold, Reasoning: "fallback"},
+		ModelCallMeta{Provider: p.provider, Model: p.model}, nil
+}
+
 // withSpecialistBuildProvider swaps the package-level provider builder for the
 // duration of a test. Restores the original on Cleanup.
 func withSpecialistBuildProvider(t *testing.T, fn func(config.ModelConfig) ModelProvider) {
@@ -54,6 +90,113 @@ func withSpecialistBuildProvider(t *testing.T, fn func(config.ModelConfig) Model
 	prev := specialistBuildProvider
 	specialistBuildProvider = fn
 	t.Cleanup(func() { specialistBuildProvider = prev })
+}
+
+func TestAnalyzeSpecialistRoleUsesConfiguredFallbackForTransientGeminiError(t *testing.T) {
+	primary := &fallbackTestProvider{
+		provider: "google", model: "gemini-3.1-pro-preview",
+		err: &geminiAPIError{StatusCode: 503, Body: "temporarily unavailable"}, waitFor: 20 * time.Millisecond,
+	}
+	fallback := &fallbackTestProvider{provider: "google", model: "gemini-2.5-flash"}
+	withSpecialistBuildProvider(t, func(c config.ModelConfig) ModelProvider {
+		if c.Model == fallback.model {
+			return fallback
+		}
+		t.Fatalf("unexpected fallback model config: %+v", c)
+		return nil
+	})
+
+	used, resp, meta, err := analyzeSpecialistRole(context.Background(), primary,
+		&config.ModelConfig{Provider: "google", Model: fallback.model, APIKey: "test"}, 40*time.Millisecond,
+		AnalysisRequest{Ticker: "AAPL"})
+	if err != nil {
+		t.Fatalf("fallback call failed: %v", err)
+	}
+	if primary.calls != 1 || fallback.calls != 1 {
+		t.Fatalf("calls primary/fallback = %d/%d, want 1/1", primary.calls, fallback.calls)
+	}
+	if used != fallback || meta.Model != fallback.model || resp.Reasoning != "fallback" {
+		t.Fatalf("fallback result provider=%v meta=%+v response=%+v", used, meta, resp)
+	}
+	if fallback.remainingAtCall < 29*time.Second {
+		t.Fatalf("fallback received only %v of its 30s provider-default timeout", fallback.remainingAtCall)
+	}
+}
+
+func TestAnalyzeSpecialistRoleDoesNotFallbackForNonTransientError(t *testing.T) {
+	primary := &fallbackTestProvider{
+		provider: "google", model: "gemini-3.1-pro-preview",
+		err: errors.New("gemini truncated (finishReason=MAX_TOKENS)"),
+	}
+	fallbackBuilds := 0
+	withSpecialistBuildProvider(t, func(config.ModelConfig) ModelProvider {
+		fallbackBuilds++
+		return &fallbackTestProvider{provider: "google", model: "gemini-2.5-flash"}
+	})
+
+	used, _, _, err := analyzeSpecialistRole(context.Background(), primary,
+		&config.ModelConfig{Provider: "google", Model: "gemini-2.5-flash", APIKey: "test"}, time.Second,
+		AnalysisRequest{Ticker: "AAPL"})
+	if err == nil {
+		t.Fatal("expected primary error")
+	}
+	if used != primary || fallbackBuilds != 0 {
+		t.Fatalf("used=%v fallback builds=%d, want primary and no fallback", used, fallbackBuilds)
+	}
+}
+
+func TestAnalyzeSpecialistRolePreservesFallbackTimeout(t *testing.T) {
+	primary := &fallbackTestProvider{
+		provider: "google", model: "gemini-3.1-pro-preview",
+		err: &geminiAPIError{StatusCode: 503, Body: "temporarily unavailable"},
+	}
+	fallback := &fallbackTestProvider{
+		provider: "google", model: "gemini-2.5-flash",
+		err: context.DeadlineExceeded,
+	}
+	withSpecialistBuildProvider(t, func(c config.ModelConfig) ModelProvider {
+		if c.Model == fallback.model {
+			return fallback
+		}
+		t.Fatalf("unexpected fallback model config: %+v", c)
+		return nil
+	})
+
+	_, _, _, err := analyzeSpecialistRole(context.Background(), primary,
+		&config.ModelConfig{Provider: "google", Model: fallback.model, APIKey: "test"}, time.Second,
+		AnalysisRequest{Ticker: "AAPL"})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("fallback error = %v, want context.DeadlineExceeded to remain discoverable", err)
+	}
+	var apiErr *geminiAPIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != 503 {
+		t.Fatalf("primary transient error = %v, want original typed 503 to remain discoverable", err)
+	}
+}
+
+func TestAnalyzeSpecialistRoleDoesNotFallbackAfterParentCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	primary := &fallbackTestProvider{
+		provider: "google", model: "gemini-3.1-pro-preview",
+		err:       &geminiAPIError{StatusCode: 429, Body: "rate limited"},
+		onAnalyze: cancel,
+	}
+	fallbackBuilds := 0
+	withSpecialistBuildProvider(t, func(config.ModelConfig) ModelProvider {
+		fallbackBuilds++
+		return &fallbackTestProvider{provider: "google", model: "gemini-2.5-flash"}
+	})
+
+	used, _, _, err := analyzeSpecialistRole(ctx, primary,
+		&config.ModelConfig{Provider: "google", Model: "gemini-2.5-flash", APIKey: "test"}, time.Second,
+		AnalysisRequest{Ticker: "AAPL"})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want overall context cancellation", err)
+	}
+	if used != primary || fallbackBuilds != 0 {
+		t.Fatalf("used=%v fallback builds=%d, want primary and no fallback", used, fallbackBuilds)
+	}
 }
 
 // TestAnalyzeSpecialist_EmitsAnalysisStarted is the regression guard for the

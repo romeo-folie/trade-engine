@@ -1105,6 +1105,206 @@ func TestResolveFallbackAbsent(t *testing.T) {
 	}
 }
 
+func TestValidateGeminiThinkingLevelSettings(t *testing.T) {
+	cfg := Defaults()
+	entry := cfg.Models.Registry["analyst_mid"]
+	entry.ThinkingBudget = 0
+	entry.ThinkingLevel = "low"
+	entry.ThinkingOutputHeadroom = 4096
+	cfg.Models.Registry["analyst_mid"] = entry
+	if errs := Validate(cfg); containsStr(errs, "thinking_level") || containsStr(errs, "thinking_output_headroom") {
+		t.Fatalf("valid Gemini thinking-level settings rejected: %v", errs)
+	}
+
+	entry.ThinkingLevel = "extreme"
+	entry.ThinkingBudget = 1024
+	cfg.Models.Registry["analyst_mid"] = entry
+	errs := Validate(cfg)
+	for _, want := range []string{
+		"thinking_level must be minimal, low, medium, or high",
+		"cannot set both thinking_level and thinking_budget",
+	} {
+		if !containsStr(errs, want) {
+			t.Errorf("missing validation error %q in %v", want, errs)
+		}
+	}
+
+	entry.ThinkingLevel = "low"
+	entry.ThinkingBudget = 0
+	entry.Model = "gemini-2.5-flash"
+	cfg.Models.Registry["analyst_mid"] = entry
+	if errs := Validate(cfg); !containsStr(errs, "thinking_level requires a supported Gemini 3/4 or Robotics ER 2 model") {
+		t.Fatalf("Gemini 2.5 thinking_level should be rejected, got %v", errs)
+	}
+
+	entry.Model = "gemini-3.1-pro-preview"
+	entry.ThinkingLevel = "minimal"
+	cfg.Models.Registry["analyst_mid"] = entry
+	if errs := Validate(cfg); !containsStr(errs, "thinking_level minimal is unsupported for model gemini-3.1-pro-preview") {
+		t.Fatalf("Gemini Pro minimal thinking should be rejected, got %v", errs)
+	}
+
+	entry.Model = "gemini-3-pro-preview"
+	entry.ThinkingLevel = "medium"
+	cfg.Models.Registry["analyst_mid"] = entry
+	if errs := Validate(cfg); !containsStr(errs, "thinking_level medium is unsupported for model gemini-3-pro-preview") {
+		t.Fatalf("Gemini 3 Pro medium thinking should be rejected, got %v", errs)
+	}
+
+	entry.Model = "gemini-3.8-flash"
+	entry.ThinkingLevel = "minimal"
+	cfg.Models.Registry["analyst_mid"] = entry
+	if errs := Validate(cfg); !containsStr(errs, "thinking_level minimal is unsupported for model gemini-3.8-flash") {
+		t.Fatalf("Gemini 3.8 Flash minimal thinking should be rejected, got %v", errs)
+	}
+
+	entry.Model = "gemini-3.6-flash"
+	cfg.Models.Registry["analyst_mid"] = entry
+	if errs := Validate(cfg); containsStr(errs, "thinking_level minimal is unsupported") {
+		t.Fatalf("Gemini 3.6 Flash minimal thinking should be accepted, got %v", errs)
+	}
+
+	entry.Model = "gemini-3.7-flash"
+	entry.ThinkingLevel = "low"
+	cfg.Models.Registry["analyst_mid"] = entry
+	if errs := Validate(cfg); containsStr(errs, "thinking_level low is unsupported") {
+		t.Fatalf("Gemini 3.7 Flash low thinking should be accepted, got %v", errs)
+	}
+
+	entry.Model = "gemini-3.5-flash"
+	entry.ThinkingLevel = "minimal"
+	cfg.Models.Registry["analyst_mid"] = entry
+	if errs := Validate(cfg); containsStr(errs, "thinking_level minimal is unsupported") {
+		t.Fatalf("Gemini 3.5 Flash minimal thinking should be accepted, got %v", errs)
+	}
+
+	entry.Model = "gemini-3.1-pro-preview"
+	entry.ThinkingLevel = "low"
+	entry.MaxTokens = 65_536
+	entry.ThinkingOutputHeadroom = 0
+	cfg.Models.Registry["analyst_mid"] = entry
+	if errs := Validate(cfg); !containsStr(errs, "max_tokens plus configured thinking allowance (69632) exceeds gemini-3.1-pro-preview output limit (65536)") {
+		t.Fatalf("oversized Gemini response allowance should be rejected, got %v", errs)
+	}
+
+	entry.MaxTokens = 61_440
+	cfg.Models.Registry["analyst_mid"] = entry
+	if errs := Validate(cfg); containsStr(errs, "exceeds gemini-3.1-pro-preview output limit") {
+		t.Fatalf("Gemini response allowance at the API limit should be accepted, got %v", errs)
+	}
+
+	entry.ThinkingLevel = ""
+	entry.ThinkingBudget = 512
+	cfg.Models.Registry["analyst_mid"] = entry
+	if errs := Validate(cfg); containsStr(errs, "thinking_budget is not supported") {
+		t.Fatalf("legacy Gemini 3 thinking_budget should remain accepted, got %v", errs)
+	}
+
+	entry.Model = "gemini-4-argon"
+	entry.ThinkingBudget = 0
+	entry.MaxTokens = 2048
+	cfg.Models.Registry["analyst_mid"] = entry
+	if errs := Validate(cfg); containsStr(errs, "thinking_level is required for Gemini 4 models") {
+		t.Fatalf("Gemini 4 should be allowed to use its default thinking level, got %v", errs)
+	}
+	entry.ThinkingLevel = ""
+	entry.MaxTokens = 32_768
+	cfg.Models.Registry["analyst_mid"] = entry
+	if errs := Validate(cfg); containsStr(errs, "exceeds gemini-4-argon output limit") {
+		t.Fatalf("Gemini 4 default thinking should accept the exact non-streaming output cap, got %v", errs)
+	}
+	entry.MaxTokens = 32_769
+	cfg.Models.Registry["analyst_mid"] = entry
+	if errs := Validate(cfg); !containsStr(errs, "max_tokens plus configured thinking allowance (32769) exceeds gemini-4-argon output limit (32768)") {
+		t.Fatalf("Gemini 4 default thinking should reject a max_tokens value above the non-streaming cap, got %v", errs)
+	}
+	entry.MaxTokens = 2048
+
+	entry.ThinkingBudget = 512
+	cfg.Models.Registry["analyst_mid"] = entry
+	if errs := Validate(cfg); containsStr(errs, "thinking_budget is not supported") {
+		t.Fatalf("legacy Gemini 4 thinking_budget should remain accepted, got %v", errs)
+	}
+	entry.ThinkingBudget = 0
+	entry.ThinkingLevel = "medium"
+	entry.MaxTokens = 28_672
+	entry.ThinkingOutputHeadroom = 0
+	cfg.Models.Registry["analyst_mid"] = entry
+	if errs := Validate(cfg); containsStr(errs, "exceeds gemini-4-argon output limit") {
+		t.Fatalf("Gemini 4 non-streaming response allowance at 32,768 should be accepted, got %v", errs)
+	}
+	entry.MaxTokens = 28_673
+	cfg.Models.Registry["analyst_mid"] = entry
+	if errs := Validate(cfg); !containsStr(errs, "max_tokens plus configured thinking allowance (32769) exceeds gemini-4-argon output limit (32768)") {
+		t.Fatalf("Gemini 4 response allowance above 32,768 should be rejected, got %v", errs)
+	}
+
+	entry.Model = "gemini-3.1-flash-lite-image"
+	entry.ThinkingLevel = "high"
+	entry.MaxTokens = 2048
+	entry.ThinkingOutputHeadroom = 2048
+	cfg.Models.Registry["analyst_mid"] = entry
+	if errs := Validate(cfg); !containsStr(errs, "does not support JSON structured outputs required by the Gemini analysis adapter") {
+		t.Fatalf("image-only model should be rejected by the JSON-only analysis adapter, got %v", errs)
+	}
+
+	entry.MaxTokens = 4096
+	entry.ThinkingOutputHeadroom = 0
+	entry.ThinkingLevel = ""
+	cfg.Models.Registry["analyst_mid"] = entry
+	if errs := Validate(cfg); !containsStr(errs, "does not support JSON structured outputs required by the Gemini analysis adapter") {
+		t.Fatalf("image-only model should be rejected even when thinking is omitted, got %v", errs)
+	}
+
+	entry.Model = "gemini-robotics-er-2-preview"
+	entry.ThinkingLevel = "minimal"
+	entry.MaxTokens = 2048
+	entry.ThinkingOutputHeadroom = 0
+	cfg.Models.Registry["analyst_mid"] = entry
+	if errs := Validate(cfg); containsStr(errs, "thinking_level") {
+		t.Fatalf("Robotics ER 2 Preview should accept minimal thinking, got %v", errs)
+	}
+
+	entry.Model = "gemini-robotics-er-2-streaming-preview"
+	cfg.Models.Registry["analyst_mid"] = entry
+	if errs := Validate(cfg); !containsStr(errs, "gemini-robotics-er-2-streaming-preview requires the Live API and does not support JSON structured outputs required by the Gemini analysis adapter") {
+		t.Fatalf("Robotics ER streaming should be rejected by the GenerateContent adapter even with thinking configured, got %v", errs)
+	}
+
+	entry.ThinkingLevel = ""
+	cfg.Models.Registry["analyst_mid"] = entry
+	if errs := Validate(cfg); !containsStr(errs, "gemini-robotics-er-2-streaming-preview requires the Live API and does not support JSON structured outputs required by the Gemini analysis adapter") {
+		t.Fatalf("Robotics ER streaming should be rejected by the GenerateContent adapter without thinking configured, got %v", errs)
+	}
+
+	entry.Model = "gemini-3-pro-preview"
+	entry.ThinkingLevel = ""
+	entry.ThinkingBudget = 0
+	cfg.Models.Registry["analyst_mid"] = entry
+	if errs := Validate(cfg); !containsStr(errs, "gemini-3-pro-preview is shut down") {
+		t.Fatalf("shut-down Gemini Pro preview should be rejected, got %v", errs)
+	}
+}
+
+func TestValidateGeminiThinkingLevelSettingsInLegacyModels(t *testing.T) {
+	cfg := Defaults()
+	cfg.Models.Registry = nil
+	cfg.Models.Analysts = []ModelConfig{{
+		Provider: "google", Model: "gemini-3.1-pro-preview",
+		ThinkingLevel: "extreme", ThinkingBudget: 512, ThinkingOutputHeadroom: -1,
+	}}
+	errs := Validate(cfg)
+	for _, want := range []string{
+		"models.analysts[0].thinking_level must be minimal, low, medium, or high",
+		"models.analysts[0] cannot set both thinking_level and thinking_budget",
+		"models.analysts[0].thinking_output_headroom must be >= 0",
+	} {
+		if !containsStr(errs, want) {
+			t.Errorf("missing validation error %q in %v", want, errs)
+		}
+	}
+}
+
 func TestAnalystConfigsFromRegistry(t *testing.T) {
 	cfg := Defaults()
 	analysts := cfg.Models.AnalystConfigs()

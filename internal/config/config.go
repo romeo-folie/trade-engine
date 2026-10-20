@@ -411,17 +411,24 @@ type ModelConfig struct {
 	MaxTokens   int     `yaml:"max_tokens"`
 	Temperature float64 `yaml:"temperature"`
 	TimeoutSec  int     `yaml:"timeout_sec"`
-	// ThinkingBudget controls Gemini 2.5 "thinking" tokens. Gemini counts
+	// ThinkingBudget controls Gemini "thinking" tokens. Gemini counts
 	// thinking tokens inside maxOutputTokens, so unbounded thinking can starve
 	// the visible answer and truncate it mid-string. Semantics (google provider):
 	//   > 0  → bounded thinking; client sends maxOutputTokens = max_tokens + budget
 	//   < 0  → dynamic thinking (-1); operator must size max_tokens generously
 	//   == 0 → unset; no thinkingConfig sent, so the model keeps its native
-	//          default. (We can't force a budget of 0 because some models —
-	//          gemini-2.5-pro, gemini-3 — reject a disabled thinking budget,
-	//          and an int field can't distinguish explicit 0 from omitted.)
+	//          default. Gemini 3/4 accept this field for compatibility, though
+	//          Google recommends thinking_level for predictable reasoning effort.
 	// Ignored by non-Gemini providers.
 	ThinkingBudget int `yaml:"thinking_budget"`
+	// ThinkingLevel controls reasoning depth for Gemini 3/4 and Robotics ER 2.
+	// Values are model-dependent (minimal, low, medium, high); leave empty to
+	// use model defaults (Gemini 4 Argon defaults to medium).
+	ThinkingLevel string `yaml:"thinking_level"`
+	// ThinkingOutputHeadroom adds room for hidden reasoning tokens to
+	// max_tokens when thinking_level is set. Zero defaults to 4096. max_tokens
+	// remains the visible answer allowance; Gemini's API cap includes both kinds.
+	ThinkingOutputHeadroom int `yaml:"thinking_output_headroom"`
 	// ReasoningEffort controls how many hidden reasoning tokens OpenAI's gpt-5
 	// and o-series models spend before emitting the answer. These reasoning
 	// tokens count inside max_completion_tokens, so unbounded reasoning on a
@@ -2463,6 +2470,110 @@ func validUniverseHistoricalFeed(feed string) bool {
 
 const delayedSIPSnapshotDelayMinutes = 16
 
+func validateThinkingOptions(path string, entry ModelConfig) []string {
+	var errs []string
+	if entry.Provider == "google" && entry.Model == "gemini-3-pro-preview" {
+		errs = append(errs, fmt.Sprintf("%s.model gemini-3-pro-preview is shut down; use gemini-3.1-pro-preview", path))
+	}
+	if entry.Provider == "google" && entry.Model == "gemini-3.1-flash-lite-image" {
+		errs = append(errs, fmt.Sprintf("%s.model gemini-3.1-flash-lite-image does not support JSON structured outputs required by the Gemini analysis adapter", path))
+	}
+	if entry.Provider == "google" && entry.Model == "gemini-robotics-er-2-streaming-preview" {
+		errs = append(errs, fmt.Sprintf("%s.model gemini-robotics-er-2-streaming-preview requires the Live API and does not support JSON structured outputs required by the Gemini analysis adapter", path))
+	}
+	if entry.ThinkingLevel != "" {
+		switch entry.ThinkingLevel {
+		case "minimal", "low", "medium", "high":
+		default:
+			errs = append(errs, fmt.Sprintf("%s.thinking_level must be minimal, low, medium, or high", path))
+		}
+		if entry.Provider != "google" {
+			errs = append(errs, fmt.Sprintf("%s.thinking_level is only supported for the google provider", path))
+		} else if !isGeminiThinkingLevelModel(entry.Model) {
+			errs = append(errs, fmt.Sprintf("%s.thinking_level requires a supported Gemini 3/4 or Robotics ER 2 model; use thinking_budget for Gemini 2.5", path))
+		} else if !geminiThinkingLevelSupported(entry.Model, entry.ThinkingLevel) {
+			errs = append(errs, fmt.Sprintf("%s.thinking_level %s is unsupported for model %s", path, entry.ThinkingLevel, entry.Model))
+		}
+		if entry.ThinkingBudget != 0 {
+			errs = append(errs, fmt.Sprintf("%s cannot set both thinking_level and thinking_budget", path))
+		}
+	}
+	if outputLimit := geminiOutputLimit(entry.Model); entry.Provider == "google" && outputLimit > 0 {
+		maxTokens := entry.MaxTokens
+		if maxTokens == 0 {
+			maxTokens = 4096 // GeminiClient default.
+		}
+		extra := 0
+		if entry.ThinkingLevel != "" {
+			extra = entry.ThinkingOutputHeadroom
+			if extra == 0 {
+				extra = 4096 // geminiDefaultThinkingOutputHeadroom.
+			}
+		} else if entry.ThinkingBudget > 0 {
+			extra = entry.ThinkingBudget
+		}
+		if maxTokens+extra > outputLimit {
+			errs = append(errs, fmt.Sprintf("%s max_tokens plus configured thinking allowance (%d) exceeds %s output limit (%d)", path, maxTokens+extra, entry.Model, outputLimit))
+		}
+	}
+	if entry.ThinkingOutputHeadroom < 0 {
+		errs = append(errs, fmt.Sprintf("%s.thinking_output_headroom must be >= 0", path))
+	}
+	return errs
+}
+
+func isGeminiThinkingLevelModel(model string) bool {
+	return strings.HasPrefix(model, "gemini-3") || strings.HasPrefix(model, "gemini-4") ||
+		model == "gemini-robotics-er-2-preview"
+}
+
+// geminiThinkingLevelSupported mirrors Google's model-specific Gemini 3/4
+// thinking-level matrix. Unknown models fail validation so a newly configured
+// model cannot silently receive a level the API rejects.
+func geminiThinkingLevelSupported(model, level string) bool {
+	all := level == "minimal" || level == "low" || level == "medium" || level == "high"
+	switch {
+	case strings.Contains(model, "gemini-3.1-pro"):
+		return level == "low" || level == "medium" || level == "high"
+	case strings.Contains(model, "gemini-3.8-flash"):
+		return level == "low" || level == "medium" || level == "high"
+	case strings.Contains(model, "gemini-3.7-flash"):
+		return level == "low" || level == "medium" || level == "high"
+	case strings.Contains(model, "gemini-3.6-flash"), strings.Contains(model, "gemini-3.5-flash"):
+		return all
+	case strings.Contains(model, "gemini-4-argon"):
+		return level == "low" || level == "medium" || level == "high"
+	case strings.Contains(model, "gemini-3.1-flash-lite-image"):
+		return level == "minimal" || level == "high"
+	case strings.Contains(model, "gemini-3.5-flash-lite"), strings.Contains(model, "gemini-3.1-flash-lite"):
+		return all
+	case strings.Contains(model, "gemini-3-flash"), model == "gemini-robotics-er-2-preview":
+		return all
+	default:
+		return false
+	}
+}
+
+// geminiOutputLimit returns the synchronous GenerateContent response cap for
+// the model families whose output limits are validated here. Gemini 3 and
+// Robotics ER 2 allow 65,536 output tokens; this adapter uses a single
+// non-streaming REST request, so Gemini 4 Argon is capped at its 32,768-token
+// non-streaming hop limit.
+func geminiOutputLimit(model string) int {
+	switch {
+	case strings.Contains(model, "gemini-4-argon"):
+		return 32_768
+	case strings.Contains(model, "gemini-3.1-flash-lite-image"):
+		return 4_096
+	case model == "gemini-robotics-er-2-preview":
+		return 65_536
+	case strings.HasPrefix(model, "gemini-3"):
+		return 65_536
+	default:
+		return 0
+	}
+}
+
 func Validate(cfg *Config) []string {
 	var errs []string
 	if cfg.Engine.MaxWatchlist <= 0 {
@@ -3192,6 +3303,7 @@ func Validate(cfg *Config) []string {
 			if entry.Model == "" {
 				errs = append(errs, fmt.Sprintf("models.registry.%s: model is required", key))
 			}
+			errs = append(errs, validateThinkingOptions("models.registry."+key, entry.ModelConfig)...)
 			// Validate fallback key exists if specified.
 			if entry.Fallback != "" {
 				if _, ok := cfg.Models.Registry[entry.Fallback]; !ok {
@@ -3241,9 +3353,19 @@ func Validate(cfg *Config) []string {
 			errs = append(errs, fmt.Sprintf("models.analysts has %d entries; ensemble works best with 3+ analysts", len(cfg.Models.Analysts)))
 		}
 		for i, a := range cfg.Models.Analysts {
+			errs = append(errs, validateThinkingOptions(fmt.Sprintf("models.analysts[%d]", i), a)...)
 			if a.APIKeyEnv != "" && os.Getenv(a.APIKeyEnv) == "" {
 				errs = append(errs, fmt.Sprintf("env var %s (models.analysts[%d].api_key_env) is not set", a.APIKeyEnv, i))
 			}
+		}
+		if len(cfg.Models.Analysts) == 0 && cfg.Models.Primary.Provider != "" {
+			errs = append(errs, validateThinkingOptions("models.primary", cfg.Models.Primary)...)
+			for i, secondary := range cfg.Models.Secondary {
+				errs = append(errs, validateThinkingOptions(fmt.Sprintf("models.secondary[%d]", i), secondary)...)
+			}
+		}
+		if cfg.Models.Arbiter.Provider != "" {
+			errs = append(errs, validateThinkingOptions("models.arbiter", cfg.Models.Arbiter)...)
 		}
 		// Legacy single-model validation.
 		if len(cfg.Models.Analysts) == 0 && cfg.Models.Primary.APIKeyEnv != "" && os.Getenv(cfg.Models.Primary.APIKeyEnv) == "" {
