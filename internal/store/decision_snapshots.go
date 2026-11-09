@@ -196,13 +196,20 @@ func CompleteDecisionSnapshot(ctx context.Context, id string, c DecisionCompleti
 // process that crashed or failed to write its completion. Stage calls are
 // never written for such rows (completion is one transaction), so the record
 // is explicitly incomplete rather than reconstructed.
-func AbandonStaleDecisionSnapshots(ctx context.Context, cutoff time.Time) (int64, error) {
+//
+// exclude lists snapshots the caller knows are still in flight; they are
+// never abandoned however old they are.
+func AbandonStaleDecisionSnapshots(ctx context.Context, cutoff time.Time, exclude []string) (int64, error) {
+	if exclude == nil {
+		exclude = []string{}
+	}
 	tag, err := GetDB().Exec(ctx, `
 		UPDATE decision_snapshots
 		SET outcome = 'abandoned',
-		    outcome_reason = 'pending at startup recovery; completion was never recorded',
+		    outcome_reason = 'pending past the recovery threshold; completion was never recorded',
 		    completed_at = now()
-		WHERE outcome = 'pending' AND created_at < $1`, cutoff)
+		WHERE outcome = 'pending' AND created_at < $1
+		  AND NOT (id = ANY($2::uuid[]))`, cutoff, exclude)
 	if err != nil {
 		return 0, err
 	}

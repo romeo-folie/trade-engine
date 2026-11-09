@@ -11,15 +11,50 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/analysis"
 	"github.com/romeo-folie/trade-engine/internal/analysis/prompts"
 	"github.com/romeo-folie/trade-engine/internal/analysis/snapshot"
+	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/logger"
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
-// staleDecisionSnapshotAge bounds how long a decision snapshot may stay
-// pending before startup recovery settles it as abandoned. It comfortably
-// exceeds any analysis deadline (per-model timeouts plus fallback and arbiter
-// hops), so a concurrently running process is never mistaken for a crash.
-const staleDecisionSnapshotAge = 30 * time.Minute
+// minStaleDecisionSnapshotAge is the floor for how long a decision snapshot
+// may stay pending before recovery settles it as abandoned. The effective
+// threshold also scales with configured model timeouts
+// (staleDecisionSnapshotAge), and this process's in-flight snapshots are
+// never reaped regardless of age.
+const minStaleDecisionSnapshotAge = 30 * time.Minute
+
+// defaultModelTimeout mirrors the analyzer's fallback when timeout_sec is 0.
+const defaultModelTimeout = 30 * time.Second
+
+// staleDecisionSnapshotAge returns an abandonment threshold that a live
+// analysis in another process cannot reach: twice the sum of every configured
+// model timeout (an upper bound on any sequential analyst, specialist,
+// fallback, and arbiter chain), and never below the floor.
+func staleDecisionSnapshotAge(cfg *config.Config) time.Duration {
+	if cfg == nil {
+		return minStaleDecisionSnapshotAge
+	}
+	timeout := func(m config.ModelConfig) time.Duration {
+		if m.TimeoutSec > 0 {
+			return time.Duration(m.TimeoutSec) * time.Second
+		}
+		return defaultModelTimeout
+	}
+	var total time.Duration
+	for _, m := range cfg.Models.AnalystConfigs() {
+		total += timeout(m)
+	}
+	if arb := cfg.Models.ArbiterConfig(); arb.Provider != "" {
+		total += timeout(arb)
+	}
+	for _, entry := range cfg.Models.Registry {
+		total += timeout(entry.ModelConfig)
+	}
+	if age := 2 * total; age > minStaleDecisionSnapshotAge {
+		return age
+	}
+	return minStaleDecisionSnapshotAge
+}
 
 // decisionSnapshotReapInterval is how often stale pending snapshots are
 // settled while the engine runs, so a crash-and-quick-restart (within
@@ -124,7 +159,25 @@ func (e *Engine) beginDecisionSnapshot(
 		logger.Warn("decision snapshot: begin failed", "ticker", req.Ticker, "err", err)
 		return ""
 	}
+	e.inflightSnapshotsMu.Lock()
+	if e.inflightSnapshots == nil {
+		e.inflightSnapshots = make(map[string]struct{})
+	}
+	e.inflightSnapshots[id] = struct{}{}
+	e.inflightSnapshotsMu.Unlock()
 	return id
+}
+
+// inflightSnapshotIDs lists this process's snapshots whose analysis is still
+// running; recovery never abandons them, however long they take.
+func (e *Engine) inflightSnapshotIDs() []string {
+	e.inflightSnapshotsMu.Lock()
+	defer e.inflightSnapshotsMu.Unlock()
+	ids := make([]string, 0, len(e.inflightSnapshots))
+	for id := range e.inflightSnapshots {
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 // recordShortCircuitSnapshot records a decision attempt that ended before any
@@ -160,6 +213,13 @@ func (e *Engine) completeDecisionSnapshot(
 	if id == "" {
 		return
 	}
+	// The analysis is over whether or not this write succeeds; a row left
+	// pending by a failed write becomes eligible for the reaper.
+	defer func() {
+		e.inflightSnapshotsMu.Lock()
+		delete(e.inflightSnapshots, id)
+		e.inflightSnapshotsMu.Unlock()
+	}()
 	completion := buildDecisionCompletion(result, final, analysisID, analysisErr, persistErr)
 	ctx, cancel := context.WithTimeout(ctx, decisionSnapshotWriteTimeout)
 	defer cancel()
@@ -227,19 +287,20 @@ func (e *Engine) markShortCircuitSnapshot(ticker, reason string, now time.Time) 
 
 // recoverDecisionSnapshots settles snapshots left pending longer than the
 // stale threshold. It runs before the first tick and then periodically.
-func recoverDecisionSnapshots(ctx context.Context, now time.Time) {
-	abandonDecisionSnapshotsBefore(ctx, now.Add(-staleDecisionSnapshotAge))
+func (e *Engine) recoverDecisionSnapshots(ctx context.Context, now time.Time) {
+	e.abandonDecisionSnapshotsBefore(ctx, now.Add(-staleDecisionSnapshotAge(e.cfg)))
 }
 
-func abandonDecisionSnapshotsBefore(ctx context.Context, cutoff time.Time) {
+func (e *Engine) abandonDecisionSnapshotsBefore(ctx context.Context, cutoff time.Time) {
 	if !store.IsConnected() {
 		return
 	}
+	exclude := e.inflightSnapshotIDs()
 	// Bounded like every snapshot write: recovery is best-effort audit
 	// housekeeping and must never block engine startup or a tick.
 	ctx, cancel := context.WithTimeout(ctx, decisionSnapshotRecoveryTimeout)
 	defer cancel()
-	n, err := store.AbandonStaleDecisionSnapshots(ctx, cutoff)
+	n, err := store.AbandonStaleDecisionSnapshots(ctx, cutoff, exclude)
 	if err != nil {
 		logger.Warn("decision snapshot: startup recovery failed", "err", err)
 		return
@@ -250,7 +311,7 @@ func abandonDecisionSnapshotsBefore(ctx context.Context, cutoff time.Time) {
 }
 
 // runDecisionSnapshotReaper settles stale pending snapshots while running.
-func runDecisionSnapshotReaper(ctx context.Context) {
+func (e *Engine) runDecisionSnapshotReaper(ctx context.Context) {
 	ticker := time.NewTicker(decisionSnapshotReapInterval)
 	defer ticker.Stop()
 	for {
@@ -258,7 +319,7 @@ func runDecisionSnapshotReaper(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
-			recoverDecisionSnapshots(ctx, now)
+			e.recoverDecisionSnapshots(ctx, now)
 		}
 	}
 }

@@ -291,7 +291,7 @@ func TestDecisionSnapshotStartupRecoveryAbandonsOnlyStalePending(t *testing.T) {
 
 	// Scope the cutoff to just after the stale row, so only it (and nothing
 	// another test holds pending) is older than the recovery threshold.
-	abandonDecisionSnapshotsBefore(ctx, staleRow.CreatedAt.Add(time.Millisecond))
+	e.abandonDecisionSnapshotsBefore(ctx, staleRow.CreatedAt.Add(time.Millisecond))
 	if got, _ := store.GetDecisionSnapshot(ctx, stale); got.Outcome != store.DecisionOutcomeAbandoned || got.OutcomeReason == "" {
 		t.Fatalf("stale pending snapshot = %s", got.Outcome)
 	}
@@ -299,7 +299,7 @@ func TestDecisionSnapshotStartupRecoveryAbandonsOnlyStalePending(t *testing.T) {
 		t.Fatalf("a newer pending snapshot must survive recovery, got %s", got.Outcome)
 	}
 	// The real-clock threshold leaves an in-flight (recent) decision alone.
-	recoverDecisionSnapshots(ctx, time.Now())
+	e.recoverDecisionSnapshots(ctx, time.Now())
 	if got, _ := store.GetDecisionSnapshot(ctx, fresh); got.Outcome != store.DecisionOutcomePending {
 		t.Fatalf("recovery abandoned a recent pending snapshot: %s", got.Outcome)
 	}
@@ -311,7 +311,7 @@ func TestDecisionSnapshotStartupRecoveryAbandonsOnlyStalePending(t *testing.T) {
 		t.Fatalf("late completion err = %v", err)
 	}
 	// Settle our fresh row so it cannot linger for other tests.
-	abandonDecisionSnapshotsBefore(ctx, time.Now().Add(time.Second))
+	e.abandonDecisionSnapshotsBefore(ctx, time.Now().Add(time.Second))
 }
 
 func TestDecisionSnapshotCompletedWhenAnalysisPersistenceFails(t *testing.T) {
@@ -430,5 +430,41 @@ func TestDecisionSnapshotRecordsFailedArbiterBeforeMajorityFallback(t *testing.T
 	}
 	if final.Arbitrated || final.Response.Action != analysis.ActionHold {
 		t.Fatalf("final output = %+v, want majority HOLD (tie WAIT/HOLD → HOLD), not arbitrated", final)
+	}
+}
+
+func TestDecisionSnapshotRecoveryNeverAbandonsInFlightAnalysis(t *testing.T) {
+	requireEngineDB(t)
+	ctx := context.Background()
+	e := snapshotTestEngine(nil, nil)
+	req := analysis.AnalysisRequest{Ticker: uniqueTicker("SNPI"), Timeframe: "1d", DecisionCutoff: time.Now()}
+	id := e.beginDecisionSnapshot(ctx, req, nil, "")
+	if id == "" {
+		t.Fatal("begin failed")
+	}
+	// Even a cutoff that makes the row "stale" must spare a live analysis.
+	e.abandonDecisionSnapshotsBefore(ctx, time.Now().Add(time.Hour))
+	if got, _ := store.GetDecisionSnapshot(ctx, id); got.Outcome != store.DecisionOutcomePending {
+		t.Fatalf("in-flight snapshot was abandoned: %s", got.Outcome)
+	}
+	e.completeDecisionSnapshot(ctx, id, analysis.AnalyzeResult{}, nil, "", errors.New("quorum"), nil)
+	if got, _ := store.GetDecisionSnapshot(ctx, id); got.Outcome != store.DecisionOutcomeFailed {
+		t.Fatalf("completion after a long analysis must still apply, got %s", got.Outcome)
+	}
+	if ids := e.inflightSnapshotIDs(); len(ids) != 0 {
+		t.Fatalf("completed snapshot still marked in flight: %v", ids)
+	}
+}
+
+func TestStaleDecisionSnapshotAgeScalesWithConfiguredTimeouts(t *testing.T) {
+	if got := staleDecisionSnapshotAge(&config.Config{}); got != minStaleDecisionSnapshotAge {
+		t.Fatalf("empty config age = %v, want floor", got)
+	}
+	cfg := &config.Config{}
+	cfg.Models.Analysts = []config.ModelConfig{{Provider: "a", Model: "m", TimeoutSec: 600}, {Provider: "b", Model: "m", TimeoutSec: 600}}
+	cfg.Models.Arbiter = config.ModelConfig{Provider: "c", Model: "m", TimeoutSec: 900}
+	// 2 × (600 + 600 + 900)s = 70m, above the 30m floor.
+	if got, want := staleDecisionSnapshotAge(cfg), 70*time.Minute; got != want {
+		t.Fatalf("age = %v, want %v", got, want)
 	}
 }

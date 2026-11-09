@@ -130,6 +130,9 @@ A replay record must never be served from it.
 > * `request_params` holds the non-prompt fields actually sent (from `ModelCallMeta.RequestParams`), not config;
 > * snapshots also record `timeframe` and `completed_at`;
 > * immutability is enforced by triggers rather than role grants;
+> * stale `pending` rows are abandoned at startup and every 15 minutes, using a threshold of the larger of
+>   30 minutes and twice the sum of every configured model timeout. This process's in-flight snapshots
+>   are never abandoned, and every snapshot write is time-bounded;
 > * retry and fallback attempts are not yet split into `attempt > 0` rows. Each stage records its final
 >   attempt, and a fallback's provider/model identifies it. Splitting attempts is a follow-up.
 

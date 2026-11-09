@@ -100,6 +100,11 @@ type Engine struct {
 	shortCircuitMu       sync.Mutex
 	shortCircuitRecorded map[string]time.Time
 
+	// inflightSnapshots holds decision snapshots whose analysis is still
+	// running in this process; the reaper never abandons them.
+	inflightSnapshotsMu sync.Mutex
+	inflightSnapshots   map[string]struct{}
+
 	// costGuardrail checks token spend against configured budgets and triggers
 	// auto-degrade when thresholds are crossed. Check() is called once per tick.
 	costGuardrail *cost.Guardrail
@@ -305,8 +310,8 @@ func (e *Engine) Run(ctx context.Context) error {
 			return err
 		}
 		// Settle decision snapshots a previous process left pending (#589).
-		recoverDecisionSnapshots(ctx, time.Now())
-		go runDecisionSnapshotReaper(ctx)
+		e.recoverDecisionSnapshots(ctx, time.Now())
+		go e.runDecisionSnapshotReaper(ctx)
 		const cacheSweepInterval = 15 * time.Minute
 		go cache.NewSweeper(cacheSweepInterval).Run(ctx)
 		go e.runExitReconcileLoop(ctx)
