@@ -54,6 +54,13 @@ func NewAnalyzer(cfg config.ModelsConfig, bus *events.Bus) *Analyzer {
 	return &Analyzer{analysts: analysts, arbiter: arbiter, cfg: cfg, bus: bus}
 }
 
+// NewAnalyzerWithProviders builds an Analyzer around already-constructed
+// providers. Engine-level tests use it to drive the real analysis path with
+// deterministic fakes; production code builds providers from config.
+func NewAnalyzerWithProviders(cfg config.ModelsConfig, analysts []ModelProvider, arbiter ModelProvider, bus *events.Bus) *Analyzer {
+	return &Analyzer{analysts: append([]ModelProvider(nil), analysts...), arbiter: arbiter, cfg: cfg, bus: bus}
+}
+
 // Primary returns the first configured analyst for backward compat.
 func (a *Analyzer) Primary() ModelProvider {
 	if len(a.analysts) == 0 {

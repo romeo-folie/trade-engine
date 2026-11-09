@@ -113,6 +113,7 @@ func (c *OllamaClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 	}
 
 	var apiResp struct {
+		Model           string `json:"model"`
 		Response        string `json:"response"`
 		PromptEvalCount int    `json:"prompt_eval_count"`
 		EvalCount       int    `json:"eval_count"`
@@ -134,6 +135,8 @@ func (c *OllamaClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 		OutputTokens:  apiResp.EvalCount,
 		LatencyMs:     latencyMs,
 		IndicatorJSON: indicatorJSON,
+		ResolvedModel: apiResp.Model,
+		RequestParams: requestParams(body, "system", "prompt"),
 	}
 
 	analysisResp, err := extractAnalysisJSON(apiResp.Response)

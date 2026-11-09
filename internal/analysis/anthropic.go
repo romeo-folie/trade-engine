@@ -140,6 +140,7 @@ func (c *AnthropicClient) Analyze(ctx context.Context, req AnalysisRequest) (Ana
 
 	// Parse the Anthropic response envelope.
 	var apiResp struct {
+		Model   string `json:"model"`
 		Content []struct {
 			Type string `json:"type"`
 			Text string `json:"text"`
@@ -171,6 +172,8 @@ func (c *AnthropicClient) Analyze(ctx context.Context, req AnalysisRequest) (Ana
 		OutputTokens:  apiResp.Usage.OutputTokens,
 		LatencyMs:     latencyMs,
 		IndicatorJSON: indicatorJSON,
+		ResolvedModel: apiResp.Model,
+		RequestParams: requestParams(body, "system", "messages"),
 	}
 
 	analysis, err := extractAnalysisJSON(rawText)

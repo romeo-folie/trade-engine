@@ -175,6 +175,7 @@ func (c *OpenAIClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 	}
 
 	var apiResp struct {
+		Model   string `json:"model"`
 		Choices []struct {
 			Message struct {
 				Content string `json:"content"`
@@ -197,6 +198,7 @@ func (c *OpenAIClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 		RawPrompt: rawPrompt, RawResponse: rawText,
 		InputTokens: apiResp.Usage.PromptTokens, OutputTokens: apiResp.Usage.CompletionTokens,
 		LatencyMs: latencyMs, IndicatorJSON: indicatorJSON,
+		ResolvedModel: apiResp.Model, RequestParams: requestParams(body, "messages"),
 	}
 	analysis, err := extractAnalysisJSON(rawText)
 	if err != nil {

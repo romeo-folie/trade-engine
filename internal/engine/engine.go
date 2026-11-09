@@ -17,6 +17,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/analysis/cache"
 	"github.com/romeo-folie/trade-engine/internal/analysis/depth"
 	"github.com/romeo-folie/trade-engine/internal/analysis/prompts"
+	"github.com/romeo-folie/trade-engine/internal/analysis/snapshot"
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/cost"
 	"github.com/romeo-folie/trade-engine/internal/data"
@@ -298,6 +299,8 @@ func (e *Engine) Run(ctx context.Context) error {
 		if err := requireStartupExitReconciliation(ctx, 5*time.Second, e.ReconcileExitsNow); err != nil {
 			return err
 		}
+		// Settle decision snapshots a previous process left pending (#589).
+		recoverDecisionSnapshots(ctx, time.Now())
 		const cacheSweepInterval = 15 * time.Minute
 		go cache.NewSweeper(cacheSweepInterval).Run(ctx)
 		go e.runExitReconcileLoop(ctx)
@@ -969,13 +972,18 @@ func (e *Engine) runAnalysisWithProfile(
 	workflow timeframeWorkflow,
 	timeframeRefreshErrors map[data.Timeframe]error,
 ) {
+	// decisionCutoff is the single clock for this decision: news selection,
+	// timing evidence, prompt news ages, and the decision snapshot (#589).
+	decisionCutoff := time.Now()
 	if set == nil {
 		e.recordScannerEngineOutcome(ctx, scannerRunID, ticker, "indicators_missing", "", "")
+		e.recordShortCircuitSnapshot(ctx, ticker, timeframe, strategy, strategies, decisionCutoff, scannerRunID, "indicators_missing")
 		return
 	}
 	if e.analyzer == nil || !e.analyzer.Primary().IsAvailable() {
 		logger.Debug("analysis skipped — primary model not available", "ticker", ticker)
 		e.recordScannerEngineOutcome(ctx, scannerRunID, ticker, "model_unavailable", "", "")
+		e.recordShortCircuitSnapshot(ctx, ticker, timeframe, strategy, strategies, decisionCutoff, scannerRunID, "model_unavailable")
 		return
 	}
 
@@ -1041,6 +1049,8 @@ func (e *Engine) runAnalysisWithProfile(
 				e.emitOwnershipShortCircuitBlock(
 					ctx, ticker, strategy, candles, reason, scannerRunID,
 				)
+				e.recordShortCircuitSnapshot(ctx, ticker, timeframe, strategy, strategies, decisionCutoff, scannerRunID,
+					"sell_only_no_position: "+reason)
 				return
 			}
 		}
@@ -1090,7 +1100,8 @@ func (e *Engine) runAnalysisWithProfile(
 	// this second query is a lightweight store read (no API call).
 	// Keep a longer timestamped source window for the deterministic timing
 	// snapshot. The prompt still receives only its configured newest subset.
-	timingNow := time.Now()
+	timingNow := decisionCutoff
+	var missing []snapshot.MissingBlock
 	recentNews, recentNewsErr := store.GetRecentNews(ctx, ticker, timingNow.Add(-antiChaseNewsLookback))
 	if recentNewsErr == nil && newsRefreshErr != nil {
 		recentNewsErr = newsRefreshErr
@@ -1107,6 +1118,8 @@ func (e *Engine) runAnalysisWithProfile(
 			Source:      n.Source,
 			PublishedAt: n.PublishedAt,
 			Sentiment:   sentimentLabel(n.SentimentScore),
+			ExternalID:  n.ExternalID,
+			IngestedAt:  n.IngestedAt,
 		}
 		timingNews = append(timingNews, item)
 	}
@@ -1120,6 +1133,8 @@ func (e *Engine) runAnalysisWithProfile(
 	var knowledgeCtx string
 	if gc, err := knowledge.BuildContext(ctx, ticker, e.portfolio.PositionMap()); err == nil {
 		knowledgeCtx = gc.Format()
+	} else {
+		missing = append(missing, snapshot.MissingBlock{Block: "knowledge_context", Reason: err.Error()})
 	}
 	// Prepend the candidate's persisted origin thesis (graph link / sympathy
 	// trigger) so the analysts know WHY this ticker is on the watchlist — e.g.
@@ -1131,16 +1146,23 @@ func (e *Engine) runAnalysisWithProfile(
 
 	// Semantic search for similar past setups (best-effort).
 	var similarSetups []analysis.SimilarSetup
-	if e.embedder != nil && e.cfg.Embeddings.SimilarAnalysesEnabled {
+	if e.embedder == nil || !e.cfg.Embeddings.SimilarAnalysesEnabled {
+		missing = append(missing, snapshot.MissingBlock{Block: "similar_analyses", Reason: "disabled"})
+	} else {
 		// Use the same compact indicator format as the worker uses at index time
 		// so search query and stored vectors occupy the same embedding space.
 		searchText := embeddings.AnalysisEmbedText(ticker, set.RSI, set.EMA20, set.MACDLine, set.ADX)
-		if queryVec, err := e.embedder.Embed(ctx, searchText); err == nil {
+		if queryVec, err := e.embedder.Embed(ctx, searchText); err != nil {
+			missing = append(missing, snapshot.MissingBlock{Block: "similar_analyses", Reason: "embed: " + err.Error()})
+		} else {
 			threshold := e.cfg.Embeddings.SimilarAnalysesThreshold
 			limit := e.cfg.Embeddings.SimilarAnalysesLimit
-			if past, err := store.FindSimilarAnalyses(ctx, queryVec, threshold, limit); err == nil {
+			if past, err := store.FindSimilarAnalyses(ctx, queryVec, threshold, limit); err != nil {
+				missing = append(missing, snapshot.MissingBlock{Block: "similar_analyses", Reason: "search: " + err.Error()})
+			} else {
 				for _, p := range past {
 					similarSetups = append(similarSetups, analysis.SimilarSetup{
+						AnalysisID:      p.ID,
 						Ticker:          p.Ticker,
 						Action:          p.Action,
 						Confidence:      p.Confidence,
@@ -1157,7 +1179,11 @@ func (e *Engine) runAnalysisWithProfile(
 	if e.cfg.Feedback.Enabled && e.cfg.Feedback.PromptEnrichment {
 		if pc, err := feedback.GetPerformanceContext(ctx, ticker); err == nil {
 			performanceCtx = pc
+		} else {
+			missing = append(missing, snapshot.MissingBlock{Block: "performance_context", Reason: err.Error()})
 		}
+	} else {
+		missing = append(missing, snapshot.MissingBlock{Block: "performance_context", Reason: "disabled"})
 	}
 
 	// Build the deterministic timing snapshot from full daily history. The
@@ -1173,6 +1199,7 @@ func (e *Engine) runAnalysisWithProfile(
 			if dailyErr != nil {
 				logger.Warn("anti-chase: load daily timing evidence", "ticker", ticker, "err", dailyErr)
 				timingDaily = nil
+				missing = append(missing, snapshot.MissingBlock{Block: "timing_daily_history", Reason: dailyErr.Error()})
 			}
 		}
 		mark, markSource := analysisAntiChaseMark(
@@ -1182,6 +1209,11 @@ func (e *Engine) runAnalysisWithProfile(
 			ticker, timingDaily, mark, markSource, timingNews, recentNewsErr,
 			e.cfg.Risk.EntryGates.AntiChase.StaleCatalystRunupEnabled, timingNow,
 		)
+	} else {
+		missing = append(missing, snapshot.MissingBlock{Block: "timing_snapshot", Reason: "disabled"})
+	}
+	if recentNewsErr != nil {
+		missing = append(missing, snapshot.MissingBlock{Block: "news", Reason: recentNewsErr.Error()})
 	}
 
 	req := analysis.AnalysisRequest{
@@ -1230,6 +1262,13 @@ func (e *Engine) runAnalysisWithProfile(
 		logger.Warn("supplemental timeframe evidence unavailable — retaining exit analysis", "ticker", ticker, "err", contextErr)
 	}
 	req.TimeframeContexts = contextEvidence
+	if contextErr != nil {
+		missing = append(missing, snapshot.MissingBlock{Block: "timeframe_contexts", Reason: contextErr.Error()})
+	}
+	// Canonical order is applied before both the snapshot hash and every
+	// prompt render, so the recorded inputs are exactly what models saw.
+	snapshot.Canonicalize(&req)
+	snapshotID := e.beginDecisionSnapshot(ctx, req, missing, scannerRunID)
 
 	impact := e.calculateImpactScore(ticker, snippets, candles)
 	routingSource := "legacy"
@@ -1315,10 +1354,12 @@ func (e *Engine) runAnalysisWithProfile(
 	if err != nil {
 		logger.Warn("analysis failed", "ticker", ticker, "err", err.Error())
 		e.recordScannerEngineOutcome(ctx, scannerRunID, ticker, "analysis_failed", err.Error(), "")
+		e.completeDecisionSnapshot(ctx, snapshotID, result, nil, "", err, nil)
 		return
 	}
 	resp, meta := result.Response, result.Meta
-	if contextErr != nil && resp.Action == analysis.ActionBuy {
+	supplementalBlocked := contextErr != nil && resp.Action == analysis.ActionBuy
+	if supplementalBlocked {
 		resp.Action = analysis.ActionWait
 		resp.SizePct, resp.StopLoss, resp.TakeProfit = 0, 0, 0
 		resp.DecisiveReason = "Entry blocked because required supplemental timeframe evidence was unavailable this cycle."
@@ -1474,6 +1515,16 @@ func (e *Engine) runAnalysisWithProfile(
 			ctx, scannerRunID, ticker, "analysis_persistence_failed", err.Error(), "",
 		)
 	}
+	// Settle the snapshot with the exact decision handed to signal generation.
+	e.completeDecisionSnapshot(ctx, snapshotID, result, &snapshot.FinalOutput{
+		ResolutionPolicyVersion: analysis.ResolutionPolicyVersion,
+		Response:                resp,
+		LensAudit:               lensAudit,
+		DecisionPolicy:          result.DecisionPolicy,
+		FastPathed:              result.FastPathed,
+		Arbitrated:              result.Arbiter != nil && !result.FastPathed,
+		SupplementalBlocked:     supplementalBlocked,
+	}, analysisID, nil, err)
 
 	// Phase 4: generate and potentially execute a signal from this analysis.
 	// Hand the pre-fetched openTrades (loaded by the SELL ownership short-circuit

@@ -151,6 +151,8 @@ func (r AnalysisRequest) LensSet() []string {
 // used for prompt injection.  Mirrors store.SimilarAnalysis without importing
 // the store package into the analysis layer.
 type SimilarSetup struct {
+	// AnalysisID is the matched analyses row (provenance only; not rendered).
+	AnalysisID      string
 	Ticker          string
 	Action          string
 	Confidence      float64
@@ -213,6 +215,30 @@ type ModelCallMeta struct {
 	OutputTokens  int
 	LatencyMs     int64
 	IndicatorJSON []byte // JSONB snapshot
+	// ResolvedModel is the model identity the provider reports having served
+	// (issue #589). It can differ from Model, the configured request, when a
+	// provider aliases or upgrades a model name. Empty when not reported.
+	ResolvedModel string `json:",omitempty"`
+	// RequestParams are the non-prompt request fields actually sent (model,
+	// temperature, token limits, reasoning settings). Prompt bodies are
+	// excluded; they are already in RawPrompt.
+	RequestParams map[string]any `json:",omitempty"`
+}
+
+// requestParams copies a provider request body without its prompt-bearing
+// keys, for audit. Nested maps are retained as-is (they hold settings only).
+func requestParams(body map[string]any, promptKeys ...string) map[string]any {
+	skip := make(map[string]bool, len(promptKeys))
+	for _, k := range promptKeys {
+		skip[k] = true
+	}
+	out := make(map[string]any, len(body))
+	for k, v := range body {
+		if !skip[k] {
+			out[k] = v
+		}
+	}
+	return out
 }
 
 // ModelProvider is the interface every LLM adapter must implement.
@@ -286,6 +312,10 @@ type NewsSnippet struct {
 	Source      string
 	PublishedAt time.Time
 	Sentiment   string // bullish | bearish | neutral
+	// ExternalID and IngestedAt are provenance for decision snapshots; they
+	// are never rendered into prompts.
+	ExternalID string
+	IngestedAt time.Time
 }
 
 // PortfolioContext carries current portfolio state for the prompt.

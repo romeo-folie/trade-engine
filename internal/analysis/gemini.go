@@ -221,7 +221,8 @@ func (c *GeminiClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 	}
 
 	var apiResp struct {
-		Candidates []struct {
+		ModelVersion string `json:"modelVersion"`
+		Candidates   []struct {
 			FinishReason string `json:"finishReason"`
 			Content      struct {
 				Parts []struct {
@@ -252,6 +253,8 @@ func (c *GeminiClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 		OutputTokens:  apiResp.UsageMetadata.CandidatesTokenCount,
 		LatencyMs:     latencyMs,
 		IndicatorJSON: indicatorJSON,
+		ResolvedModel: apiResp.ModelVersion,
+		RequestParams: geminiRequestParams(body, model),
 	}
 
 	// A MAX_TOKENS finish means the answer was cut off — thinking and/or output
@@ -329,4 +332,12 @@ func geminiTruncationGuidance(cfg config.ModelConfig) string {
 	default:
 		return "increase max_tokens"
 	}
+}
+
+// geminiRequestParams records the sent settings plus the model, which Gemini
+// carries in the request URL rather than the body.
+func geminiRequestParams(body map[string]any, model string) map[string]any {
+	params := requestParams(body, "systemInstruction", "contents")
+	params["model"] = model
+	return params
 }
