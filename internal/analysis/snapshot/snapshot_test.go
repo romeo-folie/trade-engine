@@ -239,9 +239,9 @@ func TestEncodeInputsIsZoneIndependent(t *testing.T) {
 	}
 }
 
-func TestBuildDecisionCompletionNeverLeavesPendingOnEncodeFailure(t *testing.T) {
-	// Covered in the engine package; here we pin that Encode reports NaN,
-	// the realistic unencodable value from a malformed model response.
+// TestEncodeRejectsNaN pins the encoding error the engine's completion
+// fallback relies on (a malformed model response can carry NaN).
+func TestEncodeRejectsNaN(t *testing.T) {
 	if _, _, err := Encode(FinalOutput{Response: analysis.AnalysisResponse{Confidence: math.NaN()}}); err == nil {
 		t.Fatal("NaN must be reported as an encoding error")
 	}

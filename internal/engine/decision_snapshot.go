@@ -129,7 +129,7 @@ func (e *Engine) recordShortCircuitSnapshot(
 	ctx context.Context, ticker, timeframe, strategy string, strategies []string,
 	cutoff time.Time, scannerRunID, reason string,
 ) {
-	if !store.IsConnected() || !e.allowShortCircuitSnapshot(ticker, reason, cutoff) {
+	if !store.IsConnected() || !e.shortCircuitSnapshotDue(ticker, reason, cutoff) {
 		return
 	}
 	inputs := snapshot.Inputs{
@@ -139,8 +139,12 @@ func (e *Engine) recordShortCircuitSnapshot(
 	missing := []snapshot.MissingBlock{{Block: "model_inputs", Reason: "not built: " + reason}}
 	if _, err := e.insertDecisionSnapshot(ctx, inputs, missing, scannerRunID,
 		store.DecisionOutcomeShortCircuited, reason); err != nil {
+		// Not marked recorded: the next occurrence retries instead of being
+		// suppressed for a whole interval.
 		logger.Warn("decision snapshot: short-circuit record failed", "ticker", ticker, "err", err)
+		return
 	}
+	e.markShortCircuitSnapshot(ticker, reason, cutoff)
 }
 
 // completeDecisionSnapshot settles a pending snapshot with every stage call.
@@ -198,20 +202,23 @@ func buildDecisionCompletion(
 	return completion
 }
 
-// allowShortCircuitSnapshot reports whether a short-circuit for this
-// (ticker, reason) should be recorded now, and marks it recorded.
-func (e *Engine) allowShortCircuitSnapshot(ticker, reason string, now time.Time) bool {
-	key := ticker + "|" + reason
+// shortCircuitSnapshotDue reports whether a short-circuit for this
+// (ticker, reason) has not been recorded within the throttle interval.
+func (e *Engine) shortCircuitSnapshotDue(ticker, reason string, now time.Time) bool {
+	e.shortCircuitMu.Lock()
+	defer e.shortCircuitMu.Unlock()
+	last, ok := e.shortCircuitRecorded[ticker+"|"+reason]
+	return !ok || now.Sub(last) >= shortCircuitSnapshotInterval
+}
+
+// markShortCircuitSnapshot records a successful short-circuit write.
+func (e *Engine) markShortCircuitSnapshot(ticker, reason string, now time.Time) {
 	e.shortCircuitMu.Lock()
 	defer e.shortCircuitMu.Unlock()
 	if e.shortCircuitRecorded == nil {
 		e.shortCircuitRecorded = make(map[string]time.Time)
 	}
-	if last, ok := e.shortCircuitRecorded[key]; ok && now.Sub(last) < shortCircuitSnapshotInterval {
-		return false
-	}
-	e.shortCircuitRecorded[key] = now
-	return true
+	e.shortCircuitRecorded[ticker+"|"+reason] = now
 }
 
 // recoverDecisionSnapshots settles snapshots left pending longer than the

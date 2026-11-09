@@ -381,16 +381,21 @@ func TestBuildDecisionCompletionSettlesUnencodableEvidence(t *testing.T) {
 func TestShortCircuitSnapshotsAreThrottledPerTickerAndReason(t *testing.T) {
 	e := &Engine{}
 	now := time.Now()
-	if !e.allowShortCircuitSnapshot("AAA", "model_unavailable", now) {
-		t.Fatal("first short-circuit must be recorded")
+	if !e.shortCircuitSnapshotDue("AAA", "model_unavailable", now) {
+		t.Fatal("first short-circuit must be due")
 	}
-	if e.allowShortCircuitSnapshot("AAA", "model_unavailable", now.Add(time.Minute)) {
+	// A failed write is never marked, so the next occurrence retries.
+	if !e.shortCircuitSnapshotDue("AAA", "model_unavailable", now.Add(time.Minute)) {
+		t.Fatal("an unrecorded short-circuit must stay due")
+	}
+	e.markShortCircuitSnapshot("AAA", "model_unavailable", now)
+	if e.shortCircuitSnapshotDue("AAA", "model_unavailable", now.Add(time.Minute)) {
 		t.Fatal("repeat within the interval must be throttled")
 	}
-	if !e.allowShortCircuitSnapshot("AAA", "indicators_missing", now) || !e.allowShortCircuitSnapshot("BBB", "model_unavailable", now) {
-		t.Fatal("distinct ticker or reason must be recorded")
+	if !e.shortCircuitSnapshotDue("AAA", "indicators_missing", now) || !e.shortCircuitSnapshotDue("BBB", "model_unavailable", now) {
+		t.Fatal("distinct ticker or reason must be due")
 	}
-	if !e.allowShortCircuitSnapshot("AAA", "model_unavailable", now.Add(shortCircuitSnapshotInterval)) {
-		t.Fatal("after the interval a new episode must be recorded")
+	if !e.shortCircuitSnapshotDue("AAA", "model_unavailable", now.Add(shortCircuitSnapshotInterval)) {
+		t.Fatal("after the interval a new episode must be due")
 	}
 }
