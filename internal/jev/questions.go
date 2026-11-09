@@ -67,6 +67,26 @@ func HoldsLong(req analysis.AnalysisRequest) bool {
 	return false
 }
 
+// ExitOnly reports whether the request's watchlist row is an exit-only
+// strategy (sell_only, exit_signal, close_position). Such rows may only ever
+// produce SELL or HOLD: prompts.Lenses would otherwise fall back to a default
+// entry lens and let an entry slip through.
+func ExitOnly(req analysis.AnalysisRequest) bool {
+	for _, s := range append(append([]string{req.Strategy}, req.Strategies...), req.LensSet()...) {
+		if prompts.IsExitOnlyStrategy(s) {
+			return true
+		}
+	}
+	return false
+}
+
+// NeedsCall reports whether a request requires a Jev call at all. An
+// exit-only row with no held position has exactly one valid outcome (HOLD),
+// so asking Jev would only spend tokens.
+func NeedsCall(req analysis.AnalysisRequest) bool {
+	return HoldsLong(req) || !ExitOnly(req)
+}
+
 // AdmissibleLenses returns the request's lens menu, filtered to analytical
 // lenses, in profile order.
 func AdmissibleLenses(req analysis.AnalysisRequest) []string {
@@ -75,17 +95,15 @@ func AdmissibleLenses(req analysis.AnalysisRequest) []string {
 
 // Questions builds the v1 question set for a request. Each question is
 // atomic and evaluated independently by Jev; the policy composes them.
+//
+// Only questions the policy uses are asked: held positions get exit and
+// regime; new entries get thesis, adverse evidence, lens, timing, and regime.
+// An exit-only row without a position gets none (see NeedsCall).
 func Questions(req analysis.AnalysisRequest) map[string]Question {
+	if !NeedsCall(req) {
+		return map[string]Question{}
+	}
 	qs := map[string]Question{
-		QAdverse: {
-			Type: TypeNoul,
-			Instructions: "Using only the supplied state, is there material adverse evidence for holding a long position in " +
-				req.Ticker + " now (for example a negative catalyst, a broken trend or support, guidance cuts, or regulatory risk)?",
-			Criteria: map[string]string{
-				"true":  "Material adverse evidence is present in the supplied state.",
-				"false": "No material adverse evidence is present in the supplied state.",
-			},
-		},
 		QRegime: {
 			Type:         TypeChoice,
 			Instructions: "Classify the current market regime for " + req.Ticker + " from the indicators and price action in the state.",
@@ -110,6 +128,15 @@ func Questions(req analysis.AnalysisRequest) map[string]Question {
 		return qs
 	}
 
+	qs[QAdverse] = Question{
+		Type: TypeNoul,
+		Instructions: "Using only the supplied state, is there material adverse evidence against opening a long position in " +
+			req.Ticker + " now (for example a negative catalyst, a broken trend or support, guidance cuts, or regulatory risk)?",
+		Criteria: map[string]string{
+			"true":  "Material adverse evidence is present in the supplied state.",
+			"false": "No material adverse evidence is present in the supplied state.",
+		},
+	}
 	qs[QThesis] = Question{
 		Type:         TypeChoice,
 		Instructions: "How strongly does the supplied evidence support opening a new long position in " + req.Ticker + "?",

@@ -79,6 +79,13 @@ type ClientConfig struct {
 	Backoff time.Duration
 }
 
+// maxRetries and maxBackoff bound retry cost and keep the doubling delay far
+// from overflow.
+const (
+	maxRetries = 5
+	maxBackoff = 30 * time.Second
+)
+
 // Client calls TypeSafe System One.
 type Client struct {
 	cfg  ClientConfig
@@ -102,6 +109,9 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	}
 	if cfg.MaxRetries < 0 {
 		cfg.MaxRetries = 0
+	}
+	if cfg.MaxRetries > maxRetries {
+		cfg.MaxRetries = maxRetries
 	}
 	if cfg.Backoff <= 0 {
 		cfg.Backoff = 500 * time.Millisecond
@@ -160,11 +170,12 @@ func (c *Client) Evaluate(ctx context.Context, state any, questions map[string]Q
 		respBody, status, latency, err := c.do(ctx, url, body)
 		meta.LatencyMs = latency
 		if err == nil && status < 300 {
+			// Keep the body even if it fails to parse: it is the evidence.
+			meta.RawResponse = string(respBody)
 			var parsed Response
 			if err := json.Unmarshal(respBody, &parsed); err != nil {
 				return Response{}, meta, fmt.Errorf("jev: parse response: %w", err)
 			}
-			meta.RawResponse = string(respBody)
 			meta.ResolvedModel = parsed.Model
 			meta.InputTokens, meta.OutputTokens = parsed.Usage.InputTokens, parsed.Usage.OutputTokens
 			return parsed, meta, nil
@@ -182,6 +193,9 @@ func (c *Client) Evaluate(ctx context.Context, state any, questions map[string]Q
 			return Response{}, meta, callErr
 		}
 		delay := c.cfg.Backoff << attempt
+		if delay > maxBackoff || delay <= 0 {
+			delay = maxBackoff
+		}
 		if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= delay {
 			return Response{}, meta, callErr
 		}
@@ -271,6 +285,17 @@ func ValidateAnswers(questions map[string]Question, answers map[string]Answer) e
 			}
 			if _, ok := options[a.Choice]; !ok {
 				return fmt.Errorf("%w: question %q chose unknown option %q", ErrMalformed, name, a.Choice)
+			}
+			// The choice must be the distribution's most probable option; a
+			// choice contradicting its own probabilities is not trusted.
+			chosen, ok := a.Probabilities[a.Choice]
+			if !ok {
+				return fmt.Errorf("%w: question %q choice %q has no probability", ErrMalformed, name, a.Choice)
+			}
+			for opt, p := range a.Probabilities {
+				if p > chosen+1e-9 {
+					return fmt.Errorf("%w: question %q chose %q (%.3f) over more probable %q (%.3f)", ErrMalformed, name, a.Choice, chosen, opt, p)
+				}
 			}
 			if a.Confidence == nil || !finiteUnit(*a.Confidence) {
 				return fmt.Errorf("%w: question %q confidence missing or out of [0,1]", ErrMalformed, name)

@@ -167,15 +167,27 @@ func TestValidateAnswersRejectsMalformedResponses(t *testing.T) {
 	nan := 0.0
 	nan = nan / nan
 	cases := map[string]func(map[string]Answer){
-		"unanswered":      func(a map[string]Answer) { delete(a, "n") },
-		"wrong type":      func(a map[string]Answer) { x := a["n"]; x.Type = TypeChoice; a["n"] = x },
-		"unknown choice":  func(a map[string]Answer) { x := a["c"]; x.Choice = "z"; a["c"] = x },
-		"unknown option":  func(a map[string]Answer) { x := a["c"]; x.Probabilities = map[string]float64{"a": 0.7, "z": 0.3}; a["c"] = x },
-		"bad sum":         func(a map[string]Answer) { x := a["c"]; x.Probabilities = map[string]float64{"a": 0.7, "b": 0.7}; a["c"] = x },
-		"nan probability": func(a map[string]Answer) { x := a["c"]; x.Probabilities = map[string]float64{"a": nan, "b": 0.3}; a["c"] = x },
-		"noul range":      func(a map[string]Answer) { a["n"] = Answer{Type: TypeNoul, Noul: fptr(1.2)} },
-		"score range":     func(a map[string]Answer) { x := a["s"]; x.Score = fptr(2.5); a["s"] = x },
-		"missing conf":    func(a map[string]Answer) { x := a["c"]; x.Confidence = nil; a["c"] = x },
+		"unanswered":     func(a map[string]Answer) { delete(a, "n") },
+		"wrong type":     func(a map[string]Answer) { x := a["n"]; x.Type = TypeChoice; a["n"] = x },
+		"unknown choice": func(a map[string]Answer) { x := a["c"]; x.Choice = "z"; a["c"] = x },
+		"unknown option": func(a map[string]Answer) {
+			x := a["c"]
+			x.Probabilities = map[string]float64{"a": 0.7, "z": 0.3}
+			a["c"] = x
+		},
+		"bad sum": func(a map[string]Answer) {
+			x := a["c"]
+			x.Probabilities = map[string]float64{"a": 0.7, "b": 0.7}
+			a["c"] = x
+		},
+		"nan probability": func(a map[string]Answer) {
+			x := a["c"]
+			x.Probabilities = map[string]float64{"a": nan, "b": 0.3}
+			a["c"] = x
+		},
+		"noul range":   func(a map[string]Answer) { a["n"] = Answer{Type: TypeNoul, Noul: fptr(1.2)} },
+		"score range":  func(a map[string]Answer) { x := a["s"]; x.Score = fptr(2.5); a["s"] = x },
+		"missing conf": func(a map[string]Answer) { x := a["c"]; x.Confidence = nil; a["c"] = x },
 	}
 	for name, mutate := range cases {
 		a := good()
@@ -183,5 +195,31 @@ func TestValidateAnswersRejectsMalformedResponses(t *testing.T) {
 		if err := ValidateAnswers(qs, a); !errors.Is(err, ErrMalformed) {
 			t.Errorf("%s: err = %v, want ErrMalformed", name, err)
 		}
+	}
+}
+
+func TestValidateAnswersRequiresChoiceToBeMostProbable(t *testing.T) {
+	qs := map[string]Question{"c": {Type: TypeChoice, Criteria: map[string]string{"a": "A", "b": "B"}}}
+	answers := map[string]Answer{"c": {Type: TypeChoice, Choice: "a", Confidence: fptr(0.3), Probabilities: map[string]float64{"a": 0.3, "b": 0.7}}}
+	if err := ValidateAnswers(qs, answers); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("choice contradicting its distribution accepted: %v", err)
+	}
+}
+
+func TestNewClientCapsRetries(t *testing.T) {
+	c, _ := NewClient(ClientConfig{APIKey: "k", Model: "m", MaxRetries: 1000})
+	if c.cfg.MaxRetries != maxRetries {
+		t.Fatalf("MaxRetries = %d, want cap %d", c.cfg.MaxRetries, maxRetries)
+	}
+}
+
+func TestEvaluateKeepsUnparsableSuccessBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`not json`))
+	}))
+	defer srv.Close()
+	_, meta, err := testClient(t, srv.URL, 0).Evaluate(context.Background(), "s", simpleQuestions, "v")
+	if err == nil || meta.RawResponse != "not json" {
+		t.Fatalf("err %v raw %q", err, meta.RawResponse)
 	}
 }

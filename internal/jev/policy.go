@@ -35,6 +35,10 @@ type PolicyConfig struct {
 	TargetRMultiple float64
 	// SizePct is the incremental BUY size as a percent of the sizing base.
 	SizePct float64
+	// MinConfidence is the minimum mapped confidence for a BUY. Set it to
+	// the engine's risk confidence threshold so every policy BUY is one the
+	// risk manager can accept, rather than a decision it silently rejects.
+	MinConfidence float64
 }
 
 // DefaultPolicyConfig returns the v1 starting thresholds.
@@ -42,7 +46,7 @@ func DefaultPolicyConfig() PolicyConfig {
 	return PolicyConfig{
 		MinThesisSupport: 0.60, MaxAdverse: 0.40, MinLensProbability: 0.50,
 		MinTimingProbability: 0.55, ExitThreshold: 0.60,
-		StopATRMultiple: 2.0, TargetRMultiple: 2.0, SizePct: 2.0,
+		StopATRMultiple: 2.0, TargetRMultiple: 2.0, SizePct: 2.0, MinConfidence: 0.55,
 	}
 }
 
@@ -51,7 +55,7 @@ func (c PolicyConfig) Validate() error {
 	for name, v := range map[string]float64{
 		"min_thesis_support": c.MinThesisSupport, "max_adverse": c.MaxAdverse,
 		"min_lens_probability": c.MinLensProbability, "min_timing_probability": c.MinTimingProbability,
-		"exit_threshold": c.ExitThreshold,
+		"exit_threshold": c.ExitThreshold, "min_confidence": c.MinConfidence,
 	} {
 		if !finiteUnit(v) {
 			return fmt.Errorf("jev policy: %s must be within [0,1], got %v", name, v)
@@ -77,6 +81,8 @@ const (
 	ReasonExit             = "exit_signal"
 	ReasonHoldPosition     = "position_hold"
 	ReasonExitInsufficient = "exit_insufficient_evidence"
+	ReasonExitOnlyNotHeld  = "exit_only_not_held"
+	ReasonLowConfidence    = "confidence_below_minimum"
 )
 
 // Trace is the auditable record of how answers became a decision. It holds
@@ -101,20 +107,30 @@ func Resolve(req analysis.AnalysisRequest, answers map[string]Answer, cfg Policy
 	if err := cfg.Validate(); err != nil {
 		return analysis.AnalysisResponse{}, trace, err
 	}
+	if !NeedsCall(req) {
+		trace.ReasonCodes = append(trace.ReasonCodes, ReasonExitOnlyNotHeld)
+		resp := analysis.AnalysisResponse{Action: analysis.ActionHold, SelectedStrategy: OptNone,
+			DecisiveReason: "Exit-only strategy with no held position: there is nothing to exit and entries are not permitted."}
+		resp.Reasoning = reasoning(trace)
+		return resp, trace, nil
+	}
 	if err := ValidateAnswers(Questions(req), answers); err != nil {
 		return analysis.AnalysisResponse{}, trace, err
 	}
 	regime := answers[QRegime].Choice
+	if trace.Held {
+		return resolveHeld(answers, cfg, regime, trace)
+	}
 	adverse := *answers[QAdverse].Noul
 	trace.Values["adverse"] = adverse
-
-	if trace.Held {
-		return resolveHeld(answers, cfg, regime, adverse, trace)
+	if ExitOnly(req) {
+		// Unreachable (NeedsCall): an exit-only row reaches here only when held.
+		return analysis.AnalysisResponse{}, trace, fmt.Errorf("jev policy: exit-only request routed to entry")
 	}
 	return resolveEntry(req, answers, cfg, minRiskReward, regime, adverse, trace)
 }
 
-func resolveHeld(answers map[string]Answer, cfg PolicyConfig, regime string, adverse float64, trace Trace) (analysis.AnalysisResponse, Trace, error) {
+func resolveHeld(answers map[string]Answer, cfg PolicyConfig, regime string, trace Trace) (analysis.AnalysisResponse, Trace, error) {
 	exit := answers[QExit]
 	pExit := exit.Probabilities[ExitNow]
 	trace.Values["p_exit"] = pExit
@@ -140,10 +156,10 @@ func resolveHeld(answers map[string]Answer, cfg PolicyConfig, regime string, adv
 func resolveEntry(req analysis.AnalysisRequest, answers map[string]Answer, cfg PolicyConfig, minRiskReward float64,
 	regime string, adverse float64, trace Trace) (analysis.AnalysisResponse, Trace, error) {
 	thesis, lens, timing := answers[QThesis], answers[QLens], answers[QTiming]
-	support := thesis.Probabilities[ThesisStrong] + thesis.Probabilities[ThesisModerate]
+	support := math.Min(1, thesis.Probabilities[ThesisStrong]+thesis.Probabilities[ThesisModerate])
 	trace.Values["thesis_support"] = support
 	trace.Values["p_enter_now"] = timing.Probabilities[TimingEnterNow]
-	confidence := round3(support * (1 - adverse))
+	confidence := round3(math.Min(1, math.Max(0, support*(1-adverse))))
 	resp := analysis.AnalysisResponse{Regime: regime, SelectedStrategy: OptNone, Confidence: confidence}
 
 	hold := func(code, reason string) (analysis.AnalysisResponse, Trace, error) {
@@ -187,6 +203,10 @@ func resolveEntry(req analysis.AnalysisRequest, answers map[string]Answer, cfg P
 	}
 	if p := timing.Probabilities[TimingEnterNow]; p < cfg.MinTimingProbability {
 		return wait(ReasonTimingLow, fmt.Sprintf("Jev enter-now probability %.2f is below the %.2f minimum.", p, cfg.MinTimingProbability))
+	}
+	if confidence < cfg.MinConfidence {
+		resp.SelectedStrategy, resp.RejectedStrategies, trace.SelectedLens = OptNone, nil, ""
+		return hold(ReasonLowConfidence, fmt.Sprintf("Jev mapped confidence %.3f is below the %.2f minimum.", confidence, cfg.MinConfidence))
 	}
 
 	entry, atr := entryPrice(req), req.Indicators.ATR

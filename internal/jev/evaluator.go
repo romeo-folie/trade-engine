@@ -29,6 +29,12 @@ type Evaluator struct {
 // call's metadata (and, for malformed answers, the raw response). Callers must
 // treat any error as an analysis failure: there is no fallback model.
 func (e *Evaluator) Evaluate(ctx context.Context, req analysis.AnalysisRequest) (Decision, error) {
+	if !NeedsCall(req) {
+		// Exit-only row with no position: the only valid outcome is HOLD, so
+		// no call (and no cost) is made. Meta stays empty: there was no call.
+		out, trace, err := Resolve(req, nil, e.Policy, e.MinRiskReward)
+		return Decision{Response: out, Trace: trace}, err
+	}
 	questions := Questions(req)
 	resp, meta, err := e.Client.Evaluate(ctx, BuildState(req), questions, QuestionSetVersion)
 	d := Decision{Meta: meta, Answers: resp.Answers}
