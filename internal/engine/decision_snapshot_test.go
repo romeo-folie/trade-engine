@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -284,20 +285,23 @@ func TestDecisionSnapshotStartupRecoveryAbandonsOnlyStalePending(t *testing.T) {
 		return id
 	}
 	stale := insert(uniqueTicker("SNPR"))
+	staleRow, _ := store.GetDecisionSnapshot(ctx, stale)
+	time.Sleep(5 * time.Millisecond)
+	fresh := insert(uniqueTicker("SNPN"))
 
-	// Recovery evaluated as if the process restarted after the threshold:
-	// the row is now stale and is settled as abandoned.
-	recoverDecisionSnapshots(ctx, time.Now().Add(staleDecisionSnapshotAge+time.Minute))
-	got, _ := store.GetDecisionSnapshot(ctx, stale)
-	if got.Outcome != store.DecisionOutcomeAbandoned || got.OutcomeReason == "" {
+	// Scope the cutoff to just after the stale row, so only it (and nothing
+	// another test holds pending) is older than the recovery threshold.
+	abandonDecisionSnapshotsBefore(ctx, staleRow.CreatedAt.Add(time.Millisecond))
+	if got, _ := store.GetDecisionSnapshot(ctx, stale); got.Outcome != store.DecisionOutcomeAbandoned || got.OutcomeReason == "" {
 		t.Fatalf("stale pending snapshot = %s", got.Outcome)
 	}
-	// With the real clock, a recent pending row (an in-flight decision of a
-	// concurrently running process) must survive.
-	fresh := insert(uniqueTicker("SNPN"))
+	if got, _ := store.GetDecisionSnapshot(ctx, fresh); got.Outcome != store.DecisionOutcomePending {
+		t.Fatalf("a newer pending snapshot must survive recovery, got %s", got.Outcome)
+	}
+	// The real-clock threshold leaves an in-flight (recent) decision alone.
 	recoverDecisionSnapshots(ctx, time.Now())
 	if got, _ := store.GetDecisionSnapshot(ctx, fresh); got.Outcome != store.DecisionOutcomePending {
-		t.Fatalf("a recent pending snapshot must survive recovery, got %s", got.Outcome)
+		t.Fatalf("recovery abandoned a recent pending snapshot: %s", got.Outcome)
 	}
 
 	// A late completion for an abandoned snapshot is refused, not applied.
@@ -305,5 +309,88 @@ func TestDecisionSnapshotStartupRecoveryAbandonsOnlyStalePending(t *testing.T) {
 		Outcome: store.DecisionOutcomeFailed, OutcomeReason: "late",
 	}); !errors.Is(err, store.ErrDecisionSnapshotNotPending) {
 		t.Fatalf("late completion err = %v", err)
+	}
+	// Settle our fresh row so it cannot linger for other tests.
+	abandonDecisionSnapshotsBefore(ctx, time.Now().Add(time.Second))
+}
+
+func TestDecisionSnapshotCompletedWhenAnalysisPersistenceFails(t *testing.T) {
+	requireEngineDB(t)
+	// TRADE is outside the analyses.action enum, so the analysis insert fails
+	// while the decision itself resolves.
+	trade := analysis.AnalysisResponse{Action: analysis.ActionTrade, Confidence: 0.7, Reasoning: "orb", DecisiveReason: "Gap held."}
+	a := &snapshotFakeProvider{name: "a", resp: trade, available: true}
+	b := &snapshotFakeProvider{name: "b", resp: trade, available: true}
+	e := snapshotTestEngine([]analysis.ModelProvider{a, b}, nil)
+	ticker := uniqueTicker("SNPP")
+	candles, set := snapshotTestCandles(80)
+
+	e.runAnalysis(context.Background(), ticker, "1d", "momentum", []string{"momentum"}, candles, set, "", "", "", "", false)
+
+	snap, calls := latestSnapshotForTicker(t, ticker)
+	if snap.Outcome != store.DecisionOutcomeCompleted || snap.AnalysisID != "" ||
+		!strings.HasPrefix(snap.OutcomeReason, "analysis_persistence_failed") || len(calls) != 2 {
+		t.Fatalf("snapshot = %s / %q / analysis %q / %d calls", snap.Outcome, snap.OutcomeReason, snap.AnalysisID, len(calls))
+	}
+}
+
+func TestDecisionSnapshotRecordsSupplementalBlock(t *testing.T) {
+	requireEngineDB(t)
+	buy := analysis.AnalysisResponse{Action: analysis.ActionBuy, Confidence: 0.8, SizePct: 2, StopLoss: 90, TakeProfit: 130,
+		Reasoning: "breakout", DecisiveReason: "Breakout on volume.", SelectedStrategy: "momentum"}
+	a := &snapshotFakeProvider{name: "a", resp: buy, available: true}
+	b := &snapshotFakeProvider{name: "b", resp: buy, available: true}
+	e := snapshotTestEngine([]analysis.ModelProvider{a, b}, nil)
+	ticker := uniqueTicker("SNPT")
+	candles, set := snapshotTestCandles(80)
+
+	// A configured 1h supplemental timeframe with no stored bars fails to load.
+	e.runAnalysisWithProfile(context.Background(), ticker, "1d", "momentum", []string{"momentum"}, candles, set,
+		"", "", "", "", false, nil, nil, nil, nil, candleFetchObservation{},
+		resolveTimeframeWorkflow([]string{"1d", "1h"}, nil), nil)
+
+	snap, _ := latestSnapshotForTicker(t, ticker)
+	var final snapshot.FinalOutput
+	if err := json.Unmarshal(snap.FinalOutput, &final); err != nil {
+		t.Fatal(err)
+	}
+	if !final.SupplementalBlocked || final.Response.Action != analysis.ActionWait || final.Response.SizePct != 0 {
+		t.Fatalf("final output = %+v, want BUY blocked to WAIT", final)
+	}
+	if !strings.Contains(string(snap.Missing), `"timeframe_contexts"`) {
+		t.Fatalf("missing blocks lack timeframe_contexts: %s", snap.Missing)
+	}
+}
+
+func TestBuildDecisionCompletionSettlesUnencodableEvidence(t *testing.T) {
+	final := &snapshot.FinalOutput{Response: analysis.AnalysisResponse{Action: analysis.ActionBuy, Confidence: math.NaN()}}
+	c := buildDecisionCompletion(analysis.AnalyzeResult{}, final, "", nil, nil)
+	if c.Outcome != store.DecisionOutcomeFailed || !strings.HasPrefix(c.OutcomeReason, "snapshot_final_output_unencodable") {
+		t.Fatalf("completion = %+v", c)
+	}
+	bad := analysis.AnalyzeResult{AnalystResults: []analysis.AnalystResult{
+		{Provider: "a", Model: "m", Response: analysis.AnalysisResponse{Confidence: math.Inf(1)}},
+	}}
+	c = buildDecisionCompletion(bad, nil, "", errors.New("quorum"), nil)
+	if c.Outcome != store.DecisionOutcomeFailed || len(c.StageCalls) != 0 ||
+		!strings.Contains(c.OutcomeReason, "analysis_failed: quorum") || !strings.Contains(c.OutcomeReason, "stage_calls_unencodable") {
+		t.Fatalf("completion = %+v", c)
+	}
+}
+
+func TestShortCircuitSnapshotsAreThrottledPerTickerAndReason(t *testing.T) {
+	e := &Engine{}
+	now := time.Now()
+	if !e.allowShortCircuitSnapshot("AAA", "model_unavailable", now) {
+		t.Fatal("first short-circuit must be recorded")
+	}
+	if e.allowShortCircuitSnapshot("AAA", "model_unavailable", now.Add(time.Minute)) {
+		t.Fatal("repeat within the interval must be throttled")
+	}
+	if !e.allowShortCircuitSnapshot("AAA", "indicators_missing", now) || !e.allowShortCircuitSnapshot("BBB", "model_unavailable", now) {
+		t.Fatal("distinct ticker or reason must be recorded")
+	}
+	if !e.allowShortCircuitSnapshot("AAA", "model_unavailable", now.Add(shortCircuitSnapshotInterval)) {
+		t.Fatal("after the interval a new episode must be recorded")
 	}
 }

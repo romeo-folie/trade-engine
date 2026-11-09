@@ -95,6 +95,11 @@ type Engine struct {
 	// and to feed the budget guardrail's period checks.
 	costTracker *cost.Tracker
 
+	// shortCircuitRecorded throttles short-circuit decision snapshots per
+	// (ticker, reason); see allowShortCircuitSnapshot.
+	shortCircuitMu       sync.Mutex
+	shortCircuitRecorded map[string]time.Time
+
 	// costGuardrail checks token spend against configured budgets and triggers
 	// auto-degrade when thresholds are crossed. Check() is called once per tick.
 	costGuardrail *cost.Guardrail
@@ -301,6 +306,7 @@ func (e *Engine) Run(ctx context.Context) error {
 		}
 		// Settle decision snapshots a previous process left pending (#589).
 		recoverDecisionSnapshots(ctx, time.Now())
+		go runDecisionSnapshotReaper(ctx)
 		const cacheSweepInterval = 15 * time.Minute
 		go cache.NewSweeper(cacheSweepInterval).Run(ctx)
 		go e.runExitReconcileLoop(ctx)

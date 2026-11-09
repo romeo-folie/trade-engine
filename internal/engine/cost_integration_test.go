@@ -102,9 +102,9 @@ func TestTokenRecordGuardRejectsEmptyModel(t *testing.T) {
 		wantRecord      bool
 	}{
 		{"openai", "gpt-4o", 100, 50, true},
-		{"openai", "", 100, 50, false},  // empty model
-		{"", "gpt-4o", 100, 50, false},  // empty provider
-		{"", "", 100, 50, false},         // both empty
+		{"openai", "", 100, 50, false},    // empty model
+		{"", "gpt-4o", 100, 50, false},    // empty provider
+		{"", "", 100, 50, false},          // both empty
 		{"openai", "gpt-4o", 0, 0, false}, // zero tokens
 	}
 	for _, tc := range cases {

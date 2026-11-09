@@ -3,6 +3,7 @@ package snapshot
 import (
 	"encoding/json"
 	"errors"
+	"math"
 	"reflect"
 	"regexp"
 	"strings"
@@ -12,6 +13,8 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/analysis"
 	"github.com/romeo-folie/trade-engine/internal/analysis/prompts"
 	"github.com/romeo-folie/trade-engine/internal/config"
+	"github.com/romeo-folie/trade-engine/internal/strategy/antichase"
+	"github.com/romeo-folie/trade-engine/internal/tradeprofile"
 )
 
 func sampleRequest() analysis.AnalysisRequest {
@@ -184,5 +187,62 @@ func TestStageCallsMapAnalystsSpecialistsAndArbiter(t *testing.T) {
 func TestPromptTemplateVersionIsSet(t *testing.T) {
 	if prompts.TemplateVersion == "" {
 		t.Fatal("prompt template version must be set")
+	}
+}
+
+// TestEncodeInputsIsZoneIndependent: pgx scans timestamptz into time.Local,
+// so the same instants must hash identically whatever zone they carry,
+// including times nested inside the timing snapshot.
+func TestEncodeInputsIsZoneIndependent(t *testing.T) {
+	build := func(loc *time.Location) analysis.AnalysisRequest {
+		req := sampleRequest()
+		for i := range req.RecentCandles {
+			req.RecentCandles[i].Timestamp = req.RecentCandles[i].Timestamp.In(loc)
+		}
+		for i := range req.News {
+			req.News[i].PublishedAt = req.News[i].PublishedAt.In(loc)
+			req.News[i].IngestedAt = req.News[i].PublishedAt.Add(time.Minute)
+		}
+		catalyst := req.DecisionCutoff.Add(-2 * time.Hour).In(loc)
+		req.Indicators.TimingSnapshot = &antichase.Snapshot{
+			SchemaVersion: 1, Ticker: "AAPL", ObservedAt: req.DecisionCutoff.In(loc), CatalystAt: &catalyst,
+		}
+		req.DiscoveryContext = &tradeprofile.DiscoveryContext{Version: 1, Sources: []string{"earnings"},
+			EvidenceBySource: map[string]json.RawMessage{"earnings": json.RawMessage(`{"date": "2026-03-01"}`)}}
+		Canonicalize(&req)
+		return req
+	}
+	encode := func(req analysis.AnalysisRequest) (json.RawMessage, string) {
+		raw, h, err := EncodeInputs(InputsFromRequest(req))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw, h
+	}
+	utcRaw, utcHash := encode(build(time.UTC))
+	estReq := build(time.FixedZone("EST", -5*3600))
+	_, estHash := encode(estReq)
+	if utcHash != estHash {
+		t.Fatal("identical instants in another zone produced a different input hash")
+	}
+	if strings.Contains(string(utcRaw), "-05:00") {
+		t.Fatalf("encoded inputs retain a local offset: %s", utcRaw)
+	}
+	if estReq.RecentCandles[0].Timestamp.Location().String() != "EST" {
+		t.Fatal("EncodeInputs must not modify the caller's request")
+	}
+	// Changing a nested instant still changes the identity.
+	moved := build(time.UTC)
+	moved.Indicators.TimingSnapshot.ObservedAt = moved.Indicators.TimingSnapshot.ObservedAt.Add(time.Second)
+	if _, h := encode(moved); h == utcHash {
+		t.Fatal("nested time change did not change the input hash")
+	}
+}
+
+func TestBuildDecisionCompletionNeverLeavesPendingOnEncodeFailure(t *testing.T) {
+	// Covered in the engine package; here we pin that Encode reports NaN,
+	// the realistic unencodable value from a malformed model response.
+	if _, _, err := Encode(FinalOutput{Response: analysis.AnalysisResponse{Confidence: math.NaN()}}); err == nil {
+		t.Fatal("NaN must be reported as an encoding error")
 	}
 }

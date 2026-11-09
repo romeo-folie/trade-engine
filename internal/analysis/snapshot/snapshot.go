@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"runtime/debug"
 	"slices"
 	"time"
@@ -118,6 +119,59 @@ func InputsFromRequest(req analysis.AnalysisRequest) Inputs {
 		ExecutionProfile:     req.ExecutionProfile,
 		PullbackContext:      req.PullbackContext,
 		PrimaryThesisContext: req.PrimaryThesisContext,
+	}
+}
+
+// EncodeInputs returns the canonical encoding of inputs and its digest. Every
+// time.Time is normalised to UTC first: values scanned from the store carry
+// the process's local zone, and the same instant must hash identically on
+// every host. A JSON round trip provides the deep copy, so the caller's
+// request is never modified.
+func EncodeInputs(in Inputs) (json.RawMessage, string, error) {
+	raw, err := json.Marshal(in)
+	if err != nil {
+		return nil, "", err
+	}
+	var normalised Inputs
+	if err := json.Unmarshal(raw, &normalised); err != nil {
+		return nil, "", fmt.Errorf("snapshot inputs do not round-trip: %w", err)
+	}
+	utcTimes(reflect.ValueOf(&normalised).Elem())
+	return Encode(normalised)
+}
+
+var timeType = reflect.TypeOf(time.Time{})
+
+// utcTimes rewrites every reachable, settable time.Time to UTC in place.
+func utcTimes(v reflect.Value) {
+	switch v.Kind() {
+	case reflect.Pointer, reflect.Interface:
+		if !v.IsNil() {
+			utcTimes(v.Elem())
+		}
+	case reflect.Struct:
+		if v.Type() == timeType {
+			if v.CanSet() {
+				v.Set(reflect.ValueOf(v.Interface().(time.Time).UTC()))
+			}
+			return
+		}
+		for i := 0; i < v.NumField(); i++ {
+			if f := v.Field(i); f.CanSet() {
+				utcTimes(f)
+			}
+		}
+	case reflect.Slice, reflect.Array:
+		for i := 0; i < v.Len(); i++ {
+			utcTimes(v.Index(i))
+		}
+	case reflect.Map:
+		for _, key := range v.MapKeys() {
+			elem := reflect.New(v.Type().Elem()).Elem()
+			elem.Set(v.MapIndex(key))
+			utcTimes(elem)
+			v.SetMapIndex(key, elem)
+		}
 	}
 }
 
