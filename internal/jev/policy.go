@@ -61,8 +61,12 @@ func (c PolicyConfig) Validate() error {
 			return fmt.Errorf("jev policy: %s must be within [0,1], got %v", name, v)
 		}
 	}
-	if !(c.StopATRMultiple > 0) || !(c.TargetRMultiple > 0) || !(c.SizePct > 0) || math.IsInf(c.SizePct, 0) {
-		return fmt.Errorf("jev policy: stop_atr_multiple, target_r_multiple and size_pct must be positive")
+	for name, v := range map[string]float64{
+		"stop_atr_multiple": c.StopATRMultiple, "target_r_multiple": c.TargetRMultiple, "size_pct": c.SizePct,
+	} {
+		if !(v > 0) || math.IsInf(v, 0) {
+			return fmt.Errorf("jev policy: %s must be positive and finite, got %v", name, v)
+		}
 	}
 	return nil
 }
@@ -106,6 +110,9 @@ func Resolve(req analysis.AnalysisRequest, answers map[string]Answer, cfg Policy
 		Held: HoldsLong(req), Values: map[string]float64{}}
 	if err := cfg.Validate(); err != nil {
 		return analysis.AnalysisResponse{}, trace, err
+	}
+	if math.IsNaN(minRiskReward) || math.IsInf(minRiskReward, 0) || minRiskReward < 0 {
+		return analysis.AnalysisResponse{}, trace, fmt.Errorf("jev policy: min risk/reward must be finite and non-negative, got %v", minRiskReward)
 	}
 	if !NeedsCall(req) {
 		trace.ReasonCodes = append(trace.ReasonCodes, ReasonExitOnlyNotHeld)

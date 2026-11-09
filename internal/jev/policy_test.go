@@ -328,3 +328,23 @@ func TestBracketPreservesRiskRewardFloorAfterRounding(t *testing.T) {
 		check(entry, atr, 2+float64(i%5)*0.25)
 	}
 }
+
+func TestPolicyRejectsNonFiniteBracketInputs(t *testing.T) {
+	for name, mutate := range map[string]func(*PolicyConfig){
+		"inf target": func(c *PolicyConfig) { c.TargetRMultiple = math.Inf(1) },
+		"inf stop":   func(c *PolicyConfig) { c.StopATRMultiple = math.Inf(1) },
+		"nan target": func(c *PolicyConfig) { c.TargetRMultiple = math.NaN() },
+		"inf size":   func(c *PolicyConfig) { c.SizePct = math.Inf(1) },
+	} {
+		cfg := DefaultPolicyConfig()
+		mutate(&cfg)
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("%s accepted", name)
+		}
+	}
+	for _, rr := range []float64{math.Inf(1), math.NaN(), -1} {
+		if _, _, err := Resolve(entryRequest(), qualifyingAnswers(), DefaultPolicyConfig(), rr); err == nil {
+			t.Errorf("min risk/reward %v accepted", rr)
+		}
+	}
+}
