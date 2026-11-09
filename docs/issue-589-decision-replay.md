@@ -210,7 +210,13 @@ rounding at capture). Times are RFC 3339 UTC with nanoseconds.
   window bounds. Ages are computed from `decision_cutoff`, never `time.Now()`.
 * `portfolio`: the `PortfolioContext` as supplied plus its source (`tracker` | `open_trades`).
 * `knowledge_context`, `performance_context`: text as supplied plus builder
-  version. `similar_analyses`: IDs, scores, threshold and limit.
+  version.
+* `similar_analyses`: the complete as-supplied payload for each match (ticker,
+  action, confidence, reasoning, created_at, trade outcome), plus its search
+  provenance (analysis id, score, threshold, limit, embedding model). Source
+  rows can be pruned and replay never re-fetches, so provenance alone cannot
+  rebuild the prompt section. The same rule applies to every block: store what
+  the prompt rendered, not a pointer to it.
 * `discovery_context`, `execution_profile`, `pullback_context`, `risk_policy`,
   `timing_snapshot`, `momentum_play`, `strategy`/`strategies`.
 
