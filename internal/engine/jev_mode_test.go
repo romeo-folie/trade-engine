@@ -196,6 +196,11 @@ func TestJevAuthoritativeFailureIsAnAnalysisFailure(t *testing.T) {
 	if len(calls) != 1 || calls[0].Stage != snapshot.StageJev || !strings.Contains(calls[0].Error, "typesafe API 500") || calls[0].RawPrompt == "" {
 		t.Fatalf("failed Jev call not recorded: %+v", calls)
 	}
+	var audit jevAudit
+	if err := json.Unmarshal(calls[0].Extra, &audit); err != nil ||
+		audit.Trace.PolicyVersion != jev.PolicyVersion || audit.Trace.QuestionSetVersion != jev.QuestionSetVersion {
+		t.Fatalf("failed call must still record the versions it was asked under: %+v (%v)", audit, err)
+	}
 }
 
 func TestJevShadowRecordsButNeverExecutes(t *testing.T) {

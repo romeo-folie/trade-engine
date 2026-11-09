@@ -91,6 +91,11 @@ type jevAudit struct {
 
 func (e *Engine) jevResult(d jev.Decision, err error, executed *analysis.AnalysisResponse) analysis.AnalystResult {
 	audit := jevAudit{Trace: d.Trace, Answers: d.Answers}
+	if audit.Trace.PolicyVersion == "" {
+		// A failed call never reached the policy; still record which policy
+		// and question set it was asked under.
+		audit.Trace.PolicyVersion, audit.Trace.QuestionSetVersion = jev.PolicyVersion, jev.QuestionSetVersion
+	}
 	if executed != nil {
 		audit.ExecutedAction = executed.Action
 		if err == nil {
@@ -162,7 +167,11 @@ func (s *jevShadow) collect(e *Engine, executed *analysis.AnalysisResponse) *ana
 	case <-timer.C:
 		s.cancel()
 		<-s.done // Evaluate returns promptly once cancelled.
-		s.err = fmt.Errorf("%w: %v", errJevShadowGrace, s.err)
+		// It may have finished successfully just as the timer fired; only a
+		// call that actually failed is reported as exceeding the grace.
+		if s.err != nil {
+			s.err = fmt.Errorf("%w: %w", errJevShadowGrace, s.err)
+		}
 	}
 	s.cancel()
 	if s.err != nil {
