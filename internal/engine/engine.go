@@ -1338,6 +1338,13 @@ func (e *Engine) runAnalysisWithProfile(
 				if ar.Meta.Provider != "" && ar.Meta.Model != "" && (ar.Meta.InputTokens > 0 || ar.Meta.OutputTokens > 0) {
 					e.costTracker.Record(ar.Meta.Provider, ar.Meta.Model, ar.Meta.InputTokens, ar.Meta.OutputTokens)
 				}
+				// A superseded call (e.g. a specialist primary before its
+				// fallback) may also have consumed tokens.
+				for _, prior := range ar.Meta.PriorAttempts {
+					if pm := prior.Meta; pm.Provider != "" && pm.Model != "" && (pm.InputTokens > 0 || pm.OutputTokens > 0) {
+						e.costTracker.Record(pm.Provider, pm.Model, pm.InputTokens, pm.OutputTokens)
+					}
+				}
 			}
 			if result.Arbiter != nil && result.Arbiter.Meta.Provider != "" && result.Arbiter.Meta.Model != "" &&
 				(result.Arbiter.Meta.InputTokens > 0 || result.Arbiter.Meta.OutputTokens > 0) {

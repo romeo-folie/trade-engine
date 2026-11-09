@@ -223,6 +223,28 @@ type ModelCallMeta struct {
 	// temperature, token limits, reasoning settings). Prompt bodies are
 	// excluded; they are already in RawPrompt.
 	RequestParams map[string]any `json:",omitempty"`
+	// Retries are transport attempts of this same call that failed
+	// transiently and were retried (for example a Gemini 429/503), oldest
+	// first. The final attempt is described by the rest of this struct.
+	Retries []TransportAttempt `json:",omitempty"`
+	// PriorAttempts are calls to other models that failed before this one was
+	// used (for example a specialist's primary before its registry fallback),
+	// oldest first. Without them a successful fallback would erase the failed
+	// primary's identity, settings, and error (issue #589).
+	PriorAttempts []CallAttempt `json:",omitempty"`
+}
+
+// TransportAttempt is one retried transport-level failure of a model call.
+type TransportAttempt struct {
+	StatusCode int    `json:",omitempty"`
+	Error      string
+	LatencyMs  int64
+}
+
+// CallAttempt is a complete model call that failed and was superseded.
+type CallAttempt struct {
+	Meta  ModelCallMeta
+	Error string
 }
 
 // requestParams copies a provider request body without its prompt-bearing

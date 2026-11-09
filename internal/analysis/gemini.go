@@ -221,6 +221,10 @@ func (c *GeminiClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 			}
 			return AnalysisResponse{}, meta, apiErr
 		}
+		// This attempt is superseded by the retry; keep it as evidence.
+		meta.Retries = append(meta.Retries, TransportAttempt{
+			StatusCode: resp.StatusCode, Error: apiErr.Error(), LatencyMs: latencyMs,
+		})
 		if req.Ticker != "__extraction__" {
 			logger.Warn("gemini: transient error, retrying after delay",
 				"ticker", req.Ticker, "model", c.cfg.Model,

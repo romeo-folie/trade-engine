@@ -118,6 +118,11 @@ func TestAnalyzeSpecialistRoleUsesConfiguredFallbackForTransientGeminiError(t *t
 	if used != fallback || meta.Model != fallback.model || resp.Reasoning != "fallback" {
 		t.Fatalf("fallback result provider=%v meta=%+v response=%+v", used, meta, resp)
 	}
+	// The superseded primary keeps its identity and error (issue #589).
+	if len(meta.PriorAttempts) != 1 || meta.PriorAttempts[0].Meta.Model != primary.model ||
+		meta.PriorAttempts[0].Meta.Provider != "google" || !strings.Contains(meta.PriorAttempts[0].Error, "503") {
+		t.Fatalf("prior attempts = %+v, want the failed primary", meta.PriorAttempts)
+	}
 	if fallback.remainingAtCall < 29*time.Second {
 		t.Fatalf("fallback received only %v of its 30s provider-default timeout", fallback.remainingAtCall)
 	}

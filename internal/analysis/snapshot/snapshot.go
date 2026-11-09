@@ -339,91 +339,135 @@ type ArbiterExtra struct {
 	FastPathed     bool                   `json:"fast_pathed"`
 }
 
+// RetryExtra marks a stage-call row that records a retried transport attempt.
+type RetryExtra struct {
+	Kind       string `json:"kind"` // "transport_retry"
+	StatusCode int    `json:"status_code,omitempty"`
+}
+
 // StageCalls maps an analyzer result onto stage-call rows. Partial results
 // from a failed analysis are included: their raw responses are evidence.
+//
+// Every invocation gets its own row. Within one (stage, ordinal) the attempt
+// number increases in call order: superseded calls to other models (a
+// specialist's failed primary before its fallback) come first, each followed
+// by its retried transport attempts; the final call is the highest attempt.
 func StageCalls(result analysis.AnalyzeResult) ([]store.DecisionStageCall, error) {
-	calls := make([]store.DecisionStageCall, 0, len(result.AnalystResults)+1)
+	var calls []store.DecisionStageCall
+	add := func(stage string, ordinal int, role, provider, model string, meta analysis.ModelCallMeta,
+		resp *analysis.AnalysisResponse, errText string, latencyMs int64, extra any) error {
+		rows, err := attemptRows(stage, ordinal, role, provider, model, meta, resp, errText, latencyMs, extra)
+		calls = append(calls, rows...)
+		return err
+	}
+	errText := func(err error) string {
+		if err == nil {
+			return ""
+		}
+		return err.Error()
+	}
 	for i, r := range result.AnalystResults {
 		stage := StageAnalyst
 		if r.Role != "" {
 			stage = StageSpecialist
 		}
-		call, err := stageCall(stage, i, r.Role, r.Provider, r.Model, r.Meta, r.Response, r.Err, r.LatencyMs)
-		if err != nil {
+		resp := &r.Response
+		if r.Err != nil {
+			resp = nil
+		}
+		if err := add(stage, i, r.Role, r.Provider, r.Model, r.Meta, resp, errText(r.Err), r.LatencyMs, nil); err != nil {
 			return nil, err
 		}
-		calls = append(calls, call)
 	}
 	if len(result.AnalystResults) == 0 && result.Meta.Provider != "" {
-		call, err := stageCall(StageAnalyst, 0, "", result.Meta.Provider, result.Meta.Model,
-			result.Meta, result.Response, nil, result.Meta.LatencyMs)
-		if err != nil {
+		if err := add(StageAnalyst, 0, "", result.Meta.Provider, result.Meta.Model, result.Meta,
+			&result.Response, "", result.Meta.LatencyMs, nil); err != nil {
 			return nil, err
 		}
-		calls = append(calls, call)
 	}
 	if arb := result.Arbiter; arb != nil {
-		call, err := stageCall(StageArbiter, 0, "", arb.Meta.Provider, arb.Meta.Model,
-			arb.Meta, arb.Final, nil, arb.Meta.LatencyMs)
-		if err != nil {
+		extra := ArbiterExtra{PolicyVersion: arb.PolicyVersion, Ordering: arb.Ordering,
+			DissentSummary: arb.DissentSummary, FastPathed: arb.FastPathed}
+		if err := add(StageArbiter, 0, "", arb.Meta.Provider, arb.Meta.Model, arb.Meta,
+			&arb.Final, "", arb.Meta.LatencyMs, extra); err != nil {
 			return nil, err
 		}
-		extra, err := json.Marshal(ArbiterExtra{
-			PolicyVersion: arb.PolicyVersion, Ordering: arb.Ordering,
-			DissentSummary: arb.DissentSummary, FastPathed: arb.FastPathed,
-		})
-		if err != nil {
-			return nil, err
-		}
-		call.Extra = extra
-		calls = append(calls, call)
 	}
 	if failed := result.FailedArbiter; failed != nil {
-		call, err := stageCall(StageArbiter, 0, "", failed.Provider, failed.Model,
-			failed.Meta, analysis.AnalysisResponse{}, failed.Err, failed.Meta.LatencyMs)
-		if err != nil {
+		extra := ArbiterExtra{PolicyVersion: failed.PolicyVersion, Ordering: failed.Ordering}
+		if err := add(StageArbiter, 0, "", failed.Provider, failed.Model, failed.Meta,
+			nil, errText(failed.Err), failed.Meta.LatencyMs, extra); err != nil {
 			return nil, err
 		}
-		extra, err := json.Marshal(ArbiterExtra{PolicyVersion: failed.PolicyVersion, Ordering: failed.Ordering})
-		if err != nil {
-			return nil, err
-		}
-		call.Extra = extra
-		calls = append(calls, call)
 	}
 	return calls, nil
 }
 
-func stageCall(stage string, ordinal int, role, provider, model string, meta analysis.ModelCallMeta,
-	resp analysis.AnalysisResponse, callErr error, latencyMs int64) (store.DecisionStageCall, error) {
-	if provider == "" {
-		provider = meta.Provider
-	}
-	if model == "" {
-		model = meta.Model
-	}
-	call := store.DecisionStageCall{
-		Stage: stage, Ordinal: ordinal, Role: role, Provider: provider, RequestedModel: model,
-		ResolvedModel: meta.ResolvedModel, RawPrompt: meta.RawPrompt, RawResponse: meta.RawResponse,
-		InputTokens: meta.InputTokens, OutputTokens: meta.OutputTokens, LatencyMs: latencyMs,
-	}
-	if len(meta.RequestParams) > 0 {
-		params, err := json.Marshal(meta.RequestParams)
-		if err != nil {
-			return call, err
+// attemptRows flattens one stage's call history into numbered rows.
+func attemptRows(stage string, ordinal int, role, provider, model string, meta analysis.ModelCallMeta,
+	resp *analysis.AnalysisResponse, errText string, latencyMs int64, extra any) ([]store.DecisionStageCall, error) {
+	var rows []store.DecisionStageCall
+	var emit func(meta analysis.ModelCallMeta, provider, model string, resp *analysis.AnalysisResponse,
+		errText string, latencyMs int64, extra any) error
+	emit = func(meta analysis.ModelCallMeta, provider, model string, resp *analysis.AnalysisResponse,
+		errText string, latencyMs int64, extra any) error {
+		for _, prior := range meta.PriorAttempts {
+			if err := emit(prior.Meta, prior.Meta.Provider, prior.Meta.Model, nil,
+				prior.Error, prior.Meta.LatencyMs, nil); err != nil {
+				return err
+			}
 		}
-		call.RequestParams = params
+		if provider == "" {
+			provider = meta.Provider
+		}
+		if model == "" {
+			model = meta.Model
+		}
+		params, err := marshalOptional(meta.RequestParams)
+		if err != nil {
+			return err
+		}
+		for _, retry := range meta.Retries {
+			retryExtra, err := json.Marshal(RetryExtra{Kind: "transport_retry", StatusCode: retry.StatusCode})
+			if err != nil {
+				return err
+			}
+			// The prompt is identical to the final attempt's; it is stored once
+			// there rather than duplicated on every retry row.
+			rows = append(rows, store.DecisionStageCall{
+				Stage: stage, Ordinal: ordinal, Attempt: len(rows), Role: role,
+				Provider: provider, RequestedModel: model, RequestParams: params,
+				Error: retry.Error, LatencyMs: retry.LatencyMs, Extra: retryExtra,
+			})
+		}
+		row := store.DecisionStageCall{
+			Stage: stage, Ordinal: ordinal, Attempt: len(rows), Role: role,
+			Provider: provider, RequestedModel: model, ResolvedModel: meta.ResolvedModel,
+			RequestParams: params, RawPrompt: meta.RawPrompt, RawResponse: meta.RawResponse,
+			Error: errText, InputTokens: meta.InputTokens, OutputTokens: meta.OutputTokens, LatencyMs: latencyMs,
+		}
+		if errText == "" && resp != nil {
+			if row.ParsedResponse, err = json.Marshal(resp); err != nil {
+				return err
+			}
+		}
+		if extra != nil {
+			if row.Extra, err = json.Marshal(extra); err != nil {
+				return err
+			}
+		}
+		rows = append(rows, row)
+		return nil
 	}
-	if callErr != nil {
-		call.Error = callErr.Error()
-		return call, nil
+	err := emit(meta, provider, model, resp, errText, latencyMs, extra)
+	return rows, err
+}
+
+func marshalOptional(v map[string]any) (json.RawMessage, error) {
+	if len(v) == 0 {
+		return nil, nil
 	}
-	parsed, err := json.Marshal(resp)
-	if err != nil {
-		return call, err
-	}
-	call.ParsedResponse = parsed
-	return call, nil
+	return json.Marshal(v)
 }
 
 // FinalOutput is the engine-resolved decision handed to signal generation:

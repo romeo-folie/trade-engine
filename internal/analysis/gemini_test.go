@@ -114,7 +114,7 @@ func TestGeminiClient_Analyze_RetriesOn429(t *testing.T) {
 	c := NewGeminiClient(cfg)
 	c.baseURL = srv.URL
 
-	resp, _, err := c.Analyze(context.Background(), AnalysisRequest{Ticker: "AAPL"})
+	resp, meta, err := c.Analyze(context.Background(), AnalysisRequest{Ticker: "AAPL"})
 	if err != nil {
 		t.Fatalf("expected retry to succeed, got: %v", err)
 	}
@@ -123,6 +123,11 @@ func TestGeminiClient_Analyze_RetriesOn429(t *testing.T) {
 	}
 	if calls != 2 {
 		t.Errorf("server hit %d times, want 2 (one 429 + one success)", calls)
+	}
+	// The retried 429 is kept as evidence (issue #589).
+	if len(meta.Retries) != 1 || meta.Retries[0].StatusCode != http.StatusTooManyRequests ||
+		!strings.Contains(meta.Retries[0].Error, "429") {
+		t.Errorf("retries = %+v, want the one retried 429", meta.Retries)
 	}
 }
 

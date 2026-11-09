@@ -468,3 +468,50 @@ func TestStaleDecisionSnapshotAgeScalesWithConfiguredTimeouts(t *testing.T) {
 		t.Fatalf("age = %v, want %v", got, want)
 	}
 }
+
+// attemptHistoryProvider answers successfully but reports a superseded
+// primary and a retried transport attempt, as a specialist fallback over a
+// throttled Gemini model would.
+type attemptHistoryProvider struct{ snapshotFakeProvider }
+
+func (p *attemptHistoryProvider) Analyze(ctx context.Context, req analysis.AnalysisRequest) (analysis.AnalysisResponse, analysis.ModelCallMeta, error) {
+	resp, meta, err := p.snapshotFakeProvider.Analyze(ctx, req)
+	meta.Retries = []analysis.TransportAttempt{{StatusCode: 503, Error: "gemini API 503", LatencyMs: 4}}
+	meta.PriorAttempts = []analysis.CallAttempt{{
+		Meta:  analysis.ModelCallMeta{Provider: "google", Model: "primary-pro", RawPrompt: "prompt", RequestParams: map[string]any{"model": "primary-pro"}},
+		Error: "gemini API 429: exhausted",
+	}}
+	return resp, meta, err
+}
+
+func TestDecisionSnapshotPersistsEveryAttempt(t *testing.T) {
+	requireEngineDB(t)
+	a := &attemptHistoryProvider{snapshotFakeProvider{name: "a", resp: holdResponse(0.7), available: true}}
+	b := &snapshotFakeProvider{name: "b", resp: holdResponse(0.72), available: true}
+	e := snapshotTestEngine([]analysis.ModelProvider{a, b}, nil)
+	ticker := uniqueTicker("SNPM")
+	candles, set := snapshotTestCandles(80)
+
+	e.runAnalysis(context.Background(), ticker, "1d", "momentum", []string{"momentum"}, candles, set, "", "", "", "", false)
+
+	snap, calls := latestSnapshotForTicker(t, ticker)
+	if snap.Outcome != store.DecisionOutcomeCompleted {
+		t.Fatalf("outcome = %s (%s)", snap.Outcome, snap.OutcomeReason)
+	}
+	// Analyst 0: superseded primary, retried transport attempt, final call.
+	// Analyst 1: a single call.
+	type row struct {
+		ordinal, attempt int
+		model, err       string
+	}
+	want := []row{{0, 0, "primary-pro", "gemini API 429: exhausted"}, {0, 1, "a-model", "gemini API 503"}, {0, 2, "a-model", ""}, {1, 0, "b-model", ""}}
+	if len(calls) != len(want) {
+		t.Fatalf("stage calls = %+v", calls)
+	}
+	for i, w := range want {
+		c := calls[i]
+		if c.Ordinal != w.ordinal || c.Attempt != w.attempt || c.RequestedModel != w.model || c.Error != w.err {
+			t.Fatalf("row %d = %d/%d %s %q, want %+v", i, c.Ordinal, c.Attempt, c.RequestedModel, c.Error, w)
+		}
+	}
+}

@@ -246,3 +246,52 @@ func TestEncodeRejectsNaN(t *testing.T) {
 		t.Fatal("NaN must be reported as an encoding error")
 	}
 }
+
+// TestStageCallsNumberEveryAttempt: a specialist whose primary was retried
+// once and then failed over to a fallback (itself retried once) yields four
+// rows in call order; only real calls carry the prompt, and only the final
+// successful call carries a parsed response.
+func TestStageCallsNumberEveryAttempt(t *testing.T) {
+	primary := analysis.ModelCallMeta{Provider: "google", Model: "pro", RawPrompt: "prompt",
+		RequestParams: map[string]any{"model": "pro"},
+		Retries:       []analysis.TransportAttempt{{StatusCode: 429, Error: "gemini API 429", LatencyMs: 5}}}
+	final := analysis.ModelCallMeta{Provider: "google", Model: "flash", RawPrompt: "prompt", RawResponse: "{}",
+		RequestParams: map[string]any{"model": "flash"},
+		Retries:       []analysis.TransportAttempt{{StatusCode: 503, Error: "gemini API 503", LatencyMs: 7}},
+		PriorAttempts: []analysis.CallAttempt{{Meta: primary, Error: "gemini API 503 after retry"}}}
+	calls, err := StageCalls(analysis.AnalyzeResult{AnalystResults: []analysis.AnalystResult{{
+		Provider: "google", Model: "flash", Role: "technical", Meta: final,
+		Response: analysis.AnalysisResponse{Action: analysis.ActionHold},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	type want struct {
+		attempt int
+		model   string
+		err     string
+		prompt  bool
+		parsed  bool
+	}
+	expect := []want{
+		{0, "pro", "gemini API 429", false, false},
+		{1, "pro", "gemini API 503 after retry", true, false},
+		{2, "flash", "gemini API 503", false, false},
+		{3, "flash", "", true, true},
+	}
+	if len(calls) != len(expect) {
+		t.Fatalf("rows = %d, want %d: %+v", len(calls), len(expect), calls)
+	}
+	for i, w := range expect {
+		c := calls[i]
+		if c.Attempt != w.attempt || c.RequestedModel != w.model || c.Error != w.err ||
+			(c.RawPrompt != "") != w.prompt || (len(c.ParsedResponse) > 0) != w.parsed ||
+			c.Stage != StageSpecialist || c.Ordinal != 0 || c.Role != "technical" {
+			t.Fatalf("row %d = %+v, want %+v", i, c, w)
+		}
+	}
+	var retry RetryExtra
+	if err := json.Unmarshal(calls[0].Extra, &retry); err != nil || retry.Kind != "transport_retry" || retry.StatusCode != 429 {
+		t.Fatalf("retry extra = %+v (%v)", retry, err)
+	}
+}

@@ -133,8 +133,11 @@ A replay record must never be served from it.
 > * stale `pending` rows are abandoned at startup and every 15 minutes, using a threshold of the larger of
 >   30 minutes and twice the sum of every configured model timeout. This process's in-flight snapshots
 >   are never abandoned, and every snapshot write is time-bounded;
-> * retry and fallback attempts are not yet split into `attempt > 0` rows. Each stage records its final
->   attempt, and a fallback's provider/model identifies it. Splitting attempts is a follow-up.
+> * every invocation gets its own row. Within a `(stage, ordinal)`, attempts are numbered in call order:
+>   superseded calls to other models (for example a specialist primary before its fallback) come first,
+>   each followed by its retried transport attempts (for example a Gemini 429/503, marked
+>   `extra.kind = "transport_retry"`). The final call has the highest attempt number. Retry rows omit the
+>   prompt, which is stored once on the call it retried.
 
 There is one immutable row per decision attempt, written *before* any model
 call, plus one row per stage call. Schema sketch:
