@@ -56,7 +56,7 @@ or prunable, **D** derivable only with hindsight, **X** not retained.
 |---|---|---|
 | Headlines supplied | M | Inside `raw_prompt` only. The prompt omits `summary`/`url`. |
 | Age shown to the model | X | `prompts/stock.go` renders `time.Since(n.PublishedAt)` **at render time inside each provider**, so it is a hidden wall-clock read. Analysts render at slightly different instants. Re-rendering later changes the prompt. |
-| Sentiment label | M | `sentiment_score` is overwritten on conflict (`store/news.go`: `COALESCE(EXCLUDED.sentiment_score, ...)`). |
+| Sentiment label | M | `sentiment_score` is overwritten on conflict whenever the new score is non-null (`store/news.go`: `COALESCE(EXCLUDED.sentiment_score, ...)`). |
 | Ticker associations | M | Merged on conflict. |
 | Ingestion time | R/M | `news_items.created_at` exists but is not passed to the request or the prompt. Rows are deleted after 90 days (`CleanupNewsItems`). |
 | Prompt selection window | X | `promptNewsSnippets(items, time.Now(), cap)` uses a 48h cutoff relative to the wall clock. The decision cutoff is not recorded. |
@@ -78,7 +78,7 @@ or prunable, **D** derivable only with hindsight, **X** not retained.
 | Item | Status | Evidence |
 |---|---|---|
 | Per-analyst prompt/response | R | `ensemble_results` = `json.Marshal([]AnalystResult)`, which includes `Meta.RawPrompt`/`RawResponse`. `RawPrompt` is `system + "\n\n---\n\n" + user`, not the exact HTTP body. |
-| Request parameters (temperature, max_tokens, API version) | X | Set in each adapter from config. Not persisted. Gemini/OpenAI default the temperature to 0.7 when it is unset. |
+| Request parameters (temperature, max_tokens, API version) | X | Set in each adapter from config. Not persisted. Gemini/OpenAI/Ollama default an unset temperature to 0.7. Anthropic sends the configured value as-is (0 when unset). |
 | Resolved model identity | X | `Meta.Model = c.cfg.Model` (requested). The provider-returned `model` field is not parsed. |
 | Analyst failures | X | `AnalystResult.Err` is an `error` interface. `json.Marshal` emits `{}` (verified), so the failure reason is lost from `ensemble_results`. |
 | Whole-analysis failures | X | `runAnalysisWithProfile` returns before persistence on `err != nil`. Only a scanner outcome string survives (and only when `scanner_run_id` is set). Partial analyst results, including paid raw responses, are discarded. |
@@ -93,7 +93,7 @@ or prunable, **D** derivable only with hindsight, **X** not retained.
 
 | Behavior | Problem |
 |---|---|
-| `successfulResults` sorts by `LatencyMs` | Fast-path `DecisiveReason`, `consensusRejections` first-wins reasons, majority-vote `SizePct/StopLoss/TakeProfit` (taken from the *fastest* winning analyst) and arbiter label order all depend on network timing. Same recorded answers + different latencies = different final output. |
+| `successfulResults` sorts by `LatencyMs` | Fast-path `DecisiveReason`, `consensusRejections` first-wins reasons (fast path, majority and arbiter paths), and majority-vote `SizePct/StopLoss/TakeProfit` (taken from the *fastest* winning analyst) all depend on network timing. Same recorded answers + different latencies = different final output. Arbiter label order is separately random (next rows). |
 | `runAnalystSet` appends in goroutine completion order | The stored `ensemble_results` order is nondeterministic. |
 | `rand.Perm` in `Arbitrate` | The arbiter prompt is unreproducible and the seed is not recorded. |
 | `majorityVote` builds `leaders` from map iteration | Resolved by a fixed switch, so it is deterministic today. Keep it covered by tests. |
@@ -138,13 +138,15 @@ CREATE TABLE decision_snapshots (
   policy_version    TEXT NOT NULL,          -- resolution policy (fast-path/majority/arbiter rules)
   prompt_version    TEXT NOT NULL,
   input_hash        TEXT NOT NULL,          -- sha256 of canonical inputs JSON
+  decision_hash     TEXT NOT NULL,          -- sha256(schema_version|input_hash|policy_version|prompt_version|config_hash)
   inputs            JSONB NOT NULL,         -- canonical payload (3.2)
   missing           JSONB NOT NULL,         -- explicit list of absent/failed inputs
   effective_config  JSONB NOT NULL,         -- sanitized allowlist (3.3)
   config_hash       TEXT NOT NULL,
   scanner_run_id    UUID,
   analysis_id       UUID,                   -- linked after persistence; NULL on failure
-  outcome           TEXT NOT NULL,          -- completed | failed | short_circuited
+  outcome           TEXT NOT NULL CHECK (outcome IN
+                      ('pending','completed','failed','short_circuited','abandoned')),
   final_output      JSONB,                  -- resolved response + lens audit
   output_hash       TEXT,
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -169,14 +171,35 @@ CREATE TABLE decision_stage_calls (
 ```
 
 Both tables are append-only. The application role gets no `UPDATE` except the
-single `analysis_id`/`outcome`/`final_output` completion write, guarded by
-`WHERE outcome = 'pending'`. They are excluded from `CleanupPromptCache`.
+single `analysis_id`/`outcome`/`final_output`/`output_hash` completion write,
+guarded by `WHERE outcome = 'pending'`. On startup, the engine marks any
+`pending` row older than the longest configured analysis deadline as
+`abandoned`, with the stage calls already written kept as evidence.
+`abandoned` snapshots are reported as incomplete by replay and are never
+completed retroactively.
+
+**Identities.** `input_hash` identifies *what the models saw*. `decision_hash`
+identifies *the decision under a given policy*: changing only the policy,
+prompt template, or effective config yields the same `input_hash` and a
+different `decision_hash`. `output_hash` identifies the resolved result.
+Recorded replay asserts `output_hash` equality under the same
+`decision_hash`. They are excluded from `CleanupPromptCache`.
 Retention is separate and explicit, defaulting to keep.
 
 ### 3.2 Canonical inputs payload
 
 These are typed Go structs with explicit JSON tags, marshalled with sorted map
-keys (`encoding/json` already sorts map keys). Floats are kept as-is (no
+keys (`encoding/json` already sorts map keys). `encoding/json` preserves slice
+order, so every slice has a declared canonical order, which is applied once
+*before* both hashing and prompt rendering so that the prompt and hash agree:
+
+* bars: timestamp descending (as the prompt shows them);
+* news: `published_at` descending, then `news_item_id`;
+* positions: ticker, then side;
+* similar analyses: score descending, then analysis id;
+* lens menus: kept in profile order, because order is meaningful there (the
+  profile owns it);
+* `missing[]`: block name. Floats are kept as-is (no
 rounding at capture). Times are RFC 3339 UTC with nanoseconds.
 
 * `primary`: timeframe, bars exactly as supplied (ts, OHLCV, VWAP), observed-at
@@ -268,12 +291,14 @@ resolves under its own `policy_version`. #590 adapter work does not need steps
 |---|---|
 | Changed candle (same ts, revised close) | `input_hash` differs. Recorded replay of the old snapshot is unaffected by the new DB row. |
 | Changed news (sentiment rescored, ticker merged) | Snapshot keeps the as-supplied label. `input_hash` differs only for the new decision. |
-| Input ordering (news order, map key order, positions order) | Canonicalisation gives an identical hash. |
+| Input ordering (news order, map key order, positions order) | Canonicalisation gives an identical `input_hash` *and* an identical rendered prompt. |
+| Policy-only change | Same `input_hash`, different `decision_hash`. |
+| Crash mid-decision | `pending` row becomes `abandoned` on restart. Replay reports it as incomplete. |
 | Latency permutation (same answers, different latencies/arrival order) | Identical final output and `output_hash`. |
 | Missing analyst (1 of 3 errors) | Error string persisted, quorum still met, replay identical. With 2 of 3 failed: `outcome=failed`, row still present. |
 | Arbiter permutation | Same `input_hash` gives the same permutation. A different policy version gives a different permutation. |
 | Retry / specialist fallback | Attempt rows 0 and 1, replay uses the final attempt and records both. |
 | Cache collision (two decisions with the same bucketed fingerprint) | Distinct `input_hash`. Replay never consults `analysis_cache`. |
-| Policy version bump | Distinct identity. Replay under the old version refuses or uses the old implementation. |
+| Policy version bump | Distinct `decision_hash`. Replay under the old version refuses or uses the old implementation. |
 | Clock | Prompt rendered at cutoff T and re-rendered at T+5h are byte-identical. |
 | Secrets | The effective-config projection contains no credential-shaped fields. |
