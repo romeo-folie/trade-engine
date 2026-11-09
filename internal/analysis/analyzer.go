@@ -377,6 +377,9 @@ func buildProviders(cfgs []config.ModelConfig) []ModelProvider {
 	return out
 }
 
+// HashPrompt returns the SHA-256 hex digest used as ModelCallMeta.PromptHash.
+func HashPrompt(prompt string) string { return hashPrompt(prompt) }
+
 func hashPrompt(prompt string) string {
 	sum := sha256.Sum256([]byte(prompt))
 	return fmt.Sprintf("%x", sum)
