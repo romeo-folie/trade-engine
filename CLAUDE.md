@@ -12,11 +12,23 @@ After each PR is **merged**, save a `project` memory summarising the feature —
 
 # Code review
 
-Before every push to a PR branch, always run Codex's built-in `/review` against
-the complete branch diff, followed by the `feature-dev:code-reviewer` agent over
-the changes. Address (or consciously dismiss with a reason) all findings before
-pushing. This applies to the initial push and every follow-up push to an existing
-PR.
+Use two review stages:
+
+1. **While working:** run the `feature-dev:code-reviewer` agent over the changes
+   as you go (after each meaningful slice of work and after review fixes).
+2. **Final review, before creating a PR and before every push to a PR branch:**
+   run Codex's built-in review against the complete branch diff, explicitly on
+   the `gpt-6.1-sol` model:
+
+   ```sh
+   codex review -c model='"gpt-6.1-sol"' -c review_model='"gpt-6.1-sol"' --base main
+   ```
+
+   Never let Codex fall back to another model. If `gpt-6.1-sol` is unavailable
+   or the command fails, stop and tell the user instead of pushing.
+
+Address (or consciously dismiss with a reason) all findings before pushing. This
+applies to the initial push and every follow-up push to an existing PR.
 
 ## End-to-end correctness requirement
 

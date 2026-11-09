@@ -9,9 +9,13 @@ implementation begins.
 Use the active primary model for code implementation and fixes. Do not delegate
 code-writing work solely to satisfy model routing.
 
-Run every Codex built-in `/review` with `gpt-5.6-sol`. Do not substitute a
-generic reviewer subagent or GitHub Codex review for the required local Sol
-`/review`. The project Codex configuration pins the model defaults; this rule
+Run every Codex built-in `/review` with `gpt-6.1-sol`
+(`codex review -c model='"gpt-6.1-sol"' -c review_model='"gpt-6.1-sol"' --base main`).
+If `gpt-6.1-sol` is unavailable, stop and tell the user rather than falling back
+to another model. Do not substitute a generic reviewer subagent or GitHub Codex
+review for the required local Sol `/review`. If you are the reviewer already running inside
+`codex review`, this requirement is satisfied by your own run: review the diff
+directly and do not launch a nested review or Codex process. The project Codex configuration pins the model defaults; this rule
 still applies if a session-level override would otherwise replace them.
 
 ## Mandatory pre-push review
@@ -19,8 +23,9 @@ still applies if a session-level override would otherwise replace them.
 Before every push to any PR branch, run Codex's built-in `/review` against the
 complete branch diff. Treat it as the required local review: trace changed
 behavior end to end, identify correctness and regression risks, and add or
-update tests for every actionable finding. A clean `/review` is sufficient to
-proceed; no second `feature-dev` Quality Review/code-reviewer pass is required.
+update tests for every actionable finding. During implementation, use the
+`feature-dev:code-reviewer` agent for incremental reviews; the Codex `/review`
+is the final gate once the branch is ready for a PR and before every push.
 
 Do not push until the review findings are fixed or explicitly documented as
 intentional exceptions. After that review, run the focused tests, full test
