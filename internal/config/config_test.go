@@ -1773,7 +1773,9 @@ func TestAuthoritativeJevNeedsNoAnalysts(t *testing.T) {
 		cfg.Analysis = validJevAnalysis(t)
 		cfg.Analysis.Jev.Authority = JevAuthorityAuthoritative
 		cfg.Models = ModelsConfig{}
-		cfg.Analysis.SpecialistModeEnabled = true // unused under authoritative Jev
+		// Leftovers from an ensemble config are unused under authoritative Jev.
+		cfg.Analysis.SpecialistModeEnabled = true
+		cfg.Models.Consensus.Enabled = true
 		if registry {
 			t.Setenv("CLASSIFIER_KEY_UNSET_590", "")
 			cfg.Models.Registry = ModelRegistry{

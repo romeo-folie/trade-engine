@@ -3474,14 +3474,14 @@ func Validate(cfg *Config) []string {
 		analysts := cfg.Models.AnalystConfigs()
 		if len(analysts) == 0 && decisionAnalystsUsed {
 			errs = append(errs, "models.roles.analysts must contain at least one registry key")
-		} else if len(analysts) < 3 && cfg.Models.Consensus.Enabled {
+		} else if decisionAnalystsUsed && len(analysts) < 3 && cfg.Models.Consensus.Enabled {
 			errs = append(errs, fmt.Sprintf("models.roles.analysts has %d entries; ensemble works best with 3+", len(analysts)))
 		}
 	} else {
 		// ── Legacy validation (no registry) ─────────────────────────────────
 		if len(cfg.Models.Analysts) == 0 && decisionAnalystsUsed {
 			errs = append(errs, "models.analysts must contain at least one entry (or use models.registry)")
-		} else if len(cfg.Models.Analysts) < 3 && cfg.Models.Consensus.Enabled {
+		} else if decisionAnalystsUsed && len(cfg.Models.Analysts) < 3 && cfg.Models.Consensus.Enabled {
 			errs = append(errs, fmt.Sprintf("models.analysts has %d entries; ensemble works best with 3+ analysts", len(cfg.Models.Analysts)))
 		}
 		for i, a := range cfg.Models.Analysts {
