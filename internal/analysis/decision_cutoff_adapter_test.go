@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -103,5 +104,52 @@ func TestRenderedPromptIsZoneIndependent(t *testing.T) {
 	utc := render(build(time.UTC))
 	if est := render(build(time.FixedZone("EST", -5*3600))); est != utc {
 		t.Fatalf("prompt depends on timestamp zone:\n--- UTC\n%s\n--- EST\n%s", utc, est)
+	}
+}
+
+type failingTransport struct {
+	status int // 0 = transport error
+}
+
+func (f failingTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	if f.status == 0 {
+		return nil, errors.New("connection reset")
+	}
+	return &http.Response{StatusCode: f.status, Header: http.Header{},
+		Body: io.NopCloser(strings.NewReader(`{"error":"boom"}`))}, nil
+}
+
+// TestProvidersReturnAttemptMetadataOnFailure: a failed call must still report
+// what was attempted (identity, prompt, settings) so decision snapshots keep
+// the evidence, without fabricating a response or token spend.
+func TestProvidersReturnAttemptMetadataOnFailure(t *testing.T) {
+	req := AnalysisRequest{Ticker: "TEST", Strategy: "momentum", Timeframe: "1d", DecisionCutoff: time.Now()}
+	for _, tr := range []failingTransport{{status: 500}, {status: 0}} {
+		anthropic := NewAnthropicClient(config.ModelConfig{Provider: "anthropic", Model: "am", APIKey: "k"})
+		anthropic.httpClient = &http.Client{Transport: tr}
+		openai := NewOpenAIClient(config.ModelConfig{Provider: "openai", Model: "gpt-4o", APIKey: "k"})
+		openai.httpClient = &http.Client{Transport: tr}
+		gemini := NewGeminiClient(config.ModelConfig{Provider: "google", Model: "gemini-failure-test", APIKey: "k", RequestsPerMinute: 600000})
+		gemini.httpClient = &http.Client{Transport: tr}
+		ollama := NewOllamaClient(config.ModelConfig{Provider: "ollama", Model: "llama3.1"})
+		ollama.httpClient = &http.Client{Transport: tr}
+		for _, p := range []ModelProvider{anthropic, openai, gemini, ollama} {
+			_, meta, err := p.Analyze(context.Background(), req)
+			if err == nil {
+				t.Fatalf("%s (status %d): expected error", p.ProviderName(), tr.status)
+			}
+			if meta.Provider != p.ProviderName() || meta.Model != p.ModelName() || meta.RawPrompt == "" ||
+				meta.PromptHash == "" || len(meta.RequestParams) == 0 {
+				t.Fatalf("%s (status %d): attempt metadata missing: %+v", p.ProviderName(), tr.status, meta)
+			}
+			if meta.RawResponse != "" || meta.InputTokens != 0 || meta.OutputTokens != 0 {
+				t.Fatalf("%s (status %d): failure must not fabricate a response or spend: %+v", p.ProviderName(), tr.status, meta)
+			}
+			for k := range meta.RequestParams {
+				if k == "messages" || k == "system" || k == "prompt" || k == "contents" || k == "systemInstruction" {
+					t.Fatalf("%s: request params include prompt body key %q", p.ProviderName(), k)
+				}
+			}
+		}
 	}
 }

@@ -31,6 +31,10 @@ const decisionSnapshotReapInterval = 15 * time.Minute
 // leaves the row pending for the reaper.
 const decisionSnapshotWriteTimeout = 2 * time.Second
 
+// decisionSnapshotRecoveryTimeout bounds the stale-snapshot sweep, which runs
+// synchronously before the first tick.
+const decisionSnapshotRecoveryTimeout = 5 * time.Second
+
 // shortCircuitSnapshotInterval throttles short-circuit snapshots per
 // (ticker, reason). These rows carry no model evidence, are immutable, and are
 // exempt from retention; one per episode is enough to show a candidate was
@@ -231,6 +235,10 @@ func abandonDecisionSnapshotsBefore(ctx context.Context, cutoff time.Time) {
 	if !store.IsConnected() {
 		return
 	}
+	// Bounded like every snapshot write: recovery is best-effort audit
+	// housekeeping and must never block engine startup or a tick.
+	ctx, cancel := context.WithTimeout(ctx, decisionSnapshotRecoveryTimeout)
+	defer cancel()
 	n, err := store.AbandonStaleDecisionSnapshots(ctx, cutoff)
 	if err != nil {
 		logger.Warn("decision snapshot: startup recovery failed", "err", err)

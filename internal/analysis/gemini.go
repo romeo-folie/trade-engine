@@ -158,6 +158,13 @@ func (c *GeminiClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 	}
 	// Key in header — never in URL (prevents leaking via access logs, proxies, referers).
 	url := fmt.Sprintf("%s/%s:generateContent", c.baseURL, model)
+	// The attempted call's identity, prompt, and settings are known before
+	// sending; every failure below returns them so audits keep the attempt
+	// (issue #589).
+	meta := ModelCallMeta{
+		Provider: "google", Model: c.cfg.Model, PromptHash: promptHash, RawPrompt: rawPrompt,
+		IndicatorJSON: indicatorJSON, RequestParams: geminiRequestParams(body, model),
+	}
 
 	// Pace + bounded-retry loop. The limiter proactively spaces calls under the
 	// per-model quota; the retry recovers the occasional 429/503 that still slips
@@ -168,12 +175,12 @@ func (c *GeminiClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 	var lastTransientErr *geminiAPIError
 	for attempt := 0; ; attempt++ {
 		if err := c.limiter.wait(ctx); err != nil {
-			return AnalysisResponse{}, ModelCallMeta{}, preserveGeminiRetryError(lastTransientErr, fmt.Errorf("gemini rate-limit wait: %w", err))
+			return AnalysisResponse{}, meta, preserveGeminiRetryError(lastTransientErr, fmt.Errorf("gemini rate-limit wait: %w", err))
 		}
 
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
 		if err != nil {
-			return AnalysisResponse{}, ModelCallMeta{}, preserveGeminiRetryError(lastTransientErr, fmt.Errorf("gemini build request: %w", err))
+			return AnalysisResponse{}, meta, preserveGeminiRetryError(lastTransientErr, fmt.Errorf("gemini build request: %w", err))
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
 		httpReq.Header.Set("x-goog-api-key", c.apiKey)
@@ -181,13 +188,14 @@ func (c *GeminiClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 		start := time.Now()
 		resp, err := c.httpClient.Do(httpReq)
 		latencyMs = time.Since(start).Milliseconds()
+		meta.LatencyMs = latencyMs
 		if err != nil {
-			return AnalysisResponse{}, ModelCallMeta{}, preserveGeminiRetryError(lastTransientErr, fmt.Errorf("gemini request: %w", err))
+			return AnalysisResponse{}, meta, preserveGeminiRetryError(lastTransientErr, fmt.Errorf("gemini request: %w", err))
 		}
 		respBytes, err = io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if err != nil {
-			return AnalysisResponse{}, ModelCallMeta{}, preserveGeminiRetryError(lastTransientErr, fmt.Errorf("gemini read response: %w", err))
+			return AnalysisResponse{}, meta, preserveGeminiRetryError(lastTransientErr, fmt.Errorf("gemini read response: %w", err))
 		}
 
 		if resp.StatusCode < 400 {
@@ -203,15 +211,15 @@ func (c *GeminiClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 		// if the server's requested delay fits the caller's remaining deadline.
 		retryable := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable
 		if !retryable || attempt >= geminiMaxRetries {
-			return AnalysisResponse{}, ModelCallMeta{}, apiErr
+			return AnalysisResponse{}, meta, apiErr
 		}
 		lastTransientErr = apiErr
 		delay := parseRetryDelay(respBytes)
 		if !sleepWithinDeadline(ctx, delay) {
 			if ctxErr := ctx.Err(); ctxErr != nil {
-				return AnalysisResponse{}, ModelCallMeta{}, preserveGeminiRetryError(apiErr, ctxErr)
+				return AnalysisResponse{}, meta, preserveGeminiRetryError(apiErr, ctxErr)
 			}
-			return AnalysisResponse{}, ModelCallMeta{}, apiErr
+			return AnalysisResponse{}, meta, apiErr
 		}
 		if req.Ticker != "__extraction__" {
 			logger.Warn("gemini: transient error, retrying after delay",
@@ -237,7 +245,7 @@ func (c *GeminiClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 		} `json:"usageMetadata"`
 	}
 	if err := json.Unmarshal(respBytes, &apiResp); err != nil {
-		return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("gemini parse response: %w", err)
+		return AnalysisResponse{}, meta, fmt.Errorf("gemini parse response: %w", err)
 	}
 	var rawText, finishReason string
 	if len(apiResp.Candidates) > 0 {
@@ -246,16 +254,9 @@ func (c *GeminiClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 			rawText = apiResp.Candidates[0].Content.Parts[0].Text
 		}
 	}
-	meta := ModelCallMeta{
-		Provider: "google", Model: c.cfg.Model, PromptHash: promptHash,
-		RawPrompt: rawPrompt, RawResponse: rawText,
-		InputTokens:   apiResp.UsageMetadata.PromptTokenCount,
-		OutputTokens:  apiResp.UsageMetadata.CandidatesTokenCount,
-		LatencyMs:     latencyMs,
-		IndicatorJSON: indicatorJSON,
-		ResolvedModel: apiResp.ModelVersion,
-		RequestParams: geminiRequestParams(body, model),
-	}
+	meta.RawResponse = rawText
+	meta.InputTokens, meta.OutputTokens = apiResp.UsageMetadata.PromptTokenCount, apiResp.UsageMetadata.CandidatesTokenCount
+	meta.ResolvedModel = apiResp.ModelVersion
 
 	// A MAX_TOKENS finish means the answer was cut off — thinking and/or output
 	// hit maxOutputTokens. extractAnalysisJSON would otherwise leniently salvage
