@@ -1217,6 +1217,8 @@ func (e *Engine) runAnalysisWithProfile(
 		},
 		News:      snippets,
 		Portfolio: e.portfolioContextForPrompt(ctx),
+		// One clock for news selection, timing, and prompt news ages (#589).
+		DecisionCutoff: timingNow,
 	}
 	contextEvidence, timeframeCandles, contextErr := e.unifiedTimeframeEvidence(
 		ctx, ticker, workflow, req, time.Now().AddDate(-2, 0, 0), timeframeRefreshErrors,

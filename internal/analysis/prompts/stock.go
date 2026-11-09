@@ -44,6 +44,18 @@ type NewsItem struct {
 	Source      string
 	PublishedAt time.Time
 	Sentiment   string
+	// AsOf is the decision cutoff the rendered age is measured from. Zero
+	// falls back to the wall clock for callers without a decision clock.
+	AsOf time.Time
+}
+
+// ageAt returns the item's age at its decision cutoff, or at the wall clock
+// when no cutoff was supplied.
+func (n NewsItem) ageAt() time.Duration {
+	if n.AsOf.IsZero() {
+		return time.Since(n.PublishedAt)
+	}
+	return n.AsOf.Sub(n.PublishedAt)
 }
 
 // Portfolio carries current portfolio state. OmittedPositions counts open
@@ -705,7 +717,7 @@ func buildUserWithTimeframeContext(
 		b.WriteString("No recent news available.\n")
 	} else {
 		for _, n := range news {
-			age := time.Since(n.PublishedAt)
+			age := n.ageAt()
 			b.WriteString(fmt.Sprintf("[%s | %s | %.0fh ago] %s\n",
 				n.Sentiment, n.Source, age.Hours(), n.Headline))
 		}

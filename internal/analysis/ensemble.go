@@ -4,6 +4,8 @@ package analysis
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"math"
 	"math/rand"
@@ -22,6 +24,44 @@ type ArbiterResult struct {
 	ModelVotes     map[string]Action
 	FastPathed     bool
 	Meta           ModelCallMeta
+	// PolicyVersion identifies the resolution policy that produced the
+	// arbiter prompt, including how Ordering was derived.
+	PolicyVersion string
+	// Ordering records which analyst each anonymised label denotes, in prompt
+	// order, so the arbiter prompt is attributable and reproducible.
+	Ordering []ArbiterSlot
+}
+
+// ArbiterSlot maps one anonymised arbiter label to the analyst behind it.
+type ArbiterSlot struct {
+	Label    string
+	Provider string
+	Model    string
+	Role     string
+	Ordinal  int
+}
+
+// ResolutionPolicyVersion identifies the ensemble resolution rules: identity
+// ordering of analyst results and the answer-seeded arbiter permutation.
+// Bump it whenever fast-path, majority, or arbiter composition changes.
+const ResolutionPolicyVersion = "ensemble-resolution/v1"
+
+// arbiterPermutation returns an anonymising order for the arbiter prompt that
+// is a pure function of the recorded analyst answers and the policy version.
+// Labels still carry no information about which provider is which, and the
+// order varies across decisions, but the same answers always produce the same
+// prompt — unlike the former unseeded rand.Perm.
+func arbiterPermutation(ticker string, successes []AnalystResult) []int {
+	h := sha256.New()
+	fmt.Fprintf(h, "%s\x00%s\x00", ResolutionPolicyVersion, ticker)
+	for _, r := range successes {
+		fmt.Fprintf(h, "%d\x00%s/%s\x00%s\x00%s\x00%.6f\x00%.6f\x00%.6f\x00%.6f\x00%s\x00",
+			r.Ordinal, r.Provider, r.Model, r.Role, r.Response.Action, r.Response.Confidence,
+			r.Response.SizePct, r.Response.StopLoss, r.Response.TakeProfit, r.Response.Reasoning)
+	}
+	sum := h.Sum(nil)
+	seed := int64(binary.BigEndian.Uint64(sum[:8]))
+	return rand.New(rand.NewSource(seed)).Perm(len(successes))
 }
 
 // ─── Fast-path ─────────────────────────────────────────────────────────────────
@@ -169,7 +209,8 @@ func consensusRejections(results []AnalystResult, winner Action, selected string
 // ─── Arbiter ───────────────────────────────────────────────────────────────────
 
 // Arbitrate sends all analyst results to the arbiter with anonymised labels
-// (shuffled each call to prevent self-bias) and returns a synthesised signal.
+// (answer-seeded permutation: anonymised, varies across decisions, and
+// reproducible from the recorded answers) and returns a synthesised signal.
 func Arbitrate(ctx context.Context, arbiter ModelProvider, req AnalysisRequest, results []AnalystResult) (ArbiterResult, error) {
 	if !arbiter.IsAvailable() {
 		return ArbiterResult{}, fmt.Errorf("arbiter %s/%s is not available", arbiter.ProviderName(), arbiter.ModelName())
@@ -183,11 +224,15 @@ func Arbitrate(ctx context.Context, arbiter ModelProvider, req AnalysisRequest, 
 		votes[fmt.Sprintf("%s/%s", r.Provider, r.Model)] = r.Response.Action
 	}
 
-	// Shuffle to anonymise.
-	indices := rand.Perm(len(successes))
+	// Anonymise with a reproducible, answer-seeded permutation.
+	indices := arbiterPermutation(req.Ticker, successes)
+	ordering := make([]ArbiterSlot, 0, len(indices))
 	var sb strings.Builder
 	for i, idx := range indices {
 		r := successes[idx]
+		ordering = append(ordering, ArbiterSlot{
+			Label: arbiterLabel(i), Provider: r.Provider, Model: r.Model, Role: r.Role, Ordinal: r.Ordinal,
+		})
 		// Generate enough unique labels for arbitrary ensemble sizes —
 		// previously we cycled a fixed 5-label slice, so a 6-result combined
 		// set (e.g. multi-timeframe re-arbitration with 3 analysts × 2
@@ -257,7 +302,10 @@ func Arbitrate(ctx context.Context, arbiter ModelProvider, req AnalysisRequest, 
 	// gate control to a field no analyst voted for.
 	resp.SelectedStrategy, resp.Regime = consensusLens(results, resp.Action)
 	resp.RejectedStrategies = consensusRejections(results, resp.Action, resp.SelectedStrategy)
-	return ArbiterResult{Final: resp, DissentSummary: dissentSummary, ModelVotes: votes, FastPathed: false, Meta: meta}, nil
+	return ArbiterResult{
+		Final: resp, DissentSummary: dissentSummary, ModelVotes: votes, FastPathed: false, Meta: meta,
+		PolicyVersion: ResolutionPolicyVersion, Ordering: ordering,
+	}, nil
 }
 
 // arbiterLabel returns a unique anonymised label for the i-th analyst result
@@ -490,6 +538,10 @@ func successfulResults(results []AnalystResult) []AnalystResult {
 			out = append(out, r)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].LatencyMs < out[j].LatencyMs })
+	// Identity order, never latency: every first-wins choice in resolution
+	// (decisive reason, rejection reasons, majority reference plan) must be a
+	// function of the recorded answers alone (issue #589). Stable so callers
+	// without ordinals (specialist role order, tests) keep their input order.
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Ordinal < out[j].Ordinal })
 	return out
 }
