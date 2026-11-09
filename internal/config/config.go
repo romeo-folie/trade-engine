@@ -3382,6 +3382,13 @@ func Validate(cfg *Config) []string {
 		errs = append(errs, fmt.Sprintf("cost.weekly_token_budget must be >= 0, got %d", cfg.Cost.WeeklyTokenBudget))
 	}
 
+	// Authoritative Jev (#590) is the sole decision maker: the analyst,
+	// arbiter, and specialist roles are not used, so they and their
+	// credentials are not required. Independently used roles (classifier,
+	// news enricher, embedder) are validated as usual, and analyst entries
+	// that remain configured still get structural checks.
+	decisionAnalystsUsed := !cfg.Analysis.JevAuthoritative()
+
 	// ── Registry validation ──────────────────────────────────────────────────
 	// When models.registry is present, validate that all declared roles resolve
 	// to known registry keys, and that all registry entries have required fields.
@@ -3403,16 +3410,18 @@ func Validate(cfg *Config) []string {
 				}
 			}
 		}
-		for _, k := range cfg.Models.Roles.Analysts {
-			addWithFallback(k)
+		if decisionAnalystsUsed {
+			for _, k := range cfg.Models.Roles.Analysts {
+				addWithFallback(k)
+			}
+			addWithFallback(cfg.Models.Roles.Arbiter)
 		}
 		for _, k := range []string{
-			cfg.Models.Roles.Arbiter, cfg.Models.Roles.Classifier,
-			cfg.Models.Roles.NewsEnricher, cfg.Models.Roles.Embedder,
+			cfg.Models.Roles.Classifier, cfg.Models.Roles.NewsEnricher, cfg.Models.Roles.Embedder,
 		} {
 			addWithFallback(k)
 		}
-		if cfg.Analysis.SpecialistModeEnabled {
+		if cfg.Analysis.SpecialistModeEnabled && decisionAnalystsUsed {
 			for _, role := range []string{"fundamental", "technical", "sentiment", "risk_manager"} {
 				addWithFallback(cfg.Analysis.SpecialistRoles[role])
 			}
@@ -3463,21 +3472,21 @@ func Validate(cfg *Config) []string {
 		}
 		// Registry path: analyst list comes from roles.
 		analysts := cfg.Models.AnalystConfigs()
-		if len(analysts) == 0 {
+		if len(analysts) == 0 && decisionAnalystsUsed {
 			errs = append(errs, "models.roles.analysts must contain at least one registry key")
 		} else if len(analysts) < 3 && cfg.Models.Consensus.Enabled {
 			errs = append(errs, fmt.Sprintf("models.roles.analysts has %d entries; ensemble works best with 3+", len(analysts)))
 		}
 	} else {
 		// ── Legacy validation (no registry) ─────────────────────────────────
-		if len(cfg.Models.Analysts) == 0 {
+		if len(cfg.Models.Analysts) == 0 && decisionAnalystsUsed {
 			errs = append(errs, "models.analysts must contain at least one entry (or use models.registry)")
 		} else if len(cfg.Models.Analysts) < 3 && cfg.Models.Consensus.Enabled {
 			errs = append(errs, fmt.Sprintf("models.analysts has %d entries; ensemble works best with 3+ analysts", len(cfg.Models.Analysts)))
 		}
 		for i, a := range cfg.Models.Analysts {
 			errs = append(errs, validateThinkingOptions(fmt.Sprintf("models.analysts[%d]", i), a)...)
-			if a.APIKeyEnv != "" && os.Getenv(a.APIKeyEnv) == "" {
+			if decisionAnalystsUsed && a.APIKeyEnv != "" && os.Getenv(a.APIKeyEnv) == "" {
 				errs = append(errs, fmt.Sprintf("env var %s (models.analysts[%d].api_key_env) is not set", a.APIKeyEnv, i))
 			}
 		}
@@ -3491,12 +3500,12 @@ func Validate(cfg *Config) []string {
 			errs = append(errs, validateThinkingOptions("models.arbiter", cfg.Models.Arbiter)...)
 		}
 		// Legacy single-model validation.
-		if len(cfg.Models.Analysts) == 0 && cfg.Models.Primary.APIKeyEnv != "" && os.Getenv(cfg.Models.Primary.APIKeyEnv) == "" {
+		if decisionAnalystsUsed && len(cfg.Models.Analysts) == 0 && cfg.Models.Primary.APIKeyEnv != "" && os.Getenv(cfg.Models.Primary.APIKeyEnv) == "" {
 			errs = append(errs, fmt.Sprintf("env var %s (models.primary.api_key_env) is not set", cfg.Models.Primary.APIKeyEnv))
 		}
 	}
 
-	if cfg.Analysis.SpecialistModeEnabled {
+	if cfg.Analysis.SpecialistModeEnabled && decisionAnalystsUsed {
 		for _, role := range []string{"fundamental", "technical", "sentiment", "risk_manager"} {
 			key := cfg.Analysis.SpecialistRoles[role]
 			if key == "" {

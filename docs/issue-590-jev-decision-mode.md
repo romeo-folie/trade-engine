@@ -33,6 +33,14 @@ analysis:
 | Cost | Baseline + Jev | Jev only |
 | Live account | Allowed (never executes) | Requires `allow_live: true` |
 
+In authoritative mode, analysts, the arbiter, and specialist roles are not
+required: they can be removed along with their API keys, which is where the
+cost saving comes from. Roles that are used independently are still validated:
+classifier, news enricher, and embedder. One consequence: without analysts,
+knowledge-graph news extraction needs an explicit `models.roles.news_enricher`.
+Otherwise extraction reports that no provider is available, because the
+legacy fallback picks an extraction model from the analysts.
+
 The engine refuses to start when Jev is configured but its evaluator cannot
 be built, or when authoritative Jev would run against a live account without
 `allow_live`.

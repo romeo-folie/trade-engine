@@ -1753,3 +1753,61 @@ func TestJevAPIKeyIsNeverSerialised(t *testing.T) {
 		t.Fatalf("API key serialised: %s", raw)
 	}
 }
+
+func analystErrors(errs []string) []string {
+	var out []string
+	for _, e := range errs {
+		if strings.Contains(e, "analysts") || strings.Contains(e, "models.primary") || strings.Contains(e, "specialist_roles") {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// TestAuthoritativeJevNeedsNoAnalysts: the cost motivation for #590 is
+// running without analysts, so an analyst-free authoritative configuration
+// must pass validation, while ensemble/shadow modes still require analysts.
+func TestAuthoritativeJevNeedsNoAnalysts(t *testing.T) {
+	for _, registry := range []bool{false, true} {
+		cfg := Defaults()
+		cfg.Analysis = validJevAnalysis(t)
+		cfg.Analysis.Jev.Authority = JevAuthorityAuthoritative
+		cfg.Models = ModelsConfig{}
+		cfg.Analysis.SpecialistModeEnabled = true // unused under authoritative Jev
+		if registry {
+			t.Setenv("CLASSIFIER_KEY_UNSET_590", "")
+			cfg.Models.Registry = ModelRegistry{
+				"unused_analyst": {ModelConfig: ModelConfig{Provider: "openai", Model: "m", APIKeyEnv: "ANALYST_KEY_UNSET_590"}},
+				"classifier":     {ModelConfig: ModelConfig{Provider: "openai", Model: "c", APIKeyEnv: "CLASSIFIER_KEY_UNSET_590"}},
+			}
+			cfg.Models.Roles.Analysts = []string{"unused_analyst"}
+			cfg.Models.Roles.Classifier = "classifier"
+		}
+		errs := Validate(cfg)
+		if got := analystErrors(errs); len(got) != 0 {
+			t.Fatalf("registry=%v: authoritative Jev rejected for analyst config: %v", registry, got)
+		}
+		if registry {
+			// The independently used classifier role still needs its key.
+			found := false
+			for _, e := range errs {
+				if strings.Contains(e, "CLASSIFIER_KEY_UNSET_590") {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("classifier key requirement dropped: %v", errs)
+			}
+			for _, e := range errs {
+				if strings.Contains(e, "ANALYST_KEY_UNSET_590") {
+					t.Fatalf("unused analyst key still required: %v", errs)
+				}
+			}
+		}
+		// The same analyst-free config in shadow mode still requires analysts.
+		cfg.Analysis.Jev.Authority = JevAuthorityShadow
+		if got := analystErrors(Validate(cfg)); len(got) == 0 {
+			t.Fatalf("registry=%v: shadow Jev must still require the baseline analysts", registry)
+		}
+	}
+}
