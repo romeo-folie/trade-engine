@@ -543,3 +543,23 @@ func TestDecisionSnapshotCompletesAfterAnalysisCancellation(t *testing.T) {
 		t.Fatalf("partial evidence lost: %+v", calls)
 	}
 }
+
+func TestNoNewDecisionSnapshotsAfterShutdownBegins(t *testing.T) {
+	requireEngineDB(t)
+	e := snapshotTestEngine(nil, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	ticker := uniqueTicker("SNPQ")
+	if id := e.beginDecisionSnapshot(ctx, analysis.AnalysisRequest{Ticker: ticker, Timeframe: "1d", DecisionCutoff: time.Now()}, nil, ""); id != "" {
+		t.Fatalf("a cancelled engine began snapshot %s", id)
+	}
+	e.recordShortCircuitSnapshot(ctx, ticker, "1d", "momentum", nil, time.Now(), "", "indicators_missing")
+	var n int
+	if err := store.GetDB().QueryRow(context.Background(),
+		`SELECT count(*) FROM decision_snapshots WHERE ticker = $1`, ticker).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("rows written after shutdown began: %d (%v)", n, err)
+	}
+	if !e.shortCircuitSnapshotDue(ticker, "indicators_missing", time.Now()) {
+		t.Fatal("a skipped short-circuit must not consume the throttle")
+	}
+}

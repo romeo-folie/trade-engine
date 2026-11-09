@@ -121,7 +121,9 @@ func (e *Engine) insertDecisionSnapshot(
 	if err != nil {
 		return "", err
 	}
-	ctx, cancel := snapshotWriteContext(ctx)
+	// Inserts stay cancellable: once the engine is stopping there is no new
+	// decision to record (callers also check ctx before starting one).
+	ctx, cancel := context.WithTimeout(ctx, decisionSnapshotWriteTimeout)
 	defer cancel()
 	return store.InsertDecisionSnapshot(ctx, store.DecisionSnapshot{
 		SchemaVersion:  snapshot.SchemaVersion,
@@ -150,7 +152,9 @@ func (e *Engine) insertDecisionSnapshot(
 func (e *Engine) beginDecisionSnapshot(
 	ctx context.Context, req analysis.AnalysisRequest, missing []snapshot.MissingBlock, scannerRunID string,
 ) string {
-	if !store.IsConnected() {
+	// A stopping engine starts no new snapshot: the analysis would fail on
+	// the cancelled context and only add a noise row and a shutdown delay.
+	if !store.IsConnected() || ctx.Err() != nil {
 		return ""
 	}
 	id, err := e.insertDecisionSnapshot(ctx, snapshot.InputsFromRequest(req), missing,
@@ -186,7 +190,9 @@ func (e *Engine) recordShortCircuitSnapshot(
 	ctx context.Context, ticker, timeframe, strategy string, strategies []string,
 	cutoff time.Time, scannerRunID, reason string,
 ) {
-	if !store.IsConnected() || !e.shortCircuitSnapshotDue(ticker, reason, cutoff) {
+	// Shutdown commonly surfaces as indicators_missing (cancelled fetches); it
+	// is not a real short-circuit and must not leave a permanent row.
+	if !store.IsConnected() || ctx.Err() != nil || !e.shortCircuitSnapshotDue(ticker, reason, cutoff) {
 		return
 	}
 	inputs := snapshot.Inputs{
@@ -233,8 +239,8 @@ func (e *Engine) completeDecisionSnapshot(
 	}
 }
 
-// snapshotWriteContext bounds a snapshot write by decisionSnapshotWriteTimeout
-// but detaches it from the caller's cancellation. An orderly shutdown cancels
+// snapshotWriteContext bounds a snapshot completion by
+// decisionSnapshotWriteTimeout but detaches it from the caller's cancellation. An orderly shutdown cancels
 // the engine context while model calls are in flight; those calls return their
 // partial evidence, and the completion must still be able to record it rather
 // than leave the snapshot for the reaper to abandon. Values (trace ids etc.)
