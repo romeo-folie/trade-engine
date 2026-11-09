@@ -26,7 +26,7 @@ specialists; the caller owns final lens validation.
 - knowledge-graph, similar-analysis, and performance context;
 - scanner discovery provenance and a validated execution profile;
 - deterministic pullback facts when `pullback_strength` is admissible; and
-- a timeframe role plus the completed primary thesis for entry confirmation.
+- supplemental timeframe evidence (`TimeframeContexts`) for the same decision.
 
 A valid execution profile owns the ordered analyst menu. Discovery-source
 labels explain why the candidate was found and are never offered as strategies.
@@ -65,16 +65,20 @@ flowchart LR
     V --> O[Validated response + metadata]
 ```
 
-For scanner profiles with an entry-timing timeframe, the engine can issue a
-second request with role `entry_confirmation`. That request evaluates timing
-for the already-selected thesis; it cannot substitute a new lens or create an
-independent exit. The engine owns the fail-closed merge policy.
+For scanner profiles with supplemental timeframes (for example an entry-timing
+timeframe), the engine loads that evidence into `TimeframeContexts` on the same
+request, so one ensemble judges thesis and timing together. A configured
+supplemental timeframe that cannot be loaded blocks new BUYs for the cycle while
+still permitting a risk-reducing SELL. The `entry_confirmation` role and
+`PrimaryThesisContext` prompt contract remain in `prompts/`, but the live engine
+no longer issues a separate confirmation request.
 
 ## Audit Metadata
 
 `ModelCallMeta` captures provider/model identity, prompt hash, raw prompt and
 response, token counts, latency, and the indicator snapshot. The store retains
-that raw metadata for the primary analysis plus selected/rejected lenses,
-regime, scanner lineage, and the compact timeframe-workflow audit. Entry
-confirmation records cost and compact status/action/lens/reason fields in that
-workflow audit; its raw prompt and provider response are not persisted.
+the final metadata plus each analyst's metadata (`ensemble_results`), the
+arbiter call, selected/rejected lenses, regime, scanner lineage, and the compact
+timeframe-workflow audit. Known replay gaps, including failed attempts, the
+unrecorded arbiter permutation, and mutable candles/news, are inventoried in
+`docs/issue-589-decision-replay.md`.
