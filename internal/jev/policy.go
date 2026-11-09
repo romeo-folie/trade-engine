@@ -213,23 +213,37 @@ func resolveEntry(req analysis.AnalysisRequest, answers map[string]Answer, cfg P
 	if !(entry > 0) || !(atr > 0) || math.IsInf(entry, 0) || math.IsInf(atr, 0) {
 		return hold(ReasonPlanUnavailable, "A defined-risk plan could not be derived: entry price or ATR is unavailable.")
 	}
-	stop := entry - cfg.StopATRMultiple*atr
-	if !(stop > 0) {
-		return hold(ReasonPlanUnavailable, "A defined-risk plan could not be derived: the ATR stop falls at or below zero.")
+	stop := round4(entry - cfg.StopATRMultiple*atr)
+	if !(stop > 0) || stop >= entry {
+		return hold(ReasonPlanUnavailable, "A defined-risk plan could not be derived: the ATR stop is not between zero and entry.")
 	}
 	r := math.Max(cfg.TargetRMultiple, minRiskReward)
-	target := entry + r*(entry-stop)
+	target := bracketTarget(entry, stop, r)
 	trace.Values["entry"], trace.Values["atr"], trace.Values["risk_reward"] = entry, atr, r
 
 	trace.ReasonCodes = append(trace.ReasonCodes, ReasonEntry)
 	resp.Action = analysis.ActionBuy
 	resp.SizePct = cfg.SizePct
-	resp.StopLoss = round4(stop)
-	resp.TakeProfit = round4(target)
+	resp.StopLoss = stop
+	resp.TakeProfit = target
 	resp.DecisiveReason = fmt.Sprintf("Jev supported a %s entry: thesis support %.2f, adverse evidence %.2f, enter-now %.2f.",
 		lens.Choice, support, adverse, timing.Probabilities[TimingEnterNow])
 	resp.Reasoning = reasoning(trace)
 	return resp, trace, nil
+}
+
+// bracketTarget returns the smallest 4-decimal target at or above
+// entry + r*(entry-stop) whose realised reward/risk, computed from the stored
+// (rounded) stop and target exactly as the risk manager does, is at least r.
+// Rounding each price independently could otherwise land a hair under the
+// floor and be rejected by the strict risk/reward gate.
+func bracketTarget(entry, stop, r float64) float64 {
+	risk := entry - stop
+	target := math.Ceil((entry+r*risk)*10000) / 10000
+	for i := 0; i < 4 && (target-entry)/risk < r; i++ {
+		target = round4(target + 0.0001)
+	}
+	return target
 }
 
 // entryPrice is the latest close, preferring the entry-timing timeframe when

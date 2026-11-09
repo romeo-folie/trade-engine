@@ -3,6 +3,7 @@ package jev
 import (
 	"context"
 	"errors"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -295,5 +296,35 @@ func TestEntryPriceUsesEntryTimingTimeframe(t *testing.T) {
 	resp, trace, err := Resolve(req, qualifyingAnswers(), DefaultPolicyConfig(), 0)
 	if err != nil || trace.Values["entry"] != 102 || resp.StopLoss != 97 {
 		t.Fatalf("entry %v stop %v err %v", trace.Values["entry"], resp.StopLoss, err)
+	}
+}
+
+// TestBracketPreservesRiskRewardFloorAfterRounding reproduces the rounding
+// case that fell under 2R, then checks the property across many prices with
+// the risk manager's own formula (reward/risk >= min, strict).
+func TestBracketPreservesRiskRewardFloorAfterRounding(t *testing.T) {
+	check := func(entry, atr, floor float64) {
+		req := entryRequest()
+		req.RecentCandles = []analysis.CandleSnapshot{{Close: entry}}
+		req.Indicators.ATR = atr
+		cfg := DefaultPolicyConfig()
+		resp, _, err := Resolve(req, qualifyingAnswers(), cfg, floor)
+		if err != nil || resp.Action != analysis.ActionBuy {
+			t.Fatalf("entry %v atr %v: %+v %v", entry, atr, resp, err)
+		}
+		rr := (resp.TakeProfit - entry) / (entry - resp.StopLoss)
+		if rr < math.Max(cfg.TargetRMultiple, floor) {
+			t.Fatalf("entry %v atr %v floor %v: realised R:R %.10f below floor (stop %v target %v)",
+				entry, atr, floor, rr, resp.StopLoss, resp.TakeProfit)
+		}
+	}
+	check(100.01, 2.333333, 2) // the reported case
+	for i := 0; i < 2000; i++ {
+		entry := 5 + float64(i)*0.37331
+		atr := 0.05 + float64(i%97)*0.013579
+		if entry-2*atr <= 0 {
+			continue
+		}
+		check(entry, atr, 2+float64(i%5)*0.25)
 	}
 }
