@@ -515,3 +515,31 @@ func TestDecisionSnapshotPersistsEveryAttempt(t *testing.T) {
 		}
 	}
 }
+
+// TestDecisionSnapshotCompletesAfterAnalysisCancellation: shutdown cancels the
+// engine context mid-analysis; the partial evidence must still be recorded.
+func TestDecisionSnapshotCompletesAfterAnalysisCancellation(t *testing.T) {
+	requireEngineDB(t)
+	e := snapshotTestEngine(nil, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	req := analysis.AnalysisRequest{Ticker: uniqueTicker("SNPZ"), Timeframe: "1d", DecisionCutoff: time.Now()}
+	id := e.beginDecisionSnapshot(ctx, req, nil, "")
+	if id == "" {
+		t.Fatal("begin failed")
+	}
+	cancel() // engine shutdown while the analysis was running
+	partial := analysis.AnalyzeResult{AnalystResults: []analysis.AnalystResult{
+		{Provider: "a", Model: "a-model", Err: context.Canceled,
+			Meta: analysis.ModelCallMeta{Provider: "a", Model: "a-model", RawPrompt: "prompt"}},
+	}}
+	e.completeDecisionSnapshot(ctx, id, partial, nil, "", context.Canceled, nil)
+
+	got, err := store.GetDecisionSnapshot(context.Background(), id)
+	if err != nil || got.Outcome != store.DecisionOutcomeFailed || !strings.Contains(got.OutcomeReason, "context canceled") {
+		t.Fatalf("snapshot = %+v (%v), want failed with the cancellation reason", got, err)
+	}
+	calls, _ := store.GetDecisionStageCalls(context.Background(), id)
+	if len(calls) != 1 || calls[0].RawPrompt != "prompt" {
+		t.Fatalf("partial evidence lost: %+v", calls)
+	}
+}

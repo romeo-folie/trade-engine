@@ -121,7 +121,7 @@ func (e *Engine) insertDecisionSnapshot(
 	if err != nil {
 		return "", err
 	}
-	ctx, cancel := context.WithTimeout(ctx, decisionSnapshotWriteTimeout)
+	ctx, cancel := snapshotWriteContext(ctx)
 	defer cancel()
 	return store.InsertDecisionSnapshot(ctx, store.DecisionSnapshot{
 		SchemaVersion:  snapshot.SchemaVersion,
@@ -221,7 +221,7 @@ func (e *Engine) completeDecisionSnapshot(
 		e.inflightSnapshotsMu.Unlock()
 	}()
 	completion := buildDecisionCompletion(result, final, analysisID, analysisErr, persistErr)
-	ctx, cancel := context.WithTimeout(ctx, decisionSnapshotWriteTimeout)
+	ctx, cancel := snapshotWriteContext(ctx)
 	defer cancel()
 	if err := store.CompleteDecisionSnapshot(ctx, id, completion); err != nil {
 		level := logger.Warn
@@ -231,6 +231,16 @@ func (e *Engine) completeDecisionSnapshot(
 		level("decision snapshot: complete failed — row stays pending until the reaper abandons it",
 			"snapshot_id", id, "err", err)
 	}
+}
+
+// snapshotWriteContext bounds a snapshot write by decisionSnapshotWriteTimeout
+// but detaches it from the caller's cancellation. An orderly shutdown cancels
+// the engine context while model calls are in flight; those calls return their
+// partial evidence, and the completion must still be able to record it rather
+// than leave the snapshot for the reaper to abandon. Values (trace ids etc.)
+// are preserved.
+func snapshotWriteContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), decisionSnapshotWriteTimeout)
 }
 
 // buildDecisionCompletion settles a snapshot even when its evidence cannot be
