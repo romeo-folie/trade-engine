@@ -231,6 +231,8 @@ func specialistRoleName(role string) string {
 		return "Sentiment"
 	case "risk_manager":
 		return "Risk Manager"
+	case "jev":
+		return "Jev"
 	default:
 		return role
 	}

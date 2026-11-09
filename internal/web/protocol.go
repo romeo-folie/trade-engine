@@ -245,7 +245,19 @@ func pipelineTopology(cfg *appconfig.Config) ([]NodeState, PipelineTopology) {
 	revisionParts := []string{mode}
 	riskStage := 4
 
-	if cfg != nil && cfg.Analysis.SpecialistModeEnabled {
+	if cfg != nil && cfg.Analysis.JevAuthoritative() {
+		// Issue #590: Jev is the sole decision maker; no analysts run.
+		mode = "jev"
+		revisionParts = []string{mode, "jev:" + cfg.Analysis.Jev.Model}
+		nodes = append(nodes, NodeState{
+			ID: "jev", Label: "Jev (TypeSafe)", Kind: "analyst", Stage: 3,
+			Meta: map[string]any{"provider": "typesafe", "model": cfg.Analysis.Jev.Model, "role": "jev"},
+		})
+		edges = append(edges,
+			PipelineEdge{ID: "e-indicators-jev", Source: "indicator_engine", Target: "jev", Kind: "primary"},
+			PipelineEdge{ID: "e-jev-risk-controls", Source: "jev", Target: "risk_manager", Kind: "primary"},
+		)
+	} else if cfg != nil && cfg.Analysis.SpecialistModeEnabled {
 		mode = "specialist"
 		revisionParts = []string{mode}
 		directionalRoles := []string{"fundamental", "technical", "sentiment"}

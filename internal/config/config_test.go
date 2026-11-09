@@ -1696,3 +1696,60 @@ func TestFuturesORBConfig_AsForexConfig(t *testing.T) {
 		t.Errorf("Session = %q; want empty", f.Session)
 	}
 }
+
+func validJevAnalysis(t *testing.T) AnalysisConfig {
+	t.Helper()
+	t.Setenv("TS_TEST_KEY", "k")
+	a := Defaults().Analysis
+	a.DecisionMode = "jev"
+	a.Jev.Model = "jev-2026-10"
+	a.Jev.APIKeyEnv = "TS_TEST_KEY"
+	return a
+}
+
+func TestValidateJevConfig(t *testing.T) {
+	if errs := ValidateJevConfig(Defaults().Analysis); len(errs) != 0 {
+		t.Fatalf("default ensemble mode must validate: %v", errs)
+	}
+	if errs := ValidateJevConfig(validJevAnalysis(t)); len(errs) != 0 {
+		t.Fatalf("valid jev config rejected: %v", errs)
+	}
+	cases := map[string]func(*AnalysisConfig){
+		"unknown mode":      func(a *AnalysisConfig) { a.DecisionMode = "oracle" },
+		"unknown authority": func(a *AnalysisConfig) { a.Jev.Authority = "advisory" },
+		"missing model":     func(a *AnalysisConfig) { a.Jev.Model = "" },
+		"missing key env":   func(a *AnalysisConfig) { a.Jev.APIKeyEnv = "" },
+		"unset key env":     func(a *AnalysisConfig) { a.Jev.APIKeyEnv = "TS_TEST_KEY_UNSET_589" },
+		"threshold > 1":     func(a *AnalysisConfig) { a.Jev.Policy.MaxAdverse = 1.5 },
+		"nan threshold":     func(a *AnalysisConfig) { a.Jev.Policy.ExitThreshold = math.NaN() },
+		"zero stop":         func(a *AnalysisConfig) { a.Jev.Policy.StopATRMultiple = 0 },
+		"inf target":        func(a *AnalysisConfig) { a.Jev.Policy.TargetRMultiple = math.Inf(1) },
+		"negative grace":    func(a *AnalysisConfig) { a.Jev.ShadowGraceMs = -1 },
+	}
+	for name, mutate := range cases {
+		a := validJevAnalysis(t)
+		mutate(&a)
+		if errs := ValidateJevConfig(a); len(errs) == 0 {
+			t.Errorf("%s accepted", name)
+		}
+	}
+}
+
+func TestJevModeDefaultsAreOffAndShadow(t *testing.T) {
+	a := Defaults().Analysis
+	if a.JevEnabled() || a.JevAuthoritative() || a.JevShadow() {
+		t.Fatal("Jev must be disabled by default")
+	}
+	if a.Jev.Authority != JevAuthorityShadow || a.Jev.AllowLive {
+		t.Fatal("enabling Jev must start in shadow without live authority")
+	}
+}
+
+func TestJevAPIKeyIsNeverSerialised(t *testing.T) {
+	var j JevConfig
+	j.APIKey = "ts-SECRET"
+	raw, _ := json.Marshal(j)
+	if strings.Contains(string(raw), "SECRET") {
+		t.Fatalf("API key serialised: %s", raw)
+	}
+}

@@ -616,6 +616,8 @@ func topologyMode(cfg *appconfig.Config) string {
 
 func finalAnalysisNodeID(cfg *appconfig.Config, fastPathed bool) string {
 	switch topologyMode(cfg) {
+	case "jev":
+		return "jev"
 	case "specialist":
 		return "specialist-risk-manager"
 	case "ensemble":

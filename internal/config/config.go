@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -357,6 +358,127 @@ type AnalysisConfig struct {
 	// Example: {fundamental: claude, technical: deepseek, sentiment: gemini,
 	//           risk_manager: grok}
 	SpecialistRoles map[string]string `yaml:"specialist_roles"`
+
+	// DecisionMode selects who makes analysis decisions: "ensemble" (the
+	// default: single/ensemble/specialist analysts as configured) or "jev"
+	// (TypeSafe's Jev is evaluated per analysis.jev.authority). Issue #590.
+	DecisionMode string `yaml:"decision_mode"`
+
+	// Jev configures the Jev decision mode. Ignored unless DecisionMode is jev.
+	Jev JevConfig `yaml:"jev"`
+}
+
+// Jev authorities.
+const (
+	// JevAuthorityShadow runs Jev beside the configured analyst workflow;
+	// Jev's decision is recorded and compared but never executed.
+	JevAuthorityShadow = "shadow"
+	// JevAuthorityAuthoritative makes Jev the sole decision maker: no
+	// analysts or arbiter run. Live trading additionally requires AllowLive.
+	JevAuthorityAuthoritative = "authoritative"
+)
+
+// JevConfig configures TypeSafe's Jev evaluator (issue #590).
+type JevConfig struct {
+	// Authority is "shadow" or "authoritative" (see JevAuthority*).
+	Authority string `yaml:"authority"`
+	// AllowLive must be true for authoritative Jev decisions in live mode, a
+	// separate deliberate opt-in from enabling the mode on paper.
+	AllowLive bool `yaml:"allow_live"`
+	// Model is the TypeSafe model to pin (from GET /v1/models). Prefer a
+	// specific model over a moving alias such as jev-latest so decisions
+	// remain comparable; the served model is recorded either way.
+	Model     string `yaml:"model"`
+	APIKeyEnv string `yaml:"api_key_env"`
+	APIKey    string `yaml:"-" json:"-"`
+	// BaseURL defaults to https://api.typesafe.ai.
+	BaseURL string `yaml:"base_url"`
+	// TimeoutSec bounds each HTTP attempt; MaxRetries bounds transient
+	// retries (capped at 5).
+	TimeoutSec int `yaml:"timeout_sec"`
+	MaxRetries int `yaml:"max_retries"`
+	// ShadowGraceMs bounds how long a finished baseline analysis waits for a
+	// still-running shadow Jev call before recording it as timed out, so
+	// shadow evaluation can never meaningfully delay a live decision.
+	ShadowGraceMs int `yaml:"shadow_grace_ms"`
+	// Policy holds the jev-policy/v1 thresholds.
+	Policy JevPolicyConfig `yaml:"policy"`
+}
+
+// JevPolicyConfig mirrors jev.PolicyConfig (kept here so config stays a leaf
+// package). MinConfidence defaults to risk.confidence_threshold when zero.
+type JevPolicyConfig struct {
+	MinThesisSupport     float64 `yaml:"min_thesis_support"`
+	MaxAdverse           float64 `yaml:"max_adverse"`
+	MinLensProbability   float64 `yaml:"min_lens_probability"`
+	MinTimingProbability float64 `yaml:"min_timing_probability"`
+	ExitThreshold        float64 `yaml:"exit_threshold"`
+	StopATRMultiple      float64 `yaml:"stop_atr_multiple"`
+	TargetRMultiple      float64 `yaml:"target_r_multiple"`
+	SizePct              float64 `yaml:"size_pct"`
+	MinConfidence        float64 `yaml:"min_confidence"`
+}
+
+// JevEnabled reports whether the Jev decision mode is configured.
+func (a AnalysisConfig) JevEnabled() bool {
+	return strings.EqualFold(strings.TrimSpace(a.DecisionMode), "jev")
+}
+
+// JevAuthoritative reports whether Jev is the sole decision maker.
+func (a AnalysisConfig) JevAuthoritative() bool {
+	return a.JevEnabled() && a.Jev.Authority == JevAuthorityAuthoritative
+}
+
+// JevShadow reports whether Jev runs in shadow beside the baseline workflow.
+func (a AnalysisConfig) JevShadow() bool {
+	return a.JevEnabled() && a.Jev.Authority == JevAuthorityShadow
+}
+
+// ValidateJevConfig returns configuration errors for the Jev decision mode.
+// Live-authority enforcement needs the runtime mode and lives in the engine.
+func ValidateJevConfig(a AnalysisConfig) []string {
+	var errs []string
+	mode := strings.ToLower(strings.TrimSpace(a.DecisionMode))
+	if mode != "" && mode != "ensemble" && mode != "jev" {
+		return []string{fmt.Sprintf("analysis.decision_mode must be ensemble or jev, got %q", a.DecisionMode)}
+	}
+	if mode != "jev" {
+		return nil
+	}
+	j := a.Jev
+	if j.Authority != JevAuthorityShadow && j.Authority != JevAuthorityAuthoritative {
+		errs = append(errs, fmt.Sprintf("analysis.jev.authority must be shadow or authoritative, got %q", j.Authority))
+	}
+	if strings.TrimSpace(j.Model) == "" {
+		errs = append(errs, "analysis.jev.model is required (pin a model from GET /v1/models)")
+	}
+	if strings.TrimSpace(j.APIKeyEnv) == "" {
+		errs = append(errs, "analysis.jev.api_key_env is required")
+	} else if os.Getenv(j.APIKeyEnv) == "" {
+		errs = append(errs, fmt.Sprintf("analysis.jev.api_key_env %s is not set", j.APIKeyEnv))
+	}
+	if j.TimeoutSec < 0 || j.MaxRetries < 0 || j.ShadowGraceMs < 0 {
+		errs = append(errs, "analysis.jev timeout_sec, max_retries and shadow_grace_ms must be >= 0")
+	}
+	p := j.Policy
+	for name, v := range map[string]float64{
+		"min_thesis_support": p.MinThesisSupport, "max_adverse": p.MaxAdverse,
+		"min_lens_probability": p.MinLensProbability, "min_timing_probability": p.MinTimingProbability,
+		"exit_threshold": p.ExitThreshold, "min_confidence": p.MinConfidence,
+	} {
+		if math.IsNaN(v) || v < 0 || v > 1 {
+			errs = append(errs, fmt.Sprintf("analysis.jev.policy.%s must be within [0,1]", name))
+		}
+	}
+	for name, v := range map[string]float64{
+		"stop_atr_multiple": p.StopATRMultiple, "target_r_multiple": p.TargetRMultiple, "size_pct": p.SizePct,
+	} {
+		if !(v > 0) || math.IsInf(v, 0) {
+			errs = append(errs, fmt.Sprintf("analysis.jev.policy.%s must be positive and finite", name))
+		}
+	}
+	sort.Strings(errs)
+	return errs
 }
 
 // ClassifierConfig controls the two-stage classifier gate.
@@ -2576,6 +2698,7 @@ func geminiOutputLimit(model string) int {
 
 func Validate(cfg *Config) []string {
 	var errs []string
+	errs = append(errs, ValidateJevConfig(cfg.Analysis)...)
 	if cfg.Engine.MaxWatchlist <= 0 {
 		errs = append(errs, "engine.max_watchlist must be > 0")
 	}
@@ -3667,6 +3790,7 @@ func resolveEnvVars(cfg *Config) {
 	cfg.Markets.OANDA.Token = resolveEnv(cfg.Markets.OANDA.TokenEnv)
 	cfg.Notifications.Telegram.BotToken = resolveEnv(cfg.Notifications.Telegram.BotTokenEnv)
 	cfg.Embeddings.APIKey = resolveEnv(cfg.Embeddings.APIKeyEnv)
+	cfg.Analysis.Jev.APIKey = resolveEnv(cfg.Analysis.Jev.APIKeyEnv)
 }
 
 func resolveEnv(key string) string {

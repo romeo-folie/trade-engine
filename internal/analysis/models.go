@@ -236,7 +236,7 @@ type ModelCallMeta struct {
 
 // TransportAttempt is one retried transport-level failure of a model call.
 type TransportAttempt struct {
-	StatusCode int    `json:",omitempty"`
+	StatusCode int `json:",omitempty"`
 	Error      string
 	LatencyMs  int64
 }
@@ -389,6 +389,9 @@ type AnalystResult struct {
 	Meta      ModelCallMeta
 	Err       error
 	LatencyMs int64
+	// Extra is evaluator-specific audit evidence (for example the Jev policy
+	// trace and typed answers). Recorded on the decision snapshot.
+	Extra json.RawMessage `json:",omitempty"`
 }
 
 // MarshalJSON persists Err as its message. encoding/json would otherwise

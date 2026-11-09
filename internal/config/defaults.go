@@ -240,6 +240,15 @@ func Defaults() *Config {
 			RiskFreeRate: 0.04,
 		},
 		Analysis: AnalysisConfig{
+			DecisionMode: "ensemble",
+			Jev: JevConfig{
+				Authority: JevAuthorityShadow, TimeoutSec: 20, MaxRetries: 2, ShadowGraceMs: 2000,
+				Policy: JevPolicyConfig{
+					MinThesisSupport: 0.60, MaxAdverse: 0.40, MinLensProbability: 0.50,
+					MinTimingProbability: 0.55, ExitThreshold: 0.60,
+					StopATRMultiple: 2.0, TargetRMultiple: 2.0, SizePct: 2.0,
+				},
+			},
 			MaterialChangeOnly:       true,
 			HoldCooldownMin:          120,
 			RSIDeltaThreshold:        3.0,

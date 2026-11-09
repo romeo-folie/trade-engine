@@ -33,6 +33,7 @@ const (
 	WorkflowSingle     = "single"
 	WorkflowEnsemble   = "ensemble"
 	WorkflowSpecialist = "specialist"
+	WorkflowJev        = "jev"
 )
 
 // Inputs is everything prompt-visible or resolution-relevant that an analysis
@@ -224,6 +225,9 @@ func CodeRevision() string {
 
 // Workflow names the configured analysis topology.
 func Workflow(cfg *config.Config) string {
+	if cfg.Analysis.JevAuthoritative() {
+		return WorkflowJev
+	}
 	if cfg.Analysis.SpecialistModeEnabled {
 		return WorkflowSpecialist
 	}
@@ -280,7 +284,13 @@ type EffectiveConfig struct {
 	SimilarAnalysesLimit     int                        `json:"similar_analyses_limit"`
 	EmbeddingModel           string                     `json:"embedding_model,omitempty"`
 	FeedbackPromptEnrichment bool                       `json:"feedback_prompt_enrichment"`
-	EntryGates               config.EntryGatesConfig    `json:"entry_gates"`
+	// DecisionMode, JevAuthority, JevModel and JevPolicy identify the Jev
+	// decision mode (issue #590); credentials and endpoints are excluded.
+	DecisionMode string                  `json:"decision_mode,omitempty"`
+	JevAuthority string                  `json:"jev_authority,omitempty"`
+	JevModel     string                  `json:"jev_model,omitempty"`
+	JevPolicy    *config.JevPolicyConfig `json:"jev_policy,omitempty"`
+	EntryGates   config.EntryGatesConfig `json:"entry_gates"`
 }
 
 // NewEffectiveConfig projects the operator configuration onto the allowlist.
@@ -302,6 +312,13 @@ func NewEffectiveConfig(cfg *config.Config) EffectiveConfig {
 	}
 	if cfg.Embeddings.SimilarAnalysesEnabled {
 		out.EmbeddingModel = cfg.Embeddings.Provider + "/" + cfg.Embeddings.Model
+	}
+	if cfg.Analysis.JevEnabled() {
+		policy := cfg.Analysis.Jev.Policy
+		if policy.MinConfidence == 0 {
+			policy.MinConfidence = cfg.Risk.ConfidenceThreshold // as the engine applies it
+		}
+		out.DecisionMode, out.JevAuthority, out.JevModel, out.JevPolicy = "jev", cfg.Analysis.Jev.Authority, cfg.Analysis.Jev.Model, &policy
 	}
 	for _, m := range cfg.Models.AnalystConfigs() {
 		out.Analysts = append(out.Analysts, modelSettings(m, ""))
@@ -329,7 +346,14 @@ const (
 	StageAnalyst    = "analyst"
 	StageSpecialist = "specialist"
 	StageArbiter    = "arbiter"
+	// StageJev is an authoritative Jev decision call (issue #590).
+	StageJev = "jev"
+	// StageJevShadow is a shadow Jev call recorded beside the baseline.
+	StageJevShadow = "jev_shadow"
 )
+
+// JevRole is the AnalystResult.Role the engine gives Jev results.
+const JevRole = "jev"
 
 // ArbiterExtra is the arbiter-only audit carried on its stage call.
 type ArbiterExtra struct {
@@ -352,7 +376,7 @@ type RetryExtra struct {
 // number increases in call order: superseded calls to other models (a
 // specialist's failed primary before its fallback) come first, each followed
 // by its retried transport attempts; the final call is the highest attempt.
-func StageCalls(result analysis.AnalyzeResult) ([]store.DecisionStageCall, error) {
+func StageCalls(result analysis.AnalyzeResult, shadows ...analysis.AnalystResult) ([]store.DecisionStageCall, error) {
 	var calls []store.DecisionStageCall
 	add := func(stage string, ordinal int, role, provider, model string, meta analysis.ModelCallMeta,
 		resp *analysis.AnalysisResponse, errText string, latencyMs int64, extra any) error {
@@ -368,14 +392,26 @@ func StageCalls(result analysis.AnalyzeResult) ([]store.DecisionStageCall, error
 	}
 	for i, r := range result.AnalystResults {
 		stage := StageAnalyst
-		if r.Role != "" {
+		switch {
+		case r.Role == JevRole:
+			stage = StageJev
+		case r.Role != "":
 			stage = StageSpecialist
 		}
 		resp := &r.Response
 		if r.Err != nil {
 			resp = nil
 		}
-		if err := add(stage, i, r.Role, r.Provider, r.Model, r.Meta, resp, errText(r.Err), r.LatencyMs, nil); err != nil {
+		if err := add(stage, i, r.Role, r.Provider, r.Model, r.Meta, resp, errText(r.Err), r.LatencyMs, rawExtra(r.Extra)); err != nil {
+			return nil, err
+		}
+	}
+	for i, r := range shadows {
+		resp := &r.Response
+		if r.Err != nil {
+			resp = nil
+		}
+		if err := add(StageJevShadow, i, r.Role, r.Provider, r.Model, r.Meta, resp, errText(r.Err), r.LatencyMs, rawExtra(r.Extra)); err != nil {
 			return nil, err
 		}
 	}
@@ -463,6 +499,14 @@ func attemptRows(stage string, ordinal int, role, provider, model string, meta a
 	return rows, err
 }
 
+// rawExtra passes pre-encoded audit JSON through attemptRows unchanged.
+func rawExtra(raw json.RawMessage) any {
+	if len(raw) == 0 {
+		return nil
+	}
+	return raw
+}
+
 func marshalOptional(v map[string]any) (json.RawMessage, error) {
 	if len(v) == 0 {
 		return nil, nil
@@ -474,11 +518,17 @@ func marshalOptional(v map[string]any) (json.RawMessage, error) {
 // after aggregation, final lens validation, supplemental-evidence blocking,
 // and decision-policy reasoning. Recorded-answer replay must reproduce it.
 type FinalOutput struct {
-	ResolutionPolicyVersion string                        `json:"resolution_policy_version"`
-	Response                analysis.AnalysisResponse     `json:"response"`
-	LensAudit               analysis.LensSelectionAudit   `json:"lens_audit"`
-	DecisionPolicy          *analysis.DecisionPolicyAudit `json:"decision_policy,omitempty"`
-	FastPathed              bool                          `json:"fast_pathed"`
-	Arbitrated              bool                          `json:"arbitrated"`
-	SupplementalBlocked     bool                          `json:"supplemental_blocked"`
+	ResolutionPolicyVersion string `json:"resolution_policy_version"`
+	// Evaluator names who decided: the workflow (single/ensemble/specialist)
+	// or "jev" for an authoritative Jev decision.
+	Evaluator string `json:"evaluator,omitempty"`
+	// PolicyTrace is the evaluator's resolution trace (Jev reason codes and
+	// measured values) when one exists.
+	PolicyTrace         json.RawMessage               `json:"policy_trace,omitempty"`
+	Response            analysis.AnalysisResponse     `json:"response"`
+	LensAudit           analysis.LensSelectionAudit   `json:"lens_audit"`
+	DecisionPolicy      *analysis.DecisionPolicyAudit `json:"decision_policy,omitempty"`
+	FastPathed          bool                          `json:"fast_pathed"`
+	Arbitrated          bool                          `json:"arbitrated"`
+	SupplementalBlocked bool                          `json:"supplemental_blocked"`
 }
