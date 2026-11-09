@@ -209,7 +209,8 @@ func consensusRejections(results []AnalystResult, winner Action, selected string
 // ─── Arbiter ───────────────────────────────────────────────────────────────────
 
 // Arbitrate sends all analyst results to the arbiter with anonymised labels
-// (shuffled each call to prevent self-bias) and returns a synthesised signal.
+// (answer-seeded permutation: anonymised, varies across decisions, and
+// reproducible from the recorded answers) and returns a synthesised signal.
 func Arbitrate(ctx context.Context, arbiter ModelProvider, req AnalysisRequest, results []AnalystResult) (ArbiterResult, error) {
 	if !arbiter.IsAvailable() {
 		return ArbiterResult{}, fmt.Errorf("arbiter %s/%s is not available", arbiter.ProviderName(), arbiter.ModelName())
