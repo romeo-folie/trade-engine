@@ -1339,6 +1339,13 @@ func (e *Engine) runAnalysisWithProfile(
 				e.costTracker.Record(result.Arbiter.Meta.Provider, result.Arbiter.Meta.Model,
 					result.Arbiter.Meta.InputTokens, result.Arbiter.Meta.OutputTokens)
 			}
+			// A failed arbiter call can still have consumed tokens (for example
+			// a response that failed to parse); count them so spend guardrails
+			// see it. Arbiter is nil on that path, so this cannot double count.
+			if f := result.FailedArbiter; f != nil && f.Meta.Provider != "" && f.Meta.Model != "" &&
+				(f.Meta.InputTokens > 0 || f.Meta.OutputTokens > 0) {
+				e.costTracker.Record(f.Meta.Provider, f.Meta.Model, f.Meta.InputTokens, f.Meta.OutputTokens)
+			}
 		} else if result.Meta.Provider != "" && result.Meta.Model != "" && (result.Meta.InputTokens > 0 || result.Meta.OutputTokens > 0) {
 			e.costTracker.Record(result.Meta.Provider, result.Meta.Model,
 				result.Meta.InputTokens, result.Meta.OutputTokens)
