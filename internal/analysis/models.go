@@ -392,8 +392,23 @@ type AnalyzeResult struct {
 	Meta           ModelCallMeta
 	AnalystResults []AnalystResult
 	Arbiter        *ArbiterResult // nil when fast-pathed or single-model
+	// FailedArbiter records an arbiter call that was made but failed, after
+	// which resolution fell back to majority vote. Arbiter stays nil on that
+	// path; this field exists so audits can tell a failed arbitration from a
+	// decision that never invoked the arbiter (issue #589).
+	FailedArbiter  *FailedArbiterCall
 	FastPathed     bool
 	DecisionPolicy *DecisionPolicyAudit
+}
+
+// FailedArbiterCall is the evidence of an arbiter invocation that errored.
+type FailedArbiterCall struct {
+	Provider      string
+	Model         string
+	Meta          ModelCallMeta
+	PolicyVersion string
+	Ordering      []ArbiterSlot
+	Err           error
 }
 
 // DecisionPolicyAudit records deterministic topology constraints applied after

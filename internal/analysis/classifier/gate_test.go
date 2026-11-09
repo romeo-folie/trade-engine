@@ -34,7 +34,7 @@ func makeGate(mode string, llm *classifier.LLMClassifier) *classifier.Gate {
 func TestGateShadowModeDoesNotBlock(t *testing.T) {
 	g := makeGate("shadow", nil)
 	s := base()
-	s.RSIDelta = 0    // all below threshold → WOULD_SKIP
+	s.RSIDelta = 0 // all below threshold → WOULD_SKIP
 	s.NewsHash = s.LastNewsHash
 
 	proceed, res, err := g.Classify(context.Background(), s)

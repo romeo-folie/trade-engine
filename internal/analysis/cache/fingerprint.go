@@ -33,12 +33,12 @@ type FingerprintInput struct {
 	Arbiter string
 
 	// Bucketed indicator state — small noise must not bust the cache.
-	RSI         float64 // bucketed in steps of 5
-	EMAGapPct   float64 // (price-EMA20)/EMA20 * 100, bucketed in steps of 0.5
-	MACDSign    int     // +1 | 0 | -1
-	MACDBucket  int     // magnitude bucket (0–4)
-	ADXBucket   int     // 0–3: weak/moderate/strong/extreme
-	ATRPctBucket int    // 0–4
+	RSI          float64 // bucketed in steps of 5
+	EMAGapPct    float64 // (price-EMA20)/EMA20 * 100, bucketed in steps of 0.5
+	MACDSign     int     // +1 | 0 | -1
+	MACDBucket   int     // magnitude bucket (0–4)
+	ADXBucket    int     // 0–3: weak/moderate/strong/extreme
+	ATRPctBucket int     // 0–4
 
 	// Price regime — return over lookback in one of 5 buckets.
 	PriceRegimeBucket int // -2 | -1 | 0 | +1 | +2

@@ -163,7 +163,9 @@ func (a *Analyzer) AnalyzeFull(ctx context.Context, req AnalysisRequest, impact 
 		logger.Warn("no arbiter configured — falling back to majority vote", "ticker", req.Ticker)
 		resp, ok := majorityVote(results)
 		if !ok {
-			return AnalyzeResult{}, fmt.Errorf("ensemble: no majority among %d analysts", len(results))
+			// Keep the analyst calls: they were made (and paid for) even
+			// though no decision could be resolved.
+			return AnalyzeResult{AnalystResults: results}, fmt.Errorf("ensemble: no majority among %d analysts", len(results))
 		}
 		return AnalyzeResult{Response: resp, Meta: primaryMeta(results), AnalystResults: results}, nil
 	}
@@ -171,11 +173,19 @@ func (a *Analyzer) AnalyzeFull(ctx context.Context, req AnalysisRequest, impact 
 	arbResult, err := Arbitrate(ctx, a.arbiter, req, results)
 	if err != nil {
 		logger.Warn("arbiter failed — falling back to majority vote", "ticker", req.Ticker, "err", err)
+		var failed *FailedArbiterCall
+		if arbResult.Meta.Provider != "" { // the call was actually made
+			failed = &FailedArbiterCall{
+				Provider: arbResult.Meta.Provider, Model: arbResult.Meta.Model, Meta: arbResult.Meta,
+				PolicyVersion: arbResult.PolicyVersion, Ordering: arbResult.Ordering, Err: err,
+			}
+		}
 		resp, ok := majorityVote(results)
 		if !ok {
-			return AnalyzeResult{}, fmt.Errorf("ensemble: arbiter failed and no majority: %w", err)
+			return AnalyzeResult{AnalystResults: results, FailedArbiter: failed},
+				fmt.Errorf("ensemble: arbiter failed and no majority: %w", err)
 		}
-		return AnalyzeResult{Response: resp, Meta: primaryMeta(results), AnalystResults: results}, nil
+		return AnalyzeResult{Response: resp, Meta: primaryMeta(results), AnalystResults: results, FailedArbiter: failed}, nil
 	}
 
 	logger.Info("ensemble arbitrated", "ticker", req.Ticker, "action", string(arbResult.Final.Action), "dissent", arbResult.DissentSummary != "")

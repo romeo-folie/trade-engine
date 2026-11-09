@@ -281,7 +281,15 @@ func Arbitrate(ctx context.Context, arbiter ModelProvider, req AnalysisRequest, 
 	t0 := time.Now()
 	resp, meta, err := arbiter.Analyze(ctx, arbReq)
 	if err != nil {
-		return ArbiterResult{}, fmt.Errorf("arbiter call failed: %w", err)
+		// Return the attempt's identity and ordering with the error so the
+		// failed invocation stays auditable. Final is empty: callers must not
+		// treat this result as a decision.
+		if meta.Provider == "" {
+			meta.Provider, meta.Model = arbiter.ProviderName(), arbiter.ModelName()
+		}
+		meta.LatencyMs = time.Since(t0).Milliseconds()
+		return ArbiterResult{Meta: meta, PolicyVersion: ResolutionPolicyVersion, Ordering: ordering},
+			fmt.Errorf("arbiter call failed: %w", err)
 	}
 	meta.LatencyMs = time.Since(t0).Milliseconds()
 

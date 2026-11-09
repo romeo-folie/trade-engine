@@ -378,6 +378,19 @@ func StageCalls(result analysis.AnalyzeResult) ([]store.DecisionStageCall, error
 		call.Extra = extra
 		calls = append(calls, call)
 	}
+	if failed := result.FailedArbiter; failed != nil {
+		call, err := stageCall(StageArbiter, 0, "", failed.Provider, failed.Model,
+			failed.Meta, analysis.AnalysisResponse{}, failed.Err, failed.Meta.LatencyMs)
+		if err != nil {
+			return nil, err
+		}
+		extra, err := json.Marshal(ArbiterExtra{PolicyVersion: failed.PolicyVersion, Ordering: failed.Ordering})
+		if err != nil {
+			return nil, err
+		}
+		call.Extra = extra
+		calls = append(calls, call)
+	}
 	return calls, nil
 }
 

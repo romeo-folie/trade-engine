@@ -16,21 +16,21 @@ import (
 // Do NOT reset by assigning a new zero-value struct (e.g. `cache.Global = cache.Metrics{}`):
 // atomic.Int64 must not be copied after first use.
 type Metrics struct {
-	Hits         atomic.Int64
-	Misses       atomic.Int64
+	Hits          atomic.Int64
+	Misses        atomic.Int64
 	Invalidations atomic.Int64
-	Evictions    atomic.Int64 // TTL sweep deletions
-	Errors       atomic.Int64 // store errors on read/write
+	Evictions     atomic.Int64 // TTL sweep deletions
+	Errors        atomic.Int64 // store errors on read/write
 }
 
 // Global is the process-wide cache metrics singleton.
 var Global Metrics
 
 // RecordHit increments the hit counter.
-func RecordHit()         { Global.Hits.Add(1) }
+func RecordHit() { Global.Hits.Add(1) }
 
 // RecordMiss increments the miss counter.
-func RecordMiss()        { Global.Misses.Add(1) }
+func RecordMiss() { Global.Misses.Add(1) }
 
 // RecordInvalidation increments the invalidation counter.
 func RecordInvalidation() { Global.Invalidations.Add(1) }
@@ -39,25 +39,25 @@ func RecordInvalidation() { Global.Invalidations.Add(1) }
 func RecordEviction(n int64) { Global.Evictions.Add(n) }
 
 // RecordError increments the store error counter.
-func RecordError()       { Global.Errors.Add(1) }
+func RecordError() { Global.Errors.Add(1) }
 
 // Snapshot returns a point-in-time copy of all counters.
 type Snapshot struct {
-	Hits         int64
-	Misses       int64
+	Hits          int64
+	Misses        int64
 	Invalidations int64
-	Evictions    int64
-	Errors       int64
+	Evictions     int64
+	Errors        int64
 }
 
 // TakeSnapshot returns a consistent snapshot of current counter values.
 func TakeSnapshot() Snapshot {
 	return Snapshot{
-		Hits:         Global.Hits.Load(),
-		Misses:       Global.Misses.Load(),
+		Hits:          Global.Hits.Load(),
+		Misses:        Global.Misses.Load(),
 		Invalidations: Global.Invalidations.Load(),
-		Evictions:    Global.Evictions.Load(),
-		Errors:       Global.Errors.Load(),
+		Evictions:     Global.Evictions.Load(),
+		Errors:        Global.Errors.Load(),
 	}
 }
 

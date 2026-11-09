@@ -399,3 +399,36 @@ func TestShortCircuitSnapshotsAreThrottledPerTickerAndReason(t *testing.T) {
 		t.Fatal("after the interval a new episode must be due")
 	}
 }
+
+func TestDecisionSnapshotRecordsFailedArbiterBeforeMajorityFallback(t *testing.T) {
+	requireEngineDB(t)
+	wait := analysis.AnalysisResponse{Action: analysis.ActionWait, Confidence: 0.6, Reasoning: "wait", DecisiveReason: "Extended above resistance."}
+	a := &snapshotFakeProvider{name: "a", resp: wait, available: true}
+	b := &snapshotFakeProvider{name: "b", resp: holdResponse(0.65), available: true}
+	arb := &snapshotFakeProvider{name: "arb", err: errors.New("arbiter 529: overloaded"), available: true}
+	e := snapshotTestEngine([]analysis.ModelProvider{a, b}, arb)
+	ticker := uniqueTicker("SNPX")
+	candles, set := snapshotTestCandles(80)
+
+	e.runAnalysis(context.Background(), ticker, "1d", "momentum", []string{"momentum"}, candles, set, "", "", "", "", false)
+
+	snap, calls := latestSnapshotForTicker(t, ticker)
+	if snap.Outcome != store.DecisionOutcomeCompleted {
+		t.Fatalf("majority fallback must complete, got %s (%s)", snap.Outcome, snap.OutcomeReason)
+	}
+	if len(calls) != 3 || calls[2].Stage != snapshot.StageArbiter || calls[2].Provider != "arb" ||
+		!strings.Contains(calls[2].Error, "arbiter 529: overloaded") || calls[2].ParsedResponse != nil {
+		t.Fatalf("failed arbiter call not recorded: %+v", calls)
+	}
+	var extra snapshot.ArbiterExtra
+	if err := json.Unmarshal(calls[2].Extra, &extra); err != nil || len(extra.Ordering) != 2 {
+		t.Fatalf("failed arbiter ordering = %+v (%v)", extra, err)
+	}
+	var final snapshot.FinalOutput
+	if err := json.Unmarshal(snap.FinalOutput, &final); err != nil {
+		t.Fatal(err)
+	}
+	if final.Arbitrated || final.Response.Action != analysis.ActionHold {
+		t.Fatalf("final output = %+v, want majority HOLD (tie WAIT/HOLD → HOLD), not arbitrated", final)
+	}
+}
