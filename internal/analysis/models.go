@@ -7,6 +7,7 @@ package analysis
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/analysis/prompts"
@@ -92,6 +93,12 @@ type AnalysisRequest struct {
 
 	// Portfolio context — filled by Phase 4; placeholder for now.
 	Portfolio PortfolioContext
+
+	// DecisionCutoff is the single clock for this decision (issue #589). Prompt
+	// builders render news ages relative to it instead of reading the wall
+	// clock, so a prompt re-rendered later from the same inputs is identical.
+	// The zero value keeps the legacy wall-clock behaviour for direct callers.
+	DecisionCutoff time.Time
 
 	// CustomSystemPrompt and CustomUserMessage bypass the stock prompt builder
 	// when set. If either is non-empty the adapter must use them directly.
@@ -318,13 +325,34 @@ type PositionSummary struct {
 // angle — previously the role survived only as a "[role]" text prefix inside the
 // reasoning, which was not queryable.
 type AnalystResult struct {
-	Provider  string
-	Model     string
-	Role      string
+	Provider string
+	Model    string
+	Role     string
+	// Ordinal is the analyst's stable position in the configured set that ran
+	// (registry order after availability filtering). Resolution orders results
+	// by Ordinal, never by latency, so the same recorded answers always
+	// resolve to the same output (issue #589).
+	Ordinal   int
 	Response  AnalysisResponse
 	Meta      ModelCallMeta
 	Err       error
 	LatencyMs int64
+}
+
+// MarshalJSON persists Err as its message. encoding/json would otherwise
+// serialise a non-nil error interface as {}, silently discarding why an
+// analyst failed. All other keys keep their Go field names, which the
+// ensemble_results SQL views and web mirror depend on.
+func (r AnalystResult) MarshalJSON() ([]byte, error) {
+	type plain AnalystResult
+	var errText string
+	if r.Err != nil {
+		errText = r.Err.Error()
+	}
+	return json.Marshal(struct {
+		plain
+		Err string `json:"Err,omitempty"`
+	}{plain: plain(r), Err: errText})
 }
 
 // AnalyzeResult is the richer return type for Analyzer.AnalyzeFull.

@@ -2,6 +2,8 @@ package web
 
 import (
 	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
 
 	"github.com/romeo-folie/trade-engine/internal/analysis"
@@ -306,5 +308,33 @@ func TestDeriveEnsembleVerdictIsDeterministic(t *testing.T) {
 		if got := deriveEnsembleVerdict(votes); got != first {
 			t.Fatalf("iteration %d returned %q, want a stable %q", i, got, first)
 		}
+	}
+}
+
+// Issue #589: ensemble_results now persist analyst failures as an "Err"
+// message string and carry an "Ordinal". The API mirror must still decode the
+// whole slice, keep configured order, and mark the failed analyst inactive.
+func TestMapAnalystResults_DecodesPersistedErrorAndOrdinal(t *testing.T) {
+	results := []analysis.AnalystResult{
+		{Provider: "a", Model: "m1", Ordinal: 0, Response: analysis.AnalysisResponse{Action: analysis.ActionBuy, Confidence: 0.8}},
+		{Provider: "b", Model: "m2", Ordinal: 1, Err: errors.New("gemini API 503: overloaded")},
+		{Provider: "c", Model: "m3", Ordinal: 2, Response: analysis.AnalysisResponse{Action: analysis.ActionBuy, Confidence: 0.6}},
+	}
+	raw, err := json.Marshal(results)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"Err":"gemini API 503: overloaded"`) {
+		t.Fatalf("persisted JSON lacks error text: %s", raw)
+	}
+	analysts, ensemble := mapAnalystResults(raw)
+	if len(analysts) != 3 || ensemble == nil {
+		t.Fatalf("decode failed: analysts=%d ensemble=%v", len(analysts), ensemble)
+	}
+	if analysts[0].Model != "m1" || analysts[1].Model != "m2" || analysts[2].Model != "m3" {
+		t.Fatalf("order not preserved: %+v", analysts)
+	}
+	if analysts[1].Active || !analysts[0].Active || !analysts[2].Active {
+		t.Fatalf("failed analyst must be inactive: %+v", analysts)
 	}
 }

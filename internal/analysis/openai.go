@@ -94,7 +94,7 @@ func (c *OpenAIClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 		systemPrompt, userMessage = prompts.BuildStockPromptWithAnalysisContext(
 			req.Ticker, req.LensSet(), req.Timeframe,
 			toPromptCandles(req.RecentCandles), toPromptIndicators(req.Indicators),
-			toPromptNews(req.News), toPromptPortfolio(req.Portfolio, req.Ticker),
+			toPromptNews(req.News, req.DecisionCutoff), toPromptPortfolio(req.Portfolio, req.Ticker),
 			req.KnowledgeContext, toPromptSimilarSetups(req.SimilarAnalyses),
 			req.PerformanceContext, req.MomentumPlay, req.DiscoveryContext, req.PullbackContext,
 			req.TimeframeRole, req.PrimaryThesisContext, req.RiskPolicy,

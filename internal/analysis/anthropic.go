@@ -75,7 +75,7 @@ func (c *AnthropicClient) Analyze(ctx context.Context, req AnalysisRequest) (Ana
 		systemPrompt, userMessage = prompts.BuildStockPromptWithAnalysisContext(req.Ticker, req.LensSet(), req.Timeframe,
 			toPromptCandles(req.RecentCandles),
 			toPromptIndicators(req.Indicators),
-			toPromptNews(req.News),
+			toPromptNews(req.News, req.DecisionCutoff),
 			toPromptPortfolio(req.Portfolio, req.Ticker),
 			req.KnowledgeContext,
 			toPromptSimilarSetups(req.SimilarAnalyses),
@@ -409,7 +409,7 @@ func toPromptIndicators(s IndicatorSnapshot) prompts.Indicators {
 	}
 }
 
-func toPromptNews(ns []NewsSnippet) []prompts.NewsItem {
+func toPromptNews(ns []NewsSnippet, asOf time.Time) []prompts.NewsItem {
 	out := make([]prompts.NewsItem, len(ns))
 	for i, n := range ns {
 		out[i] = prompts.NewsItem{
@@ -417,6 +417,7 @@ func toPromptNews(ns []NewsSnippet) []prompts.NewsItem {
 			Source:      n.Source,
 			PublishedAt: n.PublishedAt,
 			Sentiment:   n.Sentiment,
+			AsOf:        asOf,
 		}
 	}
 	return out

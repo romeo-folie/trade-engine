@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -229,7 +230,7 @@ func (a *Analyzer) runAnalystSet(ctx context.Context, req AnalysisRequest, avail
 	results := make([]AnalystResult, 0, len(available))
 
 	var wg sync.WaitGroup
-	for _, p := range available {
+	for ordinal, p := range available {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -244,13 +245,16 @@ func (a *Analyzer) runAnalystSet(ctx context.Context, req AnalysisRequest, avail
 			}
 			mu.Lock()
 			results = append(results, AnalystResult{
-				Provider: p.ProviderName(), Model: p.ModelName(),
+				Provider: p.ProviderName(), Model: p.ModelName(), Ordinal: ordinal,
 				Response: resp, Meta: meta, Err: err, LatencyMs: lat,
 			})
 			mu.Unlock()
 		}()
 	}
 	wg.Wait()
+	// Goroutines finish in network order; persist and resolve in configured
+	// order so ensemble_results and the UI's analyst labels are stable.
+	sort.SliceStable(results, func(i, j int) bool { return results[i].Ordinal < results[j].Ordinal })
 	return results
 }
 

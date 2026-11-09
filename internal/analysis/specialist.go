@@ -112,7 +112,7 @@ func (a *Analyzer) AnalyzeSpecialist(ctx context.Context, req AnalysisRequest, _
 	// Build the per-role custom system prompt. The user message is shared.
 	promptCandles := toPromptCandles(req.RecentCandles)
 	promptInd := toPromptIndicators(req.Indicators)
-	promptNews := toPromptNews(req.News)
+	promptNews := toPromptNews(req.News, req.DecisionCutoff)
 	promptPortfolio := toPromptPortfolio(req.Portfolio, req.Ticker)
 	promptSimilar := toPromptSimilarSetups(req.SimilarAnalyses)
 
