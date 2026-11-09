@@ -13,7 +13,9 @@ Run every Codex built-in `/review` with `gpt-6.1-sol`
 (`codex review -c model='"gpt-6.1-sol"' -c review_model='"gpt-6.1-sol"' --base main`).
 If `gpt-6.1-sol` is unavailable, stop and tell the user rather than falling back
 to another model. Do not substitute a generic reviewer subagent or GitHub Codex
-review for the required local Sol `/review`. The project Codex configuration pins the model defaults; this rule
+review for the required local Sol `/review`. If you are the reviewer already running inside
+`codex review`, this requirement is satisfied by your own run: review the diff
+directly and do not launch a nested review or Codex process. The project Codex configuration pins the model defaults; this rule
 still applies if a session-level override would otherwise replace them.
 
 ## Mandatory pre-push review
