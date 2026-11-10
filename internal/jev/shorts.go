@@ -104,10 +104,11 @@ func QuestionsWith(req analysis.AnalysisRequest, opts Options) map[string]Questi
 		return map[string]Question{}
 	}
 	if HoldsShort(req) {
-		qs := Questions(req) // regime (+ entry questions, replaced below)
-		regime := qs[QRegime]
+		// Built directly, not derived from Questions: for an exit-only row
+		// Questions returns an empty set, which would send a blank regime
+		// question and leave the short unmanaged.
 		return map[string]Question{
-			QRegime: regime,
+			QRegime: regimeQuestion(req),
 			QCover: {
 				Type: TypeChoice,
 				Instructions: "The portfolio holds a short position in " + req.Ticker +

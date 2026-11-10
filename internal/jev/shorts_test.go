@@ -242,3 +242,28 @@ func TestV2ValidatesShortThresholds(t *testing.T) {
 		t.Fatalf("v1 must not validate short fields: %v", err)
 	}
 }
+
+// TestV2ExitOnlyRowStillManagesAHeldShort: an exit-only (sell_only) row
+// holding a short must still be asked a valid cover question set.
+func TestV2ExitOnlyRowStillManagesAHeldShort(t *testing.T) {
+	req := exitOnlyRequest(false)
+	req.Portfolio.OpenPositions = []analysis.PositionSummary{{Ticker: req.Ticker, Side: "short", Quantity: 3}}
+	if !NeedsCallWith(req, v2) {
+		t.Fatal("a held short on an exit-only row needs a cover decision")
+	}
+	qs := QuestionsWith(req, v2)
+	if len(qs) != 2 || qs[QRegime].Type != TypeChoice || qs[QCover].Type != TypeChoice {
+		t.Fatalf("questions = %+v", qs)
+	}
+	answers := map[string]Answer{
+		QRegime: choice("ranging", map[string]float64{"ranging": 1}),
+		QCover:  choice(CoverNow, map[string]float64{CoverNow: 0.8, CoverHold: 0.2}),
+	}
+	if err := ValidateAnswers(qs, answers); err != nil {
+		t.Fatalf("valid cover answers rejected: %v", err)
+	}
+	resp, _, err := ResolveWith(req, answers, DefaultPolicyConfig(), 1.5, v2)
+	if err != nil || resp.Action != analysis.ActionCover {
+		t.Fatalf("resp = %+v, err %v", resp, err)
+	}
+}

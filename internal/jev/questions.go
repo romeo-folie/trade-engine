@@ -104,15 +104,7 @@ func Questions(req analysis.AnalysisRequest) map[string]Question {
 		return map[string]Question{}
 	}
 	qs := map[string]Question{
-		QRegime: {
-			Type:         TypeChoice,
-			Instructions: "Classify the current market regime for " + req.Ticker + " from the indicators and price action in the state.",
-			Criteria: map[string]string{
-				"trending":     "A sustained directional move with trend-strength confirmation.",
-				"ranging":      "Sideways price action between identifiable support and resistance.",
-				"transitional": "The regime is changing or mixed; neither trending nor ranging clearly applies.",
-			},
-		},
+		QRegime: regimeQuestion(req),
 	}
 	if HoldsLong(req) {
 		qs[QExit] = Question{
@@ -171,6 +163,19 @@ func Questions(req analysis.AnalysisRequest) map[string]Question {
 		},
 	}
 	return qs
+}
+
+// regimeQuestion is the observational regime question shared by every set.
+func regimeQuestion(req analysis.AnalysisRequest) Question {
+	return Question{
+		Type:         TypeChoice,
+		Instructions: "Classify the current market regime for " + req.Ticker + " from the indicators and price action in the state.",
+		Criteria: map[string]string{
+			"trending":     "A sustained directional move with trend-strength confirmation.",
+			"ranging":      "Sideways price action between identifiable support and resistance.",
+			"transitional": "The regime is changing or mixed; neither trending nor ranging clearly applies.",
+		},
+	}
 }
 
 // State is the System One state for a request: the canonical snapshot
