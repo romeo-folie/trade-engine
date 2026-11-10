@@ -142,3 +142,22 @@ func TestShortEligibilityIsDeterministic(t *testing.T) {
 		}
 	}
 }
+
+// TestShortExposureMustBeFinite: NaN compares false, so an unvalidated
+// non-finite exposure would silently pass both caps.
+func TestShortExposureMustBeFinite(t *testing.T) {
+	for name, mutate := range map[string]func(*ShortEligibilityInput){
+		"proposed NaN":  func(in *ShortEligibilityInput) { in.ProposedShortValue = math.NaN() },
+		"proposed zero": func(in *ShortEligibilityInput) { in.ProposedShortValue = 0 },
+		"proposed +Inf": func(in *ShortEligibilityInput) { in.ProposedShortValue = math.Inf(1) },
+		"gross NaN":     func(in *ShortEligibilityInput) { in.GrossShortValue = math.NaN() },
+		"ticker -Inf":   func(in *ShortEligibilityInput) { in.TickerShortValue = math.Inf(-1) },
+	} {
+		in := eligibleShortInput()
+		mutate(&in)
+		got := EvaluateShortEligibility(in)
+		if got.Eligible || !reflect.DeepEqual(got.Reasons, []string{ShortReasonExposureUnknown}) {
+			t.Errorf("%s: %+v, want blocked by %s only", name, got, ShortReasonExposureUnknown)
+		}
+	}
+}

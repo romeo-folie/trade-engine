@@ -33,6 +33,7 @@ const (
 	ShortReasonGrossCap         = "gross_short_exposure_cap"
 	ShortReasonTickerCap        = "ticker_short_exposure_cap"
 	ShortReasonEquityUnknown    = "equity_unknown"
+	ShortReasonExposureUnknown  = "exposure_unknown"
 )
 
 // ShortEligibilityInput is every fact a short decision depends on, observed
@@ -184,9 +185,15 @@ func EvaluateShortEligibility(in ShortEligibilityInput) ShortEligibility {
 	}
 
 	// Exposure caps, measured against equity including the proposed short.
-	if !validPositive(in.Equity) {
+	// Every input must be finite (NaN compares false and would silently pass
+	// a cap) and the proposed short must have a positive value.
+	finiteExposure := func(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
+	switch {
+	case !validPositive(in.Equity):
 		add(ShortReasonEquityUnknown)
-	} else {
+	case !finiteExposure(in.GrossShortValue) || !finiteExposure(in.TickerShortValue) || !validPositive(math.Abs(in.ProposedShortValue)):
+		add(ShortReasonExposureUnknown)
+	default:
 		proposed := math.Abs(in.ProposedShortValue)
 		if (math.Abs(in.GrossShortValue)+proposed)/in.Equity*100 > cfg.MaxGrossShortPct {
 			add(ShortReasonGrossCap)
