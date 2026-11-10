@@ -412,7 +412,9 @@ analysis:
     #   and a Jev failure is an analysis failure (no fallback model).
     authority: shadow
     allow_live: false                # authoritative on a live account requires true
-    model: ""                        # REQUIRED: pin a model from GET /v1/models
+    model: jev-latest                # REQUIRED. GET /v1/models offers aliases (jev-latest,
+                                     # jev-preview); the served version (e.g. jev-1.14.0) is
+                                     # recorded on every call as resolved_model
     api_key_env: TYPESAFE_API_KEY
     base_url: ""                     # default https://api.typesafe.ai
     timeout_sec: 20                  # per HTTP attempt

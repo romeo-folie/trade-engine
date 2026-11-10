@@ -385,9 +385,10 @@ type JevConfig struct {
 	// AllowLive must be true for authoritative Jev decisions in live mode, a
 	// separate deliberate opt-in from enabling the mode on paper.
 	AllowLive bool `yaml:"allow_live"`
-	// Model is the TypeSafe model to pin (from GET /v1/models). Prefer a
-	// specific model over a moving alias such as jev-latest so decisions
-	// remain comparable; the served model is recorded either way.
+	// Model is the TypeSafe model (from GET /v1/models). The API currently
+	// offers only aliases (jev-latest, jev-preview), so the served version
+	// (e.g. jev-1.14.0) is recorded on every call as the resolved model; use
+	// it to tell decisions made under different Jev versions apart.
 	Model     string `yaml:"model"`
 	APIKeyEnv string `yaml:"api_key_env"`
 	APIKey    string `yaml:"-" json:"-"`

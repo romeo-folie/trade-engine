@@ -19,7 +19,7 @@ analysis:
   jev:
     authority: shadow           # shadow | authoritative
     allow_live: false
-    model: <pinned model>       # from GET /v1/models
+    model: jev-latest           # GET /v1/models offers aliases only
     api_key_env: TYPESAFE_API_KEY
 ```
 
@@ -44,6 +44,18 @@ legacy fallback picks an extraction model from the analysts.
 The engine refuses to start when Jev is configured but its evaluator cannot
 be built, or when authoritative Jev would run against a live account without
 `allow_live`.
+
+## Model versions
+
+`GET /v1/models` currently offers only aliases: `jev-latest` and `jev-preview`.
+Every call records the version that actually answered (for example
+`jev-1.14.0`) as the stage call's `resolved_model`. When comparing periods,
+split by `resolved_model`: an alias can move to a new version without a config
+change.
+
+A live smoke test on 2026-11-10 (`jev-latest` → `jev-1.14.0`) used about 3.4k
+input tokens and 0.24k output tokens, with about 210 ms latency, for one
+five-question entry evaluation.
 
 ## Decision contract
 
