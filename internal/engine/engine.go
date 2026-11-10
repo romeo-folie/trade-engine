@@ -2246,10 +2246,10 @@ func (e *Engine) generateSignal(
 		// on the next normal tick.
 		return
 	}
-	if resp.Action != analysis.ActionBuy && resp.Action != analysis.ActionSell {
+	if !executableSignalAction(string(resp.Action), e.cfg.Risk.Shorts.Enabled) {
 		// SHORT/COVER (#599) are decided and recorded (the analysis row and
-		// decision snapshot keep them) but cannot become signals until short
-		// execution is supported. Refusing here keeps them out of the
+		// decision snapshot keep them) but become signals only when
+		// risk.shorts.enabled. Refusing here keeps them out of the
 		// signal/risk/execution path entirely.
 		logger.Warn("signal not generated: action not executable by this build",
 			"ticker", ticker, "action", string(resp.Action))
@@ -2518,7 +2518,7 @@ func (e *Engine) generateSignal(
 		// Reuse the slice already loaded by runAnalysis's SELL-ownership probe
 		// so a normal analysis cycle costs one GetOpenTrades query, not two.
 		openTrades = prefetchedOpenTrades
-	} else if resp.Action == "BUY" {
+	} else if risk.OpensRisk(string(resp.Action)) {
 		// A durable in-flight exit remains a real broker position until
 		// reconciliation completes, so it must count against entry limits and
 		// duplicate/pyramid policy.
@@ -2530,7 +2530,8 @@ func (e *Engine) generateSignal(
 		logger.Warn("get open trades for risk checks", "ticker", ticker, "err", openTradesErr)
 		// For SELL signals we cannot verify position ownership — block rather than
 		// risk a naked sell. BUY signals can proceed with a degraded position count.
-		if resp.Action == "SELL" {
+		// SHORT and COVER (#599) never proceed without verified ownership.
+		if resp.Action == "SELL" || resp.Action == analysis.ActionShort || resp.Action == analysis.ActionCover {
 			sig.Status = "blocked"
 			sig.BlockReason = "unable to verify open positions (DB error)"
 			if _, err := store.InsertSignal(ctx, sig); err != nil {
@@ -2540,7 +2541,7 @@ func (e *Engine) generateSignal(
 			return
 		}
 	}
-	if resp.Action == "BUY" && openTradesErr == nil {
+	if risk.OpensRisk(string(resp.Action)) && openTradesErr == nil {
 		openTrades, openTradesErr = withWorkingStockEntryReservations(ctx, openTrades)
 		if openTradesErr != nil {
 			sig.Status = "blocked"
@@ -2552,7 +2553,8 @@ func (e *Engine) generateSignal(
 			return
 		}
 	}
-	if resp.Action == "BUY" && tickerHasExitingLongIn(openTrades, ticker) {
+	if (resp.Action == "BUY" && tickerHasExitingLongIn(openTrades, ticker)) ||
+		(resp.Action == analysis.ActionShort && tickerHasExitingTradeIn(openTrades, ticker)) {
 		sig.Status = "blocked"
 		sig.BlockReason = "prior long exit is still reconciling"
 		if _, err := store.InsertSignal(ctx, sig); err != nil {
@@ -2770,6 +2772,18 @@ func maxFallbackCandleAge(tf data.Timeframe) time.Duration {
 	}
 }
 
+// executableSignalAction reports whether an action may become (and execute
+// as) a signal. SHORT and COVER are executable only with shorts enabled.
+func executableSignalAction(action string, shortsEnabled bool) bool {
+	switch action {
+	case string(analysis.ActionBuy), string(analysis.ActionSell):
+		return true
+	case string(analysis.ActionShort), string(analysis.ActionCover):
+		return shortsEnabled
+	}
+	return false
+}
+
 // executionSourceNode names the observability node an execution leaves from.
 // Empty keeps the default risk-controls attribution; queue-released executions
 // name the pending queue so the dashboard lights the path actually taken.
@@ -2789,12 +2803,12 @@ func executionSourceNode(fromQueue bool) string {
 // emitted event so the dashboard can animate the path the signal actually took;
 // it has no effect on execution itself.
 func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Signal, fromQueue bool) {
-	// Only BUY (open/add long) and SELL (exit long) are executable. Every
-	// other action — notably SHORT/COVER (#599) until short execution exists —
-	// is refused here, because the code below treats anything that is not
-	// SELL as a BUY. This is the last line of defence against a SHORT being
-	// placed as a long entry.
-	if sig.Action != string(analysis.ActionBuy) && sig.Action != string(analysis.ActionSell) {
+	// Only BUY (open/add long) and SELL (exit long) are executable, plus
+	// SHORT (open a short) and COVER (exit a short) when risk.shorts.enabled
+	// (#599). Every other action is refused here, because the long code below
+	// treats anything it is handed as a BUY. SHORT and COVER are routed to
+	// their own paths before that point.
+	if !executableSignalAction(sig.Action, e.cfg.Risk.Shorts.Enabled) {
 		reason := fmt.Sprintf("action %s is not executable by this build", sig.Action)
 		if err := store.UpdateSignalStatus(ctx, sigID, "blocked", reason); err != nil {
 			logger.Warn("update signal status", "id", sigID, "err", err)
@@ -2877,6 +2891,19 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 	if sig.Action == string(analysis.ActionSell) {
 		e.executeSellExit(ctx, sigID, sig)
 		return
+	}
+	// COVER = buy back the ticker's open short; SHORT = open one from flat
+	// (#599). Neither may reach the long BUY path below.
+	if sig.Action == string(analysis.ActionCover) {
+		e.executeCoverExit(ctx, sigID, sig)
+		return
+	}
+	if sig.Action == string(analysis.ActionShort) {
+		e.executeShortEntry(ctx, sigID, sig, fromQueue)
+		return
+	}
+	if sig.Action != string(analysis.ActionBuy) {
+		return // unreachable: executableSignalAction admits nothing else
 	}
 
 	// A pullback entry's edge and risk are anchored to the signal-session low.
@@ -3607,6 +3634,23 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		})
 		return
 	}
+	e.placeStockEntryAndProject(ctx, sigID, sig, orderReq, direction, bracketed, uncapTakeProfit, fromQueue)
+}
+
+// placeStockEntryAndProject submits a fully released stock entry and projects
+// its broker result: trade and order rows, bracket legs, protection
+// verification, and the fill poll. It is shared by long BUY entries and short
+// SELL entries (#599); direction is the trade direction ("long" or "short")
+// and every exit leg uses the side opposite the entry.
+func (e *Engine) placeStockEntryAndProject(
+	ctx context.Context,
+	sigID string,
+	sig store.Signal,
+	orderReq execution.OrderRequest,
+	direction string,
+	bracketed, uncapTakeProfit, fromQueue bool,
+) {
+	exitSide := execution.ExitSideForEntry(orderReq.Side)
 	result, err := e.executor.PlaceOrder(ctx, orderReq)
 	if err != nil {
 		// Coordinators can return an accepted broker result with a local
@@ -3654,7 +3698,7 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		if _, err := store.InsertOrderWithRetry(ctx, store.Order{
 			BrokerOrderID: result.BrokerOrderID,
 			Ticker:        sig.Ticker,
-			Side:          string(side),
+			Side:          string(orderReq.Side),
 			OrderType:     string(execution.OrderTypeMarket),
 			Quantity:      orderReq.Quantity,
 			Status:        execution.NormalizeOrderStatus(result.Status),
@@ -3711,7 +3755,7 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		TradeID:       tradeID,
 		BrokerOrderID: result.BrokerOrderID,
 		Ticker:        sig.Ticker,
-		Side:          string(side),
+		Side:          string(orderReq.Side),
 		OrderType:     string(execution.OrderTypeMarket),
 		Quantity:      orderReq.Quantity,
 		FilledPrice:   result.FilledPrice,
@@ -3769,7 +3813,7 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 			legRows := []store.Order{
 				{
 					TradeID: tradeID, BrokerOrderID: result.ChildOrderIDs[0],
-					Ticker: sig.Ticker, Side: string(execution.OrderSideSell),
+					Ticker: sig.Ticker, Side: string(exitSide),
 					OrderType: string(execution.OrderTypeLimit), Quantity: orderReq.Quantity,
 					LimitPrice: sig.TakeProfit, Status: "pending",
 					IsTakeProfit: true, ParentOrderID: result.BrokerOrderID,
@@ -3778,7 +3822,7 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 				},
 				{
 					TradeID: tradeID, BrokerOrderID: result.ChildOrderIDs[1],
-					Ticker: sig.Ticker, Side: string(execution.OrderSideSell),
+					Ticker: sig.Ticker, Side: string(exitSide),
 					OrderType: string(execution.OrderTypeStop), Quantity: orderReq.Quantity,
 					StopPrice: sig.StopLoss, Status: "pending",
 					IsStopLoss: true, ParentOrderID: result.BrokerOrderID,
@@ -5033,8 +5077,9 @@ func (e *Engine) processDeferredSignals(ctx context.Context) {
 	}
 	now := time.Now()
 	for _, sig := range deferred {
-		if sig.Action != "BUY" {
-			continue // defensive: only BUYs are ever deferred
+		shortEntry := sig.Action == string(analysis.ActionShort) && e.cfg.Risk.Shorts.Enabled
+		if sig.Action != "BUY" && !shortEntry {
+			continue // defensive: only stock entries are ever deferred
 		}
 		if !sig.ExpiresAt.IsZero() && now.After(sig.ExpiresAt) {
 			// A prepared intent can have reached the broker before the local
@@ -5065,6 +5110,11 @@ func (e *Engine) processDeferredSignals(ctx context.Context) {
 			// as a first-tick candidate or mixing in a standalone quote.
 			logger.Info("retrying stock entry after broker admission refresh", "id", sig.ID, "ticker", sig.Ticker)
 			e.executeSignal(ctx, sig.ID, sig, true)
+			continue
+		}
+		if shortEntry {
+			// A SHORT is deferred only for crash recovery or an admission
+			// refresh (both handled above); first-tick confirmation is BUY-only.
 			continue
 		}
 		if !deferredSignalPathEnabled(e.cfg.Risk.EntryGates.FirstTickDefer, false) {
@@ -5571,14 +5621,23 @@ func buildRiskInput(cfg config.RiskConfig, action, ticker string, confidence, si
 	var longCostBasis float64 // sum of qty * entry_price across open longs
 	var longNotional float64  // mark-to-market long exposure in the target ticker
 	var longMaxStop float64   // canonical (highest) existing stop across open longs
+	var holdsShort bool
+	var shortQuantity float64
+	var shortNotional float64
 	positions := make(map[string]struct{}, len(openTrades))
 	byTicker := make(map[string]int, len(openTrades))
 	for _, t := range openTrades {
 		key := t.Ticker + "|" + t.Direction
 		positions[key] = struct{}{}
 		if (action == "BUY" && t.Direction == "long") ||
-			(action == "SELL" && t.Direction == "short") {
+			(action == "SELL" && t.Direction == "short") ||
+			(action == "SHORT" && t.Direction == "short") {
 			byTicker[t.Ticker]++
+		}
+		if t.Ticker == ticker && t.Direction == "short" {
+			holdsShort = true
+			shortQuantity += t.Quantity
+			shortNotional += t.Quantity * signalPrice
 		}
 		if t.Ticker == ticker && t.Direction == "long" {
 			holdsLong = true
@@ -5596,6 +5655,11 @@ func buildRiskInput(cfg config.RiskConfig, action, ticker string, confidence, si
 	var longAvgEntry float64
 	if longQuantity > 0 {
 		longAvgEntry = longCostBasis / longQuantity
+	}
+	tickerNotional := longNotional
+	if action == "SHORT" {
+		// A short's combined-exposure cap measures the same side it adds to.
+		tickerNotional = shortNotional
 	}
 	return risk.CheckInput{
 		Cfg:                    cfg,
@@ -5617,7 +5681,9 @@ func buildRiskInput(cfg config.RiskConfig, action, ticker string, confidence, si
 		LongQuantity:           longQuantity,
 		LongAvgEntryPrice:      longAvgEntry,
 		LongMaxStop:            longMaxStop,
-		ExistingTickerNotional: longNotional,
+		HoldsShort:             holdsShort,
+		ShortQuantity:          shortQuantity,
+		ExistingTickerNotional: tickerNotional,
 	}
 }
 

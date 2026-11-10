@@ -15,6 +15,7 @@ const (
 	ExitReasonStopLoss                = "stop_loss"
 	ExitReasonTakeProfit              = "take_profit"
 	ExitReasonSellSignal              = "sell_signal"
+	ExitReasonCoverSignal             = "cover_signal"
 	ExitReasonTrailingATR             = "trailing_atr"
 	ExitReasonEMA9Close               = "ema9_close"
 	ExitReasonRecovery                = "broker_recovery"
@@ -1030,6 +1031,21 @@ func GetOwnedPositionTrades(ctx context.Context) ([]Trade, error) {
 // signal id is stored in the claim evidence before submission, which makes
 // recovery precise even when another exit for the same ticker is in flight.
 func GetExitingTradesForSellSignal(ctx context.Context, ticker, signalID string) ([]Trade, error) {
+	return GetExitingTradesForAnalystExit(ctx, ticker, signalID, "long")
+}
+
+// GetExitingTradesForAnalystExit is GetExitingTradesForSellSignal for either
+// side: direction "long" finds the lots claimed by a SELL, "short" the lots
+// claimed by a COVER (#599). The two never mix.
+func GetExitingTradesForAnalystExit(ctx context.Context, ticker, signalID, direction string) ([]Trade, error) {
+	reason := ExitReasonSellSignal
+	switch direction {
+	case "long":
+	case "short":
+		reason = ExitReasonCoverSignal
+	default:
+		return nil, fmt.Errorf("analyst exit: unknown direction %q", direction)
+	}
 	rows, err := GetDB().Query(ctx, `
 		SELECT id, COALESCE(signal_id::text,''), ticker, direction, strategy,
 		       entry_price, COALESCE(exit_price,0),
@@ -1043,10 +1059,10 @@ func GetExitingTradesForSellSignal(ctx context.Context, ticker, signalID string)
 		FROM trades
 		WHERE status='exiting'
 		  AND ticker=$1
-		  AND direction='long'
+		  AND direction=$4
 		  AND exit_reason=$2
 		  AND exit_evidence->>'signal_id'=$3
-		ORDER BY exit_claimed_at, id`, ticker, ExitReasonSellSignal, signalID)
+		ORDER BY exit_claimed_at, id`, ticker, reason, signalID, direction)
 	if err != nil {
 		return nil, err
 	}

@@ -376,10 +376,11 @@ func enableShorts(e *Engine) {
 	e.cfg.Analysis.Jev.Policy.CoverThreshold = 0.6
 }
 
-// With shorts enabled but short execution not yet built (#599 PR 3), Jev's
-// SHORT decision is recorded under policy v2 and never becomes a signal or
-// a broker order.
-func TestJevV2ShortIsRecordedButNeverExecuted(t *testing.T) {
+// With shorts enabled, Jev's SHORT decision is recorded under policy v2 and
+// becomes exactly one SHORT signal (#599 PR 3). Short execution is defined
+// only against the Alpaca broker, so on this engine's executor it is blocked
+// before any order or trade exists.
+func TestJevV2ShortBecomesSignalButNeedsBroker(t *testing.T) {
 	requireEngineDB(t)
 	ts := &fakeTypeSafe{verdict: "short"}
 	srv := httptest.NewServer(ts)
@@ -422,8 +423,17 @@ func TestJevV2ShortIsRecordedButNeverExecuted(t *testing.T) {
 		t.Fatal("v2 request must ask the short-side questions")
 	}
 	var n int
-	if err := store.GetDB().QueryRow(context.Background(), `SELECT count(*) FROM signals WHERE ticker = $1`, ticker).Scan(&n); err != nil || n != 0 {
-		t.Fatalf("a SHORT produced %d signals (%v) before short execution exists", n, err)
+	var action, status string
+	if err := store.GetDB().QueryRow(context.Background(),
+		`SELECT count(*), max(action::text), max(status::text) FROM signals WHERE ticker = $1`, ticker,
+	).Scan(&n, &action, &status); err != nil || n != 1 || action != "SHORT" || status == "executed" {
+		t.Fatalf("signals = %d action=%q status=%q (%v); want one unexecuted SHORT", n, action, status, err)
+	}
+	var orders, trades int
+	if err := store.GetDB().QueryRow(context.Background(),
+		`SELECT (SELECT count(*) FROM orders WHERE ticker=$1), (SELECT count(*) FROM trades WHERE ticker=$1)`, ticker,
+	).Scan(&orders, &trades); err != nil || orders != 0 || trades != 0 {
+		t.Fatalf("orders=%d trades=%d (%v); a short without a broker must place nothing", orders, trades, err)
 	}
 }
 

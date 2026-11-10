@@ -379,7 +379,7 @@ func (e *Engine) renewDiscoveryResidencyAfterVerifiedProtection(ctx context.Cont
 		logger.Warn("load entry intent for verified discovery renewal", "trade_id", tradeID, "err", err)
 		return
 	}
-	if intent == nil || intent.Side != "buy" || !strings.HasPrefix(intent.IdempotencyKey, "entry:") {
+	if intent == nil || (intent.Side != "buy" && intent.Side != "sell") || !strings.HasPrefix(intent.IdempotencyKey, "entry:") {
 		return
 	}
 	if fillAt.IsZero() {

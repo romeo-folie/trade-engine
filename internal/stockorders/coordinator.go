@@ -390,7 +390,12 @@ func (c *Coordinator) projectRecoveredMarketExit(ctx context.Context, intent sto
 	if !ok {
 		return fmt.Errorf("invalid analyst stock exit intent key %q", intent.IdempotencyKey)
 	}
-	trades, err := store.GetExitingTradesForSellSignal(ctx, req.Ticker, signalID)
+	// A SELL exits long lots and a buy-to-cover exits short lots (#599).
+	exitDirection := "long"
+	if req.Side == execution.OrderSideBuy {
+		exitDirection = "short"
+	}
+	trades, err := store.GetExitingTradesForAnalystExit(ctx, req.Ticker, signalID, exitDirection)
 	if err != nil {
 		return fmt.Errorf("load claimed analyst exit trades: %w", err)
 	}

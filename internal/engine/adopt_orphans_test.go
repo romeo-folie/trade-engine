@@ -63,15 +63,15 @@ func TestAdoptBrokerOrphans(t *testing.T) {
 		// Never adopted.
 		{Ticker: "SIDE", BrokerQty: -50, DBQty: 50, Source: "side_mismatch", CurrentPrice: 1},
 		{Ticker: "GONE", BrokerQty: 0, DBQty: 30, Source: "db_only"},
-		// Orphan short: adopted as short with stop ABOVE current.
+		// Orphan short: never adopted (#599), even with a live SELL signal.
 		{Ticker: "SHRT", BrokerQty: -10, DBQty: 0, Source: "broker_only", AvgEntryPrice: 20, CurrentPrice: 18},
 		// No current price: adopt without fabricating a stop.
 		{Ticker: "NOPX", BrokerQty: 7, DBQty: 0, Source: "broker_only", AvgEntryPrice: 3, CurrentPrice: 0},
 	}
 
 	adopted := AdoptBrokerOrphans(context.Background(), fs, drifts, 2.0, 4.0)
-	if len(adopted) != 4 {
-		t.Fatalf("adopted = %v, want NOK, SBET, SHRT, NOPX", adopted)
+	if len(adopted) != 3 {
+		t.Fatalf("adopted = %v, want NOK, SBET, NOPX", adopted)
 	}
 
 	byTicker := map[string]store.Trade{}
@@ -97,23 +97,12 @@ func TestAdoptBrokerOrphans(t *testing.T) {
 		t.Errorf("SBET must adopt only the surplus: got %v want %v", got, want)
 	}
 
-	shrt := byTicker["SHRT"]
-	if shrt.Direction != "short" || shrt.Quantity != 10 {
-		t.Errorf("short orphan adoption wrong: %+v", shrt)
-	}
-	if shrt.StopLoss <= 18 {
-		t.Errorf("short stop must be ABOVE current price: got %v", shrt.StopLoss)
-	}
-	if shrt.TakeProfit >= 18 {
-		t.Errorf("short TP must be BELOW current price: got %v", shrt.TakeProfit)
-	}
-
 	nopx := byTicker["NOPX"]
 	if nopx.StopLoss != 0 || nopx.TakeProfit != 0 {
 		t.Errorf("no current price must mean no fabricated stop/TP: %+v", nopx)
 	}
 
-	for _, bad := range []string{"OVER", "SIDE", "GONE"} {
+	for _, bad := range []string{"OVER", "SIDE", "GONE", "SHRT"} {
 		if _, ok := byTicker[bad]; ok {
 			t.Errorf("%s must not be adopted", bad)
 		}
@@ -143,5 +132,21 @@ func TestAdoptBrokerOrphans_ShortWithoutIntentStaysUnadopted(t *testing.T) {
 	}
 	if len(fs.inserted) != 0 {
 		t.Fatalf("expected no recovery trade insert, got %+v", fs.inserted)
+	}
+}
+
+// #599: an untracked short is never adopted, even when the newest live
+// signal is a SHORT or SELL, and even as a same-direction surplus.
+func TestAdoptBrokerOrphans_NeverAdoptsShorts(t *testing.T) {
+	fs := &fakeAdoptionStore{signals: map[string][]store.Signal{
+		"SHNEW": {{Ticker: "SHNEW", Action: "SHORT", Status: "executed"}},
+		"SHSUR": {{Ticker: "SHSUR", Action: "SELL", Status: "executed"}},
+	}}
+	drifts := []BrokerDrift{
+		{Ticker: "SHNEW", BrokerQty: -5, DBQty: 0, Source: "broker_only", AvgEntryPrice: 30, CurrentPrice: 29},
+		{Ticker: "SHSUR", BrokerQty: -9, DBQty: -4, Source: "mismatch", AvgEntryPrice: 30, CurrentPrice: 29},
+	}
+	if adopted := AdoptBrokerOrphans(context.Background(), fs, drifts, 2.0, 4.0); len(adopted) != 0 || len(fs.inserted) != 0 {
+		t.Fatalf("adopted=%v inserted=%+v; shorts must stay alert-only", adopted, fs.inserted)
 	}
 }

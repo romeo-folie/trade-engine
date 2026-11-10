@@ -188,7 +188,8 @@ func RefreshPreparedStockEntryRequest(ctx context.Context, idempotencyKey string
 		UPDATE stock_order_intents
 		SET requested_qty=$2, request_payload=$3, payload_hash=$4, updated_at=NOW()
 		WHERE idempotency_key=$1
-		  AND purpose='submit' AND side='buy'
+		  AND purpose='submit'
+		  AND (side='buy' OR (side='sell' AND idempotency_key LIKE 'entry:%'))
 		  AND status IN ('pending','partial')
 		  AND submitted_at IS NULL AND COALESCE(broker_order_id,'')=''
 		  AND filled_qty=0`, idempotencyKey, requestedQty, payload, hash)
@@ -297,7 +298,11 @@ func StockEntryBrokerProtection(ctx context.Context, tradeID string) (required b
 		             AND override.purpose='broker_protection_override'
 		       )
 		FROM stock_order_intents entry
-		WHERE entry.trade_id=$1::uuid AND entry.purpose='submit' AND entry.side='buy'
+		JOIN trades t ON t.id=entry.trade_id
+		WHERE entry.trade_id=$1::uuid AND entry.purpose='submit'
+		  -- The entry side follows the trade: a long opened with a buy, a
+		  -- short with a sell (#599). Exit intents are the opposite side.
+		  AND ((t.direction='short' AND entry.side='sell') OR (t.direction<>'short' AND entry.side='buy'))
 		ORDER BY entry.created_at DESC LIMIT 1`, tradeID).Scan(&raw, &brokerOrderID, &forced)
 	if err != nil {
 		return false, "", err
@@ -411,7 +416,12 @@ func UpsertBracketChildIntent(ctx context.Context, parentIntentID, tradeID, tick
 			broker_order_id, status, submitted_at, purpose
 			) VALUES (
 			uuid_generate_v4(), $1, $2, NULLIF($3,'')::uuid, $4::uuid,
-			$5, 'sell', $6::order_type, $7, $8::jsonb, $9,
+			$5,
+			-- A bracket child exits its parent: sell for a long entry, buy
+			-- to cover for a short entry (#599).
+			COALESCE((SELECT CASE WHEN parent.side='sell' THEN 'buy'::order_side ELSE 'sell'::order_side END
+			          FROM stock_order_intents parent WHERE parent.id=$4::uuid), 'sell'::order_side),
+			$6::order_type, $7, $8::jsonb, $9,
 			$10, 'pending', NOW(), 'broker_projection'
 			)
 			ON CONFLICT (idempotency_key) DO UPDATE
@@ -491,9 +501,11 @@ func ListUnprojectedStockStopIntents(ctx context.Context, tradeID string) ([]Sto
 	rows, err := GetDB().Query(ctx, `
 		SELECT i.idempotency_key
 		FROM stock_order_intents i
+		JOIN trades t ON t.id=i.trade_id
 		WHERE i.trade_id=$1::uuid
 		  AND i.purpose='submit'
-		  AND i.side='sell'
+		  -- A protective stop exits the trade: sell for a long, buy for a short.
+		  AND ((t.direction='short' AND i.side='buy') OR (t.direction<>'short' AND i.side='sell'))
 		  AND i.order_type IN ('stop','stop_limit')
 		  AND (
 		      i.status IN ('pending','partial')
