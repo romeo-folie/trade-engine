@@ -170,7 +170,7 @@ func (e *Engine) executeShortEntry(ctx context.Context, sigID string, sig store.
 		// A working manual SELL on a ticker with no long is a pending short
 		// the broker position snapshot cannot show yet. It blocks its ticker
 		// (no adding) and counts toward gross short exposure.
-		pending := manualPendingShorts(admission.WorkingOrders, admission.BrokerPositions, durableOwned, admission.Reservations)
+		pending := manualPendingShorts(admission.WorkingOrders, admission.BrokerPositions, admission.Reservations)
 		for _, order := range pending {
 			if strings.EqualFold(order.Ticker, sig.Ticker) {
 				block(fmt.Sprintf("working SELL order %q may already be opening a short in %s — cannot add to a short", order.OrderID, sig.Ticker), "position_ownership")
@@ -504,22 +504,18 @@ func shortExposure(
 // manualPendingShorts returns working SELL orders that may open a short: not a
 // bracket child, not engine-owned (te-stock- client IDs are engine entries,
 // already reserved, or engine exits), not an exact engine short reservation,
-// and on a ticker with no long position to close locally or at the broker.
+// and on a ticker where the fresh broker snapshot shows no long to close. A
+// local long alone does not prove a SELL is close-only: it can be stale after
+// a manual close, so only broker truth exempts a SELL.
 func manualPendingShorts(
 	working []execution.WorkingOrder,
 	positions []execution.BrokerPosition,
-	owned []store.Trade,
 	reservations []store.ActiveStockEntryReservation,
 ) []execution.WorkingOrder {
 	longHeld := map[string]bool{}
 	for _, p := range positions {
 		if strings.EqualFold(p.Side, "long") && p.Quantity > 0 {
 			longHeld[strings.ToUpper(strings.TrimSpace(p.Symbol))] = true
-		}
-	}
-	for _, t := range owned {
-		if t.Direction == "long" && t.Quantity > 0 {
-			longHeld[strings.ToUpper(strings.TrimSpace(t.Ticker))] = true
 		}
 	}
 	var out []execution.WorkingOrder

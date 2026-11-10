@@ -877,9 +877,13 @@ func mergeBrokerLongOccupancy(in *risk.CheckInput, positions []execution.BrokerP
 		in.OpenByTicker = make(map[string]int)
 	}
 	filledLongs := make(map[string]struct{})
+	trackedShorts := make(map[string]struct{})
 	for _, trade := range durableOwned {
 		if strings.EqualFold(trade.Direction, "long") && trade.Quantity > 0 {
 			filledLongs[strings.ToUpper(strings.TrimSpace(trade.Ticker))] = struct{}{}
+		}
+		if strings.EqualFold(trade.Direction, "short") && trade.Quantity > 0 {
+			trackedShorts[strings.ToUpper(strings.TrimSpace(trade.Ticker))] = struct{}{}
 		}
 	}
 	for _, position := range positions {
@@ -895,7 +899,12 @@ func mergeBrokerLongOccupancy(in *risk.CheckInput, positions []execution.BrokerP
 				return errorsForAdmission("broker holds a short position in the requested BUY ticker")
 			}
 			// Shorts consume overall capacity but must not influence BUY-only
-			// pyramid ownership or per-ticker long limits.
+			// pyramid ownership or per-ticker long limits. A short already
+			// tracked by a durable trade (#599) is counted by buildRiskInput;
+			// counting the broker position again would spend a second slot.
+			if _, tracked := trackedShorts[strings.ToUpper(symbol)]; tracked {
+				continue
+			}
 			key, count := riskInputTickerCount(in.OpenByTicker, symbol)
 			if count == 0 {
 				in.OpenByTicker[symbol] = 1

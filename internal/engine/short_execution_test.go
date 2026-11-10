@@ -1115,3 +1115,32 @@ func TestContainmentFlattensShortWithBuy(t *testing.T) {
 		t.Fatalf("short containment flatten = %+v; want a 2-share BUY", exec.placed)
 	}
 }
+
+// Codex round 4: a short tracked by a durable trade takes exactly one
+// position slot in BUY admission; an untracked broker short still takes one.
+func TestTrackedShortConsumesOneSlotInBuyAdmission(t *testing.T) {
+	owned := []store.Trade{{Ticker: "TSLA", Direction: "short", Quantity: 3, EntryPrice: 200}}
+	in := buildRiskInput(config.RiskConfig{}, "BUY", "NVDA", .9, 1, 95, 120, 110, portfolio.State{TotalValue: 1_000}, owned)
+	if err := mergeBrokerLongOccupancy(&in, []execution.BrokerPosition{
+		{Symbol: "TSLA", Side: "short", Quantity: -3, AvgEntryPrice: 200},
+		{Symbol: "AMD", Side: "short", Quantity: -1, AvgEntryPrice: 100},
+	}, "NVDA", owned); err != nil {
+		t.Fatal(err)
+	}
+	if in.OpenPositions != 2 {
+		t.Fatalf("open positions = %d, want 2 (tracked TSLA short once, untracked AMD short once)", in.OpenPositions)
+	}
+}
+
+// Codex round 4: a stale local long does not exempt a working SELL. Only the
+// fresh broker snapshot shows a long that the SELL could be closing.
+func TestManualPendingShortsTrustOnlyBrokerLongs(t *testing.T) {
+	sell := execution.WorkingOrder{OrderID: "m", TradeID: "manual", Ticker: "STALE", Side: "sell", Status: "pending", RemainingQty: 4, Price: 50}
+	if got := manualPendingShorts([]execution.WorkingOrder{sell}, nil, nil); len(got) != 1 {
+		t.Fatalf("flat broker: pending shorts = %+v, want the SELL", got)
+	}
+	brokerLong := []execution.BrokerPosition{{Symbol: "STALE", Side: "long", Quantity: 4}}
+	if got := manualPendingShorts([]execution.WorkingOrder{sell}, brokerLong, nil); len(got) != 0 {
+		t.Fatalf("broker long: pending shorts = %+v, want none", got)
+	}
+}
