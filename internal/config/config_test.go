@@ -1843,3 +1843,20 @@ func TestShortsDisabledByDefaultAndValidated(t *testing.T) {
 		}
 	}
 }
+
+func TestShortsSSRTriggerMayBeLowerButNotHigherThanRule201(t *testing.T) {
+	s := Defaults().Risk.Shorts
+	s.Enabled = true
+	for _, v := range []float64{10, 7.5, 1} {
+		s.SSRDropPct = v
+		if errs := ValidateShortsConfig(s); len(errs) != 0 {
+			t.Errorf("ssr_drop_pct %v rejected: %v", v, errs)
+		}
+	}
+	for _, v := range []float64{10.01, 20} {
+		s.SSRDropPct = v
+		if errs := ValidateShortsConfig(s); len(errs) == 0 {
+			t.Errorf("ssr_drop_pct %v accepted; it would admit Rule 201-restricted stocks", v)
+		}
+	}
+}

@@ -389,8 +389,9 @@ type ShortsConfig struct {
 	// EarningsBlackoutDays blocks new shorts this many calendar days before a
 	// scheduled earnings date (and on the date itself).
 	EarningsBlackoutDays int `yaml:"earnings_blackout_days"`
-	// SSRDropPct is the intraday decline from the prior close that triggers
-	// the SEC Rule 201 short-sale restriction (10 by rule). New shorts are not
+	// SSRDropPct is the intraday decline from the prior close treated as the
+	// SEC Rule 201 short-sale restriction trigger: 10 by rule, and it may be
+	// set lower (more conservative) but never higher. New shorts are not
 	// opened while it applies.
 	SSRDropPct float64 `yaml:"ssr_drop_pct"`
 }
@@ -420,8 +421,11 @@ func ValidateShortsConfig(s ShortsConfig) []string {
 	if s.MaxTickerShortPct > s.MaxGrossShortPct {
 		errs = append(errs, "risk.shorts.max_ticker_short_pct must not exceed max_gross_short_pct")
 	}
-	if s.SSRDropPct > 100 {
-		errs = append(errs, "risk.shorts.ssr_drop_pct must be <= 100")
+	// Rule 201 triggers at a 10% decline by regulation. A higher trigger
+	// would admit shorts on stocks that are already restricted; a lower one
+	// is merely more conservative and is allowed.
+	if s.SSRDropPct > 10 {
+		errs = append(errs, "risk.shorts.ssr_drop_pct must be <= 10 (the SEC Rule 201 trigger)")
 	}
 	sort.Strings(errs)
 	return errs
