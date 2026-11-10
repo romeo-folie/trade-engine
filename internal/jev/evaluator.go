@@ -38,9 +38,14 @@ func (e *Evaluator) Evaluate(ctx context.Context, req analysis.AnalysisRequest) 
 		return Decision{Response: out, Trace: trace}, err
 	}
 	questions := QuestionsWith(req, e.Options)
-	questionSet, _ := e.Options.Versions()
-	resp, meta, err := e.Client.Evaluate(ctx, BuildState(req), questions, questionSet)
-	d := Decision{Meta: meta, Answers: resp.Answers}
+	questionSet, policy := e.Options.Versions()
+	resp, meta, err := e.Client.Evaluate(ctx, BuildStateWith(req, e.Options), questions, questionSet)
+	// The trace carries the versions the call was made under even when it
+	// fails before the policy runs, so failed calls are attributable.
+	d := Decision{Meta: meta, Answers: resp.Answers, Trace: Trace{
+		PolicyVersion: policy, QuestionSetVersion: questionSet,
+		Held: HoldsLong(req) || HoldsShort(req), Values: map[string]float64{},
+	}}
 	if err != nil {
 		return d, err
 	}

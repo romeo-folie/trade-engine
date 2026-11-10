@@ -185,6 +185,20 @@ type State struct {
 	Inputs snapshot.Inputs `json:"inputs"`
 }
 
+// BuildStateWith frames the frozen request for opts. v1 keeps its original
+// long-only framing; v2 frames a two-sided decision so the framing does not
+// bias Jev against the short and cover questions it is asked.
+func BuildStateWith(req analysis.AnalysisRequest, opts Options) State {
+	if !opts.Shorts {
+		return BuildState(req)
+	}
+	s := BuildState(req)
+	s.Task = "Evaluate an equity trading decision for " + req.Ticker +
+		" in either direction (long or short) using only this point-in-time data. decision_cutoff is the evaluation time; news ages are relative to it. " +
+		"recent_candles are newest first. portfolio.OpenPositions shows any position already held and its side."
+	return s
+}
+
 // BuildState frames the frozen request for Jev.
 func BuildState(req analysis.AnalysisRequest) State {
 	return State{

@@ -108,7 +108,8 @@ func (e *Engine) jevResult(d jev.Decision, err error, executed *analysis.Analysi
 	if audit.Trace.PolicyVersion == "" {
 		// A failed call never reached the policy; still record which policy
 		// and question set it was asked under.
-		audit.Trace.PolicyVersion, audit.Trace.QuestionSetVersion = jev.PolicyVersion, jev.QuestionSetVersion
+		questionSet, policy := jevOptions(e.cfg).Versions()
+		audit.Trace.PolicyVersion, audit.Trace.QuestionSetVersion = policy, questionSet
 	}
 	if executed != nil {
 		audit.ExecutedAction = executed.Action

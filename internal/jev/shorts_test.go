@@ -1,7 +1,11 @@
 package jev
 
 import (
+	"context"
+	"encoding/json"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
@@ -265,5 +269,33 @@ func TestV2ExitOnlyRowStillManagesAHeldShort(t *testing.T) {
 	resp, _, err := ResolveWith(req, answers, DefaultPolicyConfig(), 1.5, v2)
 	if err != nil || resp.Action != analysis.ActionCover {
 		t.Fatalf("resp = %+v, err %v", resp, err)
+	}
+}
+
+func TestV2StateFramingIsTwoSidedAndV1Unchanged(t *testing.T) {
+	req := entryRequest()
+	if BuildStateWith(req, Options{}).Task != BuildState(req).Task {
+		t.Fatal("v1 framing must be unchanged")
+	}
+	task := BuildStateWith(req, v2).Task
+	if strings.Contains(task, "long-only") || !strings.Contains(task, "either direction") {
+		t.Fatalf("v2 framing must be two-sided, got %q", task)
+	}
+}
+
+func TestV2FailedCallKeepsV2Versions(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	e := &Evaluator{Client: testClient(t, srv.URL, 0), Policy: DefaultPolicyConfig(), Options: v2}
+	d, err := e.Evaluate(context.Background(), entryRequest())
+	if err == nil || d.Trace.PolicyVersion != PolicyVersionV2 || d.Trace.QuestionSetVersion != QuestionSetVersionV2 {
+		t.Fatalf("failed v2 call trace = %+v (err %v)", d.Trace, err)
+	}
+	var sent map[string]any
+	_ = json.Unmarshal([]byte(d.Meta.RawPrompt), &sent)
+	if q, _ := sent["questions"].(map[string]any); q[QShortThesis] == nil {
+		t.Fatal("failed v2 call must still record the v2 request")
 	}
 }
