@@ -145,7 +145,7 @@ func RenderPositionDetail(d PositionDetail, width, height int) string {
 	if len(d.RelatedSignals) > 0 {
 		b.WriteString(sectionTitle.Render(fmt.Sprintf("Related Signals (%d)", len(d.RelatedSignals))) + "\n")
 		for _, s := range d.RelatedSignals {
-			action := actionStyle(s.Action).Render(fmt.Sprintf("%-4s", s.Action))
+			action := actionStyle(s.Action).Render(fmt.Sprintf("%-5s", s.Action))
 			status := statusStyle(s.Status).Render(s.Status)
 			marker := " "
 			if s.ID == d.Trade.SignalID {

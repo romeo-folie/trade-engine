@@ -46,14 +46,15 @@ const COLUMNS: Column<Signal>[] = [
     key: 'Action',
     label: 'DIR',
     render: (s) => {
-      // store.Signal.Action is BUY/SELL today (the engine returns before
-      // writing a row for HOLD/WAIT), so this normalises through the same
-      // helper the detail panel uses rather than keeping a second local copy
-      // of the mapping. Should a non-directional action ever reach this table,
-      // it names the action instead of flattening it to NEUTRAL.
+      // store.Signal.Action is BUY/SELL, or SHORT/COVER with shorts enabled
+      // (#599); the engine returns before writing a row for HOLD/WAIT. This
+      // normalises through the same helper the detail panel uses. A SELL is a
+      // long exit and is named as such, never relabelled SHORT.
       const label = verdictLabel(s.Action);
       if (label === 'LONG') return <span className={styles.dirLong}>LONG</span>;
       if (label === 'SHORT') return <span className={styles.dirShort}>SHORT</span>;
+      if (label === 'SELL') return <span className={styles.dirShort}>SELL</span>;
+      if (label === 'COVER') return <span className={styles.dirLong}>COVER</span>;
       return <span className={styles.dirNeut} style={{ color: verdictColor(label) }}>{label}</span>;
     },
   },

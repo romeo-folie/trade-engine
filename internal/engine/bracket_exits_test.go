@@ -2445,3 +2445,34 @@ func TestCancelBracketLegs_AllClearSemantics(t *testing.T) {
 	}
 	_ = tpID
 }
+
+// Liveness regression (pre-existing on main): a strict long whose parent
+// snapshot reports a partially filled, now-cancelled take-profit child is
+// flattened for the remaining shares once that fill is booked, instead of
+// deferring forever.
+func TestContainmentAfterBookedChildFillFlattensRemainderLong(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, tpID, slID := insertBracketFixture(t, "LIVELONG", 3)
+	parentID := "parent-" + tradeID[:8]
+	exec := &fakeBracketExec{
+		statuses: map[string]execution.OrderResult{
+			parentID: {Status: "filled", Quantity: 3, FilledQty: 3, FilledPrice: 100, ChildOrders: []execution.OrderLeg{
+				{BrokerOrderID: tpID, Type: "limit", Status: "cancelled", Quantity: 3, FilledQty: 1, FilledPrice: 110},
+				{BrokerOrderID: slID, Type: "stop", Status: "cancelled", Quantity: 3},
+			}},
+			tpID: {Status: "cancelled", Quantity: 3, FilledQty: 1, FilledPrice: 110},
+			slID: {Status: "cancelled", Quantity: 3},
+		},
+		placeRes: execution.OrderResult{BrokerOrderID: "live-long-flatten", Status: "accepted"},
+	}
+	e := newBracketTestEngine(exec)
+	for pass := 0; pass < 3; pass++ {
+		e.containUnprotectedBrokerEntry(ctx, tradeID, parentID, "LIVELONG", "regression")
+	}
+	if len(exec.placed) != 1 || exec.placed[0].Side != execution.OrderSideSell || exec.placed[0].Quantity != 2 {
+		t.Fatalf("flatten = %+v, want exactly one SELL of the 2 remaining shares", exec.placed)
+	}
+}

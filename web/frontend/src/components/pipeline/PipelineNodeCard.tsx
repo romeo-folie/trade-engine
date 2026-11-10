@@ -264,8 +264,9 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
             {d.verdict ? (
               <div
                 className={`${styles.analystVerdict} ${
-                  d.verdict === 'BUY' ? styles.verdictLong :
-                  d.verdict === 'SELL' ? styles.verdictShort :
+                  // Buys (BUY, COVER) vs sells (SELL, SHORT) — #599.
+                  d.verdict === 'BUY' || d.verdict === 'COVER' ? styles.verdictLong :
+                  d.verdict === 'SELL' || d.verdict === 'SHORT' ? styles.verdictShort :
                   styles.verdictNeutral
                 }`}
                 style={{ fontSize: 13, marginTop: 8 }}
@@ -349,14 +350,21 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
 
                 const ticker = d.currentTicker as string | null;
                 const buys = activeVotes.filter(v => v.action?.toUpperCase() === 'BUY').length;
+                // Bearish votes: a SELL (exit a long) or a SHORT (#599). The
+                // label names which one leads instead of calling a SELL a SHORT.
                 const sells = activeVotes.filter(v => v.action?.toUpperCase() === 'SELL').length;
-                const consensusVerdict = activeVotes.length === 0 ? null : buys > sells ? 'LONG' : sells > buys ? 'SHORT' : 'HOLD';
+                const shorts = activeVotes.filter(v => v.action?.toUpperCase() === 'SHORT').length;
+                const bearish = sells + shorts;
+                const consensusVerdict = activeVotes.length === 0 ? null
+                  : buys > bearish ? 'LONG'
+                  : bearish > buys ? (shorts >= sells ? 'SHORT' : 'SELL')
+                  : 'HOLD';
                 const avgConf = activeVotes.length > 0
                   ? activeVotes.reduce((sum, v) => sum + v.confidence, 0) / activeVotes.length
                   : 0;
 
                 const verdictCls = consensusVerdict === 'LONG' ? styles.verdictLong
-                  : consensusVerdict === 'SHORT' ? styles.verdictShort
+                  : consensusVerdict === 'SHORT' || consensusVerdict === 'SELL' ? styles.verdictShort
                   : styles.verdictNeutral;
 
                 return (

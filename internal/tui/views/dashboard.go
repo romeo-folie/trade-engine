@@ -949,7 +949,7 @@ func renderSignalFeed(signals []SignalRow, width int) string {
 	}
 
 	for _, s := range signals[:limit] {
-		action := actionStyle(s.Action).Render(fmt.Sprintf("%-4s", s.Action))
+		action := actionStyle(s.Action).Render(fmt.Sprintf("%-5s", s.Action))
 		status := statusStyle(s.Status).Render(s.Status)
 		b.WriteString(fmt.Sprintf("  %s %-6s %s  conf:%.0f%%  %s  %s\n",
 			dimText.Render(s.CreatedAt.Format("15:04")),
@@ -1150,9 +1150,11 @@ func colorPnLPctField(v float64, width int) string {
 
 func actionStyle(action string) lipgloss.Style {
 	switch strings.ToUpper(action) {
-	case "BUY":
+	// BUY opens a long and COVER buys back a short; SELL exits a long and
+	// SHORT opens a short (#599).
+	case "BUY", "COVER":
 		return greenText.Bold(true)
-	case "SELL":
+	case "SELL", "SHORT":
 		return redText.Bold(true)
 	default:
 		return dimText

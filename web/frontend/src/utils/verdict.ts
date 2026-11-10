@@ -1,11 +1,14 @@
 /**
  * Verdict vocabulary shared by the signal and analysis surfaces.
  *
- * The API renames the directional actions (BUY→LONG, SELL→SHORT) and passes
- * every other engine action through unchanged, so these surfaces have to handle
- * more than three values:
+ * The API renames BUY→LONG and passes every other engine action through
+ * unchanged. Since #599, SELL is a long exit, SHORT opens a short, and COVER
+ * buys a short back, so these surfaces have to handle more than three values:
  *
- *   LONG  / SHORT — directional conviction
+ *   LONG          — open (or add to) a long
+ *   SHORT         — open a short
+ *   SELL          — exit a long
+ *   COVER         — buy back a short
  *   TRADE         — ORB candidate cleared the gate
  *   WAIT          — real catalyst, poor entry timing; re-evaluate next tick
  *   ADD           — scanner wants the ticker on the watchlist
@@ -22,7 +25,7 @@
 export function verdictLabel(value: string | null | undefined): string {
   const v = (value ?? '').trim().toUpperCase();
   if (v === 'BUY' || v === 'LONG') return 'LONG';
-  if (v === 'SELL' || v === 'SHORT') return 'SHORT';
+  // SELL is a long exit, never a short (#599); SHORT and COVER pass through.
   return v || 'NEUTRAL';
 }
 
@@ -36,6 +39,12 @@ export function verdictColor(value: string | null | undefined): string {
       return 'var(--accent)';
     case 'SHORT':
       return 'var(--red)';
+    // Exits: a SELL closes a long (red, like the side it sells into) and a
+    // COVER buys a short back (accent, the buying side).
+    case 'SELL':
+      return 'var(--red)';
+    case 'COVER':
+      return 'var(--accent)';
     // ORB's TRADE is a "go" like a directional call, just without a side.
     case 'TRADE':
       return 'var(--accent)';

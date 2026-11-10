@@ -155,8 +155,9 @@ func TestMapAnalystResults_inactiveAnalyst(t *testing.T) {
 		t.Error("analyst 1 should be inactive (empty action)")
 	}
 
-	if ensemble.Verdict != "SHORT" {
-		t.Errorf("expected ensemble SHORT, got %s", ensemble.Verdict)
+	// A SELL is a long exit, not a short (#599).
+	if ensemble.Verdict != "SELL" {
+		t.Errorf("expected ensemble SELL, got %s", ensemble.Verdict)
 	}
 }
 
@@ -244,7 +245,10 @@ func TestMapVerdict(t *testing.T) {
 		want string
 	}{
 		{analysis.ActionBuy, "LONG"},
-		{analysis.ActionSell, "SHORT"},
+		// SELL exits a long; SHORT and COVER are distinct actions (#599).
+		{analysis.ActionSell, "SELL"},
+		{analysis.ActionShort, "SHORT"},
+		{analysis.ActionCover, "COVER"},
 		{analysis.ActionHold, "HOLD"},
 		{analysis.ActionWait, "WAIT"},
 		{analysis.ActionTrade, "TRADE"},
@@ -336,5 +340,25 @@ func TestMapAnalystResults_DecodesPersistedErrorAndOrdinal(t *testing.T) {
 	}
 	if analysts[1].Active || !analysts[0].Active || !analysts[2].Active {
 		t.Fatalf("failed analyst must be inactive: %+v", analysts)
+	}
+}
+
+// #599: a LONG vote tied with a bearish vote (SHORT or SELL) is HOLD, and the
+// new verdicts win when they lead.
+func TestDeriveEnsembleVerdictWithShortAndCover(t *testing.T) {
+	cases := []struct {
+		votes map[string]int
+		want  string
+	}{
+		{map[string]int{"LONG": 1, "SHORT": 1}, "HOLD"},
+		{map[string]int{"LONG": 1, "SELL": 1}, "HOLD"},
+		{map[string]int{"SHORT": 2, "LONG": 1}, "SHORT"},
+		{map[string]int{"SELL": 2, "WAIT": 1}, "SELL"},
+		{map[string]int{"COVER": 1}, "COVER"},
+	}
+	for _, c := range cases {
+		if got := deriveEnsembleVerdict(c.votes); got != c.want {
+			t.Errorf("deriveEnsembleVerdict(%v) = %s, want %s", c.votes, got, c.want)
+		}
 	}
 }

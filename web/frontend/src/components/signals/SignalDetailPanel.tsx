@@ -3,7 +3,7 @@ import { fmtPrice, fmtDate } from '../../utils/format';
 import { ChamferedBox } from '../common/ChamferedBox';
 import { colors } from '../../styles/tokens';
 import CornerCard from '../CornerCard';
-import { verdictColor } from '../../utils/verdict';
+import { verdictColor, verdictLabel } from '../../utils/verdict';
 import styles from './SignalDetailPanel.module.css';
 
 /* ── Types ─────────────────────────────────────────────────────────────────── */
@@ -107,7 +107,10 @@ export default function SignalDetailPanel({ signal, onClose }: SignalDetailPanel
     return () => document.removeEventListener('keydown', handleKey);
   }, [onClose]);
 
-  const dirIsLong = signal.Action.toUpperCase() === 'BUY';
+  // BUY and COVER are buys (emerald); SELL and SHORT are sells (red). The
+  // badge names the action itself so a long exit never reads as a short.
+  const actionLabel = verdictLabel(signal.Action);
+  const dirIsLong = actionLabel === 'LONG' || actionLabel === 'COVER';
 
   // Use real analyst data when available
   const analysts = signal.Analysts && signal.Analysts.length > 0 ? signal.Analysts : [];
@@ -139,7 +142,7 @@ export default function SignalDetailPanel({ signal, onClose }: SignalDetailPanel
               style={{ display: 'inline-block', padding: '2px 8px', marginLeft: '12px' }}
             >
               <span style={{ fontSize: 10, fontWeight: 700, color: '#FFFFFF' }}>
-                {dirIsLong ? 'LONG' : 'SHORT'}
+                {actionLabel}
               </span>
             </ChamferedBox>
           </div>
@@ -218,8 +221,8 @@ export default function SignalDetailPanel({ signal, onClose }: SignalDetailPanel
               </div>
             ))}
             <div className={styles.ensembleVerdict}>
-              <span className={styles.verdictText} style={{ color: verdictColor(ensemble?.verdict ?? (dirIsLong ? 'LONG' : 'SHORT')) }}>
-                {ensemble?.verdict ?? (dirIsLong ? 'LONG' : 'SHORT')}
+              <span className={styles.verdictText} style={{ color: verdictColor(ensemble?.verdict ?? actionLabel) }}>
+                {ensemble?.verdict ?? actionLabel}
               </span>
               <span className={styles.verdictScore}>WEIGHTED <strong>{(ensemble?.confidence ?? signal.Confidence).toFixed(2)}</strong></span>
             </div>
