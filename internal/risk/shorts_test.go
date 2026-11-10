@@ -20,6 +20,7 @@ func eligibleShortInput() ShortEligibilityInput {
 		AssetActiveTradable: true, Shortable: true, ShortableKnown: true, EasyToBorrow: true, EasyToBorrowKnown: true,
 		Price: 50, PrevClose: 52, SessionLow: 49.5,
 		AvgDollarVolume: 80_000_000,
+		EarningsKnown:   true,
 		DaysToEarnings:  ip(20),
 		Equity:          2500, GrossShortValue: 0, TickerShortValue: 0, ProposedShortValue: 37.5,
 	}
@@ -67,8 +68,11 @@ func TestShortEachRuleBlocks(t *testing.T) {
 		"ssr carried over":        {func(in *ShortEligibilityInput) { in.SSRCarriedOver = true }, ShortReasonSSRActive},
 		"earnings today":          {func(in *ShortEligibilityInput) { in.DaysToEarnings = ip(0) }, ShortReasonEarnings},
 		"earnings at window edge": {func(in *ShortEligibilityInput) { in.DaysToEarnings = ip(3) }, ShortReasonEarnings},
-		"equity unknown":          {func(in *ShortEligibilityInput) { in.Equity = 0 }, ShortReasonEquityUnknown},
-		"gross cap":               {func(in *ShortEligibilityInput) { in.GrossShortValue = 480 }, ShortReasonGrossCap},
+		"earnings calendar unknown": {func(in *ShortEligibilityInput) {
+			in.EarningsKnown, in.DaysToEarnings = false, nil
+		}, ShortReasonEarningsUnknown},
+		"equity unknown": {func(in *ShortEligibilityInput) { in.Equity = 0 }, ShortReasonEquityUnknown},
+		"gross cap":      {func(in *ShortEligibilityInput) { in.GrossShortValue = 480 }, ShortReasonGrossCap},
 		"ticker cap": {func(in *ShortEligibilityInput) {
 			in.TickerShortValue = 100 // 100 + 37.5 = 137.5 > 5% of 2500 (125)
 		}, ShortReasonTickerCap},

@@ -29,6 +29,7 @@ const (
 	ShortReasonSSRUnknown       = "ssr_status_unknown"
 	ShortReasonSSRActive        = "short_sale_restriction_active"
 	ShortReasonEarnings         = "earnings_blackout"
+	ShortReasonEarningsUnknown  = "earnings_calendar_unknown"
 	ShortReasonGrossCap         = "gross_short_exposure_cap"
 	ShortReasonTickerCap        = "ticker_short_exposure_cap"
 	ShortReasonEquityUnknown    = "equity_unknown"
@@ -67,8 +68,12 @@ type ShortEligibilityInput struct {
 
 	AvgDollarVolume float64 // 20-session average; 0 = unknown
 
+	// EarningsKnown reports that the earnings calendar was consulted
+	// successfully for this ticker. Only then does a nil DaysToEarnings mean
+	// "nothing scheduled"; an unavailable calendar blocks the short.
+	EarningsKnown bool
 	// DaysToEarnings is calendar days until the next scheduled earnings date
-	// (0 = today); nil when no scheduled earnings date is known.
+	// (0 = today); nil when the (known) calendar has no upcoming date.
 	DaysToEarnings *int
 
 	Equity             float64
@@ -168,8 +173,13 @@ func EvaluateShortEligibility(in ShortEligibilityInput) ShortEligibility {
 		add(ShortReasonSSRActive)
 	}
 
-	// Earnings: no new short inside the blackout window before a scheduled date.
-	if in.DaysToEarnings != nil && *in.DaysToEarnings >= 0 && *in.DaysToEarnings <= cfg.EarningsBlackoutDays {
+	// Earnings: no new short inside the blackout window before a scheduled
+	// date. A calendar that could not be consulted is not evidence of "no
+	// earnings" and blocks the short.
+	switch {
+	case !in.EarningsKnown:
+		add(ShortReasonEarningsUnknown)
+	case in.DaysToEarnings != nil && *in.DaysToEarnings >= 0 && *in.DaysToEarnings <= cfg.EarningsBlackoutDays:
 		add(ShortReasonEarnings)
 	}
 
