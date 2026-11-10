@@ -1,4 +1,5 @@
 import { memo, useMemo } from 'react';
+import { consensusVerdict as deriveConsensus } from '../../utils/verdict';
 import { Handle, Position, type NodeProps, type Node } from '@xyflow/react';
 import type { NodeMetrics } from '../../hooks/useEngineSocket';
 import EnsembleConsensus from './EnsembleConsensus';
@@ -264,8 +265,9 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
             {d.verdict ? (
               <div
                 className={`${styles.analystVerdict} ${
-                  d.verdict === 'BUY' ? styles.verdictLong :
-                  d.verdict === 'SELL' ? styles.verdictShort :
+                  // Buys (BUY, COVER) vs sells (SELL, SHORT) — #599.
+                  d.verdict === 'BUY' || d.verdict === 'COVER' ? styles.verdictLong :
+                  d.verdict === 'SELL' || d.verdict === 'SHORT' ? styles.verdictShort :
                   styles.verdictNeutral
                 }`}
                 style={{ fontSize: 13, marginTop: 8 }}
@@ -348,15 +350,16 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
                 }));
 
                 const ticker = d.currentTicker as string | null;
-                const buys = activeVotes.filter(v => v.action?.toUpperCase() === 'BUY').length;
-                const sells = activeVotes.filter(v => v.action?.toUpperCase() === 'SELL').length;
-                const consensusVerdict = activeVotes.length === 0 ? null : buys > sells ? 'LONG' : sells > buys ? 'SHORT' : 'HOLD';
+                // Same counts and tie-breaking as the API (#599), so this card
+                // and the signal detail always agree on identical votes.
+                const consensusVerdict = activeVotes.length === 0 ? null
+                  : deriveConsensus(activeVotes.map(v => v.action));
                 const avgConf = activeVotes.length > 0
                   ? activeVotes.reduce((sum, v) => sum + v.confidence, 0) / activeVotes.length
                   : 0;
 
                 const verdictCls = consensusVerdict === 'LONG' ? styles.verdictLong
-                  : consensusVerdict === 'SHORT' ? styles.verdictShort
+                  : consensusVerdict === 'SHORT' || consensusVerdict === 'SELL' ? styles.verdictShort
                   : styles.verdictNeutral;
 
                 return (

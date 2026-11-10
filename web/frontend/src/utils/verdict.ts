@@ -1,11 +1,14 @@
 /**
  * Verdict vocabulary shared by the signal and analysis surfaces.
  *
- * The API renames the directional actions (BUY→LONG, SELL→SHORT) and passes
- * every other engine action through unchanged, so these surfaces have to handle
- * more than three values:
+ * The API renames BUY→LONG and passes every other engine action through
+ * unchanged. Since #599, SELL is a long exit, SHORT opens a short, and COVER
+ * buys a short back, so these surfaces have to handle more than three values:
  *
- *   LONG  / SHORT — directional conviction
+ *   LONG          — open (or add to) a long
+ *   SHORT         — open a short
+ *   SELL          — exit a long
+ *   COVER         — buy back a short
  *   TRADE         — ORB candidate cleared the gate
  *   WAIT          — real catalyst, poor entry timing; re-evaluate next tick
  *   ADD           — scanner wants the ticker on the watchlist
@@ -22,7 +25,7 @@
 export function verdictLabel(value: string | null | undefined): string {
   const v = (value ?? '').trim().toUpperCase();
   if (v === 'BUY' || v === 'LONG') return 'LONG';
-  if (v === 'SELL' || v === 'SHORT') return 'SHORT';
+  // SELL is a long exit, never a short (#599); SHORT and COVER pass through.
   return v || 'NEUTRAL';
 }
 
@@ -36,6 +39,12 @@ export function verdictColor(value: string | null | undefined): string {
       return 'var(--accent)';
     case 'SHORT':
       return 'var(--red)';
+    // Exits: a SELL closes a long (red, like the side it sells into) and a
+    // COVER buys a short back (accent, the buying side).
+    case 'SELL':
+      return 'var(--red)';
+    case 'COVER':
+      return 'var(--accent)';
     // ORB's TRADE is a "go" like a directional call, just without a side.
     case 'TRADE':
       return 'var(--accent)';
@@ -47,4 +56,30 @@ export function verdictColor(value: string | null | undefined): string {
     default:
       return 'var(--text-dim)';
   }
+}
+
+/**
+ * Consensus verdict across analyst votes, mirroring the API's
+ * deriveEnsembleVerdict (internal/web/types.go) exactly, so the live pipeline
+ * and the signal detail can never disagree on the same votes. Votes are raw
+ * engine actions or API verdicts; they are counted per label, never pooled
+ * (SELL and SHORT are distinct). Ties resolve by the API's precedence: HOLD,
+ * LONG tied with a bearish verdict → HOLD, then LONG, SHORT, SELL, COVER,
+ * SKIP, TRADE, WAIT, ADD.
+ */
+export function consensusVerdict(votes: ReadonlyArray<string | null | undefined>): string {
+  const counts = new Map<string, number>();
+  for (const v of votes) {
+    const label = verdictLabel(v);
+    counts.set(label, (counts.get(label) ?? 0) + 1);
+  }
+  const max = Math.max(0, ...counts.values());
+  if (max === 0) return 'NEUTRAL';
+  const leads = (label: string) => counts.get(label) === max;
+  if (leads('HOLD')) return 'HOLD';
+  if (leads('LONG') && (leads('SHORT') || leads('SELL'))) return 'HOLD';
+  for (const label of ['LONG', 'SHORT', 'SELL', 'COVER', 'SKIP', 'TRADE', 'WAIT', 'ADD']) {
+    if (leads(label)) return label;
+  }
+  return 'NEUTRAL';
 }

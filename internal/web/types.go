@@ -42,7 +42,8 @@ func analystName(idx int) string {
 // mapVerdict converts an engine Action into the dashboard's verdict vocabulary.
 //
 // Directional actions are renamed to the position they imply (BUY→LONG,
-// SELL→SHORT). Every other action passes through unchanged.
+// SELL→SELL, SHORT→SHORT, COVER→COVER since #599). Every other action passes
+// through unchanged.
 //
 // This used to be a `default:` that returned NEUTRAL for everything that was
 // not BUY or SELL, which erased five distinct decisions:
@@ -63,7 +64,13 @@ func mapVerdict(action analysis.Action) string {
 	case analysis.ActionBuy:
 		return "LONG"
 	case analysis.ActionSell:
+		// SELL exits a long. It is not a short (#599): SHORT and COVER are
+		// their own actions and are shown as such.
+		return "SELL"
+	case analysis.ActionShort:
 		return "SHORT"
+	case analysis.ActionCover:
+		return "COVER"
 	case analysis.ActionHold, analysis.ActionWait, analysis.ActionTrade,
 		analysis.ActionSkip, analysis.ActionAdd:
 		return string(action)
@@ -99,12 +106,16 @@ func deriveEnsembleVerdict(votes map[string]int) string {
 	switch {
 	case leads("HOLD"):
 		return "HOLD"
-	case leads("LONG") && leads("SHORT"):
+	case leads("LONG") && (leads("SHORT") || leads("SELL")):
 		return "HOLD"
 	case leads("LONG"):
 		return "LONG"
 	case leads("SHORT"):
 		return "SHORT"
+	case leads("SELL"):
+		return "SELL"
+	case leads("COVER"):
+		return "COVER"
 	case leads("SKIP"):
 		return "SKIP"
 	case leads("TRADE"):

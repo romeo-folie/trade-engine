@@ -144,12 +144,12 @@ func (b *shortBroker) placedOrders() []execution.OrderRequest {
 func filledBracket(req execution.OrderRequest, n int) execution.OrderResult {
 	if req.OrderClass != "bracket" {
 		return execution.OrderResult{
-			BrokerOrderID: fmt.Sprintf("order-%d", n), Status: "filled",
+			BrokerOrderID: fmt.Sprintf("%s-order-%d", req.Ticker, n), Status: "filled",
 			Quantity: req.Quantity, FilledQty: req.Quantity, FilledPrice: req.ReferencePrice,
 			FilledAt: time.Now().UTC(),
 		}
 	}
-	parent := fmt.Sprintf("parent-%d", n)
+	parent := fmt.Sprintf("%s-parent-%d", req.Ticker, n)
 	tp, sl := parent+"-tp", parent+"-sl"
 	return execution.OrderResult{
 		BrokerOrderID: parent, Status: "filled", Quantity: req.Quantity,
@@ -171,6 +171,7 @@ type shortMarket struct {
 	prevLow      float64 // low of the last completed session (SSR carry-over)
 	noToday      bool
 	historyCalls int
+	bars         []data.Candle // when set, FetchHistory serves these daily bars (gate evidence)
 }
 
 // FetchDailyBars is the consolidated (SIP) daily-bar source.
@@ -192,6 +193,9 @@ func (m *shortMarket) FetchHistory(_ context.Context, ticker string, tf data.Tim
 	m.historyCalls++
 	if tf != data.Timeframe1Day {
 		return nil, nil
+	}
+	if m.bars != nil {
+		return m.bars, nil
 	}
 	low := m.todayLow
 	if m.iexTodayLow > 0 {
@@ -270,7 +274,9 @@ func newShortFixture(t *testing.T, prefix string) *shortFixture {
 		MaxOpenPositions: 1_000_000, MaxDollarRiskPct: 2, DailyLossLimitPct: 5, MaxDrawdownPct: 20,
 		BracketExitsEnabled: true,
 		Shorts: config.ShortsConfig{
-			Enabled: true, SizePct: 5, MaxGrossShortPct: 20, MaxTickerShortPct: 10,
+			// The gross cap counts every open short in the shared test DB, so
+			// it is effectively off here; cap tests set it via setGrossRoom.
+			Enabled: true, SizePct: 5, MaxGrossShortPct: 1_000_000, MaxTickerShortPct: 10,
 			MinPrice: 5, MinAvgDollarVolume: 1_000_000, EarningsBlackoutDays: 3, SSRDropPct: 10,
 		},
 	}
@@ -308,6 +314,11 @@ func (f *shortFixture) signal() (string, store.Signal) {
 	sig.ID = id
 	return id, sig
 }
+
+// id is a fake broker order ID unique to this fixture. Real broker IDs are
+// globally unique; sharing "parent-1" across tests let an outliving
+// verification goroutine book one test's fill onto another's rows.
+func (f *shortFixture) id(local string) string { return f.ticker + "-" + local }
 
 func (f *shortFixture) signalStatus(id string) (string, string) {
 	f.t.Helper()
@@ -607,7 +618,7 @@ func TestShortEntryBrokerRejectAndUnfilled(t *testing.T) {
 	t.Run("rejected at the broker", func(t *testing.T) {
 		f := newShortFixture(t, "SHR")
 		f.broker.placeResult = func(req execution.OrderRequest, n int) (execution.OrderResult, error) {
-			return execution.OrderResult{BrokerOrderID: fmt.Sprintf("rej-%d", n), Status: "rejected", Quantity: req.Quantity}, nil
+			return execution.OrderResult{BrokerOrderID: fmt.Sprintf("%s-rej-%d", req.Ticker, n), Status: "rejected", Quantity: req.Quantity}, nil
 		}
 		id, sig := f.signal()
 		f.e.executeShortEntry(f.ctx, id, sig, false)
@@ -626,7 +637,7 @@ func TestShortEntryBrokerRejectAndUnfilled(t *testing.T) {
 	t.Run("accepted but not yet filled", func(t *testing.T) {
 		f := newShortFixture(t, "SHU")
 		f.broker.placeResult = func(req execution.OrderRequest, n int) (execution.OrderResult, error) {
-			return execution.OrderResult{BrokerOrderID: fmt.Sprintf("acc-%d", n), Status: "accepted", Quantity: req.Quantity, RemainingQty: req.Quantity}, nil
+			return execution.OrderResult{BrokerOrderID: fmt.Sprintf("%s-acc-%d", req.Ticker, n), Status: "accepted", Quantity: req.Quantity, RemainingQty: req.Quantity}, nil
 		}
 		id, sig := f.signal()
 		f.e.executeShortEntry(f.ctx, id, sig, false)
@@ -670,7 +681,7 @@ func TestShortEntryBrokerRejectAndUnfilled(t *testing.T) {
 func TestShortEntryRecoveryAfterFill(t *testing.T) {
 	f := newShortFixture(t, "SHV")
 	f.broker.placeResult = func(req execution.OrderRequest, n int) (execution.OrderResult, error) {
-		return execution.OrderResult{BrokerOrderID: fmt.Sprintf("rec-%d", n), Status: "accepted", Quantity: req.Quantity, RemainingQty: req.Quantity}, nil
+		return execution.OrderResult{BrokerOrderID: fmt.Sprintf("%s-rec-%d", req.Ticker, n), Status: "accepted", Quantity: req.Quantity, RemainingQty: req.Quantity}, nil
 	}
 	id, sig := f.signal()
 	f.e.executeShortEntry(f.ctx, id, sig, false)
@@ -681,9 +692,9 @@ func TestShortEntryRecoveryAfterFill(t *testing.T) {
 	// The broker fills while the engine is down.
 	f.broker.mu.Lock()
 	filled := filledBracket(placed[0], 1)
-	filled.BrokerOrderID = "rec-1"
+	filled.BrokerOrderID = f.id("rec-1")
 	f.broker.byClient[placed[0].ClientOrderID] = filled
-	f.broker.byID["rec-1"] = filled
+	f.broker.byID[f.id("rec-1")] = filled
 	f.broker.mu.Unlock()
 
 	coordinator := f.e.executor.(*stockorders.Coordinator)
@@ -812,10 +823,10 @@ func TestShortBracketStopFillClosesShort(t *testing.T) {
 	if len(trades) != 1 {
 		t.Fatalf("setup: trades=%+v status=%v", trades, firstNonEmpty(f.signalStatus(id)))
 	}
-	slID := "parent-1-sl"
+	slID := f.id("parent-1-sl")
 	f.broker.mu.Lock()
 	f.broker.byID[slID] = execution.OrderResult{BrokerOrderID: slID, Status: "filled", Quantity: 5, FilledQty: 5, FilledPrice: 101, FilledAt: time.Now().UTC()}
-	f.broker.byID["parent-1-tp"] = execution.OrderResult{BrokerOrderID: "parent-1-tp", Status: "cancelled", Quantity: 5}
+	f.broker.byID[f.id("parent-1-tp")] = execution.OrderResult{BrokerOrderID: f.id("parent-1-tp"), Status: "cancelled", Quantity: 5}
 	f.broker.mu.Unlock()
 	if handled := f.e.reconcileBracketTrade(f.ctx, trades[0]); !handled {
 		t.Fatal("short bracket trade was not broker-managed")
@@ -960,8 +971,8 @@ func TestShortBracketChildrenAreNotCountedAsLongs(t *testing.T) {
 	// The broker now lists the bracket's two BUY legs as working orders.
 	f.broker.mu.Lock()
 	f.broker.working = []execution.WorkingOrder{
-		{OrderID: "parent-1-tp", TradeID: "alpaca-tp", ParentOrderID: "parent-1", Ticker: f.ticker, Side: "buy", Status: "pending", RemainingQty: 5, Price: 92, OrderType: "limit"},
-		{OrderID: "parent-1-sl", TradeID: "alpaca-sl", Ticker: f.ticker, Side: "buy", Status: "pending", RemainingQty: 5, StopPrice: 101, OrderType: "stop"},
+		{OrderID: f.id("parent-1-tp"), TradeID: "alpaca-tp", ParentOrderID: f.id("parent-1"), Ticker: f.ticker, Side: "buy", Status: "pending", RemainingQty: 5, Price: 92, OrderType: "limit"},
+		{OrderID: f.id("parent-1-sl"), TradeID: "alpaca-sl", Ticker: f.ticker, Side: "buy", Status: "pending", RemainingQty: 5, StopPrice: 101, OrderType: "stop"},
 	}
 	f.broker.positions = []execution.BrokerPosition{{Symbol: f.ticker, Quantity: -5, CurrentPrice: 98, MarketValue: -490, AvgEntryPrice: 98, Side: "short"}}
 	f.broker.mu.Unlock()

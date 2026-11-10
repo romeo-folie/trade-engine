@@ -77,6 +77,12 @@ func (e *Engine) containUnprotectedBrokerEntry(ctx context.Context, tradeID, ent
 		if !e.cancelBrokerBracketChildren(ctx, tradeID, status.ChildOrders) {
 			return
 		}
+		// Booking a parent-reported child fill above reduces the trade.
+		// Flatten only the quantity still held.
+		trade, err = store.GetTradeByID(ctx, tradeID)
+		if err != nil || trade == nil || trade.Status != "open" || trade.Quantity <= 1e-9 {
+			return
+		}
 		intent := newExitIntent(store.ExitReasonBrokerProtectionFailure, map[string]any{
 			"broker_protection_failure": reason,
 			"entry_broker_order_id":     entryBrokerOrderID,
@@ -146,7 +152,15 @@ func (e *Engine) cancelBrokerBracketChildren(ctx context.Context, tradeID string
 		// child's own endpoint has been purged. Never flatten against the
 		// stale local trade quantity in that case.
 		if child.FilledQty > 1e-9 || execution.NormalizeOrderStatusForTimeInForce(child.Status, "gtc") == "filled" {
-			if err := persistParentReportedBracketChildFill(ctx, tradeID, child); err != nil {
+			booked, err := bookParentReportedBracketChildFill(ctx, tradeID, child)
+			if booked && execution.IsTerminalOrderStatusForTimeInForce(child.Status, "gtc") {
+				// The fill is now booked against the trade and the child can no
+				// longer fill, so the local quantity is current. Deferring again
+				// would never end: every later pass reads the same parent
+				// snapshot. The caller reloads the trade before flattening.
+				continue
+			}
+			if err != nil {
 				logger.Warn("broker protection: persist parent-reported child fill", "trade_id", tradeID,
 					"broker_order_id", child.BrokerOrderID, "err", err)
 			}
@@ -190,22 +204,33 @@ func (e *Engine) cancelBrokerBracketChildren(ctx context.Context, tradeID string
 // child's direct endpoint after a fill, leaving this parent response as the
 // only evidence capable of reducing the durable trade quantity.
 func persistParentReportedBracketChildFill(ctx context.Context, tradeID string, child execution.OrderLeg) error {
+	_, err := bookParentReportedBracketChildFill(ctx, tradeID, child)
+	return err
+}
+
+// bookParentReportedBracketChildFill applies the parent-reported child fill
+// and reports whether it is now booked against this trade's projected child
+// row. booked is false when there is nothing to apply it to (no trade, no
+// local child row): the local quantity is then not proven current.
+func bookParentReportedBracketChildFill(ctx context.Context, tradeID string, child execution.OrderLeg) (booked bool, err error) {
 	if tradeID == "" || child.BrokerOrderID == "" || child.FilledQty <= 0 {
-		return nil
+		return false, nil
 	}
 	order, err := store.GetOrderByBrokerOrderID(ctx, child.BrokerOrderID)
 	if err != nil || order == nil {
-		return err
+		return false, err
 	}
 	if order.TradeID != tradeID {
-		return fmt.Errorf("broker child is linked to trade %s", order.TradeID)
+		return false, fmt.Errorf("broker child is linked to trade %s", order.TradeID)
 	}
-	_, _, err = store.ApplyPartialExitAtForBrokerOrder(
+	if _, _, err = store.ApplyPartialExitAtForBrokerOrder(
 		ctx, tradeID, order.ID, child.BrokerOrderID,
 		child.FilledPrice, child.FilledQty,
 		execution.NormalizeOrderStatusForTimeInForce(child.Status, "gtc"), child.FilledAt,
-	)
-	return err
+	); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (e *Engine) containUnprotectedBrokerEntryAsync(tradeID, entryBrokerOrderID, ticker, reason string) {
@@ -305,6 +330,10 @@ func (e *Engine) cancelLegacyBrokerHeldEntry(ctx context.Context, intentKey stri
 // bracket response, but a response that only supplies child IDs is not itself
 // proof that the stop is inactive.
 func (e *Engine) verifyOrContainBrokerEntryAsync(tradeID, entryBrokerOrderID, ticker string, requestedQty float64) {
+	// Read the retry delay once, before the goroutine starts: the worker can
+	// outlive its caller, and a later reassignment (tests restore it) must
+	// not race with the retries already in flight.
+	retryDelay := brokerProtectionVerificationRetryDelay
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
@@ -314,7 +343,7 @@ func (e *Engine) verifyOrContainBrokerEntryAsync(tradeID, entryBrokerOrderID, ti
 				logger.Warn("broker protection: fresh parent snapshot unavailable; retrying",
 					"trade_id", tradeID, "broker_order_id", entryBrokerOrderID,
 					"attempt", attempt+1, "err", err)
-				if !waitForBrokerProtectionRetry(ctx) {
+				if !waitForBrokerProtectionRetry(ctx, retryDelay) {
 					return
 				}
 				continue
@@ -324,7 +353,7 @@ func (e *Engine) verifyOrContainBrokerEntryAsync(tradeID, entryBrokerOrderID, ti
 				logger.Warn("broker protection: trade projection unavailable; retrying verification",
 					"trade_id", tradeID, "broker_order_id", entryBrokerOrderID,
 					"attempt", attempt+1, "err", err)
-				if !waitForBrokerProtectionRetry(ctx) {
+				if !waitForBrokerProtectionRetry(ctx, retryDelay) {
 					return
 				}
 				continue
@@ -344,7 +373,7 @@ func (e *Engine) verifyOrContainBrokerEntryAsync(tradeID, entryBrokerOrderID, ti
 				logger.Info("broker protection: bracket unprotected; re-verifying",
 					"trade_id", tradeID, "attempt", attempt+1, "status", status.Status,
 					"transient", brokerBracketProtectionTransient(status))
-				if !waitForBrokerProtectionRetry(ctx) {
+				if !waitForBrokerProtectionRetry(ctx, retryDelay) {
 					return
 				}
 				continue
@@ -407,11 +436,11 @@ func (e *Engine) renewDiscoveryResidencyAfterVerifiedProtection(ctx context.Cont
 	}
 }
 
-func waitForBrokerProtectionRetry(ctx context.Context) bool {
+func waitForBrokerProtectionRetry(ctx context.Context, delay time.Duration) bool {
 	select {
 	case <-ctx.Done():
 		return false
-	case <-time.After(brokerProtectionVerificationRetryDelay):
+	case <-time.After(delay):
 		return true
 	}
 }

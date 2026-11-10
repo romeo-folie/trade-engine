@@ -2296,7 +2296,7 @@ func (e *Engine) generateSignal(
 		admissibleLenses = admissibleLensSets[0]
 	}
 	signalStrategy := strategy
-	if resp.Action == analysis.ActionBuy {
+	if analysis.IsEntryAction(resp.Action) {
 		signalStrategy = effectiveGateStrategy(strategy, resp.SelectedStrategy, admissibleLenses)
 	}
 	sig := store.Signal{
@@ -2523,6 +2523,28 @@ func (e *Engine) generateSignal(
 			return
 		}
 		sig.EntryGateDecisions, _ = json.Marshal(gateDecisions)
+	}
+	if resp.Action == analysis.ActionShort {
+		// Mirrored entry gates for a SHORT (#599 PR 4): anti-chase on a
+		// selloff, a required daily downtrend, and the run-up mirrors.
+		now := time.Now()
+		ev := e.gatherShortGateEvidence(ctx, ticker, now)
+		shortStrategy := effectiveGateStrategy(strategy, resp.SelectedStrategy, admissibleLenses)
+		reason, failedCheck, decisions := evaluateShortGates(eg, ticker, shortStrategy, signalPrice, "signal_close", ev, now, false)
+		sig.EntryGateDecisions, _ = json.Marshal(decisions)
+		if reason != "" {
+			sig.Status = "blocked"
+			sig.BlockReason = reason
+			if _, err := store.InsertSignal(ctx, sig); err != nil {
+				logger.Warn("store blocked signal", "ticker", ticker, "err", err)
+			}
+			logger.Warn("signal blocked", "ticker", ticker, "reason", reason)
+			e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+				Ticker: ticker, Action: string(resp.Action), Confidence: resp.Confidence,
+				BlockReason: reason, FailedCheck: failedCheck,
+			})
+			return
+		}
 	}
 
 	// Run risk checks.

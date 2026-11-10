@@ -84,6 +84,7 @@ func (e *Engine) executeShortEntry(ctx context.Context, sigID string, sig store.
 	// Market facts are gathered before admission: they can take seconds, and
 	// the coordinated broker snapshot must stay fresh until release.
 	facts := e.shortMarketFacts(ctx, sig.Ticker, time.Now())
+	gateEvidence := e.gatherShortGateEvidence(ctx, sig.Ticker, time.Now())
 
 	sizePct := sig.SizePct
 	if !(sizePct > 0) || sizePct > shortsCfg.SizePct {
@@ -122,6 +123,30 @@ func (e *Engine) executeShortEntry(ctx context.Context, sigID string, sig store.
 		sig.SignalPrice = bid
 		if err := store.UpdateSignalPrice(ctx, sigID, bid); err != nil {
 			logger.Warn("update signal with fresh broker bid", "id", sigID, "err", err)
+		}
+		// Mirrored entry gates at release (#599 PR 4), on the evidence
+		// gathered before admission and the fresh admission bid.
+		reason, failedCheck, decisions := evaluateShortGates(e.cfg.Risk.EntryGates, sig.Ticker, sig.Strategy,
+			bid, "broker_validated_bid", gateEvidence, time.Now(), true)
+		var blocking *store.EntryGateDecision
+		for i := range decisions {
+			if reason != "" && decisions[i].Name == failedCheck && blocking == nil {
+				blocking = &decisions[i]
+				continue
+			}
+			if err := store.AppendSignalEntryGateDecision(ctx, sigID, decisions[i]); err != nil && reason == "" {
+				block("short entry gates: unable to persist the release audit", "entry_gate_audit")
+				return
+			}
+		}
+		if blocking != nil {
+			observedAt := time.Now().UTC()
+			blocking.ObservedAt = &observedAt
+			if err := store.BlockSignalWithEntryGateDecision(ctx, sigID, reason, *blocking); err != nil {
+				logger.Warn("persist short entry gate block", "id", sigID, "err", err)
+			}
+			block(reason, failedCheck)
+			return
 		}
 	}
 

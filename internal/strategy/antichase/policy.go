@@ -67,7 +67,18 @@ type Snapshot struct {
 	CatalystAt       *time.Time `json:"catalyst_at,omitempty"`
 	CatalystSource   string     `json:"catalyst_source,omitempty"`
 	CatalystAgeHours float64    `json:"catalyst_age_hours,omitempty"`
+
+	// Side is "short" for a prospective SHORT (#599); empty means a long BUY.
+	// The short-only fields below are populated only for shorts, so long audit
+	// records keep their original shape.
+	Side              string  `json:"side,omitempty"`
+	BBLower           float64 `json:"bb_lower,omitempty"`
+	PriorLow52Week    float64 `json:"prior_low_52_week,omitempty"`
+	PriorLowProximity float64 `json:"prior_low_proximity,omitempty"`
 }
+
+// SideShort marks a snapshot evaluated for a prospective SHORT.
+const SideShort = "short"
 
 // RuleDecision records every combination independently so operators can see
 // why a BUY passed as well as why it was stopped.
@@ -135,6 +146,10 @@ func Evaluate(snapshot Snapshot, policy Policy) Decision {
 		return decision
 	}
 
+	if snapshot.Side == SideShort {
+		return evaluateShort(snapshot, policy, decision)
+	}
+
 	weakVolume := snapshot.VolumeRatio <= policy.WeakVolumeRatioMax
 	staleCatalyst := snapshot.CatalystAt != nil && snapshot.CatalystAgeHours > policy.StaleAfterHours
 	staleExtension := snapshot.EMAExtensionATR >= policy.StaleEMAExtensionATR
@@ -169,6 +184,60 @@ func Evaluate(snapshot Snapshot, policy Policy) Decision {
 		if rule.Matched {
 			decision.Status = "blocked"
 			decision.Reason = "anti-chase: " + rule.ID + " combination matched"
+			return decision
+		}
+	}
+	decision.Status = "passed"
+	return decision
+}
+
+// evaluateShort mirrors the three V1 combinations for a prospective SHORT:
+// never short into an extended, exhausted, or stale-news selloff. Thresholds
+// are the long thresholds reflected around the mean (returns and EMA
+// extension negated, RSI/Stoch reflected around 50, the lower band and the
+// 52-week low in place of the upper band and the high). The catalyst is the
+// newest bearish item, supplied by the snapshot builder.
+func evaluateShort(snapshot Snapshot, policy Policy, decision Decision) Decision {
+	if !positiveFinite(snapshot.BBLower) {
+		decision.Status = "unavailable_block"
+		decision.Reason = "anti-chase (short): the lower Bollinger band is unavailable"
+		return decision
+	}
+	weakVolume := snapshot.VolumeRatio <= policy.WeakVolumeRatioMax
+	staleCatalyst := snapshot.CatalystAt != nil && snapshot.CatalystAgeHours > policy.StaleAfterHours
+	staleExtension := snapshot.EMAExtensionATR <= -policy.StaleEMAExtensionATR
+	rule1 := RuleDecision{
+		ID: "stale_catalyst_selloff", Enabled: policy.StaleCatalystRunupEnabled,
+		Matched: policy.StaleCatalystRunupEnabled && staleCatalyst &&
+			snapshot.Return3SessionPct <= -policy.MinReturn3SessionPct && (weakVolume || staleExtension),
+		Reason: fmt.Sprintf("bearish catalyst_age=%.1fh stale=%t; return_3_session=%.2f%%; volume_ratio=%.2fx weak=%t; ema_extension=%.2f ATR",
+			snapshot.CatalystAgeHours, staleCatalyst, snapshot.Return3SessionPct, snapshot.VolumeRatio, weakVolume, snapshot.EMAExtensionATR),
+	}
+
+	hasTrueLow := snapshot.HistoryScope == "true_52w" && snapshot.PriorLow52Week > 0
+	nearPriorLow := hasTrueLow && snapshot.PriorLowProximity <= 1+policy.NearPriorHighPct/100
+	rule2 := RuleDecision{
+		ID: "prior_low_extension", Enabled: policy.PriorHighExtensionEnabled,
+		Matched: policy.PriorHighExtensionEnabled && nearPriorLow &&
+			snapshot.EMAExtensionATR <= -policy.HighEMAExtensionATR && weakVolume,
+		Reason: fmt.Sprintf("history_scope=%s; prior_low_proximity=%.3f near=%t; ema_extension=%.2f ATR; volume_ratio=%.2fx weak=%t",
+			snapshot.HistoryScope, snapshot.PriorLowProximity, nearPriorLow, snapshot.EMAExtensionATR, snapshot.VolumeRatio, weakVolume),
+	}
+
+	belowLower := snapshot.BBLower > 0 && snapshot.ReferencePrice < snapshot.BBLower
+	capitulated := snapshot.RSI14 <= 100-policy.RSIMin || snapshot.StochK <= 100-policy.StochKMin || belowLower
+	rule3 := RuleDecision{
+		ID: "momentum_capitulation", Enabled: policy.MomentumExhaustionEnabled,
+		Matched: policy.MomentumExhaustionEnabled && capitulated &&
+			snapshot.Return3SessionPct <= -policy.ExhaustionReturn3Pct && weakVolume,
+		Reason: fmt.Sprintf("rsi=%.2f; stoch_k=%.2f; below_bb_lower=%t; return_3_session=%.2f%%; volume_ratio=%.2fx weak=%t",
+			snapshot.RSI14, snapshot.StochK, belowLower, snapshot.Return3SessionPct, snapshot.VolumeRatio, weakVolume),
+	}
+	decision.Rules = []RuleDecision{rule1, rule2, rule3}
+	for _, rule := range decision.Rules {
+		if rule.Matched {
+			decision.Status = "blocked"
+			decision.Reason = "anti-chase (short): " + rule.ID + " combination matched"
 			return decision
 		}
 	}

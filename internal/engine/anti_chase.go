@@ -65,10 +65,38 @@ func buildAntiChaseSnapshot(
 	news []analysis.NewsSnippet,
 	now time.Time,
 ) *antichase.Snapshot {
+	return buildAntiChaseSnapshotSide(ticker, daily, mark, markSource, news, now, "")
+}
+
+// buildShortAntiChaseSnapshot is the SHORT mirror (#599): the same evidence
+// window, plus the lower band and the 52-week low, with the newest bearish
+// item as the catalyst.
+func buildShortAntiChaseSnapshot(
+	ticker string,
+	daily []data.Candle,
+	mark float64,
+	markSource string,
+	news []analysis.NewsSnippet,
+	now time.Time,
+) *antichase.Snapshot {
+	return buildAntiChaseSnapshotSide(ticker, daily, mark, markSource, news, now, antichase.SideShort)
+}
+
+func buildAntiChaseSnapshotSide(
+	ticker string,
+	daily []data.Candle,
+	mark float64,
+	markSource string,
+	news []analysis.NewsSnippet,
+	now time.Time,
+	side string,
+) *antichase.Snapshot {
+	short := side == antichase.SideShort
 	s := &antichase.Snapshot{
 		SchemaVersion: antichase.PolicyVersion,
 		Ticker:        ticker, ObservedAt: now.UTC(), ReferencePrice: mark,
 		ReferenceSource: markSource, EvidenceStatus: "unavailable", HistoryScope: "limited_history",
+		Side: side,
 	}
 	completed := completedEntryDailyCandles(daily, now)
 	// Every calculation below consumes at most one current evidence horizon:
@@ -156,13 +184,26 @@ func buildAntiChaseSnapshot(
 			if candle.High > s.PriorHigh52Week {
 				s.PriorHigh52Week = candle.High
 			}
+			if short && candle.Low > 0 && (s.PriorLow52Week == 0 || candle.Low < s.PriorLow52Week) {
+				s.PriorLow52Week = candle.Low
+			}
 		}
 		if s.PriorHigh52Week > 0 {
 			s.PriorHighProximity = mark / s.PriorHigh52Week
 		}
+		if short && s.PriorLow52Week > 0 {
+			s.PriorLowProximity = mark / s.PriorLow52Week
+		}
+	}
+	if short {
+		s.BBLower = set.BBLower
+	}
+	catalystSentiment := "bullish"
+	if short {
+		catalystSentiment = "bearish"
 	}
 	for _, item := range news {
-		if item.PublishedAt.IsZero() || item.PublishedAt.After(now) || item.Sentiment != "bullish" {
+		if item.PublishedAt.IsZero() || item.PublishedAt.After(now) || item.Sentiment != catalystSentiment {
 			continue
 		}
 		if s.CatalystAt == nil || item.PublishedAt.After(*s.CatalystAt) {
