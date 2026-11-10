@@ -1,0 +1,298 @@
+package jev
+
+import (
+	"fmt"
+	"math"
+	"sort"
+	"strings"
+
+	"github.com/romeo-folie/trade-engine/internal/analysis"
+)
+
+// PolicyVersion identifies the composition rules below. Bump it with any
+// change to thresholds' meaning, ordering, or plan derivation; it is recorded
+// on every snapshot so decisions under different policies stay distinct.
+const PolicyVersion = "jev-policy/v1"
+
+// PolicyConfig holds the policy's tunable thresholds. Values are calibrated
+// on this project's data; the defaults are conservative starting points, not
+// validated probabilities of profitable trades.
+type PolicyConfig struct {
+	// MinThesisSupport is the minimum P(strong) + P(moderate) thesis support.
+	MinThesisSupport float64
+	// MaxAdverse is the highest tolerated P(material adverse evidence).
+	MaxAdverse float64
+	// MinLensProbability is the minimum probability of the chosen lens.
+	MinLensProbability float64
+	// MinTimingProbability is the minimum P(enter_now) to enter immediately.
+	MinTimingProbability float64
+	// ExitThreshold is the P(exit_now) at which a held long is exited.
+	ExitThreshold float64
+	// StopATRMultiple places the stop this many ATRs below entry.
+	StopATRMultiple float64
+	// TargetRMultiple places the target this many risk units above entry; the
+	// engine's minimum risk/reward is applied as a floor.
+	TargetRMultiple float64
+	// SizePct is the incremental BUY size as a percent of the sizing base.
+	SizePct float64
+	// MinConfidence is the minimum mapped confidence for a BUY. Set it to
+	// the engine's risk confidence threshold so every policy BUY is one the
+	// risk manager can accept, rather than a decision it silently rejects.
+	MinConfidence float64
+}
+
+// DefaultPolicyConfig returns the v1 starting thresholds.
+func DefaultPolicyConfig() PolicyConfig {
+	return PolicyConfig{
+		MinThesisSupport: 0.60, MaxAdverse: 0.40, MinLensProbability: 0.50,
+		MinTimingProbability: 0.55, ExitThreshold: 0.60,
+		StopATRMultiple: 2.0, TargetRMultiple: 2.0, SizePct: 2.0, MinConfidence: 0.55,
+	}
+}
+
+// Validate rejects thresholds that would make the policy incoherent.
+func (c PolicyConfig) Validate() error {
+	for name, v := range map[string]float64{
+		"min_thesis_support": c.MinThesisSupport, "max_adverse": c.MaxAdverse,
+		"min_lens_probability": c.MinLensProbability, "min_timing_probability": c.MinTimingProbability,
+		"exit_threshold": c.ExitThreshold, "min_confidence": c.MinConfidence,
+	} {
+		if !finiteUnit(v) {
+			return fmt.Errorf("jev policy: %s must be within [0,1], got %v", name, v)
+		}
+	}
+	for name, v := range map[string]float64{
+		"stop_atr_multiple": c.StopATRMultiple, "target_r_multiple": c.TargetRMultiple, "size_pct": c.SizePct,
+	} {
+		if !(v > 0) || math.IsInf(v, 0) {
+			return fmt.Errorf("jev policy: %s must be positive and finite, got %v", name, v)
+		}
+	}
+	return nil
+}
+
+// Reason codes recorded in the policy trace.
+const (
+	ReasonInsufficient     = "insufficient_evidence"
+	ReasonAdverse          = "adverse_evidence"
+	ReasonThesis           = "thesis_unsupported"
+	ReasonNoLens           = "no_fitting_lens"
+	ReasonLensLow          = "lens_low_confidence"
+	ReasonTimingWait       = "timing_wait"
+	ReasonTimingLow        = "timing_low_confidence"
+	ReasonPlanUnavailable  = "plan_unavailable"
+	ReasonEntry            = "entry_qualified"
+	ReasonExit             = "exit_signal"
+	ReasonHoldPosition     = "position_hold"
+	ReasonExitInsufficient = "exit_insufficient_evidence"
+	ReasonExitOnlyNotHeld  = "exit_only_not_held"
+	ReasonLowConfidence    = "confidence_below_minimum"
+)
+
+// Trace is the auditable record of how answers became a decision. It holds
+// measured values and reason codes only — Jev produces no narrative, and the
+// policy does not invent one.
+type Trace struct {
+	PolicyVersion      string             `json:"policy_version"`
+	QuestionSetVersion string             `json:"question_set_version"`
+	Held               bool               `json:"held"`
+	ReasonCodes        []string           `json:"reason_codes"`
+	Values             map[string]float64 `json:"values"`
+	SelectedLens       string             `json:"selected_lens,omitempty"`
+}
+
+// Resolve composes validated answers into an engine response. Answers must
+// already satisfy ValidateAnswers for Questions(req); Resolve re-validates and
+// returns ErrMalformed rather than guessing. minRiskReward is the engine's
+// configured floor (0 when unset).
+func Resolve(req analysis.AnalysisRequest, answers map[string]Answer, cfg PolicyConfig, minRiskReward float64) (analysis.AnalysisResponse, Trace, error) {
+	trace := Trace{PolicyVersion: PolicyVersion, QuestionSetVersion: QuestionSetVersion,
+		Held: HoldsLong(req), Values: map[string]float64{}}
+	if err := cfg.Validate(); err != nil {
+		return analysis.AnalysisResponse{}, trace, err
+	}
+	if math.IsNaN(minRiskReward) || math.IsInf(minRiskReward, 0) || minRiskReward < 0 {
+		return analysis.AnalysisResponse{}, trace, fmt.Errorf("jev policy: min risk/reward must be finite and non-negative, got %v", minRiskReward)
+	}
+	if !NeedsCall(req) {
+		trace.ReasonCodes = append(trace.ReasonCodes, ReasonExitOnlyNotHeld)
+		resp := analysis.AnalysisResponse{Action: analysis.ActionHold, SelectedStrategy: OptNone,
+			DecisiveReason: "Exit-only strategy with no held position: there is nothing to exit and entries are not permitted."}
+		resp.Reasoning = reasoning(trace)
+		return resp, trace, nil
+	}
+	if err := ValidateAnswers(Questions(req), answers); err != nil {
+		return analysis.AnalysisResponse{}, trace, err
+	}
+	regime := answers[QRegime].Choice
+	if trace.Held {
+		return resolveHeld(answers, cfg, regime, trace)
+	}
+	adverse := *answers[QAdverse].Noul
+	trace.Values["adverse"] = adverse
+	if ExitOnly(req) {
+		// Unreachable (NeedsCall): an exit-only row reaches here only when held.
+		return analysis.AnalysisResponse{}, trace, fmt.Errorf("jev policy: exit-only request routed to entry")
+	}
+	return resolveEntry(req, answers, cfg, minRiskReward, regime, adverse, trace)
+}
+
+func resolveHeld(answers map[string]Answer, cfg PolicyConfig, regime string, trace Trace) (analysis.AnalysisResponse, Trace, error) {
+	exit := answers[QExit]
+	pExit := exit.Probabilities[ExitNow]
+	trace.Values["p_exit"] = pExit
+	resp := analysis.AnalysisResponse{Regime: regime, SelectedStrategy: OptNone, Confidence: round3(pExit)}
+	switch {
+	case exit.Choice == OptInsufficient:
+		trace.ReasonCodes = append(trace.ReasonCodes, ReasonExitInsufficient)
+		resp.Action = analysis.ActionHold
+		resp.DecisiveReason = "Jev found the state insufficient to judge an exit; the position is held under existing protective orders."
+	case pExit >= cfg.ExitThreshold:
+		trace.ReasonCodes = append(trace.ReasonCodes, ReasonExit)
+		resp.Action = analysis.ActionSell
+		resp.DecisiveReason = fmt.Sprintf("Jev exit probability %.2f met the %.2f exit threshold.", pExit, cfg.ExitThreshold)
+	default:
+		trace.ReasonCodes = append(trace.ReasonCodes, ReasonHoldPosition)
+		resp.Action = analysis.ActionHold
+		resp.DecisiveReason = fmt.Sprintf("Jev exit probability %.2f is below the %.2f exit threshold; the thesis is held.", pExit, cfg.ExitThreshold)
+	}
+	resp.Reasoning = reasoning(trace)
+	return resp, trace, nil
+}
+
+func resolveEntry(req analysis.AnalysisRequest, answers map[string]Answer, cfg PolicyConfig, minRiskReward float64,
+	regime string, adverse float64, trace Trace) (analysis.AnalysisResponse, Trace, error) {
+	thesis, lens, timing := answers[QThesis], answers[QLens], answers[QTiming]
+	support := math.Min(1, thesis.Probabilities[ThesisStrong]+thesis.Probabilities[ThesisModerate])
+	trace.Values["thesis_support"] = support
+	trace.Values["p_enter_now"] = timing.Probabilities[TimingEnterNow]
+	confidence := round3(math.Min(1, math.Max(0, support*(1-adverse))))
+	resp := analysis.AnalysisResponse{Regime: regime, SelectedStrategy: OptNone, Confidence: confidence}
+
+	hold := func(code, reason string) (analysis.AnalysisResponse, Trace, error) {
+		trace.ReasonCodes = append(trace.ReasonCodes, code)
+		resp.Action, resp.DecisiveReason = analysis.ActionHold, reason
+		resp.Reasoning = reasoning(trace)
+		return resp, trace, nil
+	}
+
+	// Order matters and is part of the versioned policy: abstentions first,
+	// then disqualifying evidence, then lens fit, then timing, then the plan.
+	if thesis.Choice == OptInsufficient || lens.Choice == OptInsufficient || timing.Choice == OptInsufficient {
+		return hold(ReasonInsufficient, "Jev found the state insufficient to judge a new entry.")
+	}
+	if adverse > cfg.MaxAdverse {
+		return hold(ReasonAdverse, fmt.Sprintf("Jev adverse-evidence probability %.2f exceeds the %.2f limit.", adverse, cfg.MaxAdverse))
+	}
+	if support < cfg.MinThesisSupport {
+		return hold(ReasonThesis, fmt.Sprintf("Jev thesis support %.2f is below the %.2f minimum.", support, cfg.MinThesisSupport))
+	}
+	if lens.Choice == OptNone {
+		return hold(ReasonNoLens, "Jev found no candidate lens that fits the current regime.")
+	}
+	pLens := lens.Probabilities[lens.Choice]
+	trace.Values["p_lens"] = pLens
+	if pLens < cfg.MinLensProbability {
+		return hold(ReasonLensLow, fmt.Sprintf("Jev lens %s probability %.2f is below the %.2f minimum.", lens.Choice, pLens, cfg.MinLensProbability))
+	}
+	trace.SelectedLens = lens.Choice
+	resp.SelectedStrategy = lens.Choice
+	resp.RejectedStrategies = rejectedLenses(AdmissibleLenses(req), lens)
+
+	wait := func(code, reason string) (analysis.AnalysisResponse, Trace, error) {
+		trace.ReasonCodes = append(trace.ReasonCodes, code)
+		resp.Action, resp.DecisiveReason = analysis.ActionWait, reason
+		resp.Reasoning = reasoning(trace)
+		return resp, trace, nil
+	}
+	if timing.Choice == TimingWait {
+		return wait(ReasonTimingWait, "Jev judged that waiting for a better entry is preferable to entering now.")
+	}
+	if p := timing.Probabilities[TimingEnterNow]; p < cfg.MinTimingProbability {
+		return wait(ReasonTimingLow, fmt.Sprintf("Jev enter-now probability %.2f is below the %.2f minimum.", p, cfg.MinTimingProbability))
+	}
+	if confidence < cfg.MinConfidence {
+		resp.SelectedStrategy, resp.RejectedStrategies, trace.SelectedLens = OptNone, nil, ""
+		return hold(ReasonLowConfidence, fmt.Sprintf("Jev mapped confidence %.3f is below the %.2f minimum.", confidence, cfg.MinConfidence))
+	}
+
+	entry, atr := entryPrice(req), req.Indicators.ATR
+	if !(entry > 0) || !(atr > 0) || math.IsInf(entry, 0) || math.IsInf(atr, 0) {
+		return hold(ReasonPlanUnavailable, "A defined-risk plan could not be derived: entry price or ATR is unavailable.")
+	}
+	stop := round4(entry - cfg.StopATRMultiple*atr)
+	if !(stop > 0) || stop >= entry {
+		return hold(ReasonPlanUnavailable, "A defined-risk plan could not be derived: the ATR stop is not between zero and entry.")
+	}
+	r := math.Max(cfg.TargetRMultiple, minRiskReward)
+	target := bracketTarget(entry, stop, r)
+	trace.Values["entry"], trace.Values["atr"], trace.Values["risk_reward"] = entry, atr, r
+
+	trace.ReasonCodes = append(trace.ReasonCodes, ReasonEntry)
+	resp.Action = analysis.ActionBuy
+	resp.SizePct = cfg.SizePct
+	resp.StopLoss = stop
+	resp.TakeProfit = target
+	resp.DecisiveReason = fmt.Sprintf("Jev supported a %s entry: thesis support %.2f, adverse evidence %.2f, enter-now %.2f.",
+		lens.Choice, support, adverse, timing.Probabilities[TimingEnterNow])
+	resp.Reasoning = reasoning(trace)
+	return resp, trace, nil
+}
+
+// bracketTarget returns the smallest 4-decimal target at or above
+// entry + r*(entry-stop) whose realised reward/risk, computed from the stored
+// (rounded) stop and target exactly as the risk manager does, is at least r.
+// Rounding each price independently could otherwise land a hair under the
+// floor and be rejected by the strict risk/reward gate.
+func bracketTarget(entry, stop, r float64) float64 {
+	risk := entry - stop
+	target := math.Ceil((entry+r*risk)*10000) / 10000
+	for i := 0; i < 4 && (target-entry)/risk < r; i++ {
+		target = round4(target + 0.0001)
+	}
+	return target
+}
+
+// entryPrice is the latest close, preferring the entry-timing timeframe when
+// supplied (matching the arbiter's signal price), else the primary timeframe.
+func entryPrice(req analysis.AnalysisRequest) float64 {
+	for _, c := range req.TimeframeContexts {
+		if c.Role == "entry_timing" && len(c.RecentCandles) > 0 {
+			return c.RecentCandles[0].Close
+		}
+	}
+	if len(req.RecentCandles) > 0 {
+		return req.RecentCandles[0].Close
+	}
+	return 0
+}
+
+// rejectedLenses states, for every admissible lens not chosen, the measured
+// reason: its Jev probability against the chosen lens's. This satisfies the
+// engine's rejection-coverage audit with facts, not invented prose.
+func rejectedLenses(admissible []string, lens Answer) map[string]string {
+	out := map[string]string{}
+	for _, l := range admissible {
+		if l == lens.Choice {
+			continue
+		}
+		out[l] = fmt.Sprintf("Jev lens probability %.2f vs %.2f for %s", lens.Probabilities[l], lens.Probabilities[lens.Choice], lens.Choice)
+	}
+	return out
+}
+
+func reasoning(t Trace) string {
+	keys := make([]string, 0, len(t.Values))
+	for k := range t.Values {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%.4g", k, t.Values[k]))
+	}
+	return fmt.Sprintf("[%s] %s; %s", t.PolicyVersion, strings.Join(t.ReasonCodes, ","), strings.Join(parts, " "))
+}
+
+func round3(v float64) float64 { return math.Round(v*1000) / 1000 }
+func round4(v float64) float64 { return math.Round(v*10000) / 10000 }
