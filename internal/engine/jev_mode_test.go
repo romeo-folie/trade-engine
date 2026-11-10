@@ -67,6 +67,20 @@ func (f *fakeTypeSafe) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			answers[name] = choice(jev.TimingEnterNow, map[string]float64{jev.TimingEnterNow: 0.8, jev.TimingWait: 0.2})
 		case jev.QExit:
 			answers[name] = choice(jev.ExitHold, map[string]float64{jev.ExitHold: 0.9, jev.ExitNow: 0.1})
+		case jev.QShortThesis:
+			if f.verdict == "short" {
+				answers[name] = choice(jev.ThesisStrong, map[string]float64{jev.ThesisStrong: 0.75, jev.ThesisModerate: 0.2, jev.ThesisWeak: 0.05})
+			} else {
+				answers[name] = choice(jev.ThesisNone, map[string]float64{jev.ThesisNone: 0.9, jev.ThesisWeak: 0.1})
+			}
+		case jev.QShortAdverse:
+			answers[name] = map[string]any{"type": "noul", "noul": 0.05}
+		case jev.QShortLens:
+			answers[name] = choice("momentum", map[string]float64{"momentum": 0.85, jev.OptNone: 0.15})
+		case jev.QShortTiming:
+			answers[name] = choice(jev.TimingEnterNow, map[string]float64{jev.TimingEnterNow: 0.8, jev.TimingWait: 0.2})
+		case jev.QCover:
+			answers[name] = choice(jev.CoverHold, map[string]float64{jev.CoverHold: 0.8, jev.CoverNow: 0.2})
 		}
 	}
 	_ = json.NewEncoder(w).Encode(map[string]any{"model": "jev-test-2026", "answers": answers,
@@ -351,5 +365,147 @@ func TestDecisionMakerAvailabilityWithoutAnalysts(t *testing.T) {
 	e.analyzer = analysis.NewAnalyzerWithProviders(config.ModelsConfig{}, nil, nil, nil)
 	if e.decisionMakerAvailable() {
 		t.Fatal("an analyzer with no analysts is unavailable (and must not panic)")
+	}
+}
+
+func enableShorts(e *Engine) {
+	e.cfg.Risk.Shorts.Enabled = true
+	e.cfg.Risk.Shorts.SizePct = 1.5
+	e.cfg.Analysis.Jev.Policy.ShortMinThesisSupport = 0.65
+	e.cfg.Analysis.Jev.Policy.ShortMaxAdverse = 0.35
+	e.cfg.Analysis.Jev.Policy.CoverThreshold = 0.6
+}
+
+// With shorts enabled but short execution not yet built (#599 PR 3), Jev's
+// SHORT decision is recorded under policy v2 and never becomes a signal or
+// a broker order.
+func TestJevV2ShortIsRecordedButNeverExecuted(t *testing.T) {
+	requireEngineDB(t)
+	ts := &fakeTypeSafe{verdict: "short"}
+	srv := httptest.NewServer(ts)
+	defer srv.Close()
+	e := jevTestEngine(t, config.JevAuthorityAuthoritative, srv.URL, nil)
+	enableShorts(e)
+	ev, err := newJevEvaluator(e.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.jevEvaluator = ev
+	ticker := uniqueTicker("JEVSH")
+	candles, set := snapshotTestCandles(80)
+
+	e.runAnalysis(context.Background(), ticker, "1d", "momentum", []string{"momentum"}, candles, set, "", "", "", "", false)
+
+	snap, calls := latestSnapshotForTicker(t, ticker)
+	if snap.PolicyVersion != jev.PolicyVersionV2 || snap.PromptVersion != jev.QuestionSetVersionV2 {
+		t.Fatalf("snapshot versions = %s/%s, want v2", snap.PolicyVersion, snap.PromptVersion)
+	}
+	var final snapshot.FinalOutput
+	if err := json.Unmarshal(snap.FinalOutput, &final); err != nil {
+		t.Fatal(err)
+	}
+	entry := candles[len(candles)-1].Close
+	if final.Response.Action != analysis.ActionShort || final.Response.StopLoss <= entry || final.Response.TakeProfit >= entry ||
+		final.LensAudit.SelectionStatus == analysis.LensSelectionInvalid {
+		t.Fatalf("final output = %+v (entry %v)", final, entry)
+	}
+	if !strings.Contains(string(snap.EffectiveConfig), `"shorts"`) {
+		t.Fatal("effective config must record the shorts configuration")
+	}
+	var req struct {
+		Questions map[string]any `json:"questions"`
+	}
+	if len(calls) != 1 || json.Unmarshal([]byte(calls[0].RawPrompt), &req) != nil {
+		t.Fatalf("stage calls = %+v", calls)
+	}
+	if _, ok := req.Questions[jev.QShortThesis]; !ok {
+		t.Fatal("v2 request must ask the short-side questions")
+	}
+	var n int
+	if err := store.GetDB().QueryRow(context.Background(), `SELECT count(*) FROM signals WHERE ticker = $1`, ticker).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("a SHORT produced %d signals (%v) before short execution exists", n, err)
+	}
+}
+
+// With shorts disabled, v1 runs unchanged: no short questions are asked.
+func TestJevShortsDisabledAsksV1Only(t *testing.T) {
+	requireEngineDB(t)
+	ts := &fakeTypeSafe{verdict: "hold"}
+	var seen map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &seen)
+		r.Body = io.NopCloser(strings.NewReader(string(raw)))
+		ts.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+	e := jevTestEngine(t, config.JevAuthorityAuthoritative, srv.URL, nil)
+	ticker := uniqueTicker("JEVV1")
+	candles, set := snapshotTestCandles(80)
+	e.runAnalysis(context.Background(), ticker, "1d", "momentum", []string{"momentum"}, candles, set, "", "", "", "", false)
+	qs, _ := seen["questions"].(map[string]any)
+	if _, ok := qs[jev.QShortThesis]; ok || len(qs) != 5 {
+		t.Fatalf("shorts disabled must ask exactly the 5 v1 questions, got %v", qs)
+	}
+	snap, _ := latestSnapshotForTicker(t, ticker)
+	if snap.PolicyVersion != jev.PolicyVersion {
+		t.Fatalf("policy version = %s, want v1", snap.PolicyVersion)
+	}
+}
+
+// An exit-only (sell_only) row holding a short must reach Jev's cover
+// decision once shorts are enabled; the pre-model ownership gate must not
+// treat a short-only holding as "no position" (#599).
+func TestJevV2ExitOnlyRowWithHeldShortIsEvaluatedForCover(t *testing.T) {
+	requireEngineDB(t)
+	ctx := context.Background()
+	for _, shortsOn := range []bool{true, false} {
+		var seen map[string]any
+		ts := &fakeTypeSafe{verdict: "short"}
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			raw, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(raw, &seen)
+			r.Body = io.NopCloser(strings.NewReader(string(raw)))
+			ts.ServeHTTP(w, r)
+		}))
+		e := jevTestEngine(t, config.JevAuthorityAuthoritative, srv.URL, nil)
+		if shortsOn {
+			enableShorts(e)
+			ev, err := newJevEvaluator(e.cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			e.jevEvaluator = ev
+		}
+		ticker := uniqueTicker("JEVXS")
+		if _, err := store.InsertTrade(ctx, store.Trade{Ticker: ticker, Direction: "short", Strategy: "sell_only",
+			EntryPrice: 140, Quantity: 3, StopLoss: 146, TakeProfit: 128, Status: "open"}); err != nil {
+			t.Fatal(err)
+		}
+		candles, set := snapshotTestCandles(80)
+		e.runAnalysis(ctx, ticker, "1d", "sell_only", []string{"sell_only"}, candles, set, "", "", "", "", false)
+		srv.Close()
+
+		if !shortsOn {
+			if ts.calls.Load() != 0 {
+				t.Fatal("with shorts disabled the exit-only gate must still skip a short-only holding")
+			}
+			continue
+		}
+		if ts.calls.Load() != 1 {
+			t.Fatalf("held short on an exit-only row was not evaluated (calls=%d)", ts.calls.Load())
+		}
+		qs, _ := seen["questions"].(map[string]any)
+		if _, ok := qs[jev.QCover]; !ok || len(qs) != 2 {
+			t.Fatalf("expected the cover question set, got %v", qs)
+		}
+		snap, _ := latestSnapshotForTicker(t, ticker)
+		var final snapshot.FinalOutput
+		if err := json.Unmarshal(snap.FinalOutput, &final); err != nil {
+			t.Fatal(err)
+		}
+		if final.Response.Action != analysis.ActionHold || !strings.Contains(string(final.PolicyTrace), jev.ReasonHoldShort) {
+			t.Fatalf("final output = %+v trace %s", final.Response, final.PolicyTrace)
+		}
 	}
 }

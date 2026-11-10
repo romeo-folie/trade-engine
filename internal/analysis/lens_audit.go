@@ -79,7 +79,7 @@ func ValidateFinalLensSelection(
 			audit.SelectionStatus = LensSelectionInvalid
 			return audit
 		}
-		if response.Action == ActionBuy && !hasCompleteRejectionCoverage(response.RejectedStrategies, selected, allowed) {
+		if IsEntryAction(response.Action) && !hasCompleteRejectionCoverage(response.RejectedStrategies, selected, allowed) {
 			// A profile offers a bounded decision set, not a menu from which the
 			// model may silently omit inconvenient alternatives. A BUY is valid
 			// only when every non-selected lens was explicitly rejected and no
@@ -101,11 +101,17 @@ func ValidateFinalLensSelection(
 // the authorisation for a new entry on those rows; "none" or no consensus is
 // explicitly not such an authorisation. SELL decisions remain intact: exits
 // must never depend on a scanner execution lens selection.
+// IsEntryAction reports whether an action opens new risk (BUY a long or
+// SHORT, issue #599). Entries are bounded by the execution profile's lens
+// contract; exits (SELL a long, COVER a short) never are, because blocking an
+// exit would trap an open position.
+func IsEntryAction(a Action) bool { return a == ActionBuy || a == ActionShort }
+
 func suppressProfileBoundAction(response *AnalysisResponse, allowed map[string]struct{}) {
 	if allowed == nil {
 		return
 	}
-	if response.Action == ActionBuy {
+	if IsEntryAction(response.Action) {
 		response.Action = ActionHold
 		// A HOLD cannot carry entry sizing or bracket prices. This function runs
 		// after JSON extraction, so it must re-establish the same invariant the

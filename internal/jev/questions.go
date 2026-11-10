@@ -104,15 +104,7 @@ func Questions(req analysis.AnalysisRequest) map[string]Question {
 		return map[string]Question{}
 	}
 	qs := map[string]Question{
-		QRegime: {
-			Type:         TypeChoice,
-			Instructions: "Classify the current market regime for " + req.Ticker + " from the indicators and price action in the state.",
-			Criteria: map[string]string{
-				"trending":     "A sustained directional move with trend-strength confirmation.",
-				"ranging":      "Sideways price action between identifiable support and resistance.",
-				"transitional": "The regime is changing or mixed; neither trending nor ranging clearly applies.",
-			},
-		},
+		QRegime: regimeQuestion(req),
 	}
 	if HoldsLong(req) {
 		qs[QExit] = Question{
@@ -173,11 +165,38 @@ func Questions(req analysis.AnalysisRequest) map[string]Question {
 	return qs
 }
 
+// regimeQuestion is the observational regime question shared by every set.
+func regimeQuestion(req analysis.AnalysisRequest) Question {
+	return Question{
+		Type:         TypeChoice,
+		Instructions: "Classify the current market regime for " + req.Ticker + " from the indicators and price action in the state.",
+		Criteria: map[string]string{
+			"trending":     "A sustained directional move with trend-strength confirmation.",
+			"ranging":      "Sideways price action between identifiable support and resistance.",
+			"transitional": "The regime is changing or mixed; neither trending nor ranging clearly applies.",
+		},
+	}
+}
+
 // State is the System One state for a request: the canonical snapshot
 // inputs (exactly what was frozen for the decision) under a short framing.
 type State struct {
 	Task   string          `json:"task"`
 	Inputs snapshot.Inputs `json:"inputs"`
+}
+
+// BuildStateWith frames the frozen request for opts. v1 keeps its original
+// long-only framing; v2 frames a two-sided decision so the framing does not
+// bias Jev against the short and cover questions it is asked.
+func BuildStateWith(req analysis.AnalysisRequest, opts Options) State {
+	if !opts.Shorts {
+		return BuildState(req)
+	}
+	s := BuildState(req)
+	s.Task = "Evaluate an equity trading decision for " + req.Ticker +
+		" in either direction (long or short) using only this point-in-time data. decision_cutoff is the evaluation time; news ages are relative to it. " +
+		"recent_candles are newest first. portfolio.OpenPositions shows any position already held and its side."
+	return s
 }
 
 // BuildState frames the frozen request for Jev.

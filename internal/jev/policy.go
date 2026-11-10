@@ -39,6 +39,13 @@ type PolicyConfig struct {
 	// the engine's risk confidence threshold so every policy BUY is one the
 	// risk manager can accept, rather than a decision it silently rejects.
 	MinConfidence float64
+
+	// Short side (jev-policy/v2, issue #599). Shorts may start stricter
+	// than longs. ShortSizePct comes from risk.shorts.size_pct.
+	ShortMinThesisSupport float64
+	ShortMaxAdverse       float64
+	CoverThreshold        float64
+	ShortSizePct          float64
 }
 
 // DefaultPolicyConfig returns the v1 starting thresholds.
@@ -47,6 +54,7 @@ func DefaultPolicyConfig() PolicyConfig {
 		MinThesisSupport: 0.60, MaxAdverse: 0.40, MinLensProbability: 0.50,
 		MinTimingProbability: 0.55, ExitThreshold: 0.60,
 		StopATRMultiple: 2.0, TargetRMultiple: 2.0, SizePct: 2.0, MinConfidence: 0.55,
+		ShortMinThesisSupport: 0.65, ShortMaxAdverse: 0.35, CoverThreshold: 0.60, ShortSizePct: 1.5,
 	}
 }
 
@@ -67,6 +75,23 @@ func (c PolicyConfig) Validate() error {
 		if !(v > 0) || math.IsInf(v, 0) {
 			return fmt.Errorf("jev policy: %s must be positive and finite, got %v", name, v)
 		}
+	}
+	return nil
+}
+
+// ValidateShorts checks the short-side thresholds; it runs only when the
+// two-sided (v2) policy is in use, so long-only configs are unaffected.
+func (c PolicyConfig) ValidateShorts() error {
+	for name, v := range map[string]float64{
+		"short_min_thesis_support": c.ShortMinThesisSupport, "short_max_adverse": c.ShortMaxAdverse,
+		"cover_threshold": c.CoverThreshold,
+	} {
+		if !finiteUnit(v) {
+			return fmt.Errorf("jev policy: %s must be within [0,1], got %v", name, v)
+		}
+	}
+	if !(c.ShortSizePct > 0) || math.IsInf(c.ShortSizePct, 0) {
+		return fmt.Errorf("jev policy: short_size_pct must be positive and finite, got %v", c.ShortSizePct)
 	}
 	return nil
 }

@@ -1061,8 +1061,11 @@ func (e *Engine) runAnalysisWithProfile(
 				"ticker", ticker, "strategy", strategy, "err", err.Error())
 		} else {
 			prefetchedOpenTrades = openTrades
-			holdsLong := tickerHasOpenLongIn(openTrades, ticker)
-			if shouldSkipSellStrategy(strategy, holdsLong) {
+			// A held short also needs managing (cover/hold) once shorts are
+			// enabled (#599): skipping here would leave it unevaluated.
+			holdsPosition := tickerHasOpenLongIn(openTrades, ticker) ||
+				(e.cfg.Risk.Shorts.Enabled && tickerHasOpenShortIn(openTrades, ticker))
+			if shouldSkipSellStrategy(strategy, holdsPosition) {
 				reason := risk.NoPositionBlockReason(ticker)
 				logger.Info("analysis skipped — no position",
 					"ticker", ticker,
@@ -1404,7 +1407,9 @@ func (e *Engine) runAnalysisWithProfile(
 		return
 	}
 	resp, meta := result.Response, result.Meta
-	supplementalBlocked := contextErr != nil && resp.Action == analysis.ActionBuy
+	// Missing supplemental evidence blocks any new entry, long or short; exits
+	// (SELL, COVER) still run.
+	supplementalBlocked := contextErr != nil && analysis.IsEntryAction(resp.Action)
 	if supplementalBlocked {
 		resp.Action = analysis.ActionWait
 		resp.SizePct, resp.StopLoss, resp.TakeProfit = 0, 0, 0
@@ -1705,6 +1710,17 @@ func shouldPrefetchOpenTrades(strategy string, dbConnected bool) bool {
 func tickerHasOpenLongIn(openTrades []store.Trade, ticker string) bool {
 	for _, t := range openTrades {
 		if t.Ticker == ticker && t.Direction == "long" {
+			return true
+		}
+	}
+	return false
+}
+
+// tickerHasOpenShortIn reports whether openTrades contains an open short in
+// ticker (issue #599).
+func tickerHasOpenShortIn(openTrades []store.Trade, ticker string) bool {
+	for _, t := range openTrades {
+		if t.Ticker == ticker && t.Direction == "short" && t.Quantity != 0 {
 			return true
 		}
 	}

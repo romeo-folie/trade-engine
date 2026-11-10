@@ -23,25 +23,33 @@ type Evaluator struct {
 	Client        *Client
 	Policy        PolicyConfig
 	MinRiskReward float64
+	// Options selects v1 (long-only) or v2 (two-sided, shorts enabled).
+	Options Options
 }
 
 // Evaluate returns a decision, or an error that still carries the attempted
 // call's metadata (and, for malformed answers, the raw response). Callers must
 // treat any error as an analysis failure: there is no fallback model.
 func (e *Evaluator) Evaluate(ctx context.Context, req analysis.AnalysisRequest) (Decision, error) {
-	if !NeedsCall(req) {
+	if !NeedsCallWith(req, e.Options) {
 		// Exit-only row with no position: the only valid outcome is HOLD, so
 		// no call (and no cost) is made. Meta stays empty: there was no call.
-		out, trace, err := Resolve(req, nil, e.Policy, e.MinRiskReward)
+		out, trace, err := ResolveWith(req, nil, e.Policy, e.MinRiskReward, e.Options)
 		return Decision{Response: out, Trace: trace}, err
 	}
-	questions := Questions(req)
-	resp, meta, err := e.Client.Evaluate(ctx, BuildState(req), questions, QuestionSetVersion)
-	d := Decision{Meta: meta, Answers: resp.Answers}
+	questions := QuestionsWith(req, e.Options)
+	questionSet, policy := e.Options.Versions()
+	resp, meta, err := e.Client.Evaluate(ctx, BuildStateWith(req, e.Options), questions, questionSet)
+	// The trace carries the versions the call was made under even when it
+	// fails before the policy runs, so failed calls are attributable.
+	d := Decision{Meta: meta, Answers: resp.Answers, Trace: Trace{
+		PolicyVersion: policy, QuestionSetVersion: questionSet,
+		Held: HoldsLong(req) || HoldsShort(req), Values: map[string]float64{},
+	}}
 	if err != nil {
 		return d, err
 	}
-	out, trace, err := Resolve(req, resp.Answers, e.Policy, e.MinRiskReward)
+	out, trace, err := ResolveWith(req, resp.Answers, e.Policy, e.MinRiskReward, e.Options)
 	d.Trace = trace
 	if err != nil {
 		return d, fmt.Errorf("jev resolve: %w", err)

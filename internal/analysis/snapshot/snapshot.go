@@ -292,8 +292,11 @@ type EffectiveConfig struct {
 	JevPolicy    *config.JevPolicyConfig `json:"jev_policy,omitempty"`
 	// JevMinRiskReward is the engine risk/reward floor applied to Jev's
 	// deterministic target (max(target_r_multiple, floor)).
-	JevMinRiskReward float64                 `json:"jev_min_risk_reward,omitempty"`
-	EntryGates       config.EntryGatesConfig `json:"entry_gates"`
+	JevMinRiskReward float64 `json:"jev_min_risk_reward,omitempty"`
+	// Shorts is the short-selling configuration when enabled (#599); it
+	// switches Jev to its two-sided v2 questions and policy.
+	Shorts     *config.ShortsConfig    `json:"shorts,omitempty"`
+	EntryGates config.EntryGatesConfig `json:"entry_gates"`
 }
 
 // NewEffectiveConfig projects the operator configuration onto the allowlist.
@@ -323,6 +326,10 @@ func NewEffectiveConfig(cfg *config.Config) EffectiveConfig {
 		}
 		out.DecisionMode, out.JevAuthority, out.JevModel, out.JevPolicy = "jev", cfg.Analysis.Jev.Authority, cfg.Analysis.Jev.Model, &policy
 		out.JevMinRiskReward = cfg.Risk.MinRiskReward
+	}
+	if cfg.Risk.Shorts.Enabled {
+		shorts := cfg.Risk.Shorts
+		out.Shorts = &shorts
 	}
 	for _, m := range cfg.Models.AnalystConfigs() {
 		out.Analysts = append(out.Analysts, modelSettings(m, ""))
