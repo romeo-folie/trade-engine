@@ -57,3 +57,29 @@ export function verdictColor(value: string | null | undefined): string {
       return 'var(--text-dim)';
   }
 }
+
+/**
+ * Consensus verdict across analyst votes, mirroring the API's
+ * deriveEnsembleVerdict (internal/web/types.go) exactly, so the live pipeline
+ * and the signal detail can never disagree on the same votes. Votes are raw
+ * engine actions or API verdicts; they are counted per label, never pooled
+ * (SELL and SHORT are distinct). Ties resolve by the API's precedence: HOLD,
+ * LONG tied with a bearish verdict → HOLD, then LONG, SHORT, SELL, COVER,
+ * SKIP, TRADE, WAIT, ADD.
+ */
+export function consensusVerdict(votes: ReadonlyArray<string | null | undefined>): string {
+  const counts = new Map<string, number>();
+  for (const v of votes) {
+    const label = verdictLabel(v);
+    counts.set(label, (counts.get(label) ?? 0) + 1);
+  }
+  const max = Math.max(0, ...counts.values());
+  if (max === 0) return 'NEUTRAL';
+  const leads = (label: string) => counts.get(label) === max;
+  if (leads('HOLD')) return 'HOLD';
+  if (leads('LONG') && (leads('SHORT') || leads('SELL'))) return 'HOLD';
+  for (const label of ['LONG', 'SHORT', 'SELL', 'COVER', 'SKIP', 'TRADE', 'WAIT', 'ADD']) {
+    if (leads(label)) return label;
+  }
+  return 'NEUTRAL';
+}

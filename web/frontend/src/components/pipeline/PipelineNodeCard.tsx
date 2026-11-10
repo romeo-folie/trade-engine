@@ -1,4 +1,5 @@
 import { memo, useMemo } from 'react';
+import { consensusVerdict as deriveConsensus } from '../../utils/verdict';
 import { Handle, Position, type NodeProps, type Node } from '@xyflow/react';
 import type { NodeMetrics } from '../../hooks/useEngineSocket';
 import EnsembleConsensus from './EnsembleConsensus';
@@ -349,16 +350,10 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
                 }));
 
                 const ticker = d.currentTicker as string | null;
-                const buys = activeVotes.filter(v => v.action?.toUpperCase() === 'BUY').length;
-                // Bearish votes: a SELL (exit a long) or a SHORT (#599). The
-                // label names which one leads instead of calling a SELL a SHORT.
-                const sells = activeVotes.filter(v => v.action?.toUpperCase() === 'SELL').length;
-                const shorts = activeVotes.filter(v => v.action?.toUpperCase() === 'SHORT').length;
-                const bearish = sells + shorts;
+                // Same counts and tie-breaking as the API (#599), so this card
+                // and the signal detail always agree on identical votes.
                 const consensusVerdict = activeVotes.length === 0 ? null
-                  : buys > bearish ? 'LONG'
-                  : bearish > buys ? (shorts >= sells ? 'SHORT' : 'SELL')
-                  : 'HOLD';
+                  : deriveConsensus(activeVotes.map(v => v.action));
                 const avgConf = activeVotes.length > 0
                   ? activeVotes.reduce((sum, v) => sum + v.confidence, 0) / activeVotes.length
                   : 0;
