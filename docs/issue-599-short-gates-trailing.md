@@ -66,7 +66,9 @@ Each test runs end to end through the real `stockorders.Coordinator` against a f
   - Regression tests cover both sides.
 - **Data race.** `verifyOrContainBrokerEntryAsync` read the global retry delay on every retry, from a goroutine that can outlive its caller. It now reads the delay once, when the goroutine is spawned, as `pollUnfilledStockIntent` already does. Behaviour is unchanged in production.
 
-## 4. Short trailing stop (PR 4b)
+## 4. Short trailing stop (PR 4b, implemented)
+
+All the side-specific logic is in `internal/execution/trailing/direction.go`. The manager calls those helpers at every point that previously assumed a long, and each helper's long branch is the original expression. All 83 existing long tests pass unchanged.
 
 `execution/trailing` is long-only (`isLongStockTrade`). The short mirror:
 
