@@ -143,17 +143,17 @@ func BlockSignalWithEntryGateDecision(ctx context.Context, id, reason string, de
 }
 
 // QueueSignalForDeferredExecution makes an approved, pending, or temporarily
-// blocked BUY retryable by the normal fresh engine admission path without
+// blocked stock entry (BUY, or SHORT since #599) retryable by the normal fresh engine admission path without
 // changing its strategy data.
 func QueueSignalForDeferredExecution(ctx context.Context, id string) error {
 	_, err := GetDB().Exec(ctx, `
 		UPDATE signals
 		SET status='pending', deferred=TRUE, block_reason=NULL, updated_at=NOW()
-		WHERE id=$1::uuid AND action='BUY' AND status IN ('pending','approved','blocked')`, id)
+		WHERE id=$1::uuid AND action IN ('BUY','SHORT') AND status IN ('pending','approved','blocked')`, id)
 	return err
 }
 
-// QueueSignalForAdmissionRetry makes a BUY retryable after its coordinated
+// QueueSignalForAdmissionRetry makes a stock entry (BUY or SHORT) retryable after its coordinated
 // broker admission became stale while later release evidence was gathered. It
 // replaces any prior retry marker, so repeated slow-provider attempts preserve
 // a bounded audit trail and do not turn a transient freshness failure into a
@@ -180,7 +180,7 @@ func QueueSignalForAdmissionRetry(ctx context.Context, id, reason string, automa
 		        WHERE existing.decision->>'name' <> $3
 		    ), '[]'::jsonb) || $4::jsonb,
 		    updated_at=NOW()
-		WHERE id=$5::uuid AND action='BUY' AND status IN ('pending','approved','blocked')`,
+		WHERE id=$5::uuid AND action IN ('BUY','SHORT') AND status IN ('pending','approved','blocked')`,
 		nullableString(reason), automatic, AdmissionRetryGateName, marker, id)
 	return err
 }

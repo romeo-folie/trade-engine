@@ -348,3 +348,23 @@ type Executor interface {
 type StopOrderReplacer interface {
 	ReplaceStopOrder(ctx context.Context, brokerOrderID string, newStopPrice float64) (OrderResult, error)
 }
+
+// ExitSideForDirection is the order side that closes a position of the given
+// trade direction: SELL closes a long, BUY covers a short (issue #599). Every
+// protective, recovery, and containment order derives its side from this so
+// that closing a short can never add to it.
+func ExitSideForDirection(direction string) OrderSide {
+	if strings.EqualFold(strings.TrimSpace(direction), "short") {
+		return OrderSideBuy
+	}
+	return OrderSideSell
+}
+
+// ExitSideForEntry is the order side that closes a position opened by an
+// entry of the given side.
+func ExitSideForEntry(entry OrderSide) OrderSide {
+	if entry == OrderSideSell {
+		return OrderSideBuy
+	}
+	return OrderSideSell
+}

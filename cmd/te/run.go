@@ -215,6 +215,17 @@ Modes:
 		if coordinator, ok := broker.(*stockorders.Coordinator); ok {
 			coordinator.SetRecoveryObserver(eng)
 		}
+		// Short eligibility (#599) needs consolidated daily bars for SSR and
+		// liquidity; it reuses the scanner universe feed settings.
+		if alpacaClient, ok := marketProvider.(*data.AlpacaClient); ok && alpacaClient != nil {
+			eng.SetShortEvidenceBars(data.NewAlpacaUniverseClient(
+				alpacaClient, cfg.Markets.Stocks.BaseURL, data.AlpacaUniverseFeeds{
+					Snapshots:          cfg.Scanner.Universe.SnapshotFeed,
+					Historical:         cfg.Scanner.Universe.HistoricalFeed,
+					SIPRecentDataDelay: time.Duration(cfg.Scanner.Universe.SIPRecentDataDelayMinutes) * time.Minute,
+				},
+			), strings.EqualFold(strings.TrimSpace(cfg.Scanner.Universe.HistoricalFeed), "sip"))
+		}
 
 		// Tag portfolio snapshots with mode (live/paper) and broker name (Phase 18).
 		portfolioMode := "paper"

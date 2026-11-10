@@ -26,18 +26,23 @@ const (
 
 type stockEntryAdmission struct {
 	BrokerAuthoritative bool
-	Account             execution.BrokerAccount
-	Asset               execution.StockAsset
-	Ask                 float64
-	QuoteAt             time.Time
-	Quantity            float64
-	RemainingCapacity   float64
-	PeakEquity          float64
-	DailyBaseline       float64
-	Reservations        []store.ActiveStockEntryReservation
-	BrokerHeldReplay    bool
-	WorkingOrders       []execution.WorkingOrder
-	BrokerPositions     []execution.BrokerPosition
+	// Side is the entry side: buy opens a long, sell opens a short (#599).
+	Side    execution.OrderSide
+	Account execution.BrokerAccount
+	Asset   execution.StockAsset
+	// Ask prices a BUY; Bid prices a short SELL. Only the side's own price is
+	// populated, so a short can never be sized or released off the ask.
+	Ask               float64
+	Bid               float64
+	QuoteAt           time.Time
+	Quantity          float64
+	RemainingCapacity float64
+	PeakEquity        float64
+	DailyBaseline     float64
+	Reservations      []store.ActiveStockEntryReservation
+	BrokerHeldReplay  bool
+	WorkingOrders     []execution.WorkingOrder
+	BrokerPositions   []execution.BrokerPosition
 }
 
 func (e *Engine) beginStockEntryAdmission(
@@ -45,6 +50,21 @@ func (e *Engine) beginStockEntryAdmission(
 	intentKey, ticker string,
 	sizePct float64,
 ) (stockEntryAdmission, *execution.OrderRequest, string, func(), error) {
+	return e.beginStockEntryAdmissionSide(ctx, execution.OrderSideBuy, intentKey, ticker, sizePct)
+}
+
+// beginStockEntryAdmissionSide is beginStockEntryAdmission for either entry
+// side. A sell-side entry opens a short (#599) through the same durable intent,
+// reservation, and replay rules as a long.
+func (e *Engine) beginStockEntryAdmissionSide(
+	ctx context.Context,
+	side execution.OrderSide,
+	intentKey, ticker string,
+	sizePct float64,
+) (stockEntryAdmission, *execution.OrderRequest, string, func(), error) {
+	if side != execution.OrderSideBuy && side != execution.OrderSideSell {
+		return stockEntryAdmission{}, nil, "", nil, errorsForAdmission("unknown entry side")
+	}
 	e.stockEntryAdmissionMu.Lock()
 	release := e.stockEntryAdmissionMu.Unlock
 	effectiveKey := intentKey
@@ -57,12 +77,12 @@ func (e *Engine) beginStockEntryAdmission(
 			return stockEntryAdmission{}, nil, "", nil, err
 		}
 	}
-	existing, err := e.existingStockEntryRequest(ctx, effectiveKey, ticker)
+	existing, err := e.existingStockEntryRequestSide(ctx, side, effectiveKey, ticker)
 	if err != nil {
 		release()
 		return stockEntryAdmission{}, nil, "", nil, err
 	}
-	admission, err := e.prepareStockEntryAdmission(ctx, effectiveKey, ticker, sizePct, existing)
+	admission, err := e.prepareStockEntryAdmissionSide(ctx, side, effectiveKey, ticker, sizePct, existing)
 	if err != nil {
 		release()
 		return stockEntryAdmission{}, existing, effectiveKey, nil, err
@@ -70,7 +90,7 @@ func (e *Engine) beginStockEntryAdmission(
 	return admission, existing, effectiveKey, release, nil
 }
 
-func (e *Engine) existingStockEntryRequest(ctx context.Context, intentKey, ticker string) (*execution.OrderRequest, error) {
+func (e *Engine) existingStockEntryRequestSide(ctx context.Context, side execution.OrderSide, intentKey, ticker string) (*execution.OrderRequest, error) {
 	if !store.IsConnected() {
 		return nil, nil
 	}
@@ -78,10 +98,14 @@ func (e *Engine) existingStockEntryRequest(ctx context.Context, intentKey, ticke
 	if err != nil || intent == nil {
 		return nil, err
 	}
-	return stockEntryRequestFromIntent(intent, intentKey, ticker)
+	return stockEntryRequestFromIntentSide(intent, side, intentKey, ticker)
 }
 
 func stockEntryRequestFromIntent(intent *store.StockOrderIntent, intentKey, ticker string) (*execution.OrderRequest, error) {
+	return stockEntryRequestFromIntentSide(intent, execution.OrderSideBuy, intentKey, ticker)
+}
+
+func stockEntryRequestFromIntentSide(intent *store.StockOrderIntent, side execution.OrderSide, intentKey, ticker string) (*execution.OrderRequest, error) {
 	if execution.IsTerminalOrderStatus(intent.Status) {
 		if intent.FilledQty > 0 {
 			return nil, errStockEntryIntentComplete
@@ -93,8 +117,8 @@ func stockEntryRequestFromIntent(intent *store.StockOrderIntent, intentKey, tick
 		return nil, fmt.Errorf("decode existing stock entry intent: %w", err)
 	}
 	if req.IntentKey != intentKey || !strings.EqualFold(req.Ticker, ticker) ||
-		req.Side != execution.OrderSideBuy || req.Type != execution.OrderTypeMarket {
-		return nil, errorsForAdmission("durable entry replay payload does not match the current BUY signal")
+		req.Side != side || req.Type != execution.OrderTypeMarket {
+		return nil, errorsForAdmission(fmt.Sprintf("durable entry replay payload does not match the current %s signal", entrySignalLabel(side)))
 	}
 	return &req, nil
 }
@@ -105,7 +129,23 @@ func (e *Engine) prepareStockEntryAdmission(
 	sizePct float64,
 	existing *execution.OrderRequest,
 ) (stockEntryAdmission, error) {
+	return e.prepareStockEntryAdmissionSide(ctx, execution.OrderSideBuy, intentKey, ticker, sizePct, existing)
+}
+
+func (e *Engine) prepareStockEntryAdmissionSide(
+	ctx context.Context,
+	side execution.OrderSide,
+	intentKey, ticker string,
+	sizePct float64,
+	existing *execution.OrderRequest,
+) (stockEntryAdmission, error) {
+	short := side == execution.OrderSideSell
 	if brokerName(e.executor) != "alpaca" {
+		if short {
+			// Short execution is defined only against broker truth: shortable,
+			// easy-to-borrow, margin, and a broker-held bracket.
+			return stockEntryAdmission{}, errorsForAdmission("short entries require the Alpaca broker")
+		}
 		return stockEntryAdmission{}, nil
 	}
 	accountView, ok := e.executor.(interface {
@@ -164,17 +204,37 @@ func (e *Engine) prepareStockEntryAdmission(
 	if err := validateStockAsset(asset, ticker, now); err != nil {
 		return stockEntryAdmission{}, err
 	}
+	if short && !asset.Marginable {
+		return stockEntryAdmission{}, errorsForAdmission("short entry requires a marginable asset")
+	}
 	capacity, err := validateStockAccount(
 		account, asset.Marginable, e.cfg.Markets.Stocks.ExpectedAccountNumber, now,
 	)
 	if err != nil {
 		return stockEntryAdmission{}, err
 	}
-	ask, err := validateStockAsk(quote, ticker, now)
+	// ask is the side's executable price: the ask for a BUY, the bid for a
+	// short SELL (a market sell fills at or near the bid).
+	var ask float64
+	if short {
+		ask, err = validateStockBid(quote, ticker, now)
+	} else {
+		ask, err = validateStockAsk(quote, ticker, now)
+	}
 	if err != nil {
 		return stockEntryAdmission{}, err
 	}
+	// Shorts are whole-share only: Alpaca does not short fractional shares.
+	fractionable := asset.Fractionable && !short
 
+	// Engine-owned BUY exits (a buy-to-cover, software exit, containment
+	// flatten, or resting buy stop on a short, #599) are not entries: they
+	// reduce exposure and reserve nothing. Drop them before entry accounting
+	// so they neither wedge admission as "unattributed" nor count as a long.
+	working, err = withoutEngineBuyExits(ctx, working, store.GetStockOrderIntentByClientOrderID, store.GetStockOrderIntentByBrokerOrderID)
+	if err != nil {
+		return stockEntryAdmission{}, err
+	}
 	capacity, err = applyStockEntryReservations(capacity, intentKey, reservations, working)
 	if err != nil {
 		return stockEntryAdmission{}, err
@@ -187,11 +247,11 @@ func (e *Engine) prepareStockEntryAdmission(
 	}
 	if existing != nil {
 		quantity = existing.Quantity
-		if !asset.Fractionable && quantity != math.Floor(quantity) {
+		if !fractionable && quantity != math.Floor(quantity) {
 			return stockEntryAdmission{}, errorsForAdmission("existing entry quantity is fractional for a nonfractionable asset")
 		}
 	} else {
-		quantity, err = sizeStockEntry(account.Equity, sizePct, capacity, ask, asset.Fractionable)
+		quantity, err = sizeStockEntry(account.Equity, sizePct, capacity, ask, fractionable)
 		if err != nil {
 			return stockEntryAdmission{}, err
 		}
@@ -201,7 +261,7 @@ func (e *Engine) prepareStockEntryAdmission(
 		// notional itself fits the configured position cap and fresh capacity.
 		// The final release gate still applies the exact stop-distance dollar
 		// risk check before the broker request is sent.
-		if minimumWholeShareAllowed(quantity, asset.Fractionable, sizePct, ask, account.Equity, capacity, e.cfg.Risk.MaxPositionPct) {
+		if minimumWholeShareAllowed(quantity, fractionable, sizePct, ask, account.Equity, capacity, e.cfg.Risk.MaxPositionPct) {
 			quantity = 1
 		}
 	}
@@ -217,14 +277,26 @@ func (e *Engine) prepareStockEntryAdmission(
 	if err != nil {
 		return stockEntryAdmission{}, fmt.Errorf("stock entry admission: persist account risk baseline: %w", err)
 	}
-	return stockEntryAdmission{
-		BrokerAuthoritative: true,
-		Account:             account, Asset: asset, Ask: ask, QuoteAt: quote.Timestamp, Quantity: quantity,
+	admission := stockEntryAdmission{
+		BrokerAuthoritative: true, Side: side,
+		Account: account, Asset: asset, Ask: ask, QuoteAt: quote.Timestamp, Quantity: quantity,
 		RemainingCapacity: capacity,
 		PeakEquity:        baseline.PeakEquity, DailyBaseline: baseline.LastEquity,
 		Reservations: reservations, BrokerHeldReplay: brokerHeldReplay,
 		WorkingOrders: working, BrokerPositions: positions,
-	}, nil
+	}
+	if short {
+		admission.Ask, admission.Bid = 0, ask
+	}
+	return admission, nil
+}
+
+// entrySignalLabel names the signal action that opens a position on side.
+func entrySignalLabel(side execution.OrderSide) string {
+	if side == execution.OrderSideSell {
+		return "SHORT"
+	}
+	return "BUY"
 }
 
 func manualWorkingEntryTrades(
@@ -289,7 +361,7 @@ func existingEntryBrokerHeld(
 			continue
 		}
 		for _, order := range working {
-			if isStandardStockWorkingOrder(order) && strings.EqualFold(order.Side, "buy") &&
+			if isStandardStockWorkingOrder(order) && strings.EqualFold(order.Side, reservationSide(reservation)) &&
 				((order.OrderID != "" && order.OrderID == reservation.BrokerOrderID) ||
 					(order.TradeID != "" && order.TradeID == reservation.ClientOrderID)) {
 				return true
@@ -385,7 +457,20 @@ func applyStockEntryReservations(
 ) (float64, error) {
 	matchedBrokerOrders := make(map[string]struct{}, len(working))
 	for _, order := range working {
-		if !isStandardStockWorkingOrder(order) || !strings.EqualFold(order.Side, string(execution.OrderSideBuy)) {
+		if !isStandardStockWorkingOrder(order) {
+			continue
+		}
+		if strings.EqualFold(order.Side, string(execution.OrderSideSell)) {
+			// A working SELL is either a pending short entry the engine owns
+			// (#599), whose hold Alpaca's buying power already reflects, or an
+			// exit leg (stop/target) that reserves nothing. Only an exact
+			// sell-side reservation match is recorded; anything else is skipped.
+			if matched := matchSellEntryReservation(order, reservations); matched != nil {
+				matchedBrokerOrders[matched.IntentID] = struct{}{}
+			}
+			continue
+		}
+		if !strings.EqualFold(order.Side, string(execution.OrderSideBuy)) {
 			continue
 		}
 		if (order.Status != "pending" && order.Status != "partial") ||
@@ -445,6 +530,73 @@ func applyStockEntryReservations(
 	}
 
 	return capacity, nil
+}
+
+// reservationSide is the broker order side of a reserved entry ("buy" when
+// unrecorded, for reservations persisted before shorts existed).
+func reservationSide(r store.ActiveStockEntryReservation) string {
+	if strings.EqualFold(r.Side, string(execution.OrderSideSell)) {
+		return string(execution.OrderSideSell)
+	}
+	return string(execution.OrderSideBuy)
+}
+
+// matchSellEntryReservation returns the sell-side entry reservation a working
+// SELL order belongs to, only when its identity, ticker, and remaining
+// quantity agree exactly.
+func matchSellEntryReservation(order execution.WorkingOrder, reservations []store.ActiveStockEntryReservation) *store.ActiveStockEntryReservation {
+	for i := range reservations {
+		r := &reservations[i]
+		if reservationSide(*r) != string(execution.OrderSideSell) {
+			continue
+		}
+		byBrokerID := order.OrderID != "" && order.OrderID == r.BrokerOrderID
+		byClientID := order.TradeID != "" && order.TradeID == r.ClientOrderID
+		if (byBrokerID || byClientID) && strings.EqualFold(order.Ticker, r.Ticker) &&
+			math.Abs(order.RemainingQty-r.RemainingQty) <= 0.000000001 {
+			return r
+		}
+	}
+	return nil
+}
+
+// withoutEngineBuyExits removes working BUY orders that are exits rather than
+// entries: a bracket child (it has a parent order; a short's stop and target
+// are BUYs with broker-generated client IDs), or an order the durable intent
+// store attributes to a non-entry intent by client or broker order ID. An
+// engine-shaped client ID whose intent cannot be read fails closed; an order
+// with no intent stays in the list, where entry accounting rejects or counts
+// it as before.
+func withoutEngineBuyExits(
+	ctx context.Context,
+	working []execution.WorkingOrder,
+	byClientID, byBrokerID func(context.Context, string) (*store.StockOrderIntent, error),
+) ([]execution.WorkingOrder, error) {
+	out := make([]execution.WorkingOrder, 0, len(working))
+	for _, order := range working {
+		if !strings.EqualFold(order.Side, string(execution.OrderSideBuy)) {
+			out = append(out, order)
+			continue
+		}
+		if strings.TrimSpace(order.ParentOrderID) != "" {
+			continue // a bracket child closes its parent's position
+		}
+		var intent *store.StockOrderIntent
+		var err error
+		if strings.HasPrefix(order.TradeID, "te-stock-") {
+			intent, err = byClientID(ctx, order.TradeID)
+		} else if order.OrderID != "" {
+			intent, err = byBrokerID(ctx, order.OrderID)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("stock entry admission: attribute working BUY %q: %w", order.OrderID, err)
+		}
+		if intent != nil && !strings.HasPrefix(intent.IdempotencyKey, "entry:") {
+			continue
+		}
+		out = append(out, order)
+	}
+	return out, nil
 }
 
 func isStandardStockWorkingOrder(order execution.WorkingOrder) bool {
@@ -512,6 +664,19 @@ func validateStockAsk(quote *data.Quote, ticker string, now time.Time) (float64,
 		return 0, err
 	}
 	return quote.Ask, nil
+}
+
+// validateStockBid returns the fresh executable bid for a short sale. A
+// crossed or one-sided quote is refused rather than priced.
+func validateStockBid(quote *data.Quote, ticker string, now time.Time) (float64, error) {
+	if quote == nil || !strings.EqualFold(quote.Ticker, ticker) || !finitePositive(quote.Bid) ||
+		!finitePositive(quote.Ask) || quote.Bid > quote.Ask {
+		return 0, errorsForAdmission("fresh positive two-sided bid is unavailable")
+	}
+	if err := validateAdmissionTimestamp("quote", quote.Timestamp, now); err != nil {
+		return 0, err
+	}
+	return quote.Bid, nil
 }
 
 func validateAdmissionTimestamp(label string, observed, now time.Time) error {
@@ -636,7 +801,7 @@ func reservationTrades(reservations []store.ActiveStockEntryReservation, exclude
 			continue
 		}
 		trades = append(trades, store.Trade{
-			Ticker: reservation.Ticker, Direction: "long", Status: "open",
+			Ticker: reservation.Ticker, Direction: reservation.Direction(), Status: "open",
 			Quantity: reservation.RemainingQty, EntryPrice: reservation.ReferencePrice,
 		})
 	}
@@ -712,9 +877,13 @@ func mergeBrokerLongOccupancy(in *risk.CheckInput, positions []execution.BrokerP
 		in.OpenByTicker = make(map[string]int)
 	}
 	filledLongs := make(map[string]struct{})
+	trackedShorts := make(map[string]struct{})
 	for _, trade := range durableOwned {
 		if strings.EqualFold(trade.Direction, "long") && trade.Quantity > 0 {
 			filledLongs[strings.ToUpper(strings.TrimSpace(trade.Ticker))] = struct{}{}
+		}
+		if strings.EqualFold(trade.Direction, "short") && trade.Quantity > 0 {
+			trackedShorts[strings.ToUpper(strings.TrimSpace(trade.Ticker))] = struct{}{}
 		}
 	}
 	for _, position := range positions {
@@ -730,7 +899,12 @@ func mergeBrokerLongOccupancy(in *risk.CheckInput, positions []execution.BrokerP
 				return errorsForAdmission("broker holds a short position in the requested BUY ticker")
 			}
 			// Shorts consume overall capacity but must not influence BUY-only
-			// pyramid ownership or per-ticker long limits.
+			// pyramid ownership or per-ticker long limits. A short already
+			// tracked by a durable trade (#599) is counted by buildRiskInput;
+			// counting the broker position again would spend a second slot.
+			if _, tracked := trackedShorts[strings.ToUpper(symbol)]; tracked {
+				continue
+			}
 			key, count := riskInputTickerCount(in.OpenByTicker, symbol)
 			if count == 0 {
 				in.OpenByTicker[symbol] = 1

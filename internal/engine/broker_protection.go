@@ -27,6 +27,9 @@ const brokerProtectionVerificationAttempts = 5
 // path. An ambiguous cancellation keeps the trade owned by this containment
 // attempt and is retried; it never falls back to application-managed exits.
 func (e *Engine) containUnprotectedBrokerEntry(ctx context.Context, tradeID, entryBrokerOrderID, ticker, reason string) {
+	// Cancelling the parent needs no database read and always comes first,
+	// so a DB outage can never leave an unprotected entry filling. Only the
+	// flatten needs the trade's direction (#599).
 	const attempts = 3
 	for attempt := 0; attempt < attempts; attempt++ {
 		if err := e.executor.CancelOrder(ctx, entryBrokerOrderID); err != nil {
@@ -58,6 +61,15 @@ func (e *Engine) containUnprotectedBrokerEntry(ctx context.Context, tradeID, ent
 		if err != nil || trade == nil || trade.Status != "open" || trade.Quantity <= 1e-9 {
 			return
 		}
+		// Flatten on the position's own closing side. If the direction is
+		// unknown, do not guess: a wrong-side flatten would double the
+		// exposure. The parent is already cancelled; an operator intervenes.
+		if trade.Direction != "long" && trade.Direction != "short" {
+			logger.Error("broker protection: unknown trade direction; parent cancelled but not flattening",
+				"trade_id", tradeID, "ticker", ticker, "direction", trade.Direction)
+			return
+		}
+		exitSide := execution.ExitSideForDirection(trade.Direction)
 		// The parent snapshot is the only authoritative source for bracket
 		// children when projection failed. Clear it before claiming the trade:
 		// if confirmation is uncertain, leave the trade open so the next sweep
@@ -85,7 +97,7 @@ func (e *Engine) containUnprotectedBrokerEntry(ctx context.Context, tradeID, ent
 			return
 		}
 		exitReq := execution.OrderRequest{
-			Ticker: ticker, Side: execution.OrderSideSell, Type: execution.OrderTypeMarket,
+			Ticker: ticker, Side: exitSide, Type: execution.OrderTypeMarket,
 			Quantity: quantity, ReferencePrice: status.FilledPrice, TradeID: tradeID,
 			IntentKey:  "broker-protection-flatten:" + tradeID,
 			ExitReason: store.ExitReasonBrokerProtectionFailure, ExitEvidence: intent.Evidence,
@@ -105,7 +117,7 @@ func (e *Engine) containUnprotectedBrokerEntry(ctx context.Context, tradeID, ent
 		}
 		if _, err := store.InsertOrderWithRetry(ctx, store.Order{
 			TradeID: tradeID, BrokerOrderID: result.BrokerOrderID, Ticker: ticker,
-			Side: string(execution.OrderSideSell), OrderType: string(execution.OrderTypeMarket),
+			Side: string(exitSide), OrderType: string(execution.OrderTypeMarket),
 			Quantity: quantity, FilledPrice: result.FilledPrice, FilledQty: result.FilledQty,
 			FilledAt: filledAtPtr(result.FilledAt), Status: execution.NormalizeOrderStatus(result.Status),
 			StockIntentID: stockIntentID, ExitReason: store.ExitReasonBrokerProtectionFailure,
@@ -369,7 +381,7 @@ func (e *Engine) renewDiscoveryResidencyAfterVerifiedProtection(ctx context.Cont
 		logger.Warn("load entry intent for verified discovery renewal", "trade_id", tradeID, "err", err)
 		return
 	}
-	if intent == nil || intent.Side != "buy" || !strings.HasPrefix(intent.IdempotencyKey, "entry:") {
+	if intent == nil || (intent.Side != "buy" && intent.Side != "sell") || !strings.HasPrefix(intent.IdempotencyKey, "entry:") {
 		return
 	}
 	if fillAt.IsZero() {

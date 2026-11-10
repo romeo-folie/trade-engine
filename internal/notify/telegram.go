@@ -680,6 +680,8 @@ func exitReasonLabel(reason string) string {
 		return "take-profit hit"
 	case "sell_signal":
 		return "sell signal"
+	case "cover_signal":
+		return "cover signal"
 	case "trailing_atr":
 		return "ATR trailing stop"
 	case "ema9_close":

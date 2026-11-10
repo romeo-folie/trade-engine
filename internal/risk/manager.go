@@ -16,7 +16,7 @@ type CheckInput struct {
 	Cfg config.RiskConfig
 
 	// Signal fields
-	Action      string // BUY | SELL
+	Action      string // BUY | SELL | SHORT | COVER
 	Ticker      string
 	Confidence  float64 // 0.0–1.0
 	SizePct     float64 // recommended position %
@@ -52,6 +52,12 @@ type CheckInput struct {
 	// or where the proposed sell quantity exceeds what is held.
 	HoldsLong    bool
 	LongQuantity float64
+
+	// HoldsShort is true when there is an open short trade in Ticker (#599).
+	// SHORT requires a flat ticker, COVER requires a held short, and a BUY
+	// never lands on a held short (no long↔short flips).
+	HoldsShort    bool
+	ShortQuantity float64
 
 	// LongAvgEntryPrice is the quantity-weighted average entry price across
 	// all open long lots in Ticker. Consumed by checkPyramidPolicy (#324) to
@@ -223,6 +229,11 @@ func computeRR(in CheckInput) (float64, bool) {
 			return 0, false
 		}
 	}
+	if in.Action == "SHORT" {
+		if in.StopLoss <= in.SignalPrice || in.TakeProfit >= in.SignalPrice {
+			return 0, false
+		}
+	}
 	risk := math.Abs(in.SignalPrice - in.StopLoss)
 	reward := math.Abs(in.TakeProfit - in.SignalPrice)
 	if risk == 0 {
@@ -251,6 +262,16 @@ func checkRiskReward(in CheckInput) CheckResult {
 			))
 		}
 	}
+	// A short loses when price rises: its stop must sit above entry and its
+	// target below (#599).
+	if in.Action == "SHORT" {
+		if in.StopLoss <= in.SignalPrice || in.TakeProfit >= in.SignalPrice {
+			return fail(name, fmt.Sprintf(
+				"invalid SL/TP geometry for SHORT (stop %.2f <= signal %.2f or take_profit %.2f >= signal %.2f)",
+				in.StopLoss, in.SignalPrice, in.TakeProfit, in.SignalPrice,
+			))
+		}
+	}
 	risk := math.Abs(in.SignalPrice - in.StopLoss)
 	reward := math.Abs(in.TakeProfit - in.SignalPrice)
 	if risk == 0 {
@@ -268,7 +289,7 @@ func checkPositionSize(in CheckInput) CheckResult {
 	// SELLs close the HELD quantity (#436) — their executed size is never
 	// derived from size_pct, so capping the analyst's proposal would only
 	// block legitimate exits (same skip pattern as checkMaxDollarRisk).
-	if in.Action != "BUY" {
+	if !OpensRisk(in.Action) {
 		return pass(name)
 	}
 	positionPct := in.SizePct
@@ -297,7 +318,7 @@ func checkPositionSize(in CheckInput) CheckResult {
 // the intended per-ticker allocation.
 func checkCombinedTickerExposure(in CheckInput) CheckResult {
 	const name = "combined_ticker_exposure"
-	if in.Action != "BUY" || in.Cfg.MaxPositionPct <= 0 || in.PortfolioValue <= 0 {
+	if !OpensRisk(in.Action) || in.Cfg.MaxPositionPct <= 0 || in.PortfolioValue <= 0 {
 		return pass(name)
 	}
 	proposed := in.ProposedNotional
@@ -342,7 +363,7 @@ func checkCombinedTickerExposure(in CheckInput) CheckResult {
 // deployed and produce false blocks.
 func checkMaxDollarRisk(in CheckInput) CheckResult {
 	name := "max_dollar_risk"
-	if in.Action != "BUY" {
+	if !OpensRisk(in.Action) {
 		return pass(name)
 	}
 	if in.PortfolioValue == 0 || in.Cfg.MaxDollarRiskPct <= 0 {
@@ -375,7 +396,7 @@ func checkMaxOpenPositions(in CheckInput) CheckResult {
 	name := "max_open_positions"
 	// SELLs are close-only exits since #436 — they strictly reduce risk;
 	// a full position budget must not block the exit that frees a slot.
-	if in.Action != "BUY" {
+	if !OpensRisk(in.Action) {
 		return pass(name)
 	}
 	if in.OpenPositions < in.Cfg.MaxOpenPositions {
@@ -394,7 +415,7 @@ func checkMaxPerTicker(in CheckInput) CheckResult {
 	name := "max_per_ticker"
 	// SELLs are close-only exits since #436 — they strictly reduce risk;
 	// per-ticker capacity only meaningfully caps opening risk.
-	if in.Action != "BUY" {
+	if !OpensRisk(in.Action) {
 		return pass(name)
 	}
 	if in.Cfg.MaxPerTicker <= 0 {
@@ -412,7 +433,7 @@ func checkDailyLossLimit(in CheckInput) CheckResult {
 	name := "daily_loss_limit"
 	// SELLs are close-only exits since #436 — they strictly reduce risk;
 	// a daily-loss pause must still allow closing positions.
-	if in.Action != "BUY" {
+	if !OpensRisk(in.Action) {
 		return pass(name)
 	}
 	if in.PortfolioValue == 0 {
@@ -430,7 +451,7 @@ func checkMaxDrawdown(in CheckInput) CheckResult {
 	name := "max_drawdown"
 	// SELLs are close-only exits since #436 — they strictly reduce risk;
 	// an emergency drawdown stop must still allow de-risking exits.
-	if in.Action != "BUY" {
+	if !OpensRisk(in.Action) {
 		return pass(name)
 	}
 	if in.PeakValue == 0 || in.PortfolioValue == 0 {
@@ -446,7 +467,29 @@ func checkMaxDrawdown(in CheckInput) CheckResult {
 
 func checkPositionOwnership(in CheckInput) CheckResult {
 	name := "position_ownership"
-	if in.Action != "SELL" {
+	switch in.Action {
+	case "BUY":
+		// No long↔short flips (#599): a BUY never lands on a held short.
+		if in.HoldsShort {
+			return fail(name, fmt.Sprintf("open short position in %s — cannot buy", in.Ticker))
+		}
+		return pass(name)
+	case "SHORT":
+		// A short opens only from flat: no flips, no adding.
+		if in.HoldsLong {
+			return fail(name, fmt.Sprintf("open long position in %s — cannot short", in.Ticker))
+		}
+		if in.HoldsShort {
+			return fail(name, fmt.Sprintf("open short position in %s — cannot add to a short", in.Ticker))
+		}
+		return pass(name)
+	case "COVER":
+		if !in.HoldsShort {
+			return fail(name, NoShortPositionBlockReason(in.Ticker))
+		}
+		return pass(name)
+	case "SELL":
+	default:
 		return pass(name)
 	}
 	if !in.HoldsLong {
@@ -519,7 +562,7 @@ func checkCooldownAfterLoss(in CheckInput) CheckResult {
 	name := "cooldown_after_loss"
 	// SELLs are close-only exits since #436 — they strictly reduce risk;
 	// a post-loss cooldown must not force holding a position.
-	if in.Action != "BUY" {
+	if !OpensRisk(in.Action) {
 		return pass(name)
 	}
 	if in.LastLossAt.IsZero() || in.Cfg.CooldownAfterLoss == 0 {
@@ -659,6 +702,16 @@ func EvaluateCounterfactual(in CheckInput, strictResults []CheckResult) Counterf
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+// OpensRisk reports whether an action opens new risk (a long BUY or a SHORT,
+// #599) and must therefore pass every entry-risk check. SELL and COVER only
+// reduce an existing position.
+func OpensRisk(action string) bool { return action == "BUY" || action == "SHORT" }
+
+// NoShortPositionBlockReason is the canonical COVER-without-a-short message.
+func NoShortPositionBlockReason(ticker string) string {
+	return fmt.Sprintf("no open short position in %s — cannot cover", ticker)
+}
 
 func pass(name string) CheckResult { return CheckResult{Name: name, Passed: true} }
 func fail(name, reason string) CheckResult {

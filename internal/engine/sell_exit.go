@@ -25,6 +25,32 @@ import (
 // unconfirmed fills to broker truth afterwards, exactly like the software
 // stop/TP exit path.
 func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Signal) {
+	e.executeAnalystExit(ctx, sigID, sig, "long")
+}
+
+// executeCoverExit is the COVER mirror of executeSellExit (#599): one market
+// buy-to-cover for exactly the held SHORT quantity. It only ever touches
+// short lots, so it can never buy more than is short and never open a long.
+func (e *Engine) executeCoverExit(ctx context.Context, sigID string, sig store.Signal) {
+	e.executeAnalystExit(ctx, sigID, sig, "short")
+}
+
+// analystExitSpec is the side-specific vocabulary of an analyst exit.
+type analystExitSpec struct {
+	side   execution.OrderSide
+	reason string
+	verb   string
+}
+
+func analystExitFor(direction string) analystExitSpec {
+	if direction == "short" {
+		return analystExitSpec{side: execution.OrderSideBuy, reason: store.ExitReasonCoverSignal, verb: "cover"}
+	}
+	return analystExitSpec{side: execution.OrderSideSell, reason: store.ExitReasonSellSignal, verb: "sell"}
+}
+
+func (e *Engine) executeAnalystExit(ctx context.Context, sigID string, sig store.Signal, direction string) {
+	spec := analystExitFor(direction)
 	e.positionExitMu.Lock()
 	defer e.positionExitMu.Unlock()
 
@@ -32,7 +58,7 @@ func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Si
 		if err := store.UpdateSignalStatus(ctx, sigID, "blocked", reason); err != nil {
 			logger.Warn("update signal status", "id", sigID, "err", err)
 		}
-		logger.Warn("sell exit blocked", "ticker", sig.Ticker, "reason", reason)
+		logger.Warn(spec.verb+" exit blocked", "ticker", sig.Ticker, "reason", reason)
 		e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
 			Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
 			BlockReason: reason, FailedCheck: failedCheck,
@@ -41,7 +67,7 @@ func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Si
 
 	if minConf := e.cfg.Risk.ExitConfMin; !sellExitConfidenceAllowed(sig.Confidence, minConf) {
 		blockSignal(
-			fmt.Sprintf("SELL confidence %.3f is below exit minimum %.3f; trailing stop remains in control", sig.Confidence, minConf),
+			fmt.Sprintf("%s confidence %.3f is below exit minimum %.3f; trailing stop remains in control", sig.Action, sig.Confidence, minConf),
 			"exit_confidence",
 		)
 		return
@@ -55,23 +81,23 @@ func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Si
 		blockSignal("unable to verify open positions (DB error)", "position lookup")
 		return
 	}
-	var longs []store.Trade
+	var lots []store.Trade
 	var totalQty float64
 	for _, t := range openTrades {
-		if t.Ticker == sig.Ticker && t.Direction == "long" && t.Quantity > 0 {
-			longs = append(longs, t)
+		if t.Ticker == sig.Ticker && t.Direction == direction && t.Quantity > 0 {
+			lots = append(lots, t)
 			totalQty += t.Quantity
 		}
 	}
-	if len(longs) == 0 || totalQty <= 0 {
+	if len(lots) == 0 || totalQty <= 0 {
 		// The ownership gate should have blocked this earlier; re-checked
 		// here because state can change between generation and execution.
-		blockSignal(fmt.Sprintf("no open long position in %s — cannot sell", sig.Ticker), "position_ownership")
+		blockSignal(fmt.Sprintf("no open %s position in %s — cannot %s", direction, sig.Ticker, spec.verb), "position_ownership")
 		return
 	}
 
-	claimed := make([]store.Trade, 0, len(longs))
-	intent := newExitIntent(store.ExitReasonSellSignal, map[string]any{
+	claimed := make([]store.Trade, 0, len(lots))
+	intent := newExitIntent(spec.reason, map[string]any{
 		"signal_id": sigID, "confidence": sig.Confidence,
 		"signal_price": sig.SignalPrice,
 	})
@@ -82,7 +108,7 @@ func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Si
 			}
 		}
 	}
-	for _, t := range longs {
+	for _, t := range lots {
 		ok, err := store.ClaimTradeExitWithIntent(ctx, t.ID, intent)
 		if err != nil || !ok {
 			releaseClaims()
@@ -101,14 +127,14 @@ func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Si
 		if releaseSafe {
 			releaseClaims()
 		}
-		blockSignal("working exit legs could not be confirmed cancelled — sell would race a live leg", "bracket_leg_cancel")
+		blockSignal("working exit legs could not be confirmed cancelled — "+spec.verb+" would race a live leg", "bracket_leg_cancel")
 		return
 	}
 	totalQty = remainingQty
 
 	exitReq := execution.OrderRequest{
 		Ticker:         sig.Ticker,
-		Side:           execution.OrderSideSell,
+		Side:           spec.side,
 		Type:           execution.OrderTypeMarket,
 		Quantity:       totalQty,
 		ReferencePrice: sig.SignalPrice, // paper executor fills at this price
@@ -124,7 +150,7 @@ func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Si
 		// orderless-exit recovery can inspect working orders/positions.
 		logger.Error("sell exit placement ambiguous — claims retained for broker recovery",
 			"ticker", sig.Ticker, "qty", totalQty, "err", err)
-		blockSignal(fmt.Sprintf("sell order failed: %v", err), "order placement")
+		blockSignal(fmt.Sprintf("%s order failed: %v", spec.verb, err), "order placement")
 		return
 	}
 
@@ -149,7 +175,7 @@ func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Si
 	fullFill := status == "filled" && result.FilledPrice > 0 &&
 		result.FilledQty >= totalQty-1e-9
 	persistFailed := false
-	for _, t := range longs {
+	for _, t := range lots {
 		lotQuantity := remainingByTrade[t.ID]
 		if lotQuantity <= 0 {
 			continue
@@ -158,7 +184,7 @@ func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Si
 			TradeID:       t.ID,
 			BrokerOrderID: result.BrokerOrderID,
 			Ticker:        sig.Ticker,
-			Side:          string(execution.OrderSideSell),
+			Side:          string(spec.side),
 			OrderType:     string(execution.OrderTypeMarket),
 			Quantity:      lotQuantity,
 			Status:        status,
@@ -188,7 +214,7 @@ func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Si
 
 	// A broker-confirmed aggregate fill closes every lot at the same execution
 	// price. Pending and partial responses remain durably exiting.
-	for _, t := range longs {
+	for _, t := range lots {
 		lotQuantity := remainingByTrade[t.ID]
 		if lotQuantity <= 0 {
 			continue

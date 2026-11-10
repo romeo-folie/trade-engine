@@ -405,6 +405,8 @@ func (adoptionStoreAdapter) GetSignalsByTicker(ctx context.Context, ticker strin
 //     both sides agree on direction; an over-recorded DB (broker < db) is a
 //     different bug class and stays alert-only.
 //   - side_mismatch / db_only → never adopted; those need a human.
+//   - any short (#599) → never adopted, even with a matching SELL/SHORT
+//     signal; an untracked short is alerted for a human to resolve.
 //
 // Stops anchor on the broker's CURRENT price, not the average entry: an orphan
 // deep underwater would otherwise trip its stop on the first monitor pass and
@@ -433,31 +435,25 @@ func AdoptBrokerOrphans(ctx context.Context, db adoptionStore, drifts []BrokerDr
 		}
 
 		if qty < 0 {
-			if action, ok := latestLiveSignalAction(ctx, db, d.Ticker); !ok || action != "SELL" {
-				logger.Warn("orphan adoption: broker-only short lacks matching short intent — leaving as drift",
-					"ticker", d.Ticker,
-					"broker_qty", d.BrokerQty,
-					"db_qty", d.DBQty,
-					"source", d.Source,
-				)
-				continue
-			}
+			// Shorts are never adopted (#599): an untracked short has
+			// unbounded upside risk and no engine-owned bracket, so it is a
+			// human decision. Alert loudly and leave it as drift.
+			logger.Error("orphan adoption: untracked broker SHORT is never auto-adopted — operator action required",
+				"ticker", d.Ticker,
+				"broker_qty", d.BrokerQty,
+				"db_qty", d.DBQty,
+				"source", d.Source,
+			)
+			continue
 		}
 
+		// Only longs reach this point (shorts are refused above).
 		direction := "long"
-		if qty < 0 {
-			direction = "short"
-		}
 
 		var stop, tp float64
 		if d.CurrentPrice > 0 {
-			if direction == "long" {
-				stop = d.CurrentPrice * (1 - defaultStopPct/100)
-				tp = d.CurrentPrice * (1 + defaultTPPct/100)
-			} else {
-				stop = d.CurrentPrice * (1 + defaultStopPct/100)
-				tp = d.CurrentPrice * (1 - defaultTPPct/100)
-			}
+			stop = d.CurrentPrice * (1 - defaultStopPct/100)
+			tp = d.CurrentPrice * (1 + defaultTPPct/100)
 		} else {
 			logger.Warn("orphan adoption: broker reported no current price — adopting without stop/TP",
 				"ticker", d.Ticker)
@@ -504,25 +500,6 @@ func AdoptBrokerOrphans(ctx context.Context, db adoptionStore, drifts []BrokerDr
 		adopted = append(adopted, d.Ticker)
 	}
 	return adopted
-}
-
-// latestLiveSignalAction returns the newest BUY/SELL signal that still
-// represents live intent. Blocked/expired/stale rows are ignored.
-func latestLiveSignalAction(ctx context.Context, db adoptionStore, ticker string) (string, bool) {
-	signals, err := db.GetSignalsByTicker(ctx, ticker, 10)
-	if err != nil {
-		return "", false
-	}
-	for _, sig := range signals {
-		switch strings.ToLower(sig.Status) {
-		case "pending", "approved", "executed":
-			action := strings.ToUpper(strings.TrimSpace(sig.Action))
-			if action == "BUY" || action == "SELL" {
-				return action, true
-			}
-		}
-	}
-	return "", false
 }
 
 // AdoptBrokerOrphansWithStore is the production wrapper over AdoptBrokerOrphans.

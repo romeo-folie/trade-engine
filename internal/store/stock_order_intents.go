@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -50,6 +51,8 @@ type ActiveStockEntryReservation struct {
 	BrokerOrderID  string
 	TradeID        string
 	Ticker         string
+	// Side is the entry side: "buy" opens a long, "sell" opens a short (#599).
+	Side           string
 	Status         string
 	RequestedQty   float64
 	FilledQty      float64
@@ -185,7 +188,8 @@ func RefreshPreparedStockEntryRequest(ctx context.Context, idempotencyKey string
 		UPDATE stock_order_intents
 		SET requested_qty=$2, request_payload=$3, payload_hash=$4, updated_at=NOW()
 		WHERE idempotency_key=$1
-		  AND purpose='submit' AND side='buy'
+		  AND purpose='submit'
+		  AND (side='buy' OR (side='sell' AND idempotency_key LIKE 'entry:%'))
 		  AND status IN ('pending','partial')
 		  AND submitted_at IS NULL AND COALESCE(broker_order_id,'')=''
 		  AND filled_qty=0`, idempotencyKey, requestedQty, payload, hash)
@@ -294,7 +298,11 @@ func StockEntryBrokerProtection(ctx context.Context, tradeID string) (required b
 		             AND override.purpose='broker_protection_override'
 		       )
 		FROM stock_order_intents entry
-		WHERE entry.trade_id=$1::uuid AND entry.purpose='submit' AND entry.side='buy'
+		JOIN trades t ON t.id=entry.trade_id
+		WHERE entry.trade_id=$1::uuid AND entry.purpose='submit'
+		  -- The entry side follows the trade: a long opened with a buy, a
+		  -- short with a sell (#599). Exit intents are the opposite side.
+		  AND ((t.direction='short' AND entry.side='sell') OR (t.direction<>'short' AND entry.side='buy'))
 		ORDER BY entry.created_at DESC LIMIT 1`, tradeID).Scan(&raw, &brokerOrderID, &forced)
 	if err != nil {
 		return false, "", err
@@ -408,7 +416,12 @@ func UpsertBracketChildIntent(ctx context.Context, parentIntentID, tradeID, tick
 			broker_order_id, status, submitted_at, purpose
 			) VALUES (
 			uuid_generate_v4(), $1, $2, NULLIF($3,'')::uuid, $4::uuid,
-			$5, 'sell', $6::order_type, $7, $8::jsonb, $9,
+			$5,
+			-- A bracket child exits its parent: sell for a long entry, buy
+			-- to cover for a short entry (#599).
+			COALESCE((SELECT CASE WHEN parent.side='sell' THEN 'buy'::order_side ELSE 'sell'::order_side END
+			          FROM stock_order_intents parent WHERE parent.id=$4::uuid), 'sell'::order_side),
+			$6::order_type, $7, $8::jsonb, $9,
 			$10, 'pending', NOW(), 'broker_projection'
 			)
 			ON CONFLICT (idempotency_key) DO UPDATE
@@ -488,9 +501,11 @@ func ListUnprojectedStockStopIntents(ctx context.Context, tradeID string) ([]Sto
 	rows, err := GetDB().Query(ctx, `
 		SELECT i.idempotency_key
 		FROM stock_order_intents i
+		JOIN trades t ON t.id=i.trade_id
 		WHERE i.trade_id=$1::uuid
 		  AND i.purpose='submit'
-		  AND i.side='sell'
+		  -- A protective stop exits the trade: sell for a long, buy for a short.
+		  AND ((t.direction='short' AND i.side='buy') OR (t.direction<>'short' AND i.side='sell'))
 		  AND i.order_type IN ('stop','stop_limit')
 		  AND (
 		      i.status IN ('pending','partial')
@@ -790,14 +805,16 @@ func ListActiveStockEntryReservations(ctx context.Context) ([]ActiveStockEntryRe
 	rows, err := GetDB().Query(ctx, `
 		SELECT id::text, idempotency_key, client_order_id,
 		       COALESCE(broker_order_id,''), COALESCE(trade_id::text,''),
-		       ticker, status, requested_qty, filled_qty,
+		       ticker, side, status, requested_qty, filled_qty,
 		       GREATEST(requested_qty-filled_qty, 0),
 		       COALESCE(NULLIF(request_payload->>'ReferencePrice','')::numeric, 0),
 		       COALESCE(broker_error,''), submitted_at, created_at
 		FROM stock_order_intents
 		WHERE purpose='submit'
 		  AND idempotency_key LIKE 'entry:%'
-		  AND side='buy'
+		  -- Entries on either side reserve buying power: BUY opens a long and
+		  -- SELL (an entry: key, never an exit) opens a short (#599).
+		  AND side IN ('buy','sell')
 		  AND status IN ('pending','partial')
 		  AND requested_qty-filled_qty > 0.000000001
 		ORDER BY created_at`)
@@ -812,7 +829,7 @@ func ListActiveStockEntryReservations(ctx context.Context) ([]ActiveStockEntryRe
 		if err := rows.Scan(
 			&reservation.IntentID, &reservation.IdempotencyKey,
 			&reservation.ClientOrderID, &reservation.BrokerOrderID,
-			&reservation.TradeID, &reservation.Ticker, &reservation.Status,
+			&reservation.TradeID, &reservation.Ticker, &reservation.Side, &reservation.Status,
 			&reservation.RequestedQty, &reservation.FilledQty,
 			&reservation.RemainingQty, &reservation.ReferencePrice,
 			&reservation.BrokerError, &reservation.SubmittedAt,
@@ -842,12 +859,20 @@ func GetWorkingStockEntryReservations(ctx context.Context) ([]Trade, error) {
 			continue
 		}
 		reservations = append(reservations, Trade{
-			Ticker: reservation.Ticker, Direction: "long",
+			Ticker: reservation.Ticker, Direction: reservation.Direction(),
 			Quantity: reservation.RemainingQty, EntryPrice: reservation.ReferencePrice,
 			Status: "open",
 		})
 	}
 	return reservations, nil
+}
+
+// Direction is the trade direction the reserved entry would open.
+func (r ActiveStockEntryReservation) Direction() string {
+	if strings.EqualFold(r.Side, "sell") {
+		return "short"
+	}
+	return "long"
 }
 
 func purposeOrSubmit(purpose string) string {

@@ -390,7 +390,12 @@ func (c *Coordinator) projectRecoveredMarketExit(ctx context.Context, intent sto
 	if !ok {
 		return fmt.Errorf("invalid analyst stock exit intent key %q", intent.IdempotencyKey)
 	}
-	trades, err := store.GetExitingTradesForSellSignal(ctx, req.Ticker, signalID)
+	// A SELL exits long lots and a buy-to-cover exits short lots (#599).
+	exitDirection := "long"
+	if req.Side == execution.OrderSideBuy {
+		exitDirection = "short"
+	}
+	trades, err := store.GetExitingTradesForAnalystExit(ctx, req.Ticker, signalID, exitDirection)
 	if err != nil {
 		return fmt.Errorf("load claimed analyst exit trades: %w", err)
 	}
@@ -918,7 +923,7 @@ func (c *Coordinator) projectRecoveredEntryExits(ctx context.Context, parent sto
 			}
 			if existing == nil {
 				order := store.Order{TradeID: tradeID, BrokerOrderID: leg.brokerID, Ticker: req.Ticker,
-					Side: string(execution.OrderSideSell), OrderType: leg.orderType, Quantity: req.Quantity,
+					Side: string(execution.ExitSideForEntry(req.Side)), OrderType: leg.orderType, Quantity: req.Quantity,
 					Status: "pending", IsStopLoss: leg.stop, IsTakeProfit: leg.take,
 					ParentOrderID: res.BrokerOrderID, StockIntentID: childID}
 				if child != nil && child.FilledQty > 0 {
@@ -1147,7 +1152,7 @@ func (c *Coordinator) ensureRecoveredProtectiveStopLocked(ctx context.Context, p
 		}
 		key += fmt.Sprintf(":resize:%s:%.8f", existing.BrokerOrderID, remainingQty)
 	}
-	stopReq := execution.OrderRequest{Ticker: req.Ticker, Side: execution.OrderSideSell,
+	stopReq := execution.OrderRequest{Ticker: req.Ticker, Side: execution.ExitSideForEntry(req.Side),
 		Type: execution.OrderTypeStop, Quantity: remainingQty, StopPrice: req.PolicyStopLoss,
 		TradeID: tradeID, TimeInForce: "gtc", IntentKey: key,
 		ExitReason: store.ExitReasonStopLoss, ExitEvidence: json.RawMessage(fmt.Sprintf(`{"stop_loss":%g}`, req.PolicyStopLoss))}
@@ -1161,7 +1166,7 @@ func (c *Coordinator) ensureRecoveredProtectiveStopLocked(ctx context.Context, p
 	}
 	if existing == nil {
 		_, err = store.InsertOrderWithRetry(ctx, store.Order{TradeID: tradeID, BrokerOrderID: stopRes.BrokerOrderID,
-			Ticker: req.Ticker, Side: string(execution.OrderSideSell), OrderType: string(execution.OrderTypeStop),
+			Ticker: req.Ticker, Side: string(stopReq.Side), OrderType: string(execution.OrderTypeStop),
 			Quantity: remainingQty, StopPrice: req.PolicyStopLoss, FilledPrice: stopRes.FilledPrice,
 			FilledQty: stopRes.FilledQty, Status: execution.NormalizeOrderStatusForTimeInForce(stopRes.Status, stopReq.TimeInForce), IsStopLoss: true,
 			ExitReason: requestExitIntent(stopReq).Reason, ExitEvidence: requestExitIntent(stopReq).Evidence, StockIntentID: stopIntent.ID})
