@@ -636,7 +636,7 @@ func reservationTrades(reservations []store.ActiveStockEntryReservation, exclude
 			continue
 		}
 		trades = append(trades, store.Trade{
-			Ticker: reservation.Ticker, Direction: "long", Status: "open",
+			Ticker: reservation.Ticker, Direction: reservation.Direction(), Status: "open",
 			Quantity: reservation.RemainingQty, EntryPrice: reservation.ReferencePrice,
 		})
 	}

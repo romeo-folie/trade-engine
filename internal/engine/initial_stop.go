@@ -69,10 +69,22 @@ func (e *Engine) ensureUncappedProtectiveStopLocked(
 		}
 	}
 
+	// The stop closes the position on its own side: a SELL stop protects a
+	// long, a BUY stop protects a short (#599). An unknown direction is never
+	// defaulted, because the wrong side would add to the position.
+	trade, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil {
+		return fmt.Errorf("protective stop: load trade direction: %w", err)
+	}
+	if trade == nil {
+		return fmt.Errorf("protective stop: trade %s not found", tradeID)
+	}
+	exitSide := execution.ExitSideForDirection(trade.Direction)
+
 	intentKey := protectiveStopIntentKey(tradeID, stopPrice, quantity)
 	stopReq := execution.OrderRequest{
 		Ticker:      ticker,
-		Side:        execution.OrderSideSell,
+		Side:        exitSide,
 		Type:        execution.OrderTypeStop,
 		Quantity:    quantity,
 		StopPrice:   stopPrice,
@@ -152,7 +164,7 @@ func (e *Engine) ensureUncappedProtectiveStopLocked(
 		TradeID:       tradeID,
 		BrokerOrderID: res.BrokerOrderID,
 		Ticker:        ticker,
-		Side:          string(execution.OrderSideSell),
+		Side:          string(exitSide),
 		OrderType:     string(execution.OrderTypeStop),
 		Quantity:      quantity,
 		StopPrice:     stopPrice,
@@ -178,7 +190,7 @@ func (e *Engine) ensureUncappedProtectiveStopLocked(
 			}
 			if _, persistErr := store.InsertOrderWithRetry(ctx, store.Order{
 				TradeID: tradeID, BrokerOrderID: res.BrokerOrderID,
-				Ticker: ticker, Side: string(execution.OrderSideSell),
+				Ticker: ticker, Side: string(exitSide),
 				OrderType: string(execution.OrderTypeStop), Quantity: quantity,
 				StopPrice: stopPrice, Status: rollbackStatus, IsStopLoss: true,
 				FilledPrice: rollbackRes.FilledPrice, FilledQty: rollbackRes.FilledQty,

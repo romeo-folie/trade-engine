@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -50,6 +51,8 @@ type ActiveStockEntryReservation struct {
 	BrokerOrderID  string
 	TradeID        string
 	Ticker         string
+	// Side is the entry side: "buy" opens a long, "sell" opens a short (#599).
+	Side           string
 	Status         string
 	RequestedQty   float64
 	FilledQty      float64
@@ -790,14 +793,16 @@ func ListActiveStockEntryReservations(ctx context.Context) ([]ActiveStockEntryRe
 	rows, err := GetDB().Query(ctx, `
 		SELECT id::text, idempotency_key, client_order_id,
 		       COALESCE(broker_order_id,''), COALESCE(trade_id::text,''),
-		       ticker, status, requested_qty, filled_qty,
+		       ticker, side, status, requested_qty, filled_qty,
 		       GREATEST(requested_qty-filled_qty, 0),
 		       COALESCE(NULLIF(request_payload->>'ReferencePrice','')::numeric, 0),
 		       COALESCE(broker_error,''), submitted_at, created_at
 		FROM stock_order_intents
 		WHERE purpose='submit'
 		  AND idempotency_key LIKE 'entry:%'
-		  AND side='buy'
+		  -- Entries on either side reserve buying power: BUY opens a long and
+		  -- SELL (an entry: key, never an exit) opens a short (#599).
+		  AND side IN ('buy','sell')
 		  AND status IN ('pending','partial')
 		  AND requested_qty-filled_qty > 0.000000001
 		ORDER BY created_at`)
@@ -812,7 +817,7 @@ func ListActiveStockEntryReservations(ctx context.Context) ([]ActiveStockEntryRe
 		if err := rows.Scan(
 			&reservation.IntentID, &reservation.IdempotencyKey,
 			&reservation.ClientOrderID, &reservation.BrokerOrderID,
-			&reservation.TradeID, &reservation.Ticker, &reservation.Status,
+			&reservation.TradeID, &reservation.Ticker, &reservation.Side, &reservation.Status,
 			&reservation.RequestedQty, &reservation.FilledQty,
 			&reservation.RemainingQty, &reservation.ReferencePrice,
 			&reservation.BrokerError, &reservation.SubmittedAt,
@@ -842,12 +847,20 @@ func GetWorkingStockEntryReservations(ctx context.Context) ([]Trade, error) {
 			continue
 		}
 		reservations = append(reservations, Trade{
-			Ticker: reservation.Ticker, Direction: "long",
+			Ticker: reservation.Ticker, Direction: reservation.Direction(),
 			Quantity: reservation.RemainingQty, EntryPrice: reservation.ReferencePrice,
 			Status: "open",
 		})
 	}
 	return reservations, nil
+}
+
+// Direction is the trade direction the reserved entry would open.
+func (r ActiveStockEntryReservation) Direction() string {
+	if strings.EqualFold(r.Side, "sell") {
+		return "short"
+	}
+	return "long"
 }
 
 func purposeOrSubmit(purpose string) string {

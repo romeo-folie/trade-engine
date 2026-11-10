@@ -27,6 +27,16 @@ const brokerProtectionVerificationAttempts = 5
 // path. An ambiguous cancellation keeps the trade owned by this containment
 // attempt and is retried; it never falls back to application-managed exits.
 func (e *Engine) containUnprotectedBrokerEntry(ctx context.Context, tradeID, entryBrokerOrderID, ticker, reason string) {
+	// Flatten on the position's own closing side (#599). If the direction is
+	// unknown, do not guess: a flatten on the wrong side would double the
+	// exposure. The failure is loud so an operator can intervene.
+	trade, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || trade == nil {
+		logger.Error("broker protection: cannot determine trade direction for containment; not flattening",
+			"trade_id", tradeID, "ticker", ticker, "err", err)
+		return
+	}
+	exitSide := execution.ExitSideForDirection(trade.Direction)
 	const attempts = 3
 	for attempt := 0; attempt < attempts; attempt++ {
 		if err := e.executor.CancelOrder(ctx, entryBrokerOrderID); err != nil {
@@ -85,7 +95,7 @@ func (e *Engine) containUnprotectedBrokerEntry(ctx context.Context, tradeID, ent
 			return
 		}
 		exitReq := execution.OrderRequest{
-			Ticker: ticker, Side: execution.OrderSideSell, Type: execution.OrderTypeMarket,
+			Ticker: ticker, Side: exitSide, Type: execution.OrderTypeMarket,
 			Quantity: quantity, ReferencePrice: status.FilledPrice, TradeID: tradeID,
 			IntentKey:  "broker-protection-flatten:" + tradeID,
 			ExitReason: store.ExitReasonBrokerProtectionFailure, ExitEvidence: intent.Evidence,
@@ -105,7 +115,7 @@ func (e *Engine) containUnprotectedBrokerEntry(ctx context.Context, tradeID, ent
 		}
 		if _, err := store.InsertOrderWithRetry(ctx, store.Order{
 			TradeID: tradeID, BrokerOrderID: result.BrokerOrderID, Ticker: ticker,
-			Side: string(execution.OrderSideSell), OrderType: string(execution.OrderTypeMarket),
+			Side: string(exitSide), OrderType: string(execution.OrderTypeMarket),
 			Quantity: quantity, FilledPrice: result.FilledPrice, FilledQty: result.FilledQty,
 			FilledAt: filledAtPtr(result.FilledAt), Status: execution.NormalizeOrderStatus(result.Status),
 			StockIntentID: stockIntentID, ExitReason: store.ExitReasonBrokerProtectionFailure,
