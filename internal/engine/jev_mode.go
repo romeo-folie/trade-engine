@@ -45,7 +45,13 @@ func newJevEvaluator(cfg *config.Config) (*jev.Evaluator, error) {
 	if err := policy.Validate(); err != nil {
 		return nil, err
 	}
-	return &jev.Evaluator{Client: client, Policy: policy, MinRiskReward: cfg.Risk.MinRiskReward}, nil
+	opts := jevOptions(cfg)
+	if opts.Shorts {
+		if err := policy.ValidateShorts(); err != nil {
+			return nil, err
+		}
+	}
+	return &jev.Evaluator{Client: client, Policy: policy, MinRiskReward: cfg.Risk.MinRiskReward, Options: opts}, nil
 }
 
 func jevPolicyConfig(cfg *config.Config) jev.PolicyConfig {
@@ -59,7 +65,15 @@ func jevPolicyConfig(cfg *config.Config) jev.PolicyConfig {
 		MinLensProbability: p.MinLensProbability, MinTimingProbability: p.MinTimingProbability,
 		ExitThreshold: p.ExitThreshold, StopATRMultiple: p.StopATRMultiple,
 		TargetRMultiple: p.TargetRMultiple, SizePct: p.SizePct, MinConfidence: minConf,
+		ShortMinThesisSupport: p.ShortMinThesisSupport, ShortMaxAdverse: p.ShortMaxAdverse,
+		CoverThreshold: p.CoverThreshold, ShortSizePct: cfg.Risk.Shorts.SizePct,
 	}
+}
+
+// jevOptions selects the two-sided v2 question set and policy when short
+// selling is enabled (#599); otherwise v1 runs unchanged.
+func jevOptions(cfg *config.Config) jev.Options {
+	return jev.Options{Shorts: cfg.Risk.Shorts.Enabled}
 }
 
 // checkJevStartup refuses to run a Jev configuration that cannot be honoured:

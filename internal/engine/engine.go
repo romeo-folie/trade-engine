@@ -1404,7 +1404,9 @@ func (e *Engine) runAnalysisWithProfile(
 		return
 	}
 	resp, meta := result.Response, result.Meta
-	supplementalBlocked := contextErr != nil && resp.Action == analysis.ActionBuy
+	// Missing supplemental evidence blocks any new entry, long or short; exits
+	// (SELL, COVER) still run.
+	supplementalBlocked := contextErr != nil && analysis.IsEntryAction(resp.Action)
 	if supplementalBlocked {
 		resp.Action = analysis.ActionWait
 		resp.SizePct, resp.StopLoss, resp.TakeProfit = 0, 0, 0

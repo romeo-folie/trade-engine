@@ -481,6 +481,10 @@ type JevPolicyConfig struct {
 	TargetRMultiple      float64 `yaml:"target_r_multiple"`
 	SizePct              float64 `yaml:"size_pct"`
 	MinConfidence        float64 `yaml:"min_confidence"`
+	// Short side (jev-policy/v2), used only when risk.shorts.enabled.
+	ShortMinThesisSupport float64 `yaml:"short_min_thesis_support"`
+	ShortMaxAdverse       float64 `yaml:"short_max_adverse"`
+	CoverThreshold        float64 `yaml:"cover_threshold"`
 }
 
 // JevEnabled reports whether the Jev decision mode is configured.
@@ -529,6 +533,8 @@ func ValidateJevConfig(a AnalysisConfig) []string {
 		"min_thesis_support": p.MinThesisSupport, "max_adverse": p.MaxAdverse,
 		"min_lens_probability": p.MinLensProbability, "min_timing_probability": p.MinTimingProbability,
 		"exit_threshold": p.ExitThreshold, "min_confidence": p.MinConfidence,
+		"short_min_thesis_support": p.ShortMinThesisSupport, "short_max_adverse": p.ShortMaxAdverse,
+		"cover_threshold": p.CoverThreshold,
 	} {
 		if math.IsNaN(v) || v < 0 || v > 1 {
 			errs = append(errs, fmt.Sprintf("analysis.jev.policy.%s must be within [0,1]", name))

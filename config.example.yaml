@@ -445,6 +445,10 @@ analysis:
       target_r_multiple: 2.0         # target = entry + N x risk (floored by risk.min_risk_reward)
       size_pct: 2.0                  # incremental BUY size, percent of the sizing base
       min_confidence: 0              # 0 = use risk.confidence_threshold
+      # Short side (jev-policy/v2), active only when risk.shorts.enabled:
+      short_min_thesis_support: 0.65 # P(strong)+P(moderate) bearish thesis support
+      short_max_adverse: 0.35        # highest tolerated P(evidence against the short)
+      cover_threshold: 0.60          # P(cover_now) that covers a held short
 
   # Adaptive depth: scores each tick and routes to fewer analysts when the
   # situation is low-volatility / low-novelty. Requires analyst tier roles

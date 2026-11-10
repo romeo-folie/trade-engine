@@ -12,7 +12,6 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/analysis/prompts"
 	"github.com/romeo-folie/trade-engine/internal/analysis/snapshot"
 	"github.com/romeo-folie/trade-engine/internal/config"
-	"github.com/romeo-folie/trade-engine/internal/jev"
 	"github.com/romeo-folie/trade-engine/internal/logger"
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
@@ -103,7 +102,8 @@ func (e *Engine) decisionSnapshotIdentity() (decisionSnapshotIdentity, error) {
 // resolution rules or analyst prompt templates.
 func (e *Engine) decisionVersions() (policy, prompt string) {
 	if e.cfg.Analysis.JevAuthoritative() {
-		return jev.PolicyVersion, jev.QuestionSetVersion
+		questionSet, policy := jevOptions(e.cfg).Versions()
+		return policy, questionSet
 	}
 	return analysis.ResolutionPolicyVersion, prompts.TemplateVersion
 }

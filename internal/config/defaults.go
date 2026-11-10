@@ -251,6 +251,7 @@ func Defaults() *Config {
 					MinThesisSupport: 0.60, MaxAdverse: 0.40, MinLensProbability: 0.50,
 					MinTimingProbability: 0.55, ExitThreshold: 0.60,
 					StopATRMultiple: 2.0, TargetRMultiple: 2.0, SizePct: 2.0,
+					ShortMinThesisSupport: 0.65, ShortMaxAdverse: 0.35, CoverThreshold: 0.60,
 				},
 			},
 			MaterialChangeOnly:       true,
