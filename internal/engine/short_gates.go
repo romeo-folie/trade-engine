@@ -24,24 +24,49 @@ const (
 
 // shortGateEvidence is the daily and news evidence the short gates read. It
 // is gathered before broker admission (network work) and evaluated against
-// the admission bid afterwards (pure).
+// the admission bid afterwards (pure). Daily and news evidence are
+// independent: a news outage must not discard good daily bars that the
+// trend and run-up gates need.
 type shortGateEvidence struct {
-	Daily     []data.Candle
-	News      []analysis.NewsSnippet
-	Reason    string  // non-empty when the anti-chase evidence is unavailable
-	PrevClose float64 // prior completed daily close; 0 = unknown
+	Daily []data.Candle
+	News  []analysis.NewsSnippet
+	// Reason is non-empty when the anti-chase evidence (daily, or news when
+	// the stale-catalyst rule needs it) is unavailable.
+	Reason string
+	// DailyReason is non-empty when the daily bars could not be refreshed.
+	DailyReason string
+	PrevClose   float64 // prior completed daily close; 0 = unknown
 }
 
-// gatherShortGateEvidence refreshes the daily bars and news used by every
-// short gate. It reuses the long execution evidence path, so the same
-// freshness and fail-closed rules apply.
+// gatherShortGateEvidence refreshes the daily bars, and the news only when
+// the stale-catalyst rule will actually read it.
 func (e *Engine) gatherShortGateEvidence(ctx context.Context, ticker string, now time.Time) shortGateEvidence {
 	eg := e.cfg.Risk.EntryGates
 	if !eg.AntiChase.Enabled && !eg.TrendAlignmentEnabled && eg.NewsMinRunupPct <= 0 && eg.MomentumMaxRunupPct <= 0 {
 		return shortGateEvidence{}
 	}
-	daily, news, reason := e.executionAntiChaseEvidence(ctx, ticker, now, eg.AntiChase.StaleCatalystRunupEnabled)
-	return shortGateEvidence{Daily: daily, News: news, Reason: reason, PrevClose: priorSessionClose(daily, now)}
+	var ev shortGateEvidence
+	if _, err := e.fetchAndStoreCandlesObserved(ctx, ticker, data.Timeframe1Day); err != nil {
+		ev.DailyReason = "unable to refresh daily evidence"
+	} else if daily, err := store.GetCandles(ctx, ticker, data.Timeframe1Day, now.AddDate(-2, 0, 0), now); err != nil {
+		ev.DailyReason = "unable to load refreshed daily evidence"
+	} else {
+		ev.Daily = daily
+		ev.PrevClose = priorSessionClose(daily, now)
+	}
+	if ev.DailyReason != "" {
+		ev.Reason = "anti-chase: " + ev.DailyReason
+	}
+	needNews := eg.AntiChase.Enabled && eg.AntiChase.StaleCatalystRunupEnabled
+	if needNews && ev.Reason == "" {
+		if err := e.fetchAndStoreNews(ctx, ticker); err != nil {
+			ev.Reason = "anti-chase: unable to refresh timestamped catalyst evidence"
+		} else {
+			items, err := store.GetRecentNews(ctx, ticker, now.Add(-antiChaseNewsLookback))
+			ev.News, ev.Reason = antiChaseNewsEvidence(items, err, true)
+		}
+	}
+	return ev
 }
 
 // priorSessionClose is the close of the newest daily bar dated before today
@@ -114,6 +139,9 @@ func evaluateShortGates(
 	// 2. Trend alignment: a short requires a proven daily downtrend.
 	if cfg.TrendAlignmentEnabled {
 		reason := evaluateShortTrendGate(mark, ev.Daily, now)
+		if ev.DailyReason != "" {
+			reason = "trend alignment (short): " + ev.DailyReason
+		}
 		status := "passed"
 		if reason != "" {
 			status = "blocked"
@@ -142,6 +170,13 @@ func evaluateShortTrendGate(mark float64, daily []data.Candle, now time.Time) st
 	completed := completedEntryDailyCandles(daily, now)
 	if mark <= 0 || len(completed) < entryTrendSlowEMAPeriod+1 {
 		return "trend alignment (short): daily downtrend evidence is unavailable"
+	}
+	// A downtrend must be proven on current history: the window has to end at
+	// the latest completed session with no missing sessions, or an old
+	// downtrend could authorize a short after the trend reversed.
+	window := completed[len(completed)-(entryTrendSlowEMAPeriod+1):]
+	if !antiChaseDailyHistoryFresh(completed, now) || !antiChaseDailyHistoryContinuous(window, now) {
+		return "trend alignment (short): daily history is stale or has missing sessions"
 	}
 	ema9 := indicators.ComputeEMA(completed, entryTrendFastEMAPeriod)
 	ema21 := indicators.ComputeEMA(completed, entryTrendSlowEMAPeriod)

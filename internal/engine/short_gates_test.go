@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -13,18 +14,12 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
-// trendBars returns 40 completed daily bars ending yesterday whose closes
-// move by step each session from start (negative step = downtrend).
+// trendBars returns 40 completed daily bars on consecutive real market
+// sessions, ending at the latest completed session, whose closes move by
+// step each session from start (negative step = downtrend).
 func trendBars(ticker string, now time.Time, start, step float64) []data.Candle {
-	et := now.In(nyLoc)
-	today := time.Date(et.Year(), et.Month(), et.Day(), 0, 0, 0, 0, nyLoc)
-	var bars []data.Candle
-	for i := 40; i >= 1; i-- {
-		c := start + step*float64(40-i)
-		bars = append(bars, data.Candle{Ticker: ticker, Timeframe: data.Timeframe1Day,
-			Timestamp: today.AddDate(0, 0, -i), Open: c, High: c + 1, Low: c - 1, Close: c, Volume: 200_000})
-	}
-	return bars
+	return sessionBars(ticker, now, 40, func(i int) float64 { return start + step*float64(i) },
+		func(int) int64 { return 200_000 })
 }
 
 func TestEvaluateShortTrendGate(t *testing.T) {
@@ -239,5 +234,46 @@ func TestShortAntiChasePassAndUnavailable(t *testing.T) {
 	reason, failed, _ := evaluateShortGates(cfg, "NEUT", "momentum", 95, "test", shortGateEvidence{Reason: "anti-chase: unable to refresh daily evidence"}, now, false)
 	if reason == "" || failed != shortGateAntiChase {
 		t.Fatalf("unavailable evidence must block a short: reason=%q failed=%q", reason, failed)
+	}
+}
+
+// Codex: a confirmed downtrend must be proven on current history. A window
+// that stops sessions ago, or has a missing session, cannot authorize a short.
+func TestShortTrendGateRequiresFreshContinuousHistory(t *testing.T) {
+	now := time.Now()
+	down := trendBars("X", now, 140, -1)
+	if r := evaluateShortTrendGate(100, down, now); r != "" {
+		t.Fatalf("fresh downtrend blocked: %s", r)
+	}
+	stale := down[:len(down)-3] // ends three sessions ago
+	if r := evaluateShortTrendGate(100, stale, now); !strings.Contains(r, "stale") {
+		t.Fatalf("stale downtrend must block: %q", r)
+	}
+	gapped := append(append([]data.Candle{}, down[:len(down)-5]...), down[len(down)-4:]...)
+	if r := evaluateShortTrendGate(100, gapped, now); !strings.Contains(r, "missing sessions") {
+		t.Fatalf("gapped history must block: %q", r)
+	}
+}
+
+type failingNews struct{}
+
+func (failingNews) FetchNews(context.Context, string, time.Time) ([]data.NewsItem, error) {
+	return nil, errors.New("news provider down")
+}
+
+// Codex: with anti-chase off, a news outage must not discard the daily bars
+// the trend gate needs; a short in a confirmed downtrend is still placed.
+func TestShortTrendGateSurvivesNewsOutageWhenAntiChaseOff(t *testing.T) {
+	f := newShortFixture(t, "SHNO")
+	f.e.cfg.Risk.EntryGates.TrendAlignmentEnabled = true
+	f.e.cfg.Risk.EntryGates.AntiChase.Enabled = false
+	f.e.cfg.Risk.EntryGates.AntiChase.StaleCatalystRunupEnabled = true
+	f.e.newsProvider = failingNews{}
+	f.market.bars = trendBars(f.ticker, time.Now(), 138, -1)
+	id, sig := f.signal()
+	f.e.executeShortEntry(f.ctx, id, sig, false)
+	if n := len(f.broker.placedOrders()); n != 1 {
+		status, reason := f.signalStatus(id)
+		t.Fatalf("placed=%d (status %s: %s); a news outage must not block the trend gate", n, status, reason)
 	}
 }
