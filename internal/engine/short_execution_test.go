@@ -1144,3 +1144,36 @@ func TestManualPendingShortsTrustOnlyBrokerLongs(t *testing.T) {
 		t.Fatalf("broker long: pending shorts = %+v, want none", got)
 	}
 }
+
+// Codex round 5: a pending manual short takes a position slot once per
+// ticker, never double-counted with a broker position or a tracked short.
+func TestPendingShortSlots(t *testing.T) {
+	pending := []execution.WorkingOrder{
+		{Ticker: "NEW1"}, {Ticker: "new1"}, // one ticker, two orders → one slot
+		{Ticker: "BROKER"},  // already a broker position
+		{Ticker: "TRACKED"}, // already a tracked short
+	}
+	positions := []execution.BrokerPosition{{Symbol: "BROKER", Side: "short", Quantity: -1}}
+	counted := []store.Trade{{Ticker: "TRACKED", Direction: "short", Quantity: 1}}
+	if got := pendingShortSlots(pending, positions, counted); got != 1 {
+		t.Fatalf("slots = %d, want 1", got)
+	}
+}
+
+func TestShortEntryPendingManualShortUsesPositionSlot(t *testing.T) {
+	f := newShortFixture(t, "SHP")
+	f.broker.working = []execution.WorkingOrder{{OrderID: "manual-sell", TradeID: "manual-1", Ticker: "ELSEWHERE", Side: "sell", Status: "pending", RemainingQty: 1, Price: 50, OrderType: "limit"}}
+	owned, err := store.GetOwnedPositionTrades(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Exactly the positions the shared DB already holds, plus one: with
+	// the pending manual short counted, the limit is reached.
+	in := buildRiskInput(f.e.cfg.Risk, "SHORT", f.ticker, .8, 5, 101, 92, 98, portfolio.State{}, owned)
+	f.e.cfg.Risk.MaxOpenPositions = in.OpenPositions + 1
+	id, sig := f.signal()
+	f.e.executeShortEntry(f.ctx, id, sig, false)
+	if status, reason := f.signalStatus(id); status != "blocked" || !strings.Contains(reason, "open positions") || len(f.broker.placedOrders()) != 0 {
+		t.Fatalf("status=%s reason=%q placed=%d; the pending short must take the last slot", status, reason, len(f.broker.placedOrders()))
+	}
+}

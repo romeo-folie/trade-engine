@@ -223,6 +223,9 @@ func (e *Engine) executeShortEntry(ctx context.Context, sigID string, sig store.
 			block(err.Error(), "position_ownership")
 			return
 		}
+		// A pending manual short becomes a position when it fills, so it
+		// takes a slot unless that ticker is already counted.
+		riskIn.OpenPositions += pendingShortSlots(pending, admission.BrokerPositions, riskOwned)
 		riskIn.ProposedQuantity = orderReq.Quantity
 		riskIn.ProposedNotional = orderReq.Quantity * bid
 		if riskIn.ProposedNotional > admission.RemainingCapacity+1e-7 {
@@ -529,6 +532,30 @@ func manualPendingShorts(
 		out = append(out, order)
 	}
 	return out
+}
+
+// pendingShortSlots counts the distinct tickers among pending manual shorts
+// that are not already a position: no broker position in the ticker, and no
+// tracked or reserved short trade for it in counted.
+func pendingShortSlots(pending []execution.WorkingOrder, positions []execution.BrokerPosition, counted []store.Trade) int {
+	seen := map[string]bool{}
+	for _, p := range positions {
+		seen[strings.ToUpper(strings.TrimSpace(p.Symbol))] = true
+	}
+	for _, t := range counted {
+		if t.Direction == "short" {
+			seen[strings.ToUpper(strings.TrimSpace(t.Ticker))] = true
+		}
+	}
+	slots := 0
+	for _, order := range pending {
+		key := strings.ToUpper(strings.TrimSpace(order.Ticker))
+		if !seen[key] {
+			seen[key] = true
+			slots++
+		}
+	}
+	return slots
 }
 
 // pendingShortNotional values pending manual shorts at their limit (or stop)
