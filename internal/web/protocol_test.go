@@ -523,3 +523,36 @@ func assertEdge(t *testing.T, edges []PipelineEdge, source, target, kind string)
 	}
 	t.Fatalf("missing %s edge %s -> %s: %+v", kind, source, target, edges)
 }
+
+func TestPipelineTopologyAuthoritativeJevReplacesAnalysts(t *testing.T) {
+	cfg := topologyTestConfig()
+	cfg.Analysis.DecisionMode = "jev"
+	cfg.Analysis.Jev.Authority = config.JevAuthorityAuthoritative
+	cfg.Analysis.Jev.Model = "jev-test"
+
+	nodes, topology := pipelineTopology(cfg)
+	if topology.AnalysisMode != "jev" {
+		t.Fatalf("mode = %q, want jev", topology.AnalysisMode)
+	}
+	assertNodeIDs(t, nodes,
+		"news_api", "alpaca", "news_enricher", "indicator_engine",
+		"jev", "risk_manager", "blocked_signals", "approvals", "executor", "portfolio",
+	)
+	assertMissingNode(t, nodes, "analyst-cheap")
+	assertMissingNode(t, nodes, "consensus")
+	assertEdge(t, topology.Edges, "indicator_engine", "jev", "primary")
+	assertEdge(t, topology.Edges, "jev", "risk_manager", "primary")
+	if got := finalAnalysisNodeID(cfg, false); got != "jev" {
+		t.Fatalf("final analysis node = %q, want jev", got)
+	}
+	// A Jev vote routes to the Jev node.
+	if ids := routedAnalystNodeIDs(cfg, []events.AnalystVotePayload{{Provider: "typesafe", Model: "jev-test", Role: "jev"}}); len(ids) != 1 || ids[0] != "jev" {
+		t.Fatalf("routed nodes = %v", ids)
+	}
+
+	// Shadow mode keeps the baseline topology: Jev never decides there.
+	cfg.Analysis.Jev.Authority = config.JevAuthorityShadow
+	if _, topology := pipelineTopology(cfg); topology.AnalysisMode == "jev" {
+		t.Fatal("shadow Jev must not change the decision topology")
+	}
+}

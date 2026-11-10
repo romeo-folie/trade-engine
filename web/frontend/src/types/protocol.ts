@@ -28,7 +28,7 @@ export interface PipelineEdge {
 
 export interface PipelineTopology {
   revision: string;
-  analysis_mode: 'single' | 'ensemble' | 'specialist';
+  analysis_mode: 'single' | 'ensemble' | 'specialist' | 'jev';
   edges: PipelineEdge[];
 }
 

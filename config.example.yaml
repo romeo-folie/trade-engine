@@ -400,6 +400,39 @@ analysis:
     sentiment: analyst_cheap        # cheap model for high-volume news/social pass
     risk_manager: analyst_frontier  # frontier model for portfolio/veto decisions
 
+  # Decision maker (issue #590). "ensemble" (default) uses the analyst
+  # workflow configured above. "jev" uses TypeSafe's Jev, per jev.authority.
+  decision_mode: ensemble
+  jev:
+    # shadow: the analyst workflow decides and executes; Jev runs concurrently
+    #   on the identical frozen inputs and is only recorded (decision
+    #   snapshots, stage "jev_shadow") for paired comparison. Costs extra.
+    # authoritative: Jev is the SOLE decision maker. No analysts or arbiter
+    #   run. Engine risk checks, entry gates, and protective exits still apply,
+    #   and a Jev failure is an analysis failure (no fallback model).
+    authority: shadow
+    allow_live: false                # authoritative on a live account requires true
+    model: jev-latest                # REQUIRED. GET /v1/models offers aliases (jev-latest,
+                                     # jev-preview); the served version (e.g. jev-1.14.0) is
+                                     # recorded on every call as resolved_model
+    api_key_env: TYPESAFE_API_KEY
+    base_url: ""                     # default https://api.typesafe.ai
+    timeout_sec: 20                  # per HTTP attempt
+    max_retries: 2                   # transient retries (429/5xx), capped at 5
+    shadow_grace_ms: 2000            # max wait for a shadow call after the baseline finishes
+    # jev-policy/v1 thresholds: conservative starting points to calibrate in
+    # shadow, not validated probabilities of profitable trades.
+    policy:
+      min_thesis_support: 0.60       # P(strong) + P(moderate) thesis support
+      max_adverse: 0.40              # highest tolerated P(material adverse evidence)
+      min_lens_probability: 0.50     # minimum probability of the chosen lens
+      min_timing_probability: 0.55   # minimum P(enter_now) to enter immediately
+      exit_threshold: 0.60           # P(exit_now) that exits a held long
+      stop_atr_multiple: 2.0         # stop = entry - N x ATR
+      target_r_multiple: 2.0         # target = entry + N x risk (floored by risk.min_risk_reward)
+      size_pct: 2.0                  # incremental BUY size, percent of the sizing base
+      min_confidence: 0              # 0 = use risk.confidence_threshold
+
   # Adaptive depth: scores each tick and routes to fewer analysts when the
   # situation is low-volatility / low-novelty. Requires analyst tier roles
   # (analyst_cheap, analyst_mid, analyst_frontier) in models.registry.

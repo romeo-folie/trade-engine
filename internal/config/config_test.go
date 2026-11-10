@@ -1696,3 +1696,120 @@ func TestFuturesORBConfig_AsForexConfig(t *testing.T) {
 		t.Errorf("Session = %q; want empty", f.Session)
 	}
 }
+
+func validJevAnalysis(t *testing.T) AnalysisConfig {
+	t.Helper()
+	t.Setenv("TS_TEST_KEY", "k")
+	a := Defaults().Analysis
+	a.DecisionMode = "jev"
+	a.Jev.Model = "jev-2026-10"
+	a.Jev.APIKeyEnv = "TS_TEST_KEY"
+	return a
+}
+
+func TestValidateJevConfig(t *testing.T) {
+	if errs := ValidateJevConfig(Defaults().Analysis); len(errs) != 0 {
+		t.Fatalf("default ensemble mode must validate: %v", errs)
+	}
+	if errs := ValidateJevConfig(validJevAnalysis(t)); len(errs) != 0 {
+		t.Fatalf("valid jev config rejected: %v", errs)
+	}
+	cases := map[string]func(*AnalysisConfig){
+		"unknown mode":      func(a *AnalysisConfig) { a.DecisionMode = "oracle" },
+		"unknown authority": func(a *AnalysisConfig) { a.Jev.Authority = "advisory" },
+		"missing model":     func(a *AnalysisConfig) { a.Jev.Model = "" },
+		"missing key env":   func(a *AnalysisConfig) { a.Jev.APIKeyEnv = "" },
+		"unset key env":     func(a *AnalysisConfig) { a.Jev.APIKeyEnv = "TS_TEST_KEY_UNSET_589" },
+		"threshold > 1":     func(a *AnalysisConfig) { a.Jev.Policy.MaxAdverse = 1.5 },
+		"nan threshold":     func(a *AnalysisConfig) { a.Jev.Policy.ExitThreshold = math.NaN() },
+		"zero stop":         func(a *AnalysisConfig) { a.Jev.Policy.StopATRMultiple = 0 },
+		"inf target":        func(a *AnalysisConfig) { a.Jev.Policy.TargetRMultiple = math.Inf(1) },
+		"negative grace":    func(a *AnalysisConfig) { a.Jev.ShadowGraceMs = -1 },
+	}
+	for name, mutate := range cases {
+		a := validJevAnalysis(t)
+		mutate(&a)
+		if errs := ValidateJevConfig(a); len(errs) == 0 {
+			t.Errorf("%s accepted", name)
+		}
+	}
+}
+
+func TestJevModeDefaultsAreOffAndShadow(t *testing.T) {
+	a := Defaults().Analysis
+	if a.JevEnabled() || a.JevAuthoritative() || a.JevShadow() {
+		t.Fatal("Jev must be disabled by default")
+	}
+	if a.Jev.Authority != JevAuthorityShadow || a.Jev.AllowLive {
+		t.Fatal("enabling Jev must start in shadow without live authority")
+	}
+}
+
+func TestJevAPIKeyIsNeverSerialised(t *testing.T) {
+	var j JevConfig
+	j.APIKey = "ts-SECRET"
+	raw, _ := json.Marshal(j)
+	if strings.Contains(string(raw), "SECRET") {
+		t.Fatalf("API key serialised: %s", raw)
+	}
+}
+
+func analystErrors(errs []string) []string {
+	var out []string
+	for _, e := range errs {
+		if strings.Contains(e, "analysts") || strings.Contains(e, "models.primary") || strings.Contains(e, "specialist_roles") {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// TestAuthoritativeJevNeedsNoAnalysts: the cost motivation for #590 is
+// running without analysts, so an analyst-free authoritative configuration
+// must pass validation, while ensemble/shadow modes still require analysts.
+func TestAuthoritativeJevNeedsNoAnalysts(t *testing.T) {
+	for _, registry := range []bool{false, true} {
+		cfg := Defaults()
+		cfg.Analysis = validJevAnalysis(t)
+		cfg.Analysis.Jev.Authority = JevAuthorityAuthoritative
+		cfg.Models = ModelsConfig{}
+		// Leftovers from an ensemble config are unused under authoritative Jev.
+		cfg.Analysis.SpecialistModeEnabled = true
+		cfg.Models.Consensus.Enabled = true
+		if registry {
+			t.Setenv("CLASSIFIER_KEY_UNSET_590", "")
+			cfg.Models.Registry = ModelRegistry{
+				"unused_analyst": {ModelConfig: ModelConfig{Provider: "openai", Model: "m", APIKeyEnv: "ANALYST_KEY_UNSET_590"}},
+				"classifier":     {ModelConfig: ModelConfig{Provider: "openai", Model: "c", APIKeyEnv: "CLASSIFIER_KEY_UNSET_590"}},
+			}
+			cfg.Models.Roles.Analysts = []string{"unused_analyst"}
+			cfg.Models.Roles.Classifier = "classifier"
+		}
+		errs := Validate(cfg)
+		if got := analystErrors(errs); len(got) != 0 {
+			t.Fatalf("registry=%v: authoritative Jev rejected for analyst config: %v", registry, got)
+		}
+		if registry {
+			// The independently used classifier role still needs its key.
+			found := false
+			for _, e := range errs {
+				if strings.Contains(e, "CLASSIFIER_KEY_UNSET_590") {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("classifier key requirement dropped: %v", errs)
+			}
+			for _, e := range errs {
+				if strings.Contains(e, "ANALYST_KEY_UNSET_590") {
+					t.Fatalf("unused analyst key still required: %v", errs)
+				}
+			}
+		}
+		// The same analyst-free config in shadow mode still requires analysts.
+		cfg.Analysis.Jev.Authority = JevAuthorityShadow
+		if got := analystErrors(Validate(cfg)); len(got) == 0 {
+			t.Fatalf("registry=%v: shadow Jev must still require the baseline analysts", registry)
+		}
+	}
+}

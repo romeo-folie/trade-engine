@@ -12,6 +12,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/analysis/prompts"
 	"github.com/romeo-folie/trade-engine/internal/analysis/snapshot"
 	"github.com/romeo-folie/trade-engine/internal/config"
+	"github.com/romeo-folie/trade-engine/internal/jev"
 	"github.com/romeo-folie/trade-engine/internal/logger"
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
@@ -96,6 +97,17 @@ func (e *Engine) decisionSnapshotIdentity() (decisionSnapshotIdentity, error) {
 	return decisionSnapshotIdentity{config: raw, configHash: hash, workflow: effective.Workflow}, nil
 }
 
+// decisionVersions returns the resolution policy and prompt/question-set
+// versions that govern this engine's decisions. An authoritative Jev
+// decision is governed by the Jev policy and question set, not the ensemble
+// resolution rules or analyst prompt templates.
+func (e *Engine) decisionVersions() (policy, prompt string) {
+	if e.cfg.Analysis.JevAuthoritative() {
+		return jev.PolicyVersion, jev.QuestionSetVersion
+	}
+	return analysis.ResolutionPolicyVersion, prompts.TemplateVersion
+}
+
 func sortedMissing(missing []snapshot.MissingBlock) []snapshot.MissingBlock {
 	out := slices.Clone(missing)
 	slices.SortStableFunc(out, func(a, b snapshot.MissingBlock) int { return strings.Compare(a.Block, b.Block) })
@@ -113,6 +125,7 @@ func (e *Engine) insertDecisionSnapshot(
 	if err != nil {
 		return "", err
 	}
+	policyVersion, promptVersion := e.decisionVersions()
 	inputsRaw, inputHash, err := snapshot.EncodeInputs(inputs)
 	if err != nil {
 		return "", err
@@ -132,11 +145,11 @@ func (e *Engine) insertDecisionSnapshot(
 		DecisionCutoff: inputs.DecisionCutoff,
 		CodeRevision:   snapshot.CodeRevision(),
 		Workflow:       identity.workflow,
-		PolicyVersion:  analysis.ResolutionPolicyVersion,
-		PromptVersion:  prompts.TemplateVersion,
+		PolicyVersion:  policyVersion,
+		PromptVersion:  promptVersion,
 		InputHash:      inputHash,
 		DecisionHash: snapshot.DecisionHash(snapshot.SchemaVersion, inputHash,
-			analysis.ResolutionPolicyVersion, prompts.TemplateVersion, identity.configHash),
+			policyVersion, promptVersion, identity.configHash),
 		Inputs:          inputsRaw,
 		Missing:         missingRaw,
 		EffectiveConfig: identity.config,
@@ -215,6 +228,7 @@ func (e *Engine) recordShortCircuitSnapshot(
 func (e *Engine) completeDecisionSnapshot(
 	ctx context.Context, id string, result analysis.AnalyzeResult,
 	final *snapshot.FinalOutput, analysisID string, analysisErr, persistErr error,
+	shadows ...analysis.AnalystResult,
 ) {
 	if id == "" {
 		return
@@ -226,7 +240,7 @@ func (e *Engine) completeDecisionSnapshot(
 		delete(e.inflightSnapshots, id)
 		e.inflightSnapshotsMu.Unlock()
 	}()
-	completion := buildDecisionCompletion(result, final, analysisID, analysisErr, persistErr)
+	completion := buildDecisionCompletion(result, final, analysisID, analysisErr, persistErr, shadows...)
 	ctx, cancel := snapshotWriteContext(ctx)
 	defer cancel()
 	if err := store.CompleteDecisionSnapshot(ctx, id, completion); err != nil {
@@ -254,9 +268,10 @@ func snapshotWriteContext(ctx context.Context) (context.Context, context.CancelF
 // never a row left pending.
 func buildDecisionCompletion(
 	result analysis.AnalyzeResult, final *snapshot.FinalOutput, analysisID string, analysisErr, persistErr error,
+	shadows ...analysis.AnalystResult,
 ) store.DecisionCompletion {
 	completion := store.DecisionCompletion{AnalysisID: analysisID}
-	calls, callsErr := snapshot.StageCalls(result)
+	calls, callsErr := snapshot.StageCalls(result, shadows...)
 	if callsErr == nil {
 		completion.StageCalls = calls
 	}

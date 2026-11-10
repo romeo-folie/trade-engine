@@ -295,3 +295,23 @@ func TestStageCallsNumberEveryAttempt(t *testing.T) {
 		t.Fatalf("retry extra = %+v (%v)", retry, err)
 	}
 }
+
+// TestEffectiveConfigIdentifiesJevPlanInputs: the risk/reward floor changes
+// Jev's deterministic target, so it must change the configuration identity.
+func TestEffectiveConfigIdentifiesJevPlanInputs(t *testing.T) {
+	hash := func(floor float64) string {
+		cfg := &config.Config{}
+		cfg.Analysis.DecisionMode = "jev"
+		cfg.Analysis.Jev.Authority = config.JevAuthorityAuthoritative
+		cfg.Analysis.Jev.Model = "jev-latest"
+		cfg.Risk.MinRiskReward = floor
+		_, h, err := Encode(NewEffectiveConfig(cfg))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return h
+	}
+	if hash(2) == hash(3) {
+		t.Fatal("different risk/reward floors produced the same config hash")
+	}
+}

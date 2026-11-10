@@ -26,6 +26,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/execution"
 	"github.com/romeo-folie/trade-engine/internal/feedback"
 	"github.com/romeo-folie/trade-engine/internal/indicators"
+	"github.com/romeo-folie/trade-engine/internal/jev"
 	"github.com/romeo-folie/trade-engine/internal/knowledge"
 	"github.com/romeo-folie/trade-engine/internal/logger"
 	"github.com/romeo-folie/trade-engine/internal/portfolio"
@@ -104,6 +105,10 @@ type Engine struct {
 	// running in this process; the reaper never abandons them.
 	inflightSnapshotsMu sync.Mutex
 	inflightSnapshots   map[string]struct{}
+
+	// jevEvaluator is set when analysis.decision_mode is jev (#590).
+	jevEvaluator *jev.Evaluator
+	jevInitErr   error
 
 	// costGuardrail checks token spend against configured budgets and triggers
 	// auto-degrade when thresholds are crossed. Check() is called once per tick.
@@ -259,6 +264,11 @@ func New(cfg *config.Config, market data.MarketDataProvider, news data.NewsProvi
 		e.feedbackReviewer = feedback.NewReviewer(cfg.Feedback, bus, store.GetDB())
 	}
 
+	// Jev decision mode (#590): build the evaluator once. A failure is kept
+	// and surfaced by Run, which refuses to start a Jev mode it cannot honour.
+	if cfg.Analysis.JevEnabled() {
+		e.jevEvaluator, e.jevInitErr = newJevEvaluator(cfg)
+	}
 	return e
 }
 
@@ -276,6 +286,9 @@ func (e *Engine) Run(ctx context.Context) error {
 		return fmt.Errorf("engine: tick_interval_sec %d overflows time.Duration (max %d)", e.cfg.Engine.TickIntervalSec, maxTickIntervalSec)
 	}
 	interval := time.Duration(e.cfg.Engine.TickIntervalSec) * time.Second
+	if err := e.checkJevStartup(); err != nil {
+		return err
+	}
 
 	// Load display timezone for log formatting (internal scheduling remains in nyLoc).
 	displayTZ := e.cfg.Engine.LogTimezone
@@ -991,7 +1004,7 @@ func (e *Engine) runAnalysisWithProfile(
 		e.recordShortCircuitSnapshot(ctx, ticker, timeframe, strategy, strategies, decisionCutoff, scannerRunID, "indicators_missing")
 		return
 	}
-	if e.analyzer == nil || !e.analyzer.Primary().IsAvailable() {
+	if !e.decisionMakerAvailable() {
 		logger.Debug("analysis skipped — primary model not available", "ticker", ticker)
 		e.recordScannerEngineOutcome(ctx, scannerRunID, ticker, "model_unavailable", "", "")
 		e.recordShortCircuitSnapshot(ctx, ticker, timeframe, strategy, strategies, decisionCutoff, scannerRunID, "model_unavailable")
@@ -1280,6 +1293,9 @@ func (e *Engine) runAnalysisWithProfile(
 	// prompt render, so the recorded inputs are exactly what models saw.
 	snapshot.Canonicalize(&req)
 	snapshotID := e.beginDecisionSnapshot(ctx, req, missing, scannerRunID)
+	// Shadow Jev (#590) runs concurrently with the baseline on the identical
+	// frozen request; it is recorded, never executed.
+	shadow := e.startJevShadow(ctx, req)
 
 	impact := e.calculateImpactScore(ticker, snippets, candles)
 	routingSource := "legacy"
@@ -1304,9 +1320,14 @@ func (e *Engine) runAnalysisWithProfile(
 	// AnalyzeResult so downstream cost tracking and persistence stay shared.
 	var result analysis.AnalyzeResult
 	var err error
-	if e.cfg.Analysis.SpecialistModeEnabled {
+	var jevTrace *jev.Trace
+	switch {
+	case e.cfg.Analysis.JevAuthoritative():
+		// Jev is the sole decision maker: no analysts or arbiter run.
+		result, jevTrace, err = e.analyzeWithJev(ctx, req)
+	case e.cfg.Analysis.SpecialistModeEnabled:
 		result, err = e.analyzer.AnalyzeSpecialist(ctx, req, impact)
-	} else {
+	default:
 		result, err = e.analyzer.AnalyzeFull(ctx, req, impact)
 	}
 
@@ -1379,7 +1400,7 @@ func (e *Engine) runAnalysisWithProfile(
 	if err != nil {
 		logger.Warn("analysis failed", "ticker", ticker, "err", err.Error())
 		e.recordScannerEngineOutcome(ctx, scannerRunID, ticker, "analysis_failed", err.Error(), "")
-		e.completeDecisionSnapshot(ctx, snapshotID, result, nil, "", err, nil)
+		e.completeDecisionSnapshot(ctx, snapshotID, result, nil, "", err, nil, shadow.results(e, nil)...)
 		return
 	}
 	resp, meta := result.Response, result.Meta
@@ -1540,16 +1561,7 @@ func (e *Engine) runAnalysisWithProfile(
 			ctx, scannerRunID, ticker, "analysis_persistence_failed", err.Error(), "",
 		)
 	}
-	// Settle the snapshot with the exact decision handed to signal generation.
-	e.completeDecisionSnapshot(ctx, snapshotID, result, &snapshot.FinalOutput{
-		ResolutionPolicyVersion: analysis.ResolutionPolicyVersion,
-		Response:                resp,
-		LensAudit:               lensAudit,
-		DecisionPolicy:          result.DecisionPolicy,
-		FastPathed:              result.FastPathed,
-		Arbitrated:              result.Arbiter != nil && !result.FastPathed,
-		SupplementalBlocked:     supplementalBlocked,
-	}, analysisID, nil, err)
+	persistErr := err
 
 	// Phase 4: generate and potentially execute a signal from this analysis.
 	// Hand the pre-fetched openTrades (loaded by the SELL ownership short-circuit
@@ -1563,6 +1575,27 @@ func (e *Engine) runAnalysisWithProfile(
 		prefetchedOpenTrades, e.analysisSourceNode(result), scannerRunID,
 		pullbackCandidate, req.LensSet(),
 	)
+
+	// Settle the snapshot with the exact decision handed to signal generation.
+	// This runs after signal generation so that waiting (bounded) for a shadow
+	// Jev result can never delay the live signal.
+	policyVersion, _ := e.decisionVersions()
+	var policyTrace json.RawMessage
+	if jevTrace != nil {
+		policyTrace, _ = json.Marshal(jevTrace)
+	}
+	shadowResults := shadow.results(e, &resp)
+	e.completeDecisionSnapshot(ctx, snapshotID, result, &snapshot.FinalOutput{
+		ResolutionPolicyVersion: policyVersion,
+		Evaluator:               snapshot.Workflow(e.cfg),
+		PolicyTrace:             policyTrace,
+		Response:                resp,
+		LensAudit:               lensAudit,
+		DecisionPolicy:          result.DecisionPolicy,
+		FastPathed:              result.FastPathed,
+		Arbitrated:              result.Arbiter != nil && !result.FastPathed,
+		SupplementalBlocked:     supplementalBlocked,
+	}, analysisID, nil, persistErr, shadowResults...)
 
 	// Update material-change gate state for next tick.
 	latestClose := 0.0
@@ -1618,6 +1651,9 @@ func lensSelectionTelemetry(
 // final verdict. Web clients use this semantic ID to route live events across
 // the same nodes advertised by the topology snapshot.
 func (e *Engine) analysisSourceNode(result analysis.AnalyzeResult) string {
+	if e.cfg.Analysis.JevAuthoritative() {
+		return jevSourceNode
+	}
 	if e.cfg.Analysis.SpecialistModeEnabled {
 		return "specialist-risk-manager"
 	}
