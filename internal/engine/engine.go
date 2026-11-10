@@ -2230,6 +2230,15 @@ func (e *Engine) generateSignal(
 		// on the next normal tick.
 		return
 	}
+	if resp.Action != analysis.ActionBuy && resp.Action != analysis.ActionSell {
+		// SHORT/COVER (#599) are decided and recorded (the analysis row and
+		// decision snapshot keep them) but cannot become signals until short
+		// execution is supported. Refusing here keeps them out of the
+		// signal/risk/execution path entirely.
+		logger.Warn("signal not generated: action not executable by this build",
+			"ticker", ticker, "action", string(resp.Action))
+		return
+	}
 
 	// Current price = latest candle close.
 	var signalPrice float64
@@ -2764,6 +2773,23 @@ func executionSourceNode(fromQueue bool) string {
 // emitted event so the dashboard can animate the path the signal actually took;
 // it has no effect on execution itself.
 func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Signal, fromQueue bool) {
+	// Only BUY (open/add long) and SELL (exit long) are executable. Every
+	// other action — notably SHORT/COVER (#599) until short execution exists —
+	// is refused here, because the code below treats anything that is not
+	// SELL as a BUY. This is the last line of defence against a SHORT being
+	// placed as a long entry.
+	if sig.Action != string(analysis.ActionBuy) && sig.Action != string(analysis.ActionSell) {
+		reason := fmt.Sprintf("action %s is not executable by this build", sig.Action)
+		if err := store.UpdateSignalStatus(ctx, sigID, "blocked", reason); err != nil {
+			logger.Warn("update signal status", "id", sigID, "err", err)
+		}
+		logger.Error("signal blocked: non-executable action", "ticker", sig.Ticker, "action", sig.Action)
+		e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+			Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
+			BlockReason: reason, FailedCheck: "executable_action",
+		})
+		return
+	}
 	// Market-hours guard (#437): a tick that STARTS before the close can
 	// spend 20+ minutes in analysis and reach execution after 16:00 ET —
 	// 17% of recorded entries landed in the 16:00 hour. After-hours market

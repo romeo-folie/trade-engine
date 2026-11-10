@@ -308,6 +308,19 @@ risk:
   default_take_profit_pct: 4.0
   signal_expiry_min: 120       # Discard pending signals older than this
   stale_price_move_pct: 2.0    # Cancel signal if price moved >X% since generation
+  # Equity short selling (issue #599). Off by default. Every rule below is
+  # deterministic and fails closed; a short opens only from a flat position
+  # (no flips, no adding) and always carries a broker-side stop.
+  shorts:
+    enabled: false
+    allow_live: false                # live accounts also need this opt-in
+    size_pct: 1.5                    # incremental short size, % of the sizing base
+    max_gross_short_pct: 20          # total short market value, % of equity
+    max_ticker_short_pct: 5          # one ticker's short market value, % of equity
+    min_price: 5                     # never short below this share price
+    min_avg_dollar_volume: 20000000  # 20-session average daily dollar volume floor
+    earnings_blackout_days: 3        # no new short this many days before earnings
+    ssr_drop_pct: 10                 # SEC Rule 201 trigger: no new short while active
   trailing_stop:               # Server-side trailing stop manager (#322)
     enabled: true
     rule: atr                  # atr = hourly broker-stop ratchet; ema9 = exit on daily close below daily 9-EMA

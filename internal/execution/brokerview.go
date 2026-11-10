@@ -56,6 +56,13 @@ type StockAsset struct {
 	TradableAvailable     bool
 	MarginableAvailable   bool
 	FractionableAvailable bool
+	// Shortable and EasyToBorrow are required for a short (issue #599). They
+	// are optional for longs, so their availability is tracked separately and
+	// a missing field makes the asset ineligible to short, never a long error.
+	Shortable             bool
+	EasyToBorrow          bool
+	ShortableAvailable    bool
+	EasyToBorrowAvailable bool
 	FetchedAt             time.Time
 }
 

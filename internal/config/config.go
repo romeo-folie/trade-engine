@@ -368,6 +368,65 @@ type AnalysisConfig struct {
 	Jev JevConfig `yaml:"jev"`
 }
 
+// ShortsConfig governs opening equity shorts (issue #599). Nothing here is
+// delegated to a model: a short is only eligible when every rule passes on
+// fresh broker, asset, and market data.
+type ShortsConfig struct {
+	// Enabled turns short selling on. Default false: no short is ever opened.
+	Enabled bool `yaml:"enabled"`
+	// AllowLive must also be true before shorts open on a live account.
+	AllowLive bool `yaml:"allow_live"`
+	// SizePct is the incremental short size as a percent of the sizing base.
+	SizePct float64 `yaml:"size_pct"`
+	// MaxGrossShortPct caps total short market value as a percent of equity.
+	MaxGrossShortPct float64 `yaml:"max_gross_short_pct"`
+	// MaxTickerShortPct caps one ticker's short market value as a percent of equity.
+	MaxTickerShortPct float64 `yaml:"max_ticker_short_pct"`
+	// MinPrice is the lowest share price that may be shorted.
+	MinPrice float64 `yaml:"min_price"`
+	// MinAvgDollarVolume is the minimum 20-session average daily dollar volume.
+	MinAvgDollarVolume float64 `yaml:"min_avg_dollar_volume"`
+	// EarningsBlackoutDays blocks new shorts this many calendar days before a
+	// scheduled earnings date (and on the date itself).
+	EarningsBlackoutDays int `yaml:"earnings_blackout_days"`
+	// SSRDropPct is the intraday decline from the prior close that triggers
+	// the SEC Rule 201 short-sale restriction (10 by rule). New shorts are not
+	// opened while it applies.
+	SSRDropPct float64 `yaml:"ssr_drop_pct"`
+}
+
+// ValidateShortsConfig returns configuration errors for short selling.
+func ValidateShortsConfig(s ShortsConfig) []string {
+	if !s.Enabled {
+		return nil
+	}
+	var errs []string
+	positive := map[string]float64{
+		"size_pct": s.SizePct, "max_gross_short_pct": s.MaxGrossShortPct,
+		"max_ticker_short_pct": s.MaxTickerShortPct, "min_price": s.MinPrice,
+		"ssr_drop_pct": s.SSRDropPct,
+	}
+	for name, v := range positive {
+		if !(v > 0) || math.IsInf(v, 0) {
+			errs = append(errs, fmt.Sprintf("risk.shorts.%s must be positive and finite", name))
+		}
+	}
+	if s.MinAvgDollarVolume < 0 || math.IsNaN(s.MinAvgDollarVolume) || math.IsInf(s.MinAvgDollarVolume, 0) {
+		errs = append(errs, "risk.shorts.min_avg_dollar_volume must be >= 0 and finite")
+	}
+	if s.EarningsBlackoutDays < 0 {
+		errs = append(errs, "risk.shorts.earnings_blackout_days must be >= 0")
+	}
+	if s.MaxTickerShortPct > s.MaxGrossShortPct {
+		errs = append(errs, "risk.shorts.max_ticker_short_pct must not exceed max_gross_short_pct")
+	}
+	if s.SSRDropPct > 100 {
+		errs = append(errs, "risk.shorts.ssr_drop_pct must be <= 100")
+	}
+	sort.Strings(errs)
+	return errs
+}
+
 // Jev authorities.
 const (
 	// JevAuthorityShadow runs Jev beside the configured analyst workflow;
@@ -2038,6 +2097,10 @@ type RiskConfig struct {
 	// confirmation, momentum anti-chase, and first-tick deferral. All gates
 	// default OFF; each is independent.
 	EntryGates EntryGatesConfig `yaml:"entry_gates"`
+
+	// Shorts configures equity short selling (issue #599). Disabled by
+	// default; every eligibility rule is deterministic and fails closed.
+	Shorts ShortsConfig `yaml:"shorts"`
 }
 
 // EntryGatesConfig holds per-strategy entry-quality gates. Zero values
@@ -2700,6 +2763,7 @@ func geminiOutputLimit(model string) int {
 func Validate(cfg *Config) []string {
 	var errs []string
 	errs = append(errs, ValidateJevConfig(cfg.Analysis)...)
+	errs = append(errs, ValidateShortsConfig(cfg.Risk.Shorts)...)
 	if cfg.Engine.MaxWatchlist <= 0 {
 		errs = append(errs, "engine.max_watchlist must be > 0")
 	}
