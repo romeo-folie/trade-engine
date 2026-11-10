@@ -1061,3 +1061,57 @@ func TestShortSignalsAreRequeuedAndSwept(t *testing.T) {
 		t.Fatalf("admission-retry SHORT was not swept: %+v", got)
 	}
 }
+
+// Codex round 3: containment cancels the unprotected parent before any
+// database read, so a trade that cannot be loaded never leaves the entry
+// filling. Only the flatten is withheld.
+func TestContainmentCancelsParentEvenWithoutTradeRow(t *testing.T) {
+	requireEngineDB(t)
+	exec := &fakeBracketExec{statuses: map[string]execution.OrderResult{
+		"orphan-parent": {Status: "cancelled", ChildOrders: nil},
+	}}
+	e := newBracketTestEngine(exec)
+	missingTrade := "00000000-0000-0000-0000-000000000000"
+	e.containUnprotectedBrokerEntry(context.Background(), missingTrade, "orphan-parent", "NOTRADE", "missing stop")
+	if len(exec.cancelled) == 0 || exec.cancelled[0] != "orphan-parent" {
+		t.Fatalf("cancelled = %v; the parent must be cancelled before any trade lookup", exec.cancelled)
+	}
+	if len(exec.placed) != 0 {
+		t.Fatalf("flattened without a known trade: %+v", exec.placed)
+	}
+}
+
+// Containing an unprotected short flattens with a BUY, never a SELL.
+func TestContainmentFlattensShortWithBuy(t *testing.T) {
+	requireEngineDB(t)
+	ctx := context.Background()
+	ticker := uniqueTicker("SHCT")
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: ticker, Direction: "short", Strategy: "test",
+		EntryPrice: 100, Quantity: 2, StopLoss: 105, TakeProfit: 90, Status: "open",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), `DELETE FROM orders WHERE trade_id=$1::uuid`, tradeID)
+		_, _ = store.GetDB().Exec(context.Background(), `DELETE FROM trades WHERE id=$1::uuid`, tradeID)
+	})
+	parentID := "short-unprotected-" + tradeID[:8]
+	exec := &fakeBracketExec{
+		statuses: map[string]execution.OrderResult{
+			parentID: {Status: "filled", ChildOrders: []execution.OrderLeg{
+				{BrokerOrderID: parentID + "-tp", Type: "limit", Status: "accepted", Quantity: 2, RemainingQty: 2},
+				{BrokerOrderID: parentID + "-sl", Type: "stop", Status: "accepted", Quantity: 2, RemainingQty: 2},
+			}},
+			parentID + "-tp": {Status: "cancelled"},
+			parentID + "-sl": {Status: "cancelled"},
+		},
+		placeRes: execution.OrderResult{BrokerOrderID: "short-containment-exit", Status: "accepted"},
+	}
+	e := newBracketTestEngine(exec)
+	e.containUnprotectedBrokerEntry(ctx, tradeID, parentID, ticker, "missing stop")
+	if len(exec.placed) != 1 || exec.placed[0].Side != execution.OrderSideBuy || exec.placed[0].Quantity != 2 {
+		t.Fatalf("short containment flatten = %+v; want a 2-share BUY", exec.placed)
+	}
+}

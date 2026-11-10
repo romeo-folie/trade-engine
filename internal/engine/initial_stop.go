@@ -79,6 +79,9 @@ func (e *Engine) ensureUncappedProtectiveStopLocked(
 	if trade == nil {
 		return fmt.Errorf("protective stop: trade %s not found", tradeID)
 	}
+	if trade.Direction != "long" && trade.Direction != "short" {
+		return fmt.Errorf("protective stop: trade %s has unknown direction %q", tradeID, trade.Direction)
+	}
 	exitSide := execution.ExitSideForDirection(trade.Direction)
 
 	intentKey := protectiveStopIntentKey(tradeID, stopPrice, quantity)

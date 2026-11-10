@@ -27,16 +27,9 @@ const brokerProtectionVerificationAttempts = 5
 // path. An ambiguous cancellation keeps the trade owned by this containment
 // attempt and is retried; it never falls back to application-managed exits.
 func (e *Engine) containUnprotectedBrokerEntry(ctx context.Context, tradeID, entryBrokerOrderID, ticker, reason string) {
-	// Flatten on the position's own closing side (#599). If the direction is
-	// unknown, do not guess: a flatten on the wrong side would double the
-	// exposure. The failure is loud so an operator can intervene.
-	trade, err := store.GetTradeByID(ctx, tradeID)
-	if err != nil || trade == nil {
-		logger.Error("broker protection: cannot determine trade direction for containment; not flattening",
-			"trade_id", tradeID, "ticker", ticker, "err", err)
-		return
-	}
-	exitSide := execution.ExitSideForDirection(trade.Direction)
+	// Cancelling the parent needs no database read and always comes first,
+	// so a DB outage can never leave an unprotected entry filling. Only the
+	// flatten needs the trade's direction (#599).
 	const attempts = 3
 	for attempt := 0; attempt < attempts; attempt++ {
 		if err := e.executor.CancelOrder(ctx, entryBrokerOrderID); err != nil {
@@ -68,6 +61,15 @@ func (e *Engine) containUnprotectedBrokerEntry(ctx context.Context, tradeID, ent
 		if err != nil || trade == nil || trade.Status != "open" || trade.Quantity <= 1e-9 {
 			return
 		}
+		// Flatten on the position's own closing side. If the direction is
+		// unknown, do not guess: a wrong-side flatten would double the
+		// exposure. The parent is already cancelled; an operator intervenes.
+		if trade.Direction != "long" && trade.Direction != "short" {
+			logger.Error("broker protection: unknown trade direction; parent cancelled but not flattening",
+				"trade_id", tradeID, "ticker", ticker, "direction", trade.Direction)
+			return
+		}
+		exitSide := execution.ExitSideForDirection(trade.Direction)
 		// The parent snapshot is the only authoritative source for bracket
 		// children when projection failed. Clear it before claiming the trade:
 		// if confirmation is uncertain, leave the trade open so the next sweep
