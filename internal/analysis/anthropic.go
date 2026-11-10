@@ -108,14 +108,21 @@ func (c *AnthropicClient) Analyze(ctx context.Context, req AnalysisRequest) (Ana
 		},
 	}
 
+	// The attempted call's identity, prompt, and settings are known before
+	// sending; every failure below returns them so audits keep the attempt
+	// (issue #589).
+	meta := ModelCallMeta{
+		Provider: "anthropic", Model: c.cfg.Model, PromptHash: promptHash, RawPrompt: rawPrompt,
+		IndicatorJSON: indicatorJSON, RequestParams: requestParams(body, "system", "messages"),
+	}
 	bodyBytes, err := json.Marshal(body)
 	if err != nil {
-		return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("marshal request: %w", err)
+		return AnalysisResponse{}, meta, fmt.Errorf("marshal request: %w", err)
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, anthropicAPIURL, bytes.NewReader(bodyBytes))
 	if err != nil {
-		return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("build request: %w", err)
+		return AnalysisResponse{}, meta, fmt.Errorf("build request: %w", err)
 	}
 	httpReq.Header.Set("x-api-key", c.apiKey)
 	httpReq.Header.Set("anthropic-version", anthropicVersion)
@@ -124,22 +131,24 @@ func (c *AnthropicClient) Analyze(ctx context.Context, req AnalysisRequest) (Ana
 	start := time.Now()
 	resp, err := c.httpClient.Do(httpReq)
 	latencyMs := time.Since(start).Milliseconds()
+	meta.LatencyMs = latencyMs
 	if err != nil {
-		return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("anthropic request: %w", err)
+		return AnalysisResponse{}, meta, fmt.Errorf("anthropic request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("read response: %w", err)
+		return AnalysisResponse{}, meta, fmt.Errorf("read response: %w", err)
 	}
 
 	if resp.StatusCode >= 400 {
-		return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("anthropic API %d: %s", resp.StatusCode, bytes.TrimSpace(respBytes[:min(512, len(respBytes))]))
+		return AnalysisResponse{}, meta, fmt.Errorf("anthropic API %d: %s", resp.StatusCode, bytes.TrimSpace(respBytes[:min(512, len(respBytes))]))
 	}
 
 	// Parse the Anthropic response envelope.
 	var apiResp struct {
+		Model   string `json:"model"`
 		Content []struct {
 			Type string `json:"type"`
 			Text string `json:"text"`
@@ -150,7 +159,7 @@ func (c *AnthropicClient) Analyze(ctx context.Context, req AnalysisRequest) (Ana
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(respBytes, &apiResp); err != nil {
-		return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("parse anthropic response: %w", err)
+		return AnalysisResponse{}, meta, fmt.Errorf("parse anthropic response: %w", err)
 	}
 
 	var rawText string
@@ -161,17 +170,9 @@ func (c *AnthropicClient) Analyze(ctx context.Context, req AnalysisRequest) (Ana
 		}
 	}
 
-	meta := ModelCallMeta{
-		Provider:      "anthropic",
-		Model:         c.cfg.Model,
-		PromptHash:    promptHash,
-		RawPrompt:     rawPrompt,
-		RawResponse:   rawText,
-		InputTokens:   apiResp.Usage.InputTokens,
-		OutputTokens:  apiResp.Usage.OutputTokens,
-		LatencyMs:     latencyMs,
-		IndicatorJSON: indicatorJSON,
-	}
+	meta.RawResponse = rawText
+	meta.InputTokens, meta.OutputTokens = apiResp.Usage.InputTokens, apiResp.Usage.OutputTokens
+	meta.ResolvedModel = apiResp.Model
 
 	analysis, err := extractAnalysisJSON(rawText)
 	if err != nil {

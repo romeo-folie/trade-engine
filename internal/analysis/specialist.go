@@ -304,6 +304,15 @@ func analyzeSpecialistRole(
 	fallbackCtx, cancelFallback := context.WithTimeout(ctx, fallbackTimeout)
 	fallbackResp, fallbackMeta, fallbackErr := fallback.Analyze(fallbackCtx, req)
 	cancelFallback()
+	// The failed primary is superseded, not forgotten: carry its attempt so
+	// audits keep its identity, settings, and error.
+	if meta.Provider == "" {
+		meta.Provider, meta.Model = primary.ProviderName(), primary.ModelName()
+	}
+	fallbackMeta.PriorAttempts = append([]CallAttempt{{Meta: meta, Error: err.Error()}}, fallbackMeta.PriorAttempts...)
+	if fallbackMeta.Provider == "" {
+		fallbackMeta.Provider, fallbackMeta.Model = fallback.ProviderName(), fallback.ModelName()
+	}
 	if fallbackErr != nil {
 		return fallback, fallbackResp, fallbackMeta,
 			fmt.Errorf("primary %s/%s failed: %w; fallback %s/%s failed: %w",

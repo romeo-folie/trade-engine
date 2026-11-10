@@ -101,10 +101,11 @@ func GetRecentNews(ctx context.Context, ticker string, since time.Time) ([]data.
 	rows, err := GetDB().Query(ctx, `
 		SELECT external_id, headline, COALESCE(summary,''), COALESCE(source,''),
 		       COALESCE(url,''), published_at, COALESCE(tickers,'{}'),
-		       COALESCE(sentiment_score, 0)
+		       COALESCE(sentiment_score, 0), created_at
 		FROM news_items
 		WHERE $1 = ANY(tickers) AND published_at >= $2
-		ORDER BY published_at DESC
+		-- id breaks published_at ties so prompt order is deterministic.
+		ORDER BY published_at DESC, id
 	`, ticker, since.UTC())
 	if err != nil {
 		return nil, err
@@ -116,7 +117,7 @@ func GetRecentNews(ctx context.Context, ticker string, since time.Time) ([]data.
 		var n data.NewsItem
 		var extID *string
 		if err := rows.Scan(&extID, &n.Headline, &n.Summary, &n.Source,
-			&n.URL, &n.PublishedAt, &n.Tickers, &n.SentimentScore); err != nil {
+			&n.URL, &n.PublishedAt, &n.Tickers, &n.SentimentScore, &n.IngestedAt); err != nil {
 			return nil, err
 		}
 		if extID != nil {

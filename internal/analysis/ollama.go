@@ -81,60 +81,61 @@ func (c *OllamaClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 			"num_predict": maxTokens,
 		},
 	}
+	// The attempted call's identity, prompt, and settings are known before
+	// sending; every failure below returns them so audits keep the attempt
+	// (issue #589).
+	meta := ModelCallMeta{
+		Provider: "ollama", Model: c.cfg.Model, PromptHash: promptHash, RawPrompt: combinedPrompt,
+		IndicatorJSON: indicatorJSON, RequestParams: requestParams(body, "system", "prompt"),
+	}
 	bodyBytes, err := json.Marshal(body)
 	if err != nil {
-		return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("ollama marshal: %w", err)
+		return AnalysisResponse{}, meta, fmt.Errorf("ollama marshal: %w", err)
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/generate", bytes.NewReader(bodyBytes))
 	if err != nil {
-		return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("ollama build request: %w", err)
+		return AnalysisResponse{}, meta, fmt.Errorf("ollama build request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 
 	start := time.Now()
 	resp, err := c.httpClient.Do(httpReq)
 	latencyMs := time.Since(start).Milliseconds()
+	meta.LatencyMs = latencyMs
 	if err != nil {
-		return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("ollama request: %w", err)
+		return AnalysisResponse{}, meta, fmt.Errorf("ollama request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBytes, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 	if err != nil {
-		return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("ollama read response: %w", err)
+		return AnalysisResponse{}, meta, fmt.Errorf("ollama read response: %w", err)
 	}
 	if resp.StatusCode >= 400 {
 		snippet := respBytes
 		if len(snippet) > 512 {
 			snippet = snippet[:512]
 		}
-		return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("ollama API %d: %s", resp.StatusCode, bytes.TrimSpace(snippet))
+		return AnalysisResponse{}, meta, fmt.Errorf("ollama API %d: %s", resp.StatusCode, bytes.TrimSpace(snippet))
 	}
 
 	var apiResp struct {
+		Model           string `json:"model"`
 		Response        string `json:"response"`
 		PromptEvalCount int    `json:"prompt_eval_count"`
 		EvalCount       int    `json:"eval_count"`
 	}
 	if err := json.Unmarshal(respBytes, &apiResp); err != nil {
-		return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("ollama parse response: %w", err)
+		return AnalysisResponse{}, meta, fmt.Errorf("ollama parse response: %w", err)
 	}
 	if strings.TrimSpace(apiResp.Response) == "" {
-		return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("ollama response empty")
+		return AnalysisResponse{}, meta, fmt.Errorf("ollama response empty")
 	}
 
-	meta := ModelCallMeta{
-		Provider:      "ollama",
-		Model:         c.cfg.Model,
-		PromptHash:    promptHash,
-		RawPrompt:     combinedPrompt,
-		RawResponse:   apiResp.Response,
-		InputTokens:   apiResp.PromptEvalCount,
-		OutputTokens:  apiResp.EvalCount,
-		LatencyMs:     latencyMs,
-		IndicatorJSON: indicatorJSON,
-	}
+	meta.RawResponse = apiResp.Response
+	meta.InputTokens, meta.OutputTokens = apiResp.PromptEvalCount, apiResp.EvalCount
+	meta.ResolvedModel = apiResp.Model
 
 	analysisResp, err := extractAnalysisJSON(apiResp.Response)
 	if err != nil {

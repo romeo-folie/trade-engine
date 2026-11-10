@@ -75,10 +75,14 @@ no longer issues a separate confirmation request.
 
 ## Audit Metadata
 
-`ModelCallMeta` captures provider/model identity, prompt hash, raw prompt and
-response, token counts, latency, and the indicator snapshot. The store retains
-the final metadata plus each analyst's metadata (`ensemble_results`), the
-arbiter call, selected/rejected lenses, regime, scanner lineage, and the compact
-timeframe-workflow audit. Known replay gaps, including failed attempts, the
-unrecorded arbiter permutation, and mutable candles/news, are inventoried in
+`ModelCallMeta` captures provider/model identity (requested and provider-reported), prompt hash, raw prompt
+and response, the non-prompt request parameters sent, token counts, latency, and the indicator snapshot. The
+store retains the final metadata plus each analyst's metadata (`ensemble_results`), the arbiter call and its
+recorded label ordering, selected/rejected lenses, regime, scanner lineage, and the compact timeframe-workflow
+audit.
+
+Every engine decision attempt also writes an immutable decision snapshot (`internal/analysis/snapshot`,
+`decision_snapshots` / `decision_stage_calls`). The snapshot holds the canonical inputs, explicit missing blocks,
+the sanitized effective configuration, versioned identities, every stage call (including failed attempts), and
+the final engine-resolved output. The contract and lifecycle are described in
 `docs/issue-589-decision-replay.md`.

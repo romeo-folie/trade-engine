@@ -40,7 +40,7 @@ func RenderTimeframeContexts(contexts []TimeframeContext) string {
 		b.WriteString("Recent OHLCV (most recent first):\n")
 		for _, candle := range context.RecentCandles {
 			b.WriteString(fmt.Sprintf("%s | O %.2f H %.2f L %.2f C %.2f V %d\n",
-				candle.Timestamp.Format("2006-01-02 15:04"), candle.Open, candle.High, candle.Low, candle.Close, candle.Volume))
+				candle.Timestamp.UTC().Format("2006-01-02 15:04"), candle.Open, candle.High, candle.Low, candle.Close, candle.Volume))
 		}
 	}
 	return b.String()

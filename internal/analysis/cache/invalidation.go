@@ -36,8 +36,8 @@ type InvalidationInput struct {
 	CurrentRSIBucket int
 
 	// High-impact news: invalidate when news hash changed and articles > threshold.
-	NewsChanged         bool
-	NewsArticleCount    int
+	NewsChanged          bool
+	NewsArticleCount     int
 	HighImpactNewsThresh int // default 3 articles
 
 	// Risk event: open position count changed since cached.

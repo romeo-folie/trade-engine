@@ -151,6 +151,8 @@ func (r AnalysisRequest) LensSet() []string {
 // used for prompt injection.  Mirrors store.SimilarAnalysis without importing
 // the store package into the analysis layer.
 type SimilarSetup struct {
+	// AnalysisID is the matched analyses row (provenance only; not rendered).
+	AnalysisID      string
 	Ticker          string
 	Action          string
 	Confidence      float64
@@ -213,6 +215,52 @@ type ModelCallMeta struct {
 	OutputTokens  int
 	LatencyMs     int64
 	IndicatorJSON []byte // JSONB snapshot
+	// ResolvedModel is the model identity the provider reports having served
+	// (issue #589). It can differ from Model, the configured request, when a
+	// provider aliases or upgrades a model name. Empty when not reported.
+	ResolvedModel string `json:",omitempty"`
+	// RequestParams are the non-prompt request fields actually sent (model,
+	// temperature, token limits, reasoning settings). Prompt bodies are
+	// excluded; they are already in RawPrompt.
+	RequestParams map[string]any `json:",omitempty"`
+	// Retries are transport attempts of this same call that failed
+	// transiently and were retried (for example a Gemini 429/503), oldest
+	// first. The final attempt is described by the rest of this struct.
+	Retries []TransportAttempt `json:",omitempty"`
+	// PriorAttempts are calls to other models that failed before this one was
+	// used (for example a specialist's primary before its registry fallback),
+	// oldest first. Without them a successful fallback would erase the failed
+	// primary's identity, settings, and error (issue #589).
+	PriorAttempts []CallAttempt `json:",omitempty"`
+}
+
+// TransportAttempt is one retried transport-level failure of a model call.
+type TransportAttempt struct {
+	StatusCode int    `json:",omitempty"`
+	Error      string
+	LatencyMs  int64
+}
+
+// CallAttempt is a complete model call that failed and was superseded.
+type CallAttempt struct {
+	Meta  ModelCallMeta
+	Error string
+}
+
+// requestParams copies a provider request body without its prompt-bearing
+// keys, for audit. Nested maps are retained as-is (they hold settings only).
+func requestParams(body map[string]any, promptKeys ...string) map[string]any {
+	skip := make(map[string]bool, len(promptKeys))
+	for _, k := range promptKeys {
+		skip[k] = true
+	}
+	out := make(map[string]any, len(body))
+	for k, v := range body {
+		if !skip[k] {
+			out[k] = v
+		}
+	}
+	return out
 }
 
 // ModelProvider is the interface every LLM adapter must implement.
@@ -286,6 +334,10 @@ type NewsSnippet struct {
 	Source      string
 	PublishedAt time.Time
 	Sentiment   string // bullish | bearish | neutral
+	// ExternalID and IngestedAt are provenance for decision snapshots; they
+	// are never rendered into prompts.
+	ExternalID string
+	IngestedAt time.Time
 }
 
 // PortfolioContext carries current portfolio state for the prompt.
@@ -362,8 +414,23 @@ type AnalyzeResult struct {
 	Meta           ModelCallMeta
 	AnalystResults []AnalystResult
 	Arbiter        *ArbiterResult // nil when fast-pathed or single-model
+	// FailedArbiter records an arbiter call that was made but failed, after
+	// which resolution fell back to majority vote. Arbiter stays nil on that
+	// path; this field exists so audits can tell a failed arbitration from a
+	// decision that never invoked the arbiter (issue #589).
+	FailedArbiter  *FailedArbiterCall
 	FastPathed     bool
 	DecisionPolicy *DecisionPolicyAudit
+}
+
+// FailedArbiterCall is the evidence of an arbiter invocation that errored.
+type FailedArbiterCall struct {
+	Provider      string
+	Model         string
+	Meta          ModelCallMeta
+	PolicyVersion string
+	Ordering      []ArbiterSlot
+	Err           error
 }
 
 // DecisionPolicyAudit records deterministic topology constraints applied after

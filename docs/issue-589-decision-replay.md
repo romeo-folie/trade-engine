@@ -124,6 +124,21 @@ A replay record must never be served from it.
 
 ### 3.1 Decision snapshot (v1)
 
+> **Implemented in step 3.** `migrations/106_decision_snapshots.sql`, `internal/store/decision_snapshots.go` and
+> `internal/analysis/snapshot` are authoritative. Where they differ from the sketch below:
+> * stage calls store the single `raw_prompt` the adapter recorded instead of separate system/user columns;
+> * `request_params` holds the non-prompt fields actually sent (from `ModelCallMeta.RequestParams`), not config;
+> * snapshots also record `timeframe` and `completed_at`;
+> * immutability is enforced by triggers rather than role grants;
+> * stale `pending` rows are abandoned at startup and every 15 minutes, using a threshold of the larger of
+>   30 minutes and twice the sum of every configured model timeout. This process's in-flight snapshots
+>   are never abandoned, and every snapshot write is time-bounded;
+> * every invocation gets its own row. Within a `(stage, ordinal)`, attempts are numbered in call order:
+>   superseded calls to other models (for example a specialist primary before its fallback) come first,
+>   each followed by its retried transport attempts (for example a Gemini 429/503, marked
+>   `extra.kind = "transport_retry"`). The final call has the highest attempt number. Retry rows omit the
+>   prompt, which is stored once on the call it retried.
+
 There is one immutable row per decision attempt, written *before* any model
 call, plus one row per stage call. Schema sketch:
 
@@ -196,7 +211,7 @@ order, so every slice has a declared canonical order, which is applied once
 * bars: timestamp descending (as the prompt shows them);
 * news: `published_at` descending, then `news_item_id`;
 * positions: ticker, then side;
-* similar analyses: score descending, then analysis id;
+* similar analyses: as returned by the pgvector search (distance order, deterministic for a fixed table);
 * lens menus: kept in profile order, because order is meaningful there (the
   profile owns it);
 * `missing[]`: block name. Floats are kept as-is (no
@@ -279,9 +294,9 @@ Both refuse a snapshot whose `schema_version`, `policy_version` or
 
 | Step | Change | Gate |
 |---|---|---|
-| 1 | This document. README correction. | Docs. |
-| 2 | Deterministic resolution: identity ordering, seeded and recorded arbiter permutation, `AnalystResult` error serialized as a string, injected cutoff clock for news selection and prompt ages. | Unit tests for latency-independence, fixed permutation, and the error string in `ensemble_results`. |
-| 3 | `decision_snapshots` + `decision_stage_calls` migration. Capture in `runAnalysisWithProfile` (including failed and short-circuited attempts). `code_revision` from `debug.ReadBuildInfo`. Exclude from retention. | Integration tests: completed, failed, and partial-ensemble attempts all produce snapshot rows. |
+| 1 ✅ | This document. README correction. | Docs. |
+| 2 ✅ | Deterministic resolution: identity ordering, seeded and recorded arbiter permutation, `AnalystResult` error serialized as a string, injected cutoff clock for news selection and prompt ages. | Unit tests for latency-independence, fixed permutation, and the error string in `ensemble_results`. |
+| 3 ✅ | `decision_snapshots` + `decision_stage_calls` migration. Capture in `runAnalysisWithProfile` (including failed and short-circuited attempts). `code_revision` from `debug.ReadBuildInfo`. Exclude from retention. | Integration tests: completed, failed, and partial-ensemble attempts all produce snapshot rows. |
 | 4 | `internal/replay` recorded-answer replay plus a CLI subcommand. | Same hash on recorded replay. Changed input or policy gives a distinct identity. |
 | 5 | Fresh-inference harness and repeatability report. | Measured separately. Not a CI gate. |
 

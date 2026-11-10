@@ -9,17 +9,17 @@ import (
 func baseInvalidation() cache.InvalidationInput {
 	return cache.InvalidationInput{
 		Fingerprint:          "fp1",
-		CachedPrice:         100.0,
-		CurrentPrice:        100.0,
-		PriceMoveThresh:     0.75,
-		CachedRSIBucket:     50,
-		CurrentRSIBucket:    50,
-		NewsChanged:         false,
-		NewsArticleCount:    0,
+		CachedPrice:          100.0,
+		CurrentPrice:         100.0,
+		PriceMoveThresh:      0.75,
+		CachedRSIBucket:      50,
+		CurrentRSIBucket:     50,
+		NewsChanged:          false,
+		NewsArticleCount:     0,
 		HighImpactNewsThresh: 3,
-		CachedOpenPositions: 2,
+		CachedOpenPositions:  2,
 		CurrentOpenPositions: 2,
-		TradeExecuted:       false,
+		TradeExecuted:        false,
 	}
 }
 

@@ -11,7 +11,7 @@ import (
 // NewsItem represents a single news article from any news provider.
 // Fields map to the news_items table.
 type NewsItem struct {
-	ExternalID     string    // provider-supplied unique ID (used for deduplication)
+	ExternalID     string // provider-supplied unique ID (used for deduplication)
 	Headline       string
 	Summary        string
 	Source         string
@@ -19,6 +19,10 @@ type NewsItem struct {
 	PublishedAt    time.Time
 	Tickers        []string
 	SentimentScore float64 // 0 if provider doesn't supply sentiment
+	// IngestedAt is when this store first recorded the article (news_items
+	// created_at). Zero for items that did not come from the store. A newly
+	// ingested old story is distinguishable from a new event (issue #589).
+	IngestedAt time.Time
 }
 
 // NewsProvider is the interface all news data adapters must satisfy.
@@ -27,7 +31,6 @@ type NewsProvider interface {
 	// FetchNews retrieves news items for a specific ticker published after 'since'.
 	FetchNews(ctx context.Context, ticker string, since time.Time) ([]NewsItem, error)
 }
-
 
 // NewsAggregator fans out to multiple NewsProvider implementations and
 // aggregates their results with deduplication.
@@ -43,8 +46,8 @@ func NewNewsAggregator(providers ...NewsProvider) *NewsAggregator {
 // FetchNews queries all providers and returns a deduplicated, newest-first list.
 //
 // Dedup key priority:
-//   1) URL (if present)
-//   2) Headline (case-insensitive, trimmed)
+//  1. URL (if present)
+//  2. Headline (case-insensitive, trimmed)
 //
 // Provider errors are isolated: failures from one provider do not suppress
 // successful results from others. If all providers fail, an aggregated error

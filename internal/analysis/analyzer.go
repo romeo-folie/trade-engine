@@ -54,6 +54,13 @@ func NewAnalyzer(cfg config.ModelsConfig, bus *events.Bus) *Analyzer {
 	return &Analyzer{analysts: analysts, arbiter: arbiter, cfg: cfg, bus: bus}
 }
 
+// NewAnalyzerWithProviders builds an Analyzer around already-constructed
+// providers. Engine-level tests use it to drive the real analysis path with
+// deterministic fakes; production code builds providers from config.
+func NewAnalyzerWithProviders(cfg config.ModelsConfig, analysts []ModelProvider, arbiter ModelProvider, bus *events.Bus) *Analyzer {
+	return &Analyzer{analysts: append([]ModelProvider(nil), analysts...), arbiter: arbiter, cfg: cfg, bus: bus}
+}
+
 // Primary returns the first configured analyst for backward compat.
 func (a *Analyzer) Primary() ModelProvider {
 	if len(a.analysts) == 0 {
@@ -156,7 +163,9 @@ func (a *Analyzer) AnalyzeFull(ctx context.Context, req AnalysisRequest, impact 
 		logger.Warn("no arbiter configured — falling back to majority vote", "ticker", req.Ticker)
 		resp, ok := majorityVote(results)
 		if !ok {
-			return AnalyzeResult{}, fmt.Errorf("ensemble: no majority among %d analysts", len(results))
+			// Keep the analyst calls: they were made (and paid for) even
+			// though no decision could be resolved.
+			return AnalyzeResult{AnalystResults: results}, fmt.Errorf("ensemble: no majority among %d analysts", len(results))
 		}
 		return AnalyzeResult{Response: resp, Meta: primaryMeta(results), AnalystResults: results}, nil
 	}
@@ -164,11 +173,19 @@ func (a *Analyzer) AnalyzeFull(ctx context.Context, req AnalysisRequest, impact 
 	arbResult, err := Arbitrate(ctx, a.arbiter, req, results)
 	if err != nil {
 		logger.Warn("arbiter failed — falling back to majority vote", "ticker", req.Ticker, "err", err)
+		var failed *FailedArbiterCall
+		if arbResult.Meta.Provider != "" { // the call was actually made
+			failed = &FailedArbiterCall{
+				Provider: arbResult.Meta.Provider, Model: arbResult.Meta.Model, Meta: arbResult.Meta,
+				PolicyVersion: arbResult.PolicyVersion, Ordering: arbResult.Ordering, Err: err,
+			}
+		}
 		resp, ok := majorityVote(results)
 		if !ok {
-			return AnalyzeResult{}, fmt.Errorf("ensemble: arbiter failed and no majority: %w", err)
+			return AnalyzeResult{AnalystResults: results, FailedArbiter: failed},
+				fmt.Errorf("ensemble: arbiter failed and no majority: %w", err)
 		}
-		return AnalyzeResult{Response: resp, Meta: primaryMeta(results), AnalystResults: results}, nil
+		return AnalyzeResult{Response: resp, Meta: primaryMeta(results), AnalystResults: results, FailedArbiter: failed}, nil
 	}
 
 	logger.Info("ensemble arbitrated", "ticker", req.Ticker, "action", string(arbResult.Final.Action), "dissent", arbResult.DissentSummary != "")

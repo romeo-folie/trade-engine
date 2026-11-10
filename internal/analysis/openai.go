@@ -142,15 +142,22 @@ func (c *OpenAIClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 		body["max_tokens"] = maxTokens
 		body["temperature"] = temperature
 	}
+	// The attempted call's identity, prompt, and settings are known before
+	// sending; every failure below returns them so audits keep the attempt
+	// (issue #589).
+	meta := ModelCallMeta{
+		Provider: c.ProviderName(), Model: c.cfg.Model, PromptHash: promptHash, RawPrompt: rawPrompt,
+		IndicatorJSON: indicatorJSON, RequestParams: requestParams(body, "messages"),
+	}
 	provider := c.ProviderName()
 	bodyBytes, err := json.Marshal(body)
 	if err != nil {
-		return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("%s marshal: %w", provider, err)
+		return AnalysisResponse{}, meta, fmt.Errorf("%s marshal: %w", provider, err)
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL, bytes.NewReader(bodyBytes))
 	if err != nil {
-		return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("%s build request: %w", provider, err)
+		return AnalysisResponse{}, meta, fmt.Errorf("%s build request: %w", provider, err)
 	}
 	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
 	httpReq.Header.Set("content-type", "application/json")
@@ -158,23 +165,25 @@ func (c *OpenAIClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 	start := time.Now()
 	resp, err := c.httpClient.Do(httpReq)
 	latencyMs := time.Since(start).Milliseconds()
+	meta.LatencyMs = latencyMs
 	if err != nil {
-		return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("%s request: %w", provider, err)
+		return AnalysisResponse{}, meta, fmt.Errorf("%s request: %w", provider, err)
 	}
 	defer resp.Body.Close()
 	respBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("%s read response: %w", provider, err)
+		return AnalysisResponse{}, meta, fmt.Errorf("%s read response: %w", provider, err)
 	}
 	if resp.StatusCode >= 400 {
 		snippet := respBytes
 		if len(snippet) > 512 {
 			snippet = snippet[:512]
 		}
-		return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("%s API %d: %s", provider, resp.StatusCode, bytes.TrimSpace(snippet))
+		return AnalysisResponse{}, meta, fmt.Errorf("%s API %d: %s", provider, resp.StatusCode, bytes.TrimSpace(snippet))
 	}
 
 	var apiResp struct {
+		Model   string `json:"model"`
 		Choices []struct {
 			Message struct {
 				Content string `json:"content"`
@@ -186,18 +195,15 @@ func (c *OpenAIClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(respBytes, &apiResp); err != nil {
-		return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("%s parse response: %w", provider, err)
+		return AnalysisResponse{}, meta, fmt.Errorf("%s parse response: %w", provider, err)
 	}
 	var rawText string
 	if len(apiResp.Choices) > 0 {
 		rawText = apiResp.Choices[0].Message.Content
 	}
-	meta := ModelCallMeta{
-		Provider: provider, Model: c.cfg.Model, PromptHash: promptHash,
-		RawPrompt: rawPrompt, RawResponse: rawText,
-		InputTokens: apiResp.Usage.PromptTokens, OutputTokens: apiResp.Usage.CompletionTokens,
-		LatencyMs: latencyMs, IndicatorJSON: indicatorJSON,
-	}
+	meta.RawResponse = rawText
+	meta.InputTokens, meta.OutputTokens = apiResp.Usage.PromptTokens, apiResp.Usage.CompletionTokens
+	meta.ResolvedModel = apiResp.Model
 	analysis, err := extractAnalysisJSON(rawText)
 	if err != nil {
 		if req.Ticker != "__extraction__" {
