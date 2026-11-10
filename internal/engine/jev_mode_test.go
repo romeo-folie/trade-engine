@@ -452,3 +452,60 @@ func TestJevShortsDisabledAsksV1Only(t *testing.T) {
 		t.Fatalf("policy version = %s, want v1", snap.PolicyVersion)
 	}
 }
+
+// An exit-only (sell_only) row holding a short must reach Jev's cover
+// decision once shorts are enabled; the pre-model ownership gate must not
+// treat a short-only holding as "no position" (#599).
+func TestJevV2ExitOnlyRowWithHeldShortIsEvaluatedForCover(t *testing.T) {
+	requireEngineDB(t)
+	ctx := context.Background()
+	for _, shortsOn := range []bool{true, false} {
+		var seen map[string]any
+		ts := &fakeTypeSafe{verdict: "short"}
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			raw, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(raw, &seen)
+			r.Body = io.NopCloser(strings.NewReader(string(raw)))
+			ts.ServeHTTP(w, r)
+		}))
+		e := jevTestEngine(t, config.JevAuthorityAuthoritative, srv.URL, nil)
+		if shortsOn {
+			enableShorts(e)
+			ev, err := newJevEvaluator(e.cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			e.jevEvaluator = ev
+		}
+		ticker := uniqueTicker("JEVXS")
+		if _, err := store.InsertTrade(ctx, store.Trade{Ticker: ticker, Direction: "short", Strategy: "sell_only",
+			EntryPrice: 140, Quantity: 3, StopLoss: 146, TakeProfit: 128, Status: "open"}); err != nil {
+			t.Fatal(err)
+		}
+		candles, set := snapshotTestCandles(80)
+		e.runAnalysis(ctx, ticker, "1d", "sell_only", []string{"sell_only"}, candles, set, "", "", "", "", false)
+		srv.Close()
+
+		if !shortsOn {
+			if ts.calls.Load() != 0 {
+				t.Fatal("with shorts disabled the exit-only gate must still skip a short-only holding")
+			}
+			continue
+		}
+		if ts.calls.Load() != 1 {
+			t.Fatalf("held short on an exit-only row was not evaluated (calls=%d)", ts.calls.Load())
+		}
+		qs, _ := seen["questions"].(map[string]any)
+		if _, ok := qs[jev.QCover]; !ok || len(qs) != 2 {
+			t.Fatalf("expected the cover question set, got %v", qs)
+		}
+		snap, _ := latestSnapshotForTicker(t, ticker)
+		var final snapshot.FinalOutput
+		if err := json.Unmarshal(snap.FinalOutput, &final); err != nil {
+			t.Fatal(err)
+		}
+		if final.Response.Action != analysis.ActionHold || !strings.Contains(string(final.PolicyTrace), jev.ReasonHoldShort) {
+			t.Fatalf("final output = %+v trace %s", final.Response, final.PolicyTrace)
+		}
+	}
+}
