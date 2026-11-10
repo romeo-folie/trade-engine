@@ -1813,3 +1813,50 @@ func TestAuthoritativeJevNeedsNoAnalysts(t *testing.T) {
 		}
 	}
 }
+
+func TestShortsDisabledByDefaultAndValidated(t *testing.T) {
+	d := Defaults().Risk.Shorts
+	if d.Enabled || d.AllowLive {
+		t.Fatal("shorts must be off (and not live) by default")
+	}
+	if errs := ValidateShortsConfig(d); len(errs) != 0 {
+		t.Fatalf("disabled defaults must validate: %v", errs)
+	}
+	d.Enabled = true
+	if errs := ValidateShortsConfig(d); len(errs) != 0 {
+		t.Fatalf("enabled defaults must validate: %v", errs)
+	}
+	for name, mutate := range map[string]func(*ShortsConfig){
+		"zero size":           func(s *ShortsConfig) { s.SizePct = 0 },
+		"nan gross cap":       func(s *ShortsConfig) { s.MaxGrossShortPct = math.NaN() },
+		"ticker above gross":  func(s *ShortsConfig) { s.MaxTickerShortPct = 30 },
+		"zero min price":      func(s *ShortsConfig) { s.MinPrice = 0 },
+		"negative dollar vol": func(s *ShortsConfig) { s.MinAvgDollarVolume = -1 },
+		"negative blackout":   func(s *ShortsConfig) { s.EarningsBlackoutDays = -1 },
+		"ssr over 100":        func(s *ShortsConfig) { s.SSRDropPct = 150 },
+		"zero ssr":            func(s *ShortsConfig) { s.SSRDropPct = 0 },
+	} {
+		s := d
+		mutate(&s)
+		if errs := ValidateShortsConfig(s); len(errs) == 0 {
+			t.Errorf("%s accepted", name)
+		}
+	}
+}
+
+func TestShortsSSRTriggerMayBeLowerButNotHigherThanRule201(t *testing.T) {
+	s := Defaults().Risk.Shorts
+	s.Enabled = true
+	for _, v := range []float64{10, 7.5, 1} {
+		s.SSRDropPct = v
+		if errs := ValidateShortsConfig(s); len(errs) != 0 {
+			t.Errorf("ssr_drop_pct %v rejected: %v", v, errs)
+		}
+	}
+	for _, v := range []float64{10.01, 20} {
+		s.SSRDropPct = v
+		if errs := ValidateShortsConfig(s); len(errs) == 0 {
+			t.Errorf("ssr_drop_pct %v accepted; it would admit Rule 201-restricted stocks", v)
+		}
+	}
+}

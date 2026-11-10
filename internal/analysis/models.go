@@ -38,6 +38,12 @@ const (
 	ActionTrade Action = "TRADE" // ORB mode: candidate passes the gate
 	ActionSkip  Action = "SKIP"  // ORB mode: candidate filtered out
 	ActionAdd   Action = "ADD"   // scanner mode: candidate should be added to the watchlist
+	// ActionShort opens a short on a flat position and ActionCover closes a
+	// held short (issue #599). They are distinct from SELL, which only ever
+	// exits a long, so no action can mean "exit one side" and "open the
+	// other" at once.
+	ActionShort Action = "SHORT"
+	ActionCover Action = "COVER"
 )
 
 // AnalysisRequest carries everything a model needs to produce a recommendation.

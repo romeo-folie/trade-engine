@@ -453,3 +453,35 @@ func TestPlaceOrder_DefaultTIFAndNoLegs(t *testing.T) {
 		t.Errorf("ChildOrderIDs = %v, want empty", res.ChildOrderIDs)
 	}
 }
+
+// TestStockAssetSnapshotBorrowFields: shortable/easy_to_borrow are parsed
+// with explicit availability (issue #599). Their absence must not break the
+// long path, and must leave the asset unknown (never assumed borrowable).
+func TestStockAssetSnapshotBorrowFields(t *testing.T) {
+	cases := map[string]struct {
+		extra                          string
+		shortable, etb, sKnown, eKnown bool
+	}{
+		"both true":  {`,"shortable":true,"easy_to_borrow":true`, true, true, true, true},
+		"htb":        {`,"shortable":true,"easy_to_borrow":false`, true, false, true, true},
+		"absent":     {``, false, false, false, false},
+		"only short": {`,"shortable":true`, true, false, true, false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				fmt.Fprintln(w, `{"symbol":"AAPL","status":"active","class":"us_equity","tradable":true,"marginable":true,"fractionable":true`+tc.extra+`}`)
+			}))
+			defer ts.Close()
+			broker := &AlpacaBroker{baseURL: ts.URL, httpClient: ts.Client()}
+			asset, err := broker.StockAssetSnapshot(context.Background(), "AAPL")
+			if err != nil {
+				t.Fatalf("borrow fields must be optional for the long path: %v", err)
+			}
+			if asset.Shortable != tc.shortable || asset.EasyToBorrow != tc.etb ||
+				asset.ShortableAvailable != tc.sKnown || asset.EasyToBorrowAvailable != tc.eKnown {
+				t.Fatalf("asset = %+v", asset)
+			}
+		})
+	}
+}

@@ -179,6 +179,10 @@ func Defaults() *Config {
 			},
 		},
 		Risk: RiskConfig{
+			Shorts: ShortsConfig{
+				Enabled: false, SizePct: 1.5, MaxGrossShortPct: 20, MaxTickerShortPct: 5,
+				MinPrice: 5, MinAvgDollarVolume: 20_000_000, EarningsBlackoutDays: 3, SSRDropPct: 10,
+			},
 			ConfidenceThreshold: 0.55,
 			// ConfidenceTiers defaults to nil so existing configs that omit
 			// `risk.confidence_tiers` keep using the static

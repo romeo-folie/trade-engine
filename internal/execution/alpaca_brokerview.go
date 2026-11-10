@@ -121,6 +121,8 @@ func (b *AlpacaBroker) StockAssetSnapshot(ctx context.Context, symbol string) (S
 		Tradable     *bool  `json:"tradable"`
 		Marginable   *bool  `json:"marginable"`
 		Fractionable *bool  `json:"fractionable"`
+		Shortable    *bool  `json:"shortable"`
+		EasyToBorrow *bool  `json:"easy_to_borrow"`
 	}
 	symbol = strings.ToUpper(strings.TrimSpace(symbol))
 	if symbol == "" {
@@ -132,12 +134,19 @@ func (b *AlpacaBroker) StockAssetSnapshot(ctx context.Context, symbol string) (S
 	if resp.Tradable == nil || resp.Marginable == nil || resp.Fractionable == nil {
 		return StockAsset{}, fmt.Errorf("alpaca StockAssetSnapshot: required asset capability fields are missing")
 	}
-	return StockAsset{
+	asset := StockAsset{
 		Symbol: strings.ToUpper(strings.TrimSpace(resp.Symbol)), Status: resp.Status,
 		AssetClass: resp.Class, Tradable: *resp.Tradable, Marginable: *resp.Marginable,
 		Fractionable: *resp.Fractionable, TradableAvailable: true,
 		MarginableAvailable: true, FractionableAvailable: true, FetchedAt: time.Now().UTC(),
-	}, nil
+	}
+	if resp.Shortable != nil {
+		asset.Shortable, asset.ShortableAvailable = *resp.Shortable, true
+	}
+	if resp.EasyToBorrow != nil {
+		asset.EasyToBorrow, asset.EasyToBorrowAvailable = *resp.EasyToBorrow, true
+	}
+	return asset, nil
 }
 
 func parseRequiredFiniteAccountFloat(label, raw string) (float64, error) {
