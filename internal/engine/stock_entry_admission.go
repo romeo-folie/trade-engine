@@ -231,7 +231,7 @@ func (e *Engine) prepareStockEntryAdmissionSide(
 	// flatten, or resting buy stop on a short, #599) are not entries: they
 	// reduce exposure and reserve nothing. Drop them before entry accounting
 	// so they neither wedge admission as "unattributed" nor count as a long.
-	working, err = withoutEngineBuyExits(ctx, working, store.GetStockOrderIntentByClientOrderID)
+	working, err = withoutEngineBuyExits(ctx, working, store.GetStockOrderIntentByClientOrderID, store.GetStockOrderIntentByBrokerOrderID)
 	if err != nil {
 		return stockEntryAdmission{}, err
 	}
@@ -560,25 +560,39 @@ func matchSellEntryReservation(order execution.WorkingOrder, reservations []stor
 	return nil
 }
 
-// withoutEngineBuyExits removes working BUY orders that the durable intent
-// store attributes to a non-entry engine intent. An engine-shaped client ID
-// whose intent cannot be read fails closed; one with no intent stays in the
-// list, where entry accounting rejects it as unattributed.
+// withoutEngineBuyExits removes working BUY orders that are exits rather than
+// entries: a bracket child (it has a parent order; a short's stop and target
+// are BUYs with broker-generated client IDs), or an order the durable intent
+// store attributes to a non-entry intent by client or broker order ID. An
+// engine-shaped client ID whose intent cannot be read fails closed; an order
+// with no intent stays in the list, where entry accounting rejects or counts
+// it as before.
 func withoutEngineBuyExits(
 	ctx context.Context,
 	working []execution.WorkingOrder,
-	lookup func(context.Context, string) (*store.StockOrderIntent, error),
+	byClientID, byBrokerID func(context.Context, string) (*store.StockOrderIntent, error),
 ) ([]execution.WorkingOrder, error) {
 	out := make([]execution.WorkingOrder, 0, len(working))
 	for _, order := range working {
-		if strings.EqualFold(order.Side, string(execution.OrderSideBuy)) && strings.HasPrefix(order.TradeID, "te-stock-") {
-			intent, err := lookup(ctx, order.TradeID)
-			if err != nil {
-				return nil, fmt.Errorf("stock entry admission: attribute working BUY %q: %w", order.OrderID, err)
-			}
-			if intent != nil && !strings.HasPrefix(intent.IdempotencyKey, "entry:") {
-				continue
-			}
+		if !strings.EqualFold(order.Side, string(execution.OrderSideBuy)) {
+			out = append(out, order)
+			continue
+		}
+		if strings.TrimSpace(order.ParentOrderID) != "" {
+			continue // a bracket child closes its parent's position
+		}
+		var intent *store.StockOrderIntent
+		var err error
+		if strings.HasPrefix(order.TradeID, "te-stock-") {
+			intent, err = byClientID(ctx, order.TradeID)
+		} else if order.OrderID != "" {
+			intent, err = byBrokerID(ctx, order.OrderID)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("stock entry admission: attribute working BUY %q: %w", order.OrderID, err)
+		}
+		if intent != nil && !strings.HasPrefix(intent.IdempotencyKey, "entry:") {
+			continue
 		}
 		out = append(out, order)
 	}

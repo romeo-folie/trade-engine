@@ -422,6 +422,27 @@ func TestShortEntryFilledEndToEnd(t *testing.T) {
 	}
 }
 
+// setGrossRoom sets the gross short cap so that exactly room dollars remain
+// above brokerShort, after any open shorts other tests left in the shared
+// test DB (shortExposure counts the larger of broker and local truth).
+func (f *shortFixture) setGrossRoom(brokerShort, pendingShort, room float64) {
+	f.t.Helper()
+	owned, err := store.GetOwnedPositionTrades(f.ctx)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	local, _, err := shortExposure(nil, owned, nil, "", f.ticker)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	gross := local
+	if brokerShort > gross {
+		gross = brokerShort
+	}
+	gross += pendingShort
+	f.e.cfg.Risk.Shorts.MaxGrossShortPct = (gross + room) / f.broker.account.Equity * 100
+}
+
 func firstNonEmpty(a, b string) string {
 	if b != "" {
 		return a + ": " + b
@@ -489,6 +510,7 @@ func TestShortEntryExposureCapsSizeAndBlock(t *testing.T) {
 		// $1,700 of other shorts against a $2,000 (20%) gross cap leaves
 		// $300: three shares at $98, not the five size_pct asks for.
 		f.broker.positions = []execution.BrokerPosition{{Symbol: "OTHERSHORT", Quantity: -17, CurrentPrice: 100, MarketValue: -1700, AvgEntryPrice: 100, Side: "short"}}
+		f.setGrossRoom(1700, 0, 300)
 		id, sig := f.signal()
 		f.e.executeShortEntry(f.ctx, id, sig, false)
 		placed := f.broker.placedOrders()
@@ -499,6 +521,7 @@ func TestShortEntryExposureCapsSizeAndBlock(t *testing.T) {
 	t.Run("no room blocks", func(t *testing.T) {
 		f := newShortFixture(t, "SHC")
 		f.broker.positions = []execution.BrokerPosition{{Symbol: "OTHERSHORT", Quantity: -20, CurrentPrice: 100, MarketValue: -2000, AvgEntryPrice: 100, Side: "short"}}
+		f.setGrossRoom(2000, 0, 50) // less than one $98 share
 		id, sig := f.signal()
 		f.e.executeShortEntry(f.ctx, id, sig, false)
 		if status, _ := f.signalStatus(id); status != "blocked" || len(f.broker.placedOrders()) != 0 {
@@ -835,7 +858,15 @@ func TestWithoutEngineBuyExits(t *testing.T) {
 		}
 		return intents[id], nil
 	}
+	byBroker := func(_ context.Context, id string) (*store.StockOrderIntent, error) {
+		if id == "child-by-broker-id" {
+			return &store.StockOrderIntent{IdempotencyKey: "bracket-child:parent:stop-loss"}, nil
+		}
+		return nil, nil
+	}
 	working := []execution.WorkingOrder{
+		{OrderID: "7", TradeID: "alpaca-generated", ParentOrderID: "short-parent", Side: "buy"},
+		{OrderID: "child-by-broker-id", TradeID: "alpaca-generated-2", Side: "buy"},
 		{OrderID: "1", TradeID: "te-stock-cover", Side: "buy"},
 		{OrderID: "2", TradeID: "te-stock-stop", Side: "buy"},
 		{OrderID: "3", TradeID: "te-stock-entry", Side: "buy"},
@@ -843,7 +874,7 @@ func TestWithoutEngineBuyExits(t *testing.T) {
 		{OrderID: "5", TradeID: "manual-1", Side: "buy"},
 		{OrderID: "6", TradeID: "te-stock-cover", Side: "sell"},
 	}
-	got, err := withoutEngineBuyExits(context.Background(), working, lookup)
+	got, err := withoutEngineBuyExits(context.Background(), working, lookup, byBroker)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -854,7 +885,7 @@ func TestWithoutEngineBuyExits(t *testing.T) {
 	if strings.Join(ids, ",") != "3,4,5,6" {
 		t.Fatalf("kept %v, want entry, unknown, manual, and the SELL", ids)
 	}
-	if _, err := withoutEngineBuyExits(context.Background(), []execution.WorkingOrder{{OrderID: "x", TradeID: "te-stock-broken", Side: "buy"}}, lookup); err == nil {
+	if _, err := withoutEngineBuyExits(context.Background(), []execution.WorkingOrder{{OrderID: "x", TradeID: "te-stock-broken", Side: "buy"}}, lookup, byBroker); err == nil {
 		t.Fatal("an unreadable intent must fail closed")
 	}
 }
@@ -886,4 +917,79 @@ func TestShortEntryAdmitsBesideWorkingEngineCover(t *testing.T) {
 	if status, reason := f.signalStatus(id); status != "executed" || len(f.broker.placedOrders()) != 1 {
 		t.Fatalf("status=%s reason=%q placed=%d; a working engine cover must not block a new short", status, reason, len(f.broker.placedOrders()))
 	}
+}
+
+// Codex P2: a filled short's bracket children are working BUYs with
+// broker-generated client IDs. They are exits, never a phantom long.
+func TestShortBracketChildrenAreNotCountedAsLongs(t *testing.T) {
+	f := newShortFixture(t, "SHK")
+	id, sig := f.signal()
+	f.e.executeShortEntry(f.ctx, id, sig, false)
+	if len(f.openTrades()) != 1 {
+		t.Fatalf("setup: status %v", firstNonEmpty(f.signalStatus(id)))
+	}
+	// The broker now lists the bracket's two BUY legs as working orders.
+	f.broker.mu.Lock()
+	f.broker.working = []execution.WorkingOrder{
+		{OrderID: "parent-1-tp", TradeID: "alpaca-tp", ParentOrderID: "parent-1", Ticker: f.ticker, Side: "buy", Status: "pending", RemainingQty: 5, Price: 92, OrderType: "limit"},
+		{OrderID: "parent-1-sl", TradeID: "alpaca-sl", Ticker: f.ticker, Side: "buy", Status: "pending", RemainingQty: 5, StopPrice: 101, OrderType: "stop"},
+	}
+	f.broker.positions = []execution.BrokerPosition{{Symbol: f.ticker, Quantity: -5, CurrentPrice: 98, MarketValue: -490, AvgEntryPrice: 98, Side: "short"}}
+	f.broker.mu.Unlock()
+	other := uniqueTicker("SHKO")
+	admission, _, _, release, err := f.e.beginStockEntryAdmissionSide(f.ctx, execution.OrderSideBuy, "entry:k-"+other, other, 1)
+	if err != nil {
+		t.Fatalf("admission beside a protected short: %v", err)
+	}
+	release()
+	if len(admission.WorkingOrders) != 0 {
+		t.Fatalf("bracket children kept as entry inventory: %+v", admission.WorkingOrders)
+	}
+	if phantom := manualWorkingEntryTrades(admission.WorkingOrders, admission.Reservations, 98); len(phantom) != 0 {
+		t.Fatalf("bracket children projected as long positions: %+v", phantom)
+	}
+}
+
+// Codex P1: a working manual SELL on a flat ticker is a pending short.
+func TestShortEntryCountsPendingManualShorts(t *testing.T) {
+	t.Run("same ticker blocks", func(t *testing.T) {
+		f := newShortFixture(t, "SHM")
+		f.broker.working = []execution.WorkingOrder{{OrderID: "manual-sell", TradeID: "manual-1", Ticker: f.ticker, Side: "sell", Status: "pending", RemainingQty: 2, Price: 99, OrderType: "limit"}}
+		id, sig := f.signal()
+		f.e.executeShortEntry(f.ctx, id, sig, false)
+		if status, reason := f.signalStatus(id); status != "blocked" || !strings.Contains(reason, "cannot add to a short") || len(f.broker.placedOrders()) != 0 {
+			t.Fatalf("status=%s reason=%q placed=%d", status, reason, len(f.broker.placedOrders()))
+		}
+	})
+	t.Run("other ticker counts toward the gross cap", func(t *testing.T) {
+		f := newShortFixture(t, "SHM")
+		// $1,700 pending manual short elsewhere leaves $300 of the $2,000 cap.
+		f.broker.working = []execution.WorkingOrder{{OrderID: "manual-sell", TradeID: "manual-1", Ticker: "ELSEWHERE", Side: "sell", Status: "pending", RemainingQty: 17, Price: 100, OrderType: "limit"}}
+		f.setGrossRoom(0, 1700, 300)
+		id, sig := f.signal()
+		f.e.executeShortEntry(f.ctx, id, sig, false)
+		if placed := f.broker.placedOrders(); len(placed) != 1 || placed[0].Quantity != 3 {
+			t.Fatalf("placed=%+v status=%v; want a 3-share short", placed, firstNonEmpty(f.signalStatus(id)))
+		}
+	})
+	t.Run("unpriced manual short fails closed", func(t *testing.T) {
+		f := newShortFixture(t, "SHM")
+		f.broker.working = []execution.WorkingOrder{{OrderID: "manual-mkt", TradeID: "manual-2", Ticker: "ELSEWHERE", Side: "sell", Status: "pending", RemainingQty: 5, OrderType: "market"}}
+		id, sig := f.signal()
+		f.e.executeShortEntry(f.ctx, id, sig, false)
+		if status, reason := f.signalStatus(id); status != "blocked" || !strings.Contains(reason, "exposure_unknown") {
+			t.Fatalf("status=%s reason=%q", status, reason)
+		}
+	})
+	t.Run("sell closing a held long is not a short", func(t *testing.T) {
+		f := newShortFixture(t, "SHM")
+		f.broker.positions = []execution.BrokerPosition{{Symbol: "LONGHELD", Quantity: 17, CurrentPrice: 100, MarketValue: 1700, AvgEntryPrice: 90, Side: "long"}}
+		f.broker.working = []execution.WorkingOrder{{OrderID: "manual-exit", TradeID: "manual-3", Ticker: "LONGHELD", Side: "sell", Status: "pending", RemainingQty: 17, Price: 100, OrderType: "limit"}}
+		f.setGrossRoom(0, 0, 2000) // room for the full 5 shares only if the exit is not counted
+		id, sig := f.signal()
+		f.e.executeShortEntry(f.ctx, id, sig, false)
+		if placed := f.broker.placedOrders(); len(placed) != 1 || placed[0].Quantity != 5 {
+			t.Fatalf("placed=%+v status=%v; a long exit must not consume short room", placed, firstNonEmpty(f.signalStatus(id)))
+		}
+	})
 }
