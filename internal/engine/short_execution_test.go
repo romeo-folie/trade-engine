@@ -30,6 +30,7 @@ type shortBroker struct {
 	positions   []execution.BrokerPosition
 	working     []execution.WorkingOrder
 	placed      []execution.OrderRequest
+	replaced    []shortReplace
 	cancelled   []string
 	byClient    map[string]execution.OrderResult
 	byID        map[string]execution.OrderResult

@@ -1,7 +1,8 @@
 // Package trailing implements a server-side trailing stop manager (#322).
 //
-// On each tick the manager iterates open long stock trades and applies one
-// of two rules:
+// On each tick the manager iterates open long and short stock trades (shorts
+// since #599; see direction.go for the mirrored formulas) and applies one of
+// two rules:
 //
 //   - atr: ratchet a broker stop using
 //     new_stop = max(current_stop, high_water_mark − atr_multiple × ATR)
@@ -22,7 +23,7 @@
 // cancel+resubmit. Failures are logged WARN and retried on the next tick;
 // the manager never crashes on a single trade.
 //
-// Initial scope is stocks/long-only — forex/ORB exit logic is unchanged.
+// Scope is stocks, long and short — forex/ORB exit logic is unchanged.
 package trailing
 
 import (
@@ -315,7 +316,7 @@ func (m *Manager) updateAll(ctx context.Context, startupSweep bool) {
 	}
 	active := make(map[string]bool, len(trades))
 	for _, t := range trades {
-		if !isLongStockTrade(t) {
+		if !isManagedStockTrade(t) {
 			continue
 		}
 		active[t.ID] = true
@@ -381,12 +382,8 @@ func (m *Manager) updateOne(ctx context.Context, t store.Trade, startupSweep boo
 
 	// First-tick HWM seed: max(entry_price, current_price). Subsequent ticks
 	// only ratchet the HWM upward when price prints a fresh high.
-	hwm := t.HighWaterMark
-	if hwm <= 0 {
-		hwm = math.Max(t.EntryPrice, currentPrice)
-	} else if currentPrice > hwm {
-		hwm = currentPrice
-	}
+	// For a short this is the low-water mark (#599); see seedOrAdvanceExtreme.
+	hwm := seedOrAdvanceExtreme(t, currentPrice)
 
 	// Withhold the trail until the position has earned it. Everything below
 	// this point either ratchets the broker stop or exits at market, and both
@@ -398,7 +395,7 @@ func (m *Manager) updateOne(ctx context.Context, t store.Trade, startupSweep boo
 	// bracket leg never landed would otherwise sit naked until it gained 5%.
 	// Capped trades stay app-managed: a standalone stop beside their software
 	// take-profit creates two exit owners and can double-sell.
-	if !TrailArmed(t.EntryPrice, hwm, m.cfg.ActivateAtGainPct) {
+	if !trailArmedFor(t, hwm, m.cfg.ActivateAtGainPct) {
 		// Persist the peak FIRST, before anything that can fail. This branch runs
 		// every tick for the whole disarmed life of a trade, so a transient broker
 		// error below must not discard a high that already printed: losing it
@@ -423,7 +420,7 @@ func (m *Manager) updateOne(ctx context.Context, t store.Trade, startupSweep boo
 	// so the stop never widens (and never sinks below the original
 	// stop_loss recorded at trade open, which is the floor on the first
 	// tick).
-	newStop := ComputeNewStop(t.StopLoss, hwm, atr, m.cfg.ATRMultiple)
+	newStop := computeNewStopFor(t, t.StopLoss, hwm, atr, m.cfg.ATRMultiple)
 
 	// Round to broker tick size before persistence + comparison so tiny
 	// floating-point noise (e.g. 48.50000001 vs 48.5) doesn't trigger a
@@ -450,7 +447,7 @@ func (m *Manager) updateOne(ctx context.Context, t store.Trade, startupSweep boo
 	// the broker stop would fill instantly anyway. Don't leave a stale stop
 	// sitting at the old price — exit at market immediately so the band's
 	// implied "we're done" actually plays out.
-	if newStop >= currentPrice {
+	if stopCrossed(t, newStop, currentPrice) {
 		marketOpen := m.marketOpen(m.now())
 		deferred, wasDeferred := m.deferredATRExit[t.ID]
 		waitingForFresh := wasDeferred && deferred.RequireFresh && !observation.advancedFrom(deferred.Observation)
@@ -545,7 +542,7 @@ func (m *Manager) updateOne(ctx context.Context, t store.Trade, startupSweep boo
 	needsUncappedSeed := existingStop == nil && t.TakeProfit <= 0
 	if needsStopUpdate || needsUncappedSeed {
 		intent := stopExitIntent(newStop)
-		if newStop > persistedStop {
+		if stopTightened(t, newStop, persistedStop) {
 			intent = store.ExitIntent{Reason: store.ExitReasonTrailingATR, Evidence: exitEvidence(map[string]any{
 				"current_price": currentPrice, "trailing_stop": newStop,
 				"high_water_mark": hwm, "atr": atr, "atr_multiple": m.cfg.ATRMultiple,
@@ -623,7 +620,7 @@ func (m *Manager) updateOneEMA9(ctx context.Context, t store.Trade) error {
 		return errors.New("non-positive close or ema9")
 	}
 
-	if closePrice < ema {
+	if emaExitSignal(t, closePrice, ema) {
 		if !t.OpenedAt.IsZero() && !closeCompletedAt.IsZero() &&
 			!closeCompletedAt.After(t.OpenedAt) {
 			// The close signal existed before this position did. Acting on it
@@ -861,13 +858,13 @@ func (m *Manager) submitOrReplaceStopWithTrailingState(
 		if err != nil {
 			return fmt.Errorf("reload trade before protective stop: %w", err)
 		}
-		if fresh == nil || !isLongStockTrade(*fresh) || fresh.Quantity <= 1e-9 {
-			logger.Info("trailing-stop: skip protective mutation for non-open long trade",
-				"trade_id", t.ID, "ticker", t.Ticker)
+		if fresh == nil || !sameManagedSide(t, *fresh) || fresh.Quantity <= 1e-9 {
+			logger.Info("trailing-stop: skip protective mutation for non-open trade",
+				"trade_id", t.ID, "ticker", t.Ticker, "direction", t.Direction)
 			return nil
 		}
-		effectiveHWM := math.Max(fresh.HighWaterMark, hwm)
-		brokerQty, brokerVerified, verifyErr := m.brokerLongQuantity(ctx, fresh.Ticker)
+		effectiveHWM := moreFavourableExtreme(*fresh, fresh.HighWaterMark, hwm)
+		brokerQty, brokerVerified, verifyErr := m.brokerPositionQuantity(ctx, *fresh)
 		if verifyErr != nil {
 			if persistTrailing {
 				if persistErr := m.store.UpdateTradeTrailing(ctx, fresh.ID, 0, effectiveHWM); persistErr != nil {
@@ -878,8 +875,8 @@ func (m *Manager) submitOrReplaceStopWithTrailingState(
 		}
 		if brokerVerified {
 			if brokerQty <= 1e-9 {
-				logger.Warn("trailing-stop: broker holds no long position; refusing protective sell",
-					"trade_id", fresh.ID, "ticker", fresh.Ticker)
+				logger.Warn("trailing-stop: broker holds no position on this side; refusing protective stop",
+					"trade_id", fresh.ID, "ticker", fresh.Ticker, "direction", fresh.Direction)
 				if persistTrailing {
 					return m.store.UpdateTradeTrailing(ctx, fresh.ID, 0, effectiveHWM)
 				}
@@ -889,10 +886,10 @@ func (m *Manager) submitOrReplaceStopWithTrailingState(
 		// The pre-lock snapshot may also predate another ratchet. Preserve the
 		// durable floor so this delayed tick can never widen an already-raised
 		// stop.
-		newStop = math.Max(newStop, fresh.StopLoss)
+		newStop = tighterStop(*fresh, newStop, fresh.StopLoss)
 		resubmitAllowed := true
 		if brokerVerified {
-			resubmitAllowed, verifyErr = m.canAttributeBrokerLong(ctx, *fresh, brokerQty)
+			resubmitAllowed, verifyErr = m.canAttributeBrokerPosition(ctx, *fresh, brokerQty)
 			if verifyErr != nil {
 				if persistTrailing {
 					if persistErr := m.store.UpdateTradeTrailing(ctx, fresh.ID, 0, effectiveHWM); persistErr != nil {
@@ -924,11 +921,45 @@ func (m *Manager) persistTrailingState(ctx context.Context, t store.Trade, stop,
 		if err != nil {
 			return err
 		}
-		if fresh == nil || !isLongStockTrade(*fresh) {
+		if fresh == nil || !sameManagedSide(t, *fresh) {
 			return nil
 		}
-		return m.store.UpdateTradeTrailing(ctx, fresh.ID, math.Max(stop, fresh.StopLoss), math.Max(hwm, fresh.HighWaterMark))
+		return m.store.UpdateTradeTrailing(ctx, fresh.ID,
+			tighterStop(*fresh, stop, fresh.StopLoss), moreFavourableExtreme(*fresh, hwm, fresh.HighWaterMark))
 	})
+}
+
+// brokerPositionQuantity is brokerLongQuantity on the trade's side: the
+// broker's absolute short quantity for a short (#599), its long quantity
+// otherwise.
+func (m *Manager) brokerPositionQuantity(ctx context.Context, t store.Trade) (float64, bool, error) {
+	if t.Direction == "short" {
+		return m.brokerShortQuantity(ctx, t.Ticker)
+	}
+	return m.brokerLongQuantity(ctx, t.Ticker)
+}
+
+// brokerShortQuantity mirrors brokerLongQuantity for short positions. Alpaca
+// reports a short as side "short" with a negative or positive quantity, so
+// the absolute value is used.
+func (m *Manager) brokerShortQuantity(ctx context.Context, ticker string) (quantity float64, verified bool, err error) {
+	view, ok := m.exec.(execution.BrokerView)
+	if !ok {
+		return 0, false, nil
+	}
+	positions, err := view.PositionsSnapshot(ctx)
+	if errors.Is(err, execution.ErrBrokerUnavailable) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, true, err
+	}
+	for _, position := range positions {
+		if strings.EqualFold(position.Symbol, ticker) && strings.EqualFold(position.Side, "short") {
+			quantity += math.Abs(position.Quantity)
+		}
+	}
+	return quantity, true, nil
 }
 
 // brokerLongQuantity obtains a just-in-time position check where the executor
@@ -958,11 +989,11 @@ func (m *Manager) brokerLongQuantity(ctx context.Context, ticker string) (quanti
 	return quantity, true, nil
 }
 
-// canAttributeBrokerLong allows a fresh standalone protective STOP only when
+// canAttributeBrokerPosition allows a fresh standalone protective STOP only when
 // the broker's aggregate long is unambiguously this one durable trade. Alpaca
 // exposes positions by symbol, not trade lot: if a pyramided sibling exists,
 // a filled lot cannot safely be distinguished from the remaining shares.
-func (m *Manager) canAttributeBrokerLong(ctx context.Context, trade store.Trade, brokerQty float64) (bool, error) {
+func (m *Manager) canAttributeBrokerPosition(ctx context.Context, trade store.Trade, brokerQty float64) (bool, error) {
 	if math.Abs(brokerQty-trade.Quantity) > 1e-9 {
 		return false, nil
 	}
@@ -971,7 +1002,7 @@ func (m *Manager) canAttributeBrokerLong(ctx context.Context, trade store.Trade,
 		return false, err
 	}
 	for _, candidate := range trades {
-		if candidate.ID != trade.ID && isLongStockTrade(candidate) && strings.EqualFold(candidate.Ticker, trade.Ticker) && candidate.Quantity > 1e-9 {
+		if candidate.ID != trade.ID && sameManagedSide(trade, candidate) && strings.EqualFold(candidate.Ticker, trade.Ticker) && candidate.Quantity > 1e-9 {
 			return false, nil
 		}
 	}
@@ -984,7 +1015,7 @@ func (m *Manager) submitOrReplaceStopLocked(ctx context.Context, t store.Trade, 
 		return fmt.Errorf("lookup existing stop: %w", err)
 	}
 
-	side := execution.OrderSideSell // long-only scope: exit a long via SELL
+	side := exitSideFor(t) // SELL closes a long, BUY covers a short (#599)
 	stopTIF := protectiveStopTIF(t.Quantity)
 	if existing != nil && existing.BrokerOrderID != "" {
 		quantityChanged := stopQuantityDiffers(existing, t.Quantity)
@@ -1315,7 +1346,7 @@ func (m *Manager) rollbackUnrecordedStop(
 		_, _ = m.store.ClaimTradeExitWithIntent(ctx, t.ID, intent)
 		if _, err := m.store.InsertOrder(ctx, store.Order{
 			TradeID: t.ID, BrokerOrderID: brokerOrderID,
-			Ticker: t.Ticker, Side: string(execution.OrderSideSell),
+			Ticker: t.Ticker, Side: string(exitSideFor(t)),
 			OrderType: string(execution.OrderTypeStop), Quantity: t.Quantity,
 			StopPrice: stopPrice, Status: terminalStatus, IsStopLoss: true,
 			FilledPrice: status.FilledPrice, FilledQty: status.FilledQty,
@@ -1330,7 +1361,7 @@ func (m *Manager) rollbackUnrecordedStop(
 		_, _ = m.store.ClaimTradeExitWithIntent(ctx, t.ID, intent)
 		if _, err := m.store.InsertOrder(ctx, store.Order{
 			TradeID: t.ID, BrokerOrderID: brokerOrderID,
-			Ticker: t.Ticker, Side: string(execution.OrderSideSell),
+			Ticker: t.Ticker, Side: string(exitSideFor(t)),
 			OrderType: string(execution.OrderTypeStop), Quantity: t.Quantity,
 			StopPrice: stopPrice, Status: terminalStatus, IsStopLoss: true,
 			FilledPrice: status.FilledPrice, FilledQty: status.FilledQty,
@@ -1392,7 +1423,7 @@ func (m *Manager) exitAndClose(ctx context.Context, t store.Trade, referencePric
 		TradeID:       t.ID,
 		BrokerOrderID: exitRes.BrokerOrderID,
 		Ticker:        t.Ticker,
-		Side:          string(execution.OrderSideSell),
+		Side:          string(exitSideFor(t)),
 		OrderType:     string(execution.OrderTypeMarket),
 		Quantity:      t.Quantity,
 		FilledPrice:   exitRes.FilledPrice,
@@ -1534,7 +1565,7 @@ func (m *Manager) exitAtMarket(ctx context.Context, t store.Trade, referencePric
 	}
 	req := execution.OrderRequest{
 		Ticker:         t.Ticker,
-		Side:           execution.OrderSideSell,
+		Side:           exitSideFor(t),
 		Type:           execution.OrderTypeMarket,
 		Quantity:       exitQty,
 		ReferencePrice: referencePrice,
