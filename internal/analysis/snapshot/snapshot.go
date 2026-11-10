@@ -290,7 +290,10 @@ type EffectiveConfig struct {
 	JevAuthority string                  `json:"jev_authority,omitempty"`
 	JevModel     string                  `json:"jev_model,omitempty"`
 	JevPolicy    *config.JevPolicyConfig `json:"jev_policy,omitempty"`
-	EntryGates   config.EntryGatesConfig `json:"entry_gates"`
+	// JevMinRiskReward is the engine risk/reward floor applied to Jev's
+	// deterministic target (max(target_r_multiple, floor)).
+	JevMinRiskReward float64                 `json:"jev_min_risk_reward,omitempty"`
+	EntryGates       config.EntryGatesConfig `json:"entry_gates"`
 }
 
 // NewEffectiveConfig projects the operator configuration onto the allowlist.
@@ -319,6 +322,7 @@ func NewEffectiveConfig(cfg *config.Config) EffectiveConfig {
 			policy.MinConfidence = cfg.Risk.ConfidenceThreshold // as the engine applies it
 		}
 		out.DecisionMode, out.JevAuthority, out.JevModel, out.JevPolicy = "jev", cfg.Analysis.Jev.Authority, cfg.Analysis.Jev.Model, &policy
+		out.JevMinRiskReward = cfg.Risk.MinRiskReward
 	}
 	for _, m := range cfg.Models.AnalystConfigs() {
 		out.Analysts = append(out.Analysts, modelSettings(m, ""))
