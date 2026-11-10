@@ -132,6 +132,9 @@ type Engine struct {
 	// dependency needed to run the trailing worker is present. Config alone is
 	// insufficient: uncapping without a running worker removes the winning exit.
 	trailingManagerAvailable bool
+	// shortEvidenceBars supplies consolidated (SIP) daily bars for short
+	// eligibility (#599). Nil means short eligibility fails closed.
+	shortEvidenceBars data.BulkDailyBarsProvider
 
 	// todayStartingEquity tracks the equity at 00:00 UTC for the current day.
 	todayStartingEquity float64
@@ -2147,6 +2150,18 @@ func (e *Engine) SetBatchFlusher(f BatchFlusher) {
 // this runtime capability is present.
 func (e *Engine) SetTrailingManagerAvailable(available bool) {
 	e.trailingManagerAvailable = available
+}
+
+// SetShortEvidenceBars wires the consolidated daily-bar source for short
+// eligibility (SSR and liquidity). Only a consolidated (SIP) feed is valid
+// evidence: IEX bars miss trades on other venues, so a non-SIP provider is
+// ignored and shorts then fail closed.
+func (e *Engine) SetShortEvidenceBars(p data.BulkDailyBarsProvider, consolidated bool) {
+	if !consolidated {
+		e.shortEvidenceBars = nil
+		return
+	}
+	e.shortEvidenceBars = p
 }
 
 // SetMode updates the engine's active trading mode at runtime.

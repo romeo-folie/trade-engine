@@ -166,10 +166,20 @@ func filledBracket(req execution.OrderRequest, n int) execution.OrderResult {
 // sessions closing at 100 on 200k shares ($20M/day) and today's partial bar.
 type shortMarket struct {
 	bid, ask     float64
-	todayLow     float64
+	todayLow     float64 // consolidated (SIP) low through the entitlement cutoff
+	iexTodayLow  float64 // real-time primary-feed low; 0 = same as todayLow
 	prevLow      float64 // low of the last completed session (SSR carry-over)
 	noToday      bool
 	historyCalls int
+}
+
+// FetchDailyBars is the consolidated (SIP) daily-bar source.
+func (m *shortMarket) FetchDailyBars(_ context.Context, symbols []string, _, _ time.Time, _ int) (data.DailyBarsBatchResult, error) {
+	res := data.DailyBarsBatchResult{Bars: map[string][]data.Candle{}, Failures: map[string]error{}}
+	for _, s := range symbols {
+		res.Bars[s] = shortDailyBars(s, time.Now(), m.todayLow, m.prevLow, m.noToday)
+	}
+	return res, nil
 }
 
 func (m *shortMarket) FetchQuote(_ context.Context, ticker string) (*data.Quote, error) {
@@ -183,7 +193,11 @@ func (m *shortMarket) FetchHistory(_ context.Context, ticker string, tf data.Tim
 	if tf != data.Timeframe1Day {
 		return nil, nil
 	}
-	return shortDailyBars(ticker, time.Now(), m.todayLow, m.prevLow, m.noToday), nil
+	low := m.todayLow
+	if m.iexTodayLow > 0 {
+		low = m.iexTodayLow
+	}
+	return shortDailyBars(ticker, time.Now(), low, m.prevLow, m.noToday), nil
 }
 
 func shortDailyBars(ticker string, now time.Time, todayLow, prevLow float64, noToday bool) []data.Candle {
@@ -227,9 +241,16 @@ func newShortFixture(t *testing.T, prefix string) *shortFixture {
 	shortEntryMarketOpen = func(time.Time) bool { return true }
 	prevDelay := brokerProtectionVerificationRetryDelay
 	brokerProtectionVerificationRetryDelay = 0
+	// An accepted-but-unfilled entry starts pollUnfilledStockIntent, whose
+	// Coordinator.Recover sweeps every intent in the shared test DB. Park it
+	// past the test run so it cannot race other tests' intents through this
+	// fixture's fake broker (recovery itself is exercised explicitly).
+	prevPoll := unfilledEntryPollDelay
+	unfilledEntryPollDelay = 24 * time.Hour
 	t.Cleanup(func() {
 		shortEntryMarketOpen = prevOpen
 		brokerProtectionVerificationRetryDelay = prevDelay
+		unfilledEntryPollDelay = prevPoll
 	})
 	ctx := context.Background()
 	ticker := uniqueTicker(prefix)
@@ -256,7 +277,9 @@ func newShortFixture(t *testing.T, prefix string) *shortFixture {
 	e := &Engine{
 		cfg: cfg, executor: stockorders.New(broker), marketData: market,
 		portfolio: portfolio.NewTracker(time.Hour), bus: events.New(), costTracker: cost.NewTracker(),
+		mode: "paper",
 	}
+	e.SetShortEvidenceBars(market, true)
 	t.Cleanup(func() {
 		c := context.Background()
 		_, _ = store.GetDB().Exec(c, `DELETE FROM orders WHERE ticker=$1`, ticker)
@@ -467,6 +490,12 @@ func TestShortEntryEligibilityBlocksAtOrderTime(t *testing.T) {
 		{"ssr today", func(f *shortFixture) { f.market.todayLow = 89 }, "short_sale_restriction_active"},
 		{"ssr carried over", func(f *shortFixture) { f.market.prevLow = 89 }, "short_sale_restriction_active"},
 		{"session low unknown", func(f *shortFixture) { f.market.noToday = true }, "ssr_status_unknown"},
+		// Codex: SSR needs consolidated evidence. No SIP source, or an IEX-only
+		// source, leaves SSR and liquidity unknown.
+		{"no consolidated bars", func(f *shortFixture) { f.e.SetShortEvidenceBars(nil, true) }, "ssr_status_unknown"},
+		{"iex-only bars refused", func(f *shortFixture) { f.e.SetShortEvidenceBars(f.market, false) }, "liquidity_unknown"},
+		// A primary-feed print after the SIP cutoff still triggers SSR.
+		{"ssr after the sip cutoff", func(f *shortFixture) { f.market.iexTodayLow = 89 }, "short_sale_restriction_active"},
 		{"below min price", func(f *shortFixture) { f.e.cfg.Risk.Shorts.MinPrice = 150 }, "below_min_price"},
 		{"illiquid", func(f *shortFixture) { f.e.cfg.Risk.Shorts.MinAvgDollarVolume = 1e9 }, "below_min_dollar_volume"},
 		{"earnings blackout", func(f *shortFixture) {
@@ -992,4 +1021,43 @@ func TestShortEntryCountsPendingManualShorts(t *testing.T) {
 			t.Fatalf("placed=%+v status=%v; a long exit must not consume short room", placed, firstNonEmpty(f.signalStatus(id)))
 		}
 	})
+}
+
+// Codex P2: an aged short admission and a prepared-short broker miss must be
+// durably queued and then picked up by the deferred sweep.
+func TestShortSignalsAreRequeuedAndSwept(t *testing.T) {
+	f := newShortFixture(t, "SHQ")
+	for _, queue := range []struct {
+		name string
+		fn   func(id string) error
+	}{
+		{"admission retry", func(id string) error {
+			return store.QueueSignalForAdmissionRetry(f.ctx, id, "broker admission aged", true)
+		}},
+		{"deferred execution", func(id string) error { return store.QueueSignalForDeferredExecution(f.ctx, id) }},
+	} {
+		t.Run(queue.name, func(t *testing.T) {
+			id, _ := f.signal()
+			if err := queue.fn(id); err != nil {
+				t.Fatal(err)
+			}
+			var deferred bool
+			var status string
+			if err := store.GetDB().QueryRow(f.ctx, `SELECT deferred, status::text FROM signals WHERE id=$1::uuid`, id).Scan(&deferred, &status); err != nil || !deferred || status != "pending" {
+				t.Fatalf("queued SHORT deferred=%v status=%s (%v); want deferred pending", deferred, status, err)
+			}
+		})
+	}
+	// The sweep dispatches an admission-retry SHORT (it is no longer left
+	// pending): with the market open it executes, otherwise the release
+	// guard blocks it, but it is never skipped.
+	id, _ := f.signal()
+	if err := store.QueueSignalForAdmissionRetry(f.ctx, id, "broker admission aged", true); err != nil {
+		t.Fatal(err)
+	}
+	f.e.processDeferredSignals(f.ctx)
+	got, _ := store.GetSignalByID(f.ctx, id)
+	if got == nil || got.Status == "pending" {
+		t.Fatalf("admission-retry SHORT was not swept: %+v", got)
+	}
 }

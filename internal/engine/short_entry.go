@@ -341,16 +341,38 @@ func shortEligibilityInput(
 	return in
 }
 
-// shortMarketFacts fetches fresh daily candles and the earnings calendar.
+// shortMarketFacts fetches consolidated daily bars and the earnings calendar.
 // Every failure leaves the corresponding fact unknown.
+//
+// SSR and liquidity need consolidated (SIP) bars: an IEX-only low can miss a
+// Rule 201 trigger printed on another venue. On a delayed-SIP plan today's
+// bar ends at the entitlement cutoff, so the session low is the lowest of
+// that SIP low, the real-time primary feed's low, and (in
+// shortEligibilityInput) the current bid. Before today's SIP bar exists the
+// SSR status is unknown and the short is blocked.
 func (e *Engine) shortMarketFacts(ctx context.Context, ticker string, now time.Time) shortMarketFacts {
 	var facts shortMarketFacts
-	if e.marketData != nil {
-		candles, err := e.marketData.FetchHistory(ctx, ticker, data.Timeframe1Day, 30)
-		if err != nil {
-			logger.Warn("short eligibility: daily candles unavailable", "ticker", ticker, "err", err)
-		} else {
-			facts = shortFactsFromDailyCandles(candles, now, e.cfg.Risk.Shorts.SSRDropPct)
+	if e.shortEvidenceBars == nil {
+		logger.Warn("short eligibility: no consolidated daily-bar source; SSR and liquidity unknown", "ticker", ticker)
+	} else {
+		res, err := e.shortEvidenceBars.FetchDailyBars(ctx, []string{ticker}, now.AddDate(0, 0, -45), now, 1)
+		switch {
+		case err != nil:
+			logger.Warn("short eligibility: consolidated daily bars unavailable", "ticker", ticker, "err", err)
+		case res.Failures[ticker] != nil:
+			logger.Warn("short eligibility: consolidated daily bars unavailable", "ticker", ticker, "err", res.Failures[ticker])
+		default:
+			facts = shortFactsFromDailyCandles(res.Bars[ticker], now, e.cfg.Risk.Shorts.SSRDropPct)
+		}
+	}
+	if facts.SessionLow > 0 && e.marketData != nil {
+		if candles, err := e.marketData.FetchHistory(ctx, ticker, data.Timeframe1Day, 2); err == nil {
+			today := now.In(nyLoc).Format("2006-01-02")
+			for _, c := range candles {
+				if c.Low > 0 && c.Timestamp.In(nyLoc).Format("2006-01-02") == today {
+					facts.SessionLow = math.Min(facts.SessionLow, c.Low)
+				}
+			}
 		}
 	}
 	if store.IsConnected() {

@@ -53,7 +53,8 @@ Disabled: an identical run with shorts disabled produces no short orders anywher
 ## 4. Operational notes
 
 - The earnings calendar must cover a ticker before it can be shorted: an uncovered ticker (`earnings_calendar_unknown`) is blocked by design.
-- SSR and liquidity use fresh daily bars; when today's partial bar is unavailable the SSR status is unknown and the short is blocked.
+- SSR and liquidity need **consolidated (SIP)** daily bars, from the `scanner.universe.historical_feed: sip` source. IEX-only bars miss prints on other venues, so without SIP every short is blocked.
+- On Alpaca Basic, SIP is delayed (`sip_recent_data_delay_minutes`). The session low is the lowest of the SIP low through the cutoff, the real-time feed's low, and the current bid. Until today's SIP bar exists (roughly the first 16 minutes of the session), SSR is unknown and shorts are blocked. Alpaca still enforces Rule 201 on the order itself.
 - A trading-blocked or non-active account is refused at admission, before eligibility runs.
 - `buy_control` (the stock entry pause) also pauses new shorts. Exits, covers, and brackets keep running.
 - Short entries are never first-tick deferred. The deferred sweep picks up a SHORT only for crash recovery or a broker-admission refresh.
