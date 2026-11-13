@@ -304,6 +304,42 @@ func analysisIntradayMarkMaxAge(timeframe data.Timeframe) (time.Duration, bool) 
 	}
 }
 
+// analysisQuoteMark is a prompt-time fallback when the refreshed daily candle
+// has not started yet. Never turn yesterday's close or an untimestamped quote
+// into current evidence. Use the two-sided midpoint rather than a possibly
+// stale last trade; the cutoff bounds every input to this decision.
+func analysisQuoteMark(ticker string, quote *data.Quote, cutoff time.Time) (float64, string) {
+	if quote == nil || quote.Ticker != ticker || quote.Timestamp.IsZero() ||
+		quote.Timestamp.After(cutoff) || cutoff.Sub(quote.Timestamp) > time.Minute ||
+		!IsMarketOpen(cutoff) || !sameDate(quote.Timestamp, cutoff) ||
+		quote.Bid <= 0 || quote.Ask < quote.Bid ||
+		math.IsNaN(quote.Bid) || math.IsNaN(quote.Ask) ||
+		math.IsInf(quote.Bid, 0) || math.IsInf(quote.Ask, 0) {
+		return 0, "analysis_current_mark_unavailable"
+	}
+	return quote.Bid/2 + quote.Ask/2, "analysis_current_quote_mid"
+}
+
+func prepareAnalysisMark(ctx context.Context, ticker string, candles []data.Candle, tf data.Timeframe, observation candleFetchObservation,
+	fetch func(context.Context, string) (*data.Quote, error), now func() time.Time,
+) (float64, string, time.Time) {
+	cutoff := now()
+	mark, source := analysisAntiChaseMark(ticker, candles, tf, cutoff, observation)
+	if mark > 0 || fetch == nil || !IsMarketOpen(cutoff) {
+		return mark, source, cutoff
+	}
+	quoteCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	quote, err := fetch(quoteCtx, ticker)
+	cancel()
+	// Freeze the cutoff after collecting the quote, before news selection and
+	// enrichment. A quote published during the fetch is legitimate evidence.
+	cutoff = now()
+	if err == nil {
+		mark, source = analysisQuoteMark(ticker, quote, cutoff)
+	}
+	return mark, source, cutoff
+}
+
 // buildAnalysisAntiChaseSnapshot keeps a failed catalyst read distinct from a
 // confirmed empty result. Prompt-time evidence is persisted and gates BUYs, so
 // an enabled stale-catalyst rule must fail closed rather than audit an empty

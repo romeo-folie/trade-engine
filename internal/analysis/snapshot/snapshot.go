@@ -69,6 +69,21 @@ type MissingBlock struct {
 	Reason string `json:"reason"`
 }
 
+// Request restores frozen inputs for offline evaluation. It deliberately does
+// not fetch missing blocks or use the current operator configuration.
+func (in Inputs) Request() analysis.AnalysisRequest {
+	return analysis.AnalysisRequest{
+		Ticker: in.Ticker, Timeframe: in.Timeframe, TimeframeRole: in.TimeframeRole,
+		Strategy: in.Strategy, Strategies: in.Strategies, MomentumPlay: in.MomentumPlay,
+		DecisionCutoff: in.DecisionCutoff, RiskPolicy: in.RiskPolicy,
+		RecentCandles: in.RecentCandles, Indicators: in.Indicators, TimeframeContexts: in.TimeframeContexts,
+		News: in.News, Portfolio: in.Portfolio, KnowledgeContext: in.KnowledgeContext,
+		PerformanceContext: in.PerformanceContext, SimilarAnalyses: in.SimilarAnalyses,
+		DiscoveryContext: in.DiscoveryContext, ExecutionProfile: in.ExecutionProfile,
+		PullbackContext: in.PullbackContext, PrimaryThesisContext: in.PrimaryThesisContext,
+	}
+}
+
 // Canonicalize applies the declared canonical order to order-insensitive
 // request slices. It runs before both prompt rendering and hashing, so the
 // prompt and the hash always agree. Bars and timeframe contexts are already
