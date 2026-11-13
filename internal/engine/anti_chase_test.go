@@ -14,6 +14,54 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
+func TestAnalysisQuoteMarkValidatesCurrentTwoSidedEvidence(t *testing.T) {
+	now := time.Date(2026, time.November, 13, 15, 0, 0, 0, time.UTC)
+	valid := data.Quote{Ticker: "TEST", Bid: 99, Ask: 101, Last: 50, Timestamp: now.Add(-time.Second)}
+	mark, source := analysisQuoteMark("TEST", &valid, now)
+	if mark != 100 || source != "analysis_current_quote_mid" {
+		t.Fatalf("mark=%v source=%s", mark, source)
+	}
+	for name, change := range map[string]func(*data.Quote){
+		"wrong ticker":  func(q *data.Quote) { q.Ticker = "OTHER" },
+		"stale":         func(q *data.Quote) { q.Timestamp = now.Add(-61 * time.Second) },
+		"future":        func(q *data.Quote) { q.Timestamp = now.Add(time.Second) },
+		"untimestamped": func(q *data.Quote) { q.Timestamp = time.Time{} },
+		"one sided":     func(q *data.Quote) { q.Bid = 0 },
+		"crossed":       func(q *data.Quote) { q.Ask = 98 },
+		"nan":           func(q *data.Quote) { q.Ask = math.NaN() },
+		"infinite":      func(q *data.Quote) { q.Bid = math.Inf(1) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			q := valid
+			change(&q)
+			if mark, _ := analysisQuoteMark("TEST", &q, now); mark != 0 {
+				t.Fatalf("invalid quote accepted: %+v", q)
+			}
+		})
+	}
+}
+
+func TestPrepareAnalysisMarkFreezesCutoffAfterQuote(t *testing.T) {
+	start := time.Date(2026, time.November, 13, 15, 0, 0, 0, time.UTC)
+	clock := start
+	quote := &data.Quote{Ticker: "TEST", Bid: 99, Ask: 101, Timestamp: start.Add(time.Second)}
+	fetch := func(context.Context, string) (*data.Quote, error) {
+		clock = start.Add(2 * time.Second)
+		return quote, nil
+	}
+	mark, source, cutoff := prepareAnalysisMark(context.Background(), "TEST", []data.Candle{{Close: 90, Timestamp: start.AddDate(0, 0, -1)}}, data.Timeframe1Day, candleFetchObservation{}, fetch, func() time.Time { return clock })
+	if mark != 100 || source != "analysis_current_quote_mid" || !cutoff.Equal(clock) {
+		t.Fatalf("mark=%v source=%s cutoff=%v", mark, source, cutoff)
+	}
+	// A fresh primary response avoids another API call.
+	current := data.Candle{Close: 102, Timestamp: start.Add(-time.Minute)}
+	observation := candleFetchObservation{ObservedAt: start, Ticker: "TEST", Timeframe: data.Timeframe1Day, LatestFetched: &current}
+	mark, _, _ = prepareAnalysisMark(context.Background(), "TEST", []data.Candle{current}, data.Timeframe1Day, observation, func(context.Context, string) (*data.Quote, error) { t.Fatal("unneeded quote call"); return nil, nil }, func() time.Time { return start })
+	if mark != 102 {
+		t.Fatalf("fresh candle lost: %v", mark)
+	}
+}
+
 func TestSignalNeedsAdmissionRetry(t *testing.T) {
 	decisions, err := json.Marshal([]store.EntryGateDecision{
 		{Name: "universal_anti_chase_release", Status: "passed"},

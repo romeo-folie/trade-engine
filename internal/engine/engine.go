@@ -1130,6 +1130,15 @@ func (e *Engine) runAnalysisWithProfile(
 	// this second query is a lightweight store read (no API call).
 	// Keep a longer timestamped source window for the deterministic timing
 	// snapshot. The prompt still receives only its configured newest subset.
+	var timingMark float64
+	var timingMarkSource string
+	if e.cfg.Risk.EntryGates.AntiChase.Enabled {
+		var fetchQuote func(context.Context, string) (*data.Quote, error)
+		if e.marketData != nil {
+			fetchQuote = e.marketData.FetchQuote
+		}
+		timingMark, timingMarkSource, decisionCutoff = prepareAnalysisMark(ctx, ticker, candles, data.Timeframe(timeframe), primaryCandleObservation, fetchQuote, time.Now)
+	}
 	timingNow := decisionCutoff
 	var missing []snapshot.MissingBlock
 	recentNews, recentNewsErr := store.GetRecentNews(ctx, ticker, timingNow.Add(-antiChaseNewsLookback))
@@ -1232,11 +1241,11 @@ func (e *Engine) runAnalysisWithProfile(
 				missing = append(missing, snapshot.MissingBlock{Block: "timing_daily_history", Reason: dailyErr.Error()})
 			}
 		}
-		mark, markSource := analysisAntiChaseMark(
-			ticker, candles, data.Timeframe(timeframe), timingNow, primaryCandleObservation,
-		)
+		if timingMark <= 0 {
+			missing = append(missing, snapshot.MissingBlock{Block: "timing_current_mark", Reason: "current candle and fresh two-sided quote unavailable at decision cutoff"})
+		}
 		timingSnapshot = buildAnalysisAntiChaseSnapshot(
-			ticker, timingDaily, mark, markSource, timingNews, recentNewsErr,
+			ticker, timingDaily, timingMark, timingMarkSource, timingNews, recentNewsErr,
 			e.cfg.Risk.EntryGates.AntiChase.StaleCatalystRunupEnabled, timingNow,
 		)
 	} else {
